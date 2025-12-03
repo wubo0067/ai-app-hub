@@ -1,0 +1,30 @@
+# 数据源配置
+datasource:
+  root_dir: "../data"
+
+iobs:
+  server: "http://iobs.example.com"
+  port: 80
+  api_endpoint: "/api/open/kn/fileUpload"
+  user_name: "os"
+  tenant_id: "os"
+
+# RAG 知识库配置
+rag:
+  server: "http://rag.example.com"
+  port: 80
+  api_endpoint: "/api/open/kn/docCreateV2"
+  tenant_id: "os"
+  user_name: "os"
+  knowledge_base_id: 12345
+  category_id: 12345
+  source: "local"
+  max_concurrent_files: 10 # 每次批量导入 md 文档数量
+
+# 日志和监控
+logging:
+  level: "DEBUG" # DEBUG, INFO, WARNING, ERROR
+  file: "./logs/import.log"
+  max_size: "10MB"
+  backup_count: 5
+  process_record_file: "./logs/.process" # 记录导入进度的文件
