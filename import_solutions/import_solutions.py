@@ -15,43 +15,52 @@ class ImportSolutions:
         self.config = config
         datasource = config.get('datasource', {})
         rag_cfg = config.get('rag', {})
-        iobs_cfg = config.get('iobs', {})
         logging_cfg = config.get('logging', {})
+
+        env = rag_cfg.get('env', 'prod').lower()
+        rag_server = ''  # 添加默认值
+        if env == 'prod':
+            rag_server = rag_cfg.get('prod_url', '')
+        elif env == 'stg':
+            rag_server = rag_cfg.get('stg_url', '')
+        else:
+            # 添加 else 分支处理其他情况
+            logmod.logger.warning(f"Unknown environment: {env}, using prod as default")
+            rag_server = rag_cfg.get('prod_url', '')
 
         self.root_dir = datasource.get('root_dir', './data')
         self.process_file = logging_cfg.get('process_record_file', './.process')
 
         self.max_concurrency = max(1, int(rag_cfg.get('max_concurrent_files', 10)))  # 同时上传多少个
 
-        timeout_seconds = float(iobs_cfg.get('timeout', 60))
+        timeout_seconds = float(rag_cfg.get('timeout', 10))
         self.http_timeout = aiohttp.ClientTimeout(total=timeout_seconds)
 
-        # IOBS 配置
-        server = (iobs_cfg.get('server') or '').rstrip('/')
-        port = iobs_cfg.get('port')
-        endpoint = iobs_cfg.get('api_endpoint', '')
+        port = rag_cfg.get('port')
+        base_url = rag_server if not port else f"{rag_server}:{port}"
+
+        # RAG 文件上传
+        endpoint = rag_cfg.get('upload_api_endpoint', '')
         if endpoint and not endpoint.startswith('/'):
             endpoint = f'/{endpoint}'
-        base_url = server if not port else f"{server}:{port}"
-        self.iobs_url = f"{base_url}{endpoint}" if base_url else endpoint
-        if not self.iobs_url:
-            logmod.logger.warning("iobs server endpoint is empty; uploads will fail.")
+        self.upload_url = f"{base_url}{endpoint}" if base_url else endpoint
+        if not self.upload_url:
+            logmod.logger.warning("RAG upload API endpoint is empty; uploads will fail.")
 
-        self.iobs_payload_defaults = {
-            'tenantId': iobs_cfg.get('tenant_id'),
-            'userName': iobs_cfg.get('user_name'),
+        self.upload_payload_defaults = {
+            'tenantId': rag_cfg.get('tenant_id'),
+            'userName': rag_cfg.get('user_name'),
         }
 
-        # RAG 配置（如果需要第二步导入）
-        rag_server = (rag_cfg.get('server') or '').rstrip('/')
-        rag_port = rag_cfg.get('port')
-        rag_endpoint = rag_cfg.get('api_endpoint', '')
-        if rag_endpoint and not rag_endpoint.startswith('/'):
-            rag_endpoint = f'/{rag_endpoint}'
-        rag_base_url = rag_server if not rag_port else f"{rag_server}:{rag_port}"
-        self.rag_url = f"{rag_base_url}{rag_endpoint}" if rag_base_url else rag_endpoint
+        # RAG 导入
+        endpoint = rag_cfg.get('import_api_endpoint', '')
+        if endpoint and not endpoint.startswith('/'):
+            endpoint = f'/{endpoint}'
+        self.import_url = f"{base_url}{endpoint}" if base_url else endpoint
+        if not self.import_url:
+            logmod.logger.warning("RAG import API endpoint is empty; imports will fail.")
 
-        self.rag_payload_defaults = {
+        self.import_payload_defaults = {
             'knId': rag_cfg.get('knowledge_base_id'),
             'categoryId': rag_cfg.get('category_id'),
             'source': rag_cfg.get('source'),
@@ -155,19 +164,19 @@ class ImportSolutions:
 
             # 构建上传 iobs 的请求体
             payload = {
-                **{k: v for k, v in self.iobs_payload_defaults.items() if v is not None},
+                **{k: v for k, v in self.upload_payload_defaults.items() if v is not None},
                 'file': md_content,
             }
 
             # 打印完整的 POST 请求信息
             logmod.logger.debug(f"file_path: {file_path}")
-            logmod.logger.debug(f"POST Request URL: {self.iobs_url}")
+            logmod.logger.debug(f"POST Request URL: {self.upload_url}")
             logmod.logger.debug(f"POST Request Headers: Content-Type=application/json")
             logmod.logger.debug(f"POST Request Payload: {payload}")
 
 
             try:
-                async with session.post(self.iobs_url, json=payload) as response:
+                async with session.post(self.upload_url, json=payload) as response:
                     if response.content_type == 'application/json':
                         rsp_data = await response.json()
                     else:
@@ -175,7 +184,7 @@ class ImportSolutions:
                         logmod.logger.error(f"Unexpected response for {rel_path}: {rsp_data}")
                         return False
             except Exception as exc:
-                logmod.logger.error(f"Failed to upload file {rel_path} to iobs: {exc}")
+                logmod.logger.error(f"Failed to upload file {rel_path} to upload URL: {exc}")
                 return False
 
             if rsp_data.get('state') == 'success' and rsp_data.get('code') == 200:
@@ -183,8 +192,8 @@ class ImportSolutions:
 
                 #上传 iobs 成功后，将 markdown 导入 RAG 系统
                 # 构建上传 RAG 的请求体
-                rag_payload = {
-                    **{k: v for k, v in self.rag_payload_defaults.items() if v is not None},
+                payload = {
+                    **{k: v for k, v in self.import_payload_defaults.items() if v is not None},
                     'docFiles': [{
                         'fileKey' : rsp_data.get('data', {}).get('fileKey'),
                         'fileSize' : str(rsp_data.get('data', {}).get('fileSize')),
@@ -194,12 +203,12 @@ class ImportSolutions:
                         }],
                 }
 
-                logmod.logger.debug(f"RAG POST Request URL: {self.rag_url}")
+                logmod.logger.debug(f"RAG POST Request URL: {self.import_url}")
                 logmod.logger.debug(f"RAG POST Request Headers: Content-Type=application/json")
-                logmod.logger.debug(f"RAG POST Request Payload: {rag_payload}")
+                logmod.logger.debug(f"RAG POST Request Payload: {payload}")
 
                 try:
-                    async with session.post(self.rag_url, json=rag_payload) as rag_response:
+                    async with session.post(self.import_url, json=payload) as rag_response:
                         if rag_response.content_type == 'application/json':
                             rag_rsp_data = await rag_response.json()
                         else:
@@ -207,7 +216,7 @@ class ImportSolutions:
                             logmod.logger.error(f"Unexpected RAG response for {rel_path}: {rag_rsp_data}")
                             return False
                 except Exception as exc:
-                    logmod.logger.error(f"Failed to upload file {rel_path} to RAG: {exc}")
+                    logmod.logger.error(f"Failed to upload file {rel_path} to import URL: {exc}")
                     return False
 
                 if rag_rsp_data.get('state') == 'success':

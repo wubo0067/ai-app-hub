@@ -2,18 +2,14 @@
 datasource:
   root_dir: "../data"
 
-iobs:
-  server: "http://iobs.example.com"
-  port: 80
-  api_endpoint: "/api/open/kn/fileUpload"
-  user_name: "os"
-  tenant_id: "os"
-
 # RAG 知识库配置
 rag:
-  server: "http://rag.example.com"
+  env: "stg" # 环境：prod, stg
+  prod_url: "http://rag.prod.example.com"
+  stg_url: "http://rag.stg.example.com"
   port: 80
-  api_endpoint: "/api/open/kn/docCreateV2"
+  import_api_endpoint: "/api/open/kn/docCreateV2" # RAG 知识库导入接口
+  upload_api_endpoint: "/api/open/kn/fileUpload" # MD 文件上传接口
   tenant_id: "os"
   user_name: "os"
   knowledge_base_id: 12345
