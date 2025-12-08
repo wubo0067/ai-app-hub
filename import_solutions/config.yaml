@@ -8,10 +8,12 @@ rag:
   prod_url: "http://rag.prod.example.com"
   stg_url: "http://rag.stg.example.com"
   port: 80
+  login_api_endpoint: "/appid/auth/login"
   import_api_endpoint: "/api/open/kn/docCreateV2" # RAG 知识库导入接口
   upload_api_endpoint: "/api/open/kn/fileUpload" # MD 文件上传接口
-  tenant_id: "os"
-  user_name: "os"
+  tenant_id: "os" # 租户编码
+  user_name: "os" # 登录用户名
+  secret_key: "123456789abcdef" # 登录密钥
   knowledge_base_id: 12345
   category_id: 12345
   source: "local"
