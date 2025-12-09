@@ -223,7 +223,7 @@ class ImportSolutions:
                     form_data.add_field(k, str(v))
 
             # 打印完整的 POST 请求信息
-            logmod.logger.debug(f"Upload file_path: {file_path}")
+            logmod.logger.info(f"Upload file: {file_path}")
             #logmod.logger.debug(f"POST Request URL: {self.upload_url}")
             #logmod.logger.debug(f"POST Request Headers: auth-token")
             #logmod.logger.debug(f"POST Request Payload: multipart/form-data")
@@ -234,7 +234,6 @@ class ImportSolutions:
                 async with session.post(self.upload_url, data=form_data, headers=headers) as response:
                     if response.content_type == 'application/json':
                         rsp_data = await response.json()
-                        logmod.logger.debug(f"Upload response: {rsp_data}")
                     else:
                         rsp_data = {'status': response.status, 'body': await response.text()}
                         logmod.logger.error(f"Unexpected response for {rel_path}: {rsp_data}")
@@ -243,7 +242,7 @@ class ImportSolutions:
                 logmod.logger.error(f"Failed to upload file {rel_path} to upload URL: {exc}")
                 return False
 
-            if rsp_data.get('state') == 'success' and rsp_data.get('code') == 200:
+            if rsp_data.get('state') == 'success' and rsp_data.get('code') == '200':
                 logmod.logger.info(f"Imported file: {rel_path}")
 
                 #上传 iobs 成功后，将 markdown 导入 RAG 系统
@@ -253,13 +252,13 @@ class ImportSolutions:
                     'docFiles': [{
                         'fileKey' : rsp_data.get('data', {}).get('fileKey'),
                         'fileSize' : str(rsp_data.get('data', {}).get('fileSize')),
-                        'docType' : 'MD',
+                        'docType' : 'MARKDOWN',
                         'name' : rsp_data.get('data', {}).get('fileName'),
                         'fileUrl' : rsp_data.get('data', {}).get('fileUrl'),
                         }],
                 }
 
-                logmod.logger.debug(f"RAG POST Request URL: {self.import_url}")
+                #logmod.logger.debug(f"RAG POST Request URL: {self.import_url}")
                 #logmod.logger.debug(f"RAG POST Request Headers: Content-Type=application/json")
                 #logmod.logger.debug(f"RAG POST Request Payload: {payload}")
 
@@ -278,10 +277,15 @@ class ImportSolutions:
                 if rag_rsp_data.get('state') == 'success':
                     logmod.logger.info(f"RAG import successful for file: {rel_path}, RAG response: {rag_rsp_data}")
                     # 只在导入成功后才记录进度
-                    self._record_progress(file_path)
+                    await self._record_progress(file_path)
                     return True
                 else:
                     logmod.logger.error(f"RAG import failed for {rel_path}: {rag_rsp_data}")
+                    # 如果 state = 'failure', code = '400', msg 包含'单元名称重复，以跳过上传'，则视为成功，继续下一个文件
+                    if rag_rsp_data.get('code') == '400' and '单元名称重复，以跳过上传' in rag_rsp_data.get('msg', ''):
+                        logmod.logger.info(f"RAG import skipped for duplicate file: {rel_path}")
+                        await self._record_progress(file_path)
+                        return True
             else:
                 logmod.logger.error(f"File upload failed for {rel_path}: {rsp_data}")
 
@@ -298,13 +302,13 @@ class ImportSolutions:
             logmod.logger.warning(f"Unable to read process record '{self.process_file}': {exc}")
             return None
 
-    def _record_progress(self, file_path):
+    async def _record_progress(self, file_path):
         record = self._relative_path(file_path)
         record_dir = os.path.dirname(self.process_file)
         if record_dir:
             os.makedirs(record_dir, exist_ok=True)
-        with open(self.process_file, 'w', encoding='utf-8') as f:
-            f.write(record + '\n')
+        async with aiofiles.open(self.process_file, 'w', encoding='utf-8') as f:
+            await f.write(record + '\n')
 
     def _relative_path(self, absolute_path):
         try:
@@ -340,4 +344,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logmod.logger.warning("Ctrl+C received, stopping asynchronous import...")
     finally:
+        logmod.shutdown_logger()
         logging.shutdown()

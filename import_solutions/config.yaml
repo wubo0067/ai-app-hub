@@ -26,3 +26,6 @@ logging:
   max_size: "10MB"
   backup_count: 5
   process_record_file: "./logs/.process" # 记录导入进度的文件
+  handlers:
+    file:
+      class: "logging.handlers.QueueHandler" # 使用队列异步处理日志，不影响并发
