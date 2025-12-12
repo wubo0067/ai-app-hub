@@ -1,6 +1,6 @@
-data/
-output/
-import_solutions/logs/
+scrapy_rhel/data/
+scrapy_rhel/output/
+scrapy_rhel/import_solutions/logs/
 __pycache__/
 .vscode/
 *.md
