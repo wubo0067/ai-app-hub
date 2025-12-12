@@ -1,7 +1,7 @@
 import asyncio
 from fastmcp import FastMCP, Client
 
-# 设置 server 服务器
+# 创建 mcp 服务器
 mcp = FastMCP("My MCP Server")
 
 @mcp.tool()
@@ -15,6 +15,6 @@ client = Client(mcp)
 async def call_tool(name: str):
     async with client:
         result = await client.call_tool("greet", {"name": name})
-        print(result)
+        print(f"Result: {result}")
 
 asyncio.run(call_tool("Ford"))
