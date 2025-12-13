@@ -1,0 +1,16 @@
+{
+    "mcpServers": {
+        "weather": {
+            "disabled": false,
+            "timeout": 60,
+            "command": "uv",
+            "args": [
+                "--directory",
+                "J:\\ai-app-hub\\mcp\\weather",
+                "run",
+                "weather.py"
+            ],
+            "transportType": "stdio"
+        }
+    }
+}
