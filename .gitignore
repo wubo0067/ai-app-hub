@@ -1,5 +1,6 @@
 scrapy_rhel/data/
 scrapy_rhel/output/
+scrapy_rhel/solutions/
 scrapy_rhel/import_solutions/logs/
 __pycache__/
 .vscode/
