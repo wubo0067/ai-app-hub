@@ -1,6 +1,6 @@
 from langchain.messages import ToolMessage
 from tools import tools_by_name
-
+from log import logger
 
 # 这段代码定义了一个名为 tool_node 的函数，它是 LangGraph 状态机中的一个核心节点，专门负责执行大语言模型（LLM）请求的工具调用。
 # 在 AI Agent 的工作流中，当模型决定不直接回答问题而是调用外部工具（如计算器、搜索 API 等）时，该函数会被触发。
@@ -15,10 +15,12 @@ def tool_node(state: dict):
         tool = tools_by_name[tool_call["name"]]
 
         # 调用该工具并传入所需的参数
-        print(f"Invoking tool: {tool_call['name']} with args: {tool_call['args']}")
+        logger.info(
+            f"Invoking tool: {tool_call['name']} with args: {tool_call['args']}"
+        )
         observation = tool.invoke(tool_call["args"])
 
         # 将工具调用的结果封装为 ToolMessage 并添加到结果列表中
-        print(f"Tool result: {observation}")
+        logger.info(f"Tool result: {observation}")
         result.append(ToolMessage(content=observation, tool_call_id=tool_call["id"]))
     return {"messages": result}
