@@ -9,5 +9,6 @@ dependencies = [
     "langchain>=1.2.0",
     "langchain-openai>=1.1.5",
     "langgraph>=1.0.5",
+    "langgraph-cli[inmem]>=0.4.11",
     "pyppeteer>=2.0.0",
 ]

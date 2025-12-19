@@ -17,5 +17,5 @@ class MessagesState(TypedDict):
         llm_calls: 整数类型，记录 LLM 调用次数
     """
 
-    messages: Annotated[list[AnyMessage], operator.add]
+    messages: Annotated[list[AnyMessage], operator.add]  # TypeDict 来确定字段类型
     llm_calls: int
