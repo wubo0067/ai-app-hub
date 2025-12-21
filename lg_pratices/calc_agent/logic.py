@@ -1,5 +1,6 @@
 from typing import Literal
 from state import MessagesState
+from langchain_core.messages import AIMessage
 
 
 def should_continue(state: MessagesState) -> Literal["tool_node", "__end__"]:
@@ -14,7 +15,7 @@ def should_continue(state: MessagesState) -> Literal["tool_node", "__end__"]:
     # 函数通过检查该消息的 tool_calls 属性来判断模型的意图：如果该属性非空，
     # 意味着模型认为当前问题需要调用外部工具（如计算器或搜索 API）来获取更多信息，
     # 此时函数返回 "tool_node"，引导工作流进入工具执行阶段。
-    if last_message.tool_calls:
+    if isinstance(last_message, AIMessage) and last_message.tool_calls:
         return "tool_node"
 
     # 如果 last_message.tool_calls 为空，则表明模型已经生成了最终的文本答复，不再需要执行任何工具。

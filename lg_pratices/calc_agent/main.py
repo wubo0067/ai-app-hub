@@ -17,8 +17,8 @@ def build_agent():
     agent_builder = StateGraph(MessagesState)
 
     # 添加节点到状态图，Node = 流程中的步骤（如果调用 LLM, 执行工具)
-    agent_builder.add_node("llm_call", llm_call)
-    agent_builder.add_node("tool_node", tool_node)
+    agent_builder.add_node("llm_call", llm_call)  # type: ignore
+    agent_builder.add_node("tool_node", tool_node)  # type: ignore
 
     # 添加决策逻辑以决定工作流的路径，Edge = 步骤之间的连接线
     agent_builder.add_edge(START, "llm_call")
@@ -61,7 +61,7 @@ def agent_main():
         )
     ]
     messages = agent.invoke(
-        {"messages": messages}, config={"callbacks": [logging_callback_handler]}
+        {"messages": messages}, config={"callbacks": [logging_callback_handler]}  # type: ignore
     )
     for m in messages["messages"]:
         m.pretty_print()

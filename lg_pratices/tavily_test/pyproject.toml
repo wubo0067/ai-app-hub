@@ -1,0 +1,12 @@
+[project]
+name = "tavily-test"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain-community>=0.4.1",
+    "langchain-openai>=1.1.6",
+    "langchain-tavily>=0.2.15",
+    "langgraph-prebuilt>=1.0.5",
+]
