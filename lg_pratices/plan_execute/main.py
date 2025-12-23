@@ -14,14 +14,14 @@ import operator
 # 定义 State, 用于存储输入，计划，过去的步骤和响应
 class PlanExecute(TypedDict):
     input: str  # 用户输入
-    plan: List[str]  # 计划步骤列表
+    plan: List[str]  # 计划步骤列表，这个步骤会被 replanner 更新
     past_steps: Annotated[
         List[Tuple], operator.add
     ]  # 记录先前执行的步骤，每个元组包含执行步骤和执行结果
     response: str  # 最终响应结果
 
 
-# 定义计划步骤，用于描述未来要执行的计划
+# 定义计划步骤，用于描述未来要执行的计划，第一阶段用户输入问题，llm 针对该问题分解的步骤，llm 的 response 会结构化输出到 Plan
 class Plan(BaseModel):
     """Plan to follow in future"""
 
@@ -45,28 +45,6 @@ class Act(BaseModel):
     )
 
 
-# 步骤执行函数
-async def execute_step(state: PlanExecute) -> PlanExecute:
-    """Execute a single step of the plan"""
-    # 从状态中获取计划列表，例如：["检查 CPU 使用率", "分析进程列表", "检查系统日志"]
-    plan = state["plan"]
-    # 2. 格式化计划为编号列表字符串
-    plan_str = "\n".join(f"{i + 1}. {step}" for i, step in enumerate(plan))
-    # 3. 获取当前要执行的任务（第一个），例如："检查 CPU 使用率"
-    task = plan[0]
-
-    # 4. 构造任务提示词
-    task_formatted = f"""For the following plan:
-{plan_str}\n\nYou are tasked with executing step {1}, {task}."""
-
-    # 5. 异步调用 agent 执行任务
-    messages = [HumanMessage(content=task_formatted)]
-    agent_response = await agent_executor.ainvoke({"messages": messages})
-    return {
-        "past_steps": [(task, agent_response["messages"][-1].content)],
-    }
-
-
 # 生成计划函数
 async def plan_step(state: PlanExecute) -> PlanExecute:
     """Generate a plan based on the input"""
@@ -76,23 +54,59 @@ async def plan_step(state: PlanExecute) -> PlanExecute:
     plan_result = await planner.ainvoke({"messages": messages})
     # 获取结构化输出的 steps
     plan_steps = plan_result.steps
+    print(f"Generated plan steps: {plan_steps}")
     # 将 plan_steps 放入 state 的 plan 字段中返回
     return {"plan": plan_steps}
 
 
+# 步骤执行函数
+async def execute_step(state: PlanExecute) -> PlanExecute:
+    """Execute a single step of the plan"""
+    # 从状态中获取计划列表，例如：["检查 CPU 使用率", "分析进程列表", "检查系统日志"]
+    plan = state["plan"]
+    # 2. 格式化计划为编号列表字符串
+    plan_str = "\n".join(f"{i + 1}. {step}" for i, step in enumerate(plan))
+    print(f"--->will execute plan: {plan_str}")
+    # 3. 获取当前要执行的任务（第一个），例如："检查 CPU 使用率"
+    task = plan[0]
+
+    # 4. 构造任务提示词
+    task_formatted = f"""For the following plan:
+{plan_str}\n\nYou are tasked with executing step {1}, {task}."""
+
+    # 5. 异步调用 agent 执行任务
+    messages = [HumanMessage(content=task_formatted)]
+    # 这个 invoke 就包括了工具调用，调用 tavily_search
+    agent_response = await agent_executor.ainvoke({"messages": messages})
+    print(f"<---execute response: {agent_response}")
+    # 记录过往步骤和结果
+    return {
+        # 拿最终追加的最后一条消息（通常是最后一轮 AIMessage）作为本 step 的结果
+        "past_steps": [(task, agent_response["messages"][-1].content)],
+    }
+
+
 # 重新规划步骤函数
-async def replan_step(state: PlanExecute):
+async def replan_step(state: PlanExecute) -> PlanExecute:
+    # replanner 返回 Act 结构对象，该结构包含 Response, Plan
+    # !! AI 会根据 Prompt 返回新的 Plan，或者直接返回 Response, Action 是个 Union
     output = await replanner.ainvoke(state)
+    print(f"<---replanner output:", output)
     if isinstance(output.action, Response):
+        print("<---replanner final response:", output.action.response)
         return {"response": output.action.response}
     else:
+        print("<---replanner updated plan steps:", output.action.steps)
         return {"plan": output.action.steps}
 
 
 def should_end(state: PlanExecute):
+
     if "response" in state and state["response"]:
+        # 返回 END：当 state 中存在 response 且不为空时，流程结束
         return END
     else:
+        # 否则继续执行 agent 节点，继续处理计划中的下一步
         return "agent"
 
 
@@ -103,7 +117,10 @@ async def main():
     # Add the plan node
     workflow.add_node("planner", plan_step)
 
-    # Add the execution step
+    # Add the execution step, agent 包括 LLM 调用和工具使用
+    # agent 是思考 + 行动，所以 agent 应该有两个步骤
+    # !! 1：给出问题，agent 思考后给出行动方案
+    # !! 2：根据行动方案使用工具，给出结果
     workflow.add_node("agent", execute_step)
 
     # Add a replan node
@@ -112,12 +129,13 @@ async def main():
     # 第一步构建计划
     workflow.add_edge(START, "planner")
 
-    # 从计划到执行计划中的 steps
+    # 从计划到执行计划中的 steps,
     workflow.add_edge("planner", "agent")
 
     # From agent, we replan
     workflow.add_edge("agent", "replan")
 
+    # 根据 should_end 函数的判断，决定是继续执行 agent 还是结束
     workflow.add_conditional_edges(
         "replan",
         # Next, we pass in the function that will determine which node is called next.
@@ -128,7 +146,10 @@ async def main():
     app = workflow.compile()
 
     config = {"recursion_limit": 50}
-    inputs = {"input": "what is the hometown of the mens 2024 Australia open winner?"}
+    # inputs = {"input": "what is the hometown of the mens 2024 Australia open winner?"}
+    inputs = {
+        "input": "Where is the hometown of the Asian men's 100-meter sprint record holder?"
+    }
     async for event in app.astream(inputs, config=config):
         for k, v in event.items():
             if k != "__end__":
@@ -142,7 +163,7 @@ if __name__ == "__main__":
     os.environ["LANGSMITH_API_KEY"] = "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" # fmt: skip
 
     # 在环境变量设置后初始化工具和模型
-    search_tool = TavilySearch(max_results=3)
+    search_tool = TavilySearch(max_results=1)
     tools = [search_tool]
 
     llm = ChatOpenAI(
