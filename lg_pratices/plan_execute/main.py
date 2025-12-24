@@ -78,6 +78,15 @@ async def execute_step(state: PlanExecute) -> PlanExecute:
     messages = [HumanMessage(content=task_formatted)]
     # 这个 invoke 就包括了工具调用，调用 tavily_search
     agent_response = await agent_executor.ainvoke({"messages": messages})
+    # !!agent_response 返回的是一个 dict，messages 字段必有，包含整个执行过程中交换的所有消息列表
+    # {
+    #    "messages": [
+    #        HumanMessage(content="..."),      # 你的输入
+    #        AIMessage(content="...", tool_calls=[...]),  # AI 的思考 + 工具调用
+    #        ToolMessage(content="...", tool_call_id="..."),  # 工具执行结果
+    #        AIMessage(content="...")           # AI 的最终回答
+    #    ]
+    # }
     print(f"<---execute response: {agent_response}")
     # 记录过往步骤和结果
     return {
@@ -170,6 +179,7 @@ if __name__ == "__main__":
         api_key="sk-b5480f840a794c69a0af1732459f3ae4",  # type: ignore
         base_url="https://api.deepseek.com",
         model="deepseek-chat",
+        temperature=0,  # temperature 的作用是控制生成文本的随机性，值越低，生成的文本越确定和一致
     )
 
     prompt = "You are a helpful assistant."
@@ -191,6 +201,13 @@ if __name__ == "__main__":
             ("placeholder", "{messages}"),
         ]
     )
+    # Plan 是提示大模型要结构化输出
+    # !! 为什么大模型对 planner_prompt 这样的 prompt 产生的 response 能解析成 Plan 这种 schema 呢？
+    # !! 模型是如何理解“结构”与“语义”映射的核心机制
+    # !! LangChain 的 structured output ≠ 纯 prompt 工程，而是模型能力 + 协议约束 + 解析器三者协同工作的结果。
+    # ** with_structured_output(schema) 里的 schema 并不是简单地“加到 prompt 里的说明文字”。LangChain 把 schema 转换成一种「模型必须遵守的输出协议（contract）」，
+    # ** 并通过 OpenAI function calling / JSON mode / tool calling 等机制，强制模型只输出可被该 schema 解析的结构化数据。
+    # ** schema / function 信息也会被发送给大模型，但它们不是作为普通的 prompt 文本发送的，而是作为「模型调用协议的一部分」发送的。
     planner = planner_prompt | llm.with_structured_output(
         Plan, method="function_calling"
     )
