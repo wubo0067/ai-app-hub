@@ -1,0 +1,112 @@
+{
+  "scenario": "Hard lockup due to multiple CPUs busy-waiting on a spinlock owned by no one",
+  "symptoms": [
+    "panic without hard lockup message",
+    "exception RIP: _raw_spin_lock+30",
+    "exception RIP: native_queued_spin_lock_slowpath",
+    "watchdog_overflow_callback",
+    "is_hardlockup() returns true",
+    "multiple CPUs stuck in spinlock busy-wait"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "首先检查panic任务的完整调用栈，确认是否由watchdog触发。需要查看panic调用链，特别是watchdog_overflow_callback是否被调用，这指示硬锁死检测器触发了panic。",
+      "action": "bt -p",
+      "observation": "调用栈显示panic -> watchdog_overflow_callback -> nmi_panic，但缺少'Hard LOCKUP'消息。RIP显示_raw_spin_lock+30，表明CPU在获取自旋锁时卡住。"
+    },
+    {
+      "step_number": 2,
+      "thought": "验证硬锁死检测器是否启用。检查nmi_watchdog_user_enabled和hardlockup_panic变量，确认系统配置允许watchdog触发panic。",
+      "action": "p nmi_watchdog_user_enabled; p hardlockup_panic",
+      "observation": "nmi_watchdog_user_enabled = 1, hardlockup_panic = 1，表明硬锁死检测器已启用且配置为触发panic。"
+    },
+    {
+      "step_number": 3,
+      "thought": "分析卡住CPU的寄存器状态，特别是RBX寄存器，它通常包含自旋锁地址。需要确定哪个自旋锁导致死锁。",
+      "action": "dis -lr ffffffffb4ff4d3e",
+      "observation": "反汇编显示_raw_spin_lock将RDI（自旋锁地址）复制到RBX。从寄存器转储中，RBX = ffff8d43cc072180，这是CPU 2的rq.lock地址。"
+    },
+    {
+      "step_number": 4,
+      "thought": "检查该自旋锁的具体状态。需要分析spinlock_t结构，查看locked、pending、owner等字段，确认锁的持有状态。",
+      "action": "spinlock_t 0xffff8d43cc072180 -x",
+      "observation": "锁状态显示：locked=1, pending=1, owner=0x0。这表明锁被占用且有等待者，但owner字段为NULL，意味着没有明确的持有者。"
+    },
+    {
+      "step_number": 5,
+      "thought": "分析锁的二进制表示，确认竞争状态。需要查看raw_lock的完整值，了解locked、pending和tail字段的具体设置。",
+      "action": "eval -b 0x001c0101",
+      "observation": "二进制显示：bits 20,19,18,8,0被设置。这对应locked=1, pending=1, tail=0x1c，表明锁被占用、有等待者且有多个CPU在等待队列中。"
+    },
+    {
+      "step_number": 6,
+      "thought": "检查所有CPU的调用栈，确认哪些CPU在等待同一个自旋锁。需要统计所有CPU的RBX寄存器值，识别共同的锁地址。",
+      "action": "bt -a | grep exception\\ RIP -A3 | grep spin -A3 | grep -oE 'RBX: ffff.{12}' | uniq -c",
+      "observation": "结果显示4个CPU（0,2,4,6）的RBX都指向同一个地址：ffff8d43cc072180，即CPU 2的rq.lock。"
+    },
+    {
+      "step_number": 7,
+      "thought": "检查定时器队列，确认由于自旋锁忙等待导致的中断禁用是否造成了定时器积压。需要查看各CPU的hrtimer队列中过期的定时器。",
+      "action": "timer -r | awk '$1~/CPU:/||$3~/-[0-9]+/'",
+      "observation": "CPU 0,2,4,6,8都有大量过期定时器（负值表示过期时间）。特别是CPU 2和8的watchdog定时器也过期，表明这些CPU无法处理中断。"
+    },
+    {
+      "step_number": 8,
+      "thought": "检查CPU 8的状态，因为它也显示硬锁死但等待不同的锁。需要分析CPU 8的调用栈和锁状态。",
+      "action": "bt -c 8",
+      "observation": "CPU 8卡在cpupri_set+76，正在尝试获取任务结构体的pi_lock（地址ffff8d38846f0c58）和CPU 8的rq.lock（ffff8d43cc132180）。"
+    },
+    {
+      "step_number": 9,
+      "thought": "验证CPU 8是否确实持有pi_lock。检查该自旋锁的状态，确认owner信息。",
+      "action": "spinlock_t 0xffff8d38846f0c58",
+      "observation": "pi_lock显示locked=1, pending=0, owner=0x0。锁被占用但owner为NULL，与CPU 2的rq.lock情况类似。"
+    },
+    {
+      "step_number": 10,
+      "thought": "检查hrtimer中断计数器，确认哪些CPU的定时器中断被冻结。比较hrtimer_interrupts和hrtimer_interrupts_saved的差异。",
+      "action": "p per_cpu(hrtimer_interrupts,*) | paste - - | column -t",
+      "observation": "CPU 0,2,4,6,8的hrtimer_interrupts计数与saved版本比较显示，CPU 2和8的计数没有增加，表明这些CPU的定时器中断处理被阻塞。"
+    },
+    {
+      "step_number": 11,
+      "thought": "检查timer_base时钟值，确认哪些CPU的定时器基础时钟落后于当前jiffies。这可以指示CPU处理定时器中断的能力。",
+      "action": "p timer_bases | awk '$2~/ffff.{12}/{print \"timer_base.clk \" $NF}' | paste - - | awk '{print \"CPU: \" NR-1 \" \" $0}' | sed 's/crash> //' | sed 's/,$//'",
+      "observation": "CPU 0,2,6,8的timer_base.clk值显著落后于当前jiffies（超过12秒），表明这些CPU无法更新定时器基础时钟。"
+    }
+  ],
+  "root_cause_analysis": [
+    {
+      "phenomenon": "自旋锁owner字段为NULL但locked=1",
+      "possible_cause": "锁状态不一致，可能是内存损坏、硬件故障或竞争条件导致锁状态更新不完整"
+    },
+    {
+      "phenomenon": "多个CPU（0,2,4,6）等待同一个rq.lock",
+      "possible_cause": "锁持有者可能因某种原因（如硬件故障、内存错误）未能释放锁，或锁状态损坏导致无法正确传递所有权"
+    },
+    {
+      "phenomenon": "硬锁死检测触发但无'Hard LOCKUP'消息",
+      "possible_cause": "panic路径可能在打印消息前被中断，或内存损坏导致字符串无法正确输出"
+    },
+    {
+      "phenomenon": "hrtimer中断计数器停滞",
+      "possible_cause": "CPU因自旋锁忙等待而禁用中断，无法处理定时器中断，导致计数器无法更新"
+    },
+    {
+      "phenomenon": "timer_base.clk显著落后于jiffies",
+      "possible_cause": "CPU无法处理定时器中断，导致定时器基础时钟无法更新，积压大量过期定时器"
+    },
+    {
+      "phenomenon": "watchdog定时器过期但CPU仍处于忙等待",
+      "possible_cause": "CPU在禁用中断状态下忙等待自旋锁，无法响应NMI中断，导致watchdog检测到硬锁死"
+    }
+  ],
+  "data_patterns": [
+    "0x1c0101 (spinlock raw_lock value with locked=1, pending=1, tail=0x1c)",
+    "owner field = 0x0 in locked spinlock",
+    "hrtimer expiration times negative (overdue timers)",
+    "timer_base.clk behind jiffies by >12000 ticks",
+    "per_cpu(hrtimer_interrupts) unchanged for affected CPUs"
+  ]
+}

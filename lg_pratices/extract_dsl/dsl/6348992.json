@@ -1,0 +1,122 @@
+{
+  "scenario": "Hard Lockup with Timer Discrepancy and Spinlock Deadlock",
+  "symptoms": [
+    "Watchdog detected hard LOCKUP",
+    "exception RIP: _spin_lock_irqsave+50",
+    "exception RIP: mwait_idle_with_hints+196",
+    "Kernel panic - not syncing: Hard LOCKUP",
+    "tvec_base values way behind current jiffies"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "首先检查系统基本信息，确认硬件环境和内核版本，这有助于识别已知的硬件兼容性问题。HP ProLiant DL580 G7 系统可能存在特定的硬件问题。",
+      "action": "sys -i",
+      "observation": "检查DMI_BIOS_VERSION和DMI_BIOS_DATE，确认BIOS版本是否过旧（如示例中的P65 05/21/2018）。"
+    },
+    {
+      "step_number": 2,
+      "thought": "分析panic信息，确认硬锁定的CPU编号和触发进程。硬锁定通常发生在某个CPU上的任务长时间占用内核而不让出CPU。",
+      "action": "bt -a",
+      "observation": "查找包含'Watchdog detected hard LOCKUP'的CPU堆栈，确认锁定发生在哪个CPU（如CPU 22）。"
+    },
+    {
+      "step_number": 3,
+      "thought": "检查硬锁定CPU上运行的任务状态，分析其堆栈以确定卡在哪个内核函数中。",
+      "action": "bt -c 22",
+      "observation": "确认任务是否卡在_spin_lock_irqsave函数中，并检查其RAX寄存器的值（如0xfc5a）。"
+    },
+    {
+      "step_number": 4,
+      "thought": "分析导致硬锁定的自旋锁状态。使用ticket-spinlock机制分析锁的拥有者和等待者。",
+      "action": "spinlock_t <address>",
+      "observation": "检查自旋锁的raw_lock.slock值（如0xfc5b fc59），计算等待者数量（upper-lower=2），确认有2个调用者感兴趣：一个拥有者，一个等待者。"
+    },
+    {
+      "step_number": 5,
+      "thought": "查找持有该自旋锁的任务。需要检查所有CPU的状态，特别是那些在mwait_idle_with_hints中的CPU。",
+      "action": "foreach bt | grep -A5 -B5 \"mwait_idle_with_hints\"",
+      "observation": "找到在mwait_idle_with_hints中持有自旋锁的CPU（如CPU 24），确认其堆栈显示在hrtimer_try_to_cancel函数中。"
+    },
+    {
+      "step_number": 6,
+      "thought": "验证持有自旋锁的任务是否具有正确的抢占计数。持有自旋锁的任务应该有非零的preempt_count。",
+      "action": "task -R preempt_count <task_address>",
+      "observation": "检查preempt_count是否为0（异常情况），正常持有自旋锁的任务应该有非零的preempt_count。"
+    },
+    {
+      "step_number": 7,
+      "thought": "检查系统时间同步问题。分析所有CPU的tvec_base.timer_jiffies值与当前jiffies的差异。",
+      "action": "p tvec_bases:a | awk '{print \"struct tvec_base.timer_jiffies \" $9}' | while read cmd; do crash -q -c \"$cmd\" 2>/dev/null; done",
+      "observation": "比较timer_jiffies与当前jiffies（如4479229141），发现大多数CPU的timer_jiffies值落后约1.8M jiffies（异常）。"
+    },
+    {
+      "step_number": 8,
+      "thought": "检查watchdog线程的CPU亲和性设置，异常的亲和性设置可能导致watchdog无法正常运行。",
+      "action": "foreach 'watchdog/*' task -R cpus_allowed.bits",
+      "observation": "检查watchdog/64-79线程的cpus_allowed.bits是否为0x0（异常），正常应为对应的CPU位掩码。"
+    },
+    {
+      "step_number": 9,
+      "thought": "分析I/O等待任务，确认是否存在存储子系统问题导致的任务阻塞。",
+      "action": "foreach UN bt | head -20",
+      "observation": "检查UN（不可中断）状态的任务是否卡在sync_page、io_schedule等函数中，确认是否存在存储I/O问题。"
+    },
+    {
+      "step_number": 10,
+      "thought": "检查SCSI命令超时情况，确认存储子系统是否存在未完成的请求。",
+      "action": "scsishow --t",
+      "observation": "检查active的scsi_cmnd及其deadline值，确认是否存在长时间未完成的SCSI命令。"
+    },
+    {
+      "step_number": 11,
+      "thought": "分析请求队列的超时定时器状态，确认定时器是否因tvec_base滞后而未触发。",
+      "action": "struct request_queue.timeout <address>",
+      "observation": "检查timeout.expires值与对应tvec_base的timer_jiffies值，确认定时器是否因时间滞后而未执行。"
+    },
+    {
+      "step_number": 12,
+      "thought": "检查第三方模块的影响，特别是可能修改CPU亲和性或干扰定时器系统的模块。",
+      "action": "mod",
+      "observation": "列出加载的模块，特别关注非标准模块如oracleacfs、oracleadvm、oracleoks、ktap_90265等。"
+    }
+  ],
+  "root_cause_analysis": [
+    {
+      "phenomenon": "大多数CPU的tvec_base.timer_jiffies值显著落后于当前jiffies（约1.8M jiffies）",
+      "possible_cause": "定时器中断未正常触发或jiffies计数器突然大幅跳跃，导致定时器系统停滞"
+    },
+    {
+      "phenomenon": "持有自旋锁的任务（swapper on CPU 24）preempt_count为0",
+      "possible_cause": "内核状态异常，持有自旋锁的任务应具有非零的preempt_count以防止被抢占"
+    },
+    {
+      "phenomenon": "watchdog/64-79线程的CPU亲和性设置为0x0",
+      "possible_cause": "第三方模块或系统软件错误修改了watchdog线程的CPU亲和性，导致这些watchdog无法运行"
+    },
+    {
+      "phenomenon": "多个任务卡在sync_page()和io_schedule()中等待I/O",
+      "possible_cause": "存储子系统问题导致I/O请求未完成，可能与定时器系统停滞相关"
+    },
+    {
+      "phenomenon": "SCSI命令deadline为负值且长时间未完成",
+      "possible_cause": "存储控制器或驱动器问题，或由于定时器停滞导致超时机制未触发"
+    },
+    {
+      "phenomenon": "64个CPU处于mwait_idle_with_hints状态",
+      "possible_cause": "由于定时器系统停滞，CPU进入深度空闲状态且未被唤醒执行定时器任务"
+    },
+    {
+      "phenomenon": "自旋锁ticket机制显示有2个调用者（0xfc5b-0xfc59=2）",
+      "possible_cause": "一个调用者持有锁（ticket 0xfc59），另一个等待（ticket 0xfc5a），持有者在mwait状态中未释放锁"
+    }
+  ],
+  "data_patterns": [
+    "timer_jiffies落后值：约1,879,580 jiffies",
+    "自旋锁值格式：0xfc5b fc59（upper=0xfc5b, lower=0xfc59）",
+    "当前jiffies：4479229141",
+    "典型timer_jiffies值：4477349561",
+    "watchdog线程CPU亲和性异常范围：CPU 64-79",
+    "SCSI命令deadline负值范围：-1124215到-1807207"
+  ]
+}
