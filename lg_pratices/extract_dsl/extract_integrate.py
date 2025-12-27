@@ -142,71 +142,94 @@ class DiagnosisDSL(BaseModel):
     model_config = ConfigDict(populate_by_name=True)  # 替换 Config 类
 
 
-diagnostic_knowledge_prompt = ChatPromptTemplate.from_template(
-    """You are a Linux kernel failure modeling expert,
-    skilled in integrating multiple historical cases into a knowledge base for decision-making.
+# 1. 简化后的 Branch 定义
+class DiagnosticBranch(BaseModel):
+    """
+    Simplified diagnostic rule: Condition -> Action.
+    """
+
+    # 移除 branch_id，使用列表索引即可
+    # 移除 match_type，默认为语义匹配
+
+    trigger: str = Field(
+        ...,
+        description="The observation from previous step that triggers this action. Keep it concise.",
+    )
+
+    action: str = Field(
+        ...,
+        description="Command template with placeholders, e.g., 'struct spinlock_t {addr}'.",
+    )
+
+    # 合并 required_variables 和 variable_extraction_hint
+    arg_hints: Optional[str] = Field(
+        None,
+        description="Short syntax defining how to fill placeholders. E.g., 'addr: from RBX register'.",
+    )
+
+    # 缩短 rationale
+    why: str = Field(
+        ...,
+        description="Brief reason for this action.",
+    )
+
+    # 重命名 expected_outcome -> expect
+    expect: str = Field(
+        ...,
+        description="Expected output to look for.",
+    )
+
+    # 简化终止逻辑
+    is_end: bool = Field(
+        False,
+        description="True if this is a root cause conclusion.",
+    )
+
+
+# 2. 简化后的 Dict 定义
+class DiagnosticDict(BaseModel):
+    """
+    Compact diagnostic knowledge base.
+    """
+
+    summary: str = Field(..., description="Brief scenario summary")
+
+    # 缩短字段名
+    init_cmds: List[str] = Field(
+        ..., description="Common initial commands (e.g., 'bt -a', 'sys')."
+    )
+
+    matrix: List[DiagnosticBranch] = Field(..., description="The decision matrix.")
+
+    # 移除 potential_root_causes，因为可以通过遍历 matrix 中 is_end=True 的节点获得
+
+
+# 3. 优化后的 Prompt (修复了转义错误，并强调简洁)
+diagnostic_dict_prompt = ChatPromptTemplate.from_template(
+    """You are a Linux Kernel Diagnostic Architect. Build a COMPACT decision matrix.
 
     # Task
-    You have received {count} diagnostic DSL documents retrieved from the expert knowledge base.
-    Please integrate them into a structured "Diagnostic Knowledge Library" for subsequent diagnostic agent calls.
+    Decompose {count} diagnostic workflows into a minimal set of "Condition -> Action" rules.
 
-    # Input Data (Retrieved DSLs)
-    The following are the retrieved {count} original DSL contents:
+    # Input Data
     {retrieved_dsl_list_json}
 
+    # Rules for Token Economy
+    1. **Conciseness**: Use short sentences. Avoid fluff.
+    2. **Trigger**: Describe the *observation* that leads to this step (e.g., "Crash in spin_lock").
+    3. **Action**: Use `crash` commands with `{{placeholder}}` syntax (e.g., "struct spinlock {{addr}}").
+    4. **Arg Hints**: Briefly explain where to get the variable (e.g., "addr: RBX register").
+    5. **Deduplicate**: Merge identical steps aggressively.
+
     # Output Requirement
-    You MUST output ONLY a valid JSON object that strictly follows the schema below.
-    Do NOT include any markdown formatting, code blocks, or explanatory text.
-    Start your response directly with the JSON object.
+    - Output strictly according to the JSON Schema.
+    - **Language**: English.
+    - **Fix**: Ensure double curly braces are used for placeholders in the prompt examples, but single braces in the JSON output.
 
     # Output JSON Schema
     {schema}
-
-    Special Notes:
-    1. **CaseSummary**: Extract the function names or flags that best represent the characteristics of each
-    DSL (e.g., Case A focuses on `pi_lock`, Case B focuses on `rq->lock`).
-    2. **Comparison Map**: Summarize the similarities and differences between these cases.
-    3. **Common Actions**: If these examples all recommend executing certain
-    commands first (such as `bt -a` or `timer -r`), please list them as common initial actions.
-
-    # CRITICAL: Output ONLY valid JSON. No markdown, no explanations. Start with {{ and end with }}.
-    # Language: Output must be in English.
 """
 )
-
-
-class CaseSummary(BaseModel):
-    """Fingerprint for quick comparison of cases"""
-
-    case_id: str
-    scenario: str
-    unique_symptoms: List[str] = Field(
-        description="Unique symptoms or function symbols for this case"
-    )
-    confidence_score: float = Field(description="Similarity score during retrieval")
-
-
-class DiagnosticKnowledgeLibrary(BaseModel):
-    """
-    Aggregated RAG knowledge base object.
-    The Agent will hold this object as its "expert brain" during diagnosis.
-    """
-
-    collection_name: str = "vmcore_expert_methodologies"
-    # Contains all retrieved original DSL objects
-    retrieved_cases: List[DiagnosisDSL] = Field(
-        description="Multiple retrieved expert DSL instances"
-    )
-
-    # Core: comparison map to help Agent decide "which one to look at"
-    comparison_map: List[CaseSummary] = Field(
-        description="Comparison summary of all retrieved cases, listing core features of each case for easy pattern matching by Agent"
-    )
-
-    # Recommended common initial actions (if all cases suggest checking bt -a first, summarize here)
-    common_initial_actions: List[str] = Field(default_factory=list)
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)  # Replace Config class
 
 
 class LoggingCallbackHandler(BaseCallbackHandler):
@@ -257,7 +280,6 @@ def main():
         base_url="https://api.deepseek.com",
         model="deepseek-chat",
         temperature=0,  # temperature 的作用是控制生成文本的随机性，值越低，生成的文本越确定和一致
-        max_tokens=8192,  # 增加输出长度限制
     )
 
     md_list = [
@@ -293,7 +315,16 @@ def main():
         response = extract_dsl.invoke({"markdown_content": markdown_content})
 
         # 存储为字典对象，方便后续处理
-        dsl_dict = response.model_dump()
+        if isinstance(response, DiagnosisDSL):
+            # 如果是 DiagnosisDSL 实例，使用 model_dump()
+            dsl_dict = response.model_dump()
+        elif isinstance(response, dict):
+            # 如果已经是字典，直接使用
+            dsl_dict = response
+        else:
+            # 其他情况，抛出错误
+            raise TypeError(f"Expected DiagnosisDSL or dict, got {type(response)}")
+
         dsl_list.append(dsl_dict)
 
         # 保存为 JSON 文件
@@ -308,35 +339,14 @@ def main():
         print(f"Extracted DSL from {md_path}")
 
         # # 1. 提取用于检索的语义特征 (指纹)
-        # search_content = f"""
-        # Scenario: {response.scenario}
-        # Symptoms: {', '.join(response.symptoms)}
-        # Root Causes: {'; '.join([rc.phenomenon for rc in response.root_cause_analysis])}
-        # """
-
-        # # 2. 将原始 JSON 存入元数据，方便 Agent 直接解析成 BaseModel
-        # metadata = {
-        #     "source": os.path.basename(md_path),  # 提取文件文件名，不包括目录名
-        #     "scenario": response.scenario,
-        #     "raw_dsl": dsl_data,  # 关键：存入完整 JSON
-        # }
-
-        # # 3. 创建 LangChain Document
-        # doc = Document(page_content=search_content, metadata=metadata)
-
-        # # 将 Document 对象转换为字典
-        # doc_dict = {"search_content": doc.page_content, "metadata": doc.metadata}
-
-        # with open(output_path, "w", encoding="utf-8") as f:
-        #     json.dump(doc_dict, f, ensure_ascii=False, indent=2)
 
     # 整合多个 DSL 成为 DiagnosticKnowledgeLibrary
     print(f"Extracted {len(dsl_list)} DSL documents.")
 
-    library_schema = DiagnosticKnowledgeLibrary.model_json_schema()
+    dd_schema = DiagnosticDict.model_json_schema()
 
-    diagnostic_knowledge = diagnostic_knowledge_prompt | llm.with_structured_output(
-        DiagnosticKnowledgeLibrary, method="json_mode"  # 改用 json_mode
+    diagnostic_dict = diagnostic_dict_prompt | llm.with_structured_output(
+        DiagnosticDict, method="json_mode"  # 改用 json_mode
     )
 
     print("\n开始整合诊断知识库...")
@@ -344,53 +354,44 @@ def main():
 
     # 将字典列表转换为 JSON 字符串用于 prompt
     dsl_list_json = json.dumps(dsl_list, ensure_ascii=False, indent=2)
-    print(f"输入数据大小：{len(dsl_list_json)} 字符")
 
-    # 先测试不带结构化输出的 LLM 调用，看看原始响应
-    print("\n=== 测试：调用 LLM 获取原始响应 ===")
-    test_chain = diagnostic_knowledge_prompt | llm
-    test_response = test_chain.invoke(
-        {
-            "retrieved_dsl_list_json": dsl_list_json,
-            "count": len(dsl_list),
-            "schema": json.dumps(library_schema, indent=2),
-        }
-    )
-    print(f"原始响应类型：{type(test_response)}")
-    if hasattr(test_response, "content"):
-        content_str = str(test_response.content)
-        print(f"响应长度：{len(content_str)} 字符")
-        print(f"响应内容预览 (前 800 字符):\n{content_str[:800]}")
-        if len(content_str) > 800:
-            print(f"\n...\n后 200 字符:\n{content_str[-200:]}")
-    print("\n=== 开始结构化输出解析 ===")
+    # # 先测试不带结构化输出的 LLM 调用，看看原始响应
+    # print("\n=== 测试：调用 LLM 获取原始响应 ===")
+    # test_chain = diagnostic_knowledge_prompt | llm
+    # test_response = test_chain.invoke(
+    #     {
+    #         "retrieved_dsl_list_json": dsl_list_json,
+    #         "count": len(dsl_list),
+    #         "schema": json.dumps(library_schema, indent=2),
+    #     }
+    # )
+    # print(f"test_response:{test_response}")
 
     try:
-        knowledge_response = diagnostic_knowledge.invoke(
+        diagnostic_dict_response = diagnostic_dict.invoke(
             {
                 "retrieved_dsl_list_json": dsl_list_json,
                 "count": len(dsl_list),
-                "schema": json.dumps(library_schema, indent=2),
+                "schema": json.dumps(dd_schema, indent=2),
             },
             config={"callbacks": [LoggingCallbackHandler()]},
         )
 
-        print(f"\n返回类型：{type(knowledge_response)}")
-        print(f"返回值是否为 None: {knowledge_response is None}")
-
-        if knowledge_response:
-            print(f"\n成功整合诊断知识库：")
-            print(f"检索到的案例数：{len(knowledge_response.retrieved_cases)}")
-            print(f"对比摘要数：{len(knowledge_response.comparison_map)}")
-
-            # 保存整合后的知识库
-            output_path = "dsl/integrated_knowledge_library.json"
-            with open(output_path, "w", encoding="utf-8") as f:
-                f.write(knowledge_response.model_dump_json(indent=2))
-            print(f"知识库已保存到：{output_path}")
+        # 如果 diagnostic_dict_response 不为 None，json 格式输出
+        if diagnostic_dict_response is not None and isinstance(
+            diagnostic_dict_response, DiagnosticDict
+        ):
+            # 使用 model_dump_json() 直接转换为 JSON 字符串
+            diagnostic_dict_json = diagnostic_dict_response.model_dump_json(indent=2)
+            # 将 JSON 字符串写入 dsl 目录下的 diagnostic_knowledge_library.json 文件
+            with open(
+                os.path.join("dsl", "diagnostic_knowledge_library.json"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                f.write(diagnostic_dict_json)
         else:
-            print("\n警告：knowledge_response 为 None！")
-            print("请检查 LLM 的响应和结构化输出解析")
+            print(f"错误：整合知识库失败！")
 
     except Exception as e:
         print(f"\n错误：整合知识库失败！")
@@ -405,9 +406,6 @@ if __name__ == "__main__":
     # 先设置环境变量
     os.environ["TAVILY_API_KEY"] = "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"
     os.environ["LANGSMITH_TRACING"] = "false"
-    # fmt: skip
-    os.environ["LANGSMITH_API_KEY"] = (
-        "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"
-    )
+    os.environ["LANGSMITH_API_KEY"] = "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" # fmt: skip
 
     main()

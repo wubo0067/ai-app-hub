@@ -1,0 +1,162 @@
+{
+  "summary": "Three hard/soft lockup scenarios: 1) Timer discrepancy with spinlock deadlock, 2) Spinlock owned by no one with multiple CPUs busy-waiting, 3) Race between ring_buffer_detach() and ring_buffer_wakeup() causing perf event list corruption.",
+  "init_cmds": [
+    "bt -a",
+    "sys -i",
+    "log | grep -i lockup"
+  ],
+  "matrix": [
+    {
+      "trigger": "Watchdog detected hard LOCKUP or panic without hard lockup message.",
+      "action": "bt -p",
+      "arg_hints": null,
+      "why": "Check panic call chain and confirm if watchdog triggered.",
+      "expect": "panic -> watchdog_overflow_callback or RIP in spin_lock functions.",
+      "is_end": false
+    },
+    {
+      "trigger": "Exception RIP in _spin_lock, _raw_spin_lock, or native_queued_spin_lock_slowpath.",
+      "action": "dis -lr {rip_addr}",
+      "arg_hints": "rip_addr: from exception RIP in stack trace.",
+      "why": "Find spinlock address from RBX/RDI register.",
+      "expect": "RBX/RDI contains spinlock address.",
+      "is_end": false
+    },
+    {
+      "trigger": "Spinlock address identified.",
+      "action": "spinlock_t {addr} -x",
+      "arg_hints": "addr: from RBX/RDI register.",
+      "why": "Check lock state: locked, pending, owner.",
+      "expect": "locked=1, pending=1, owner=0x0 indicates inconsistent state.",
+      "is_end": false
+    },
+    {
+      "trigger": "Multiple CPUs stuck in spinlock busy-wait.",
+      "action": "bt -a | grep exception\\\\ RIP -A3 | grep spin -A3 | grep -oE 'RBX: ffff.{12}' | uniq -c",
+      "arg_hints": null,
+      "why": "Identify common lock address across CPUs.",
+      "expect": "Multiple CPUs with same RBX (lock address).",
+      "is_end": false
+    },
+    {
+      "trigger": "Spinlock owner is NULL but locked=1.",
+      "action": "timer -r | awk '$1~/CPU:/||$3~/-[0-9]+/'",
+      "arg_hints": null,
+      "why": "Check for expired timers due to interrupt disable.",
+      "expect": "Negative expiration times for affected CPUs.",
+      "is_end": false
+    },
+    {
+      "trigger": "Timer discrepancy or tvec_base values behind jiffies.",
+      "action": "p tvec_bases:a | awk '{print \"struct tvec_base.timer_jiffies \" $9}' | while read cmd; do crash -q -c \"$cmd\" 2>/dev/null; done",
+      "arg_hints": null,
+      "why": "Compare timer_jiffies with current jiffies.",
+      "expect": "timer_jiffies lagging behind jiffies (e.g., ~1.8M).",
+      "is_end": false
+    },
+    {
+      "trigger": "CPU stuck in mwait_idle_with_hints.",
+      "action": "foreach bt | grep -A5 -B5 \"mwait_idle_with_hints\"",
+      "arg_hints": null,
+      "why": "Find CPU holding spinlock in idle state.",
+      "expect": "CPU in mwait_idle_with_hints holding lock.",
+      "is_end": false
+    },
+    {
+      "trigger": "Task holding spinlock identified.",
+      "action": "task -R preempt_count {task_addr}",
+      "arg_hints": "task_addr: from stack trace or lock owner.",
+      "why": "Verify preempt_count for lock holder.",
+      "expect": "preempt_count=0 is abnormal for lock holder.",
+      "is_end": false
+    },
+    {
+      "trigger": "Watchdog thread CPU affinity issue suspected.",
+      "action": "foreach 'watchdog/*' task -R cpus_allowed.bits",
+      "arg_hints": null,
+      "why": "Check watchdog thread CPU affinity.",
+      "expect": "cpus_allowed.bits=0x0 indicates affinity error.",
+      "is_end": false
+    },
+    {
+      "trigger": "I/O wait tasks in UN state.",
+      "action": "foreach UN bt | head -20",
+      "arg_hints": null,
+      "why": "Check for storage subsystem blocking.",
+      "expect": "Tasks stuck in sync_page, io_schedule.",
+      "is_end": false
+    },
+    {
+      "trigger": "SCSI command timeout suspected.",
+      "action": "scsishow --t",
+      "arg_hints": null,
+      "why": "Check active SCSI commands and deadlines.",
+      "expect": "Negative deadline values for long-pending commands.",
+      "is_end": false
+    },
+    {
+      "trigger": "Perf event lockup with perf_event_wakeup in stack.",
+      "action": "struct ring_buffer {rb_addr}",
+      "arg_hints": "rb_addr: from perf_event.rb field (offset 0x298).",
+      "why": "Check ring_buffer.event_list for corruption.",
+      "expect": "event_list.next/prev pointing to self or invalid.",
+      "is_end": false
+    },
+    {
+      "trigger": "Ring buffer event list corrupted.",
+      "action": "struct perf_event {event_addr}",
+      "arg_hints": "event_addr: from stack or ring_buffer list.",
+      "why": "Verify rb_entry linkage to ring_buffer.",
+      "expect": "rb_entry.next/prev not pointing to ring_buffer head.",
+      "is_end": false
+    },
+    {
+      "trigger": "CPU stuck in list_for_each_entry_rcu loop.",
+      "action": "dis -r perf_event_wakeup+0x70",
+      "arg_hints": null,
+      "why": "Check assembly for infinite loop condition.",
+      "expect": "cmp %rax,%r12 never equal due to list corruption.",
+      "is_end": false
+    },
+    {
+      "trigger": "RFLAGS show interrupts disabled (e.g., 00000046).",
+      "action": "struct wait_queue_head_t {waitq_addr}",
+      "arg_hints": "waitq_addr: from perf_event.waitq (offset 0x2a8).",
+      "why": "Check wait queue state.",
+      "expect": "Empty task_list but lock held (counter=0x1).",
+      "is_end": false
+    },
+    {
+      "trigger": "Third-party module interference suspected.",
+      "action": "mod",
+      "arg_hints": null,
+      "why": "List loaded modules for non-standard ones.",
+      "expect": "Modules like oracleacfs, oracleadvm, ktap.",
+      "is_end": false
+    },
+    {
+      "trigger": "hrtimer interrupt counters stagnant.",
+      "action": "p per_cpu(hrtimer_interrupts,*) | paste - - | column -t",
+      "arg_hints": null,
+      "why": "Compare hrtimer_interrupts with saved versions.",
+      "expect": "No increase for CPUs with locked spinlocks.",
+      "is_end": false
+    },
+    {
+      "trigger": "timer_base.clk lagging behind jiffies.",
+      "action": "p timer_bases | awk '$2~/ffff.{12}/{print \"timer_base.clk \" $NF}' | paste - - | awk '{print \"CPU: \" NR-1 \" \" $0}' | sed 's/crash> //' | sed 's/,$//'",
+      "arg_hints": null,
+      "why": "Check timer base clock for affected CPUs.",
+      "expect": "timer_base.clk significantly behind jiffies (>12 sec).",
+      "is_end": false
+    },
+    {
+      "trigger": "Multiple root causes identified (timer lag, lock corruption, affinity error).",
+      "action": "Root cause analysis complete.",
+      "arg_hints": null,
+      "why": "Consolidate findings from above steps.",
+      "expect": "Timer system stalled, spinlock state inconsistent, watchdog affinity broken, perf event list corrupted.",
+      "is_end": true
+    }
+  ]
+}
