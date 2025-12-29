@@ -158,7 +158,7 @@ class DiagnosticBranch(BaseModel):
 
     action: str = Field(
         ...,
-        description="Command template with placeholders, e.g., 'struct spinlock_t {addr}'.",
+        description="Command template with placeholders, e.g., 'struct spinlock {addr}'.",
     )
 
     # 合并 required_variables 和 variable_extraction_hint
@@ -204,22 +204,25 @@ class DiagnosticDict(BaseModel):
     # 移除 potential_root_causes，因为可以通过遍历 matrix 中 is_end=True 的节点获得
 
 
-# 3. 优化后的 Prompt (修复了转义错误，并强调简洁)
+# 3. 优化后的 Prompt (侧重于全面性和细节保留，
+# 当前的 Prompt 过于强调“压缩” (Compression) 和“去重” (Deduplication)，
+# 而不是“整合” (Integration) 和“覆盖” (Coverage)。)
 diagnostic_dict_prompt = ChatPromptTemplate.from_template(
-    """You are a Linux Kernel Diagnostic Architect. Build a COMPACT decision matrix.
+    """You are a Linux Kernel Diagnostic Architect. Build a COMPREHENSIVE decision matrix.
 
     # Task
-    Decompose {count} diagnostic workflows into a minimal set of "Condition -> Action" rules.
+    Integrate {count} diagnostic workflows into a unified, master "Condition -> Action" rule set.
+    Your goal is to create a knowledge base that covers ALL distinct scenarios and edge cases found in the input data.
 
     # Input Data
     {retrieved_dsl_list_json}
 
-    # Rules for Token Economy
-    1. **Conciseness**: Use short sentences. Avoid fluff.
-    2. **Trigger**: Describe the *observation* that leads to this step (e.g., "Crash in spin_lock").
-    3. **Action**: Use `crash` commands with `{{placeholder}}` syntax (e.g., "struct spinlock {{addr}}").
-    4. **Arg Hints**: Briefly explain where to get the variable (e.g., "addr: RBX register").
-    5. **Deduplicate**: Merge identical steps aggressively.
+    # Integration Guidelines
+    1. **Maximize Coverage**: Do NOT over-simplify. Ensure that every unique diagnostic path and specific check from the inputs is represented in the matrix.
+    2. **Preserve Nuance**: If two workflows look similar but check different fields or have different thresholds, create a BRANCH based on the specific symptom or trigger. Do not merge them if it loses technical accuracy.
+    3. **Trigger Specificity**: The `trigger` must be specific enough to distinguish between different scenarios (e.g., distinguish "General Panic" from "Null Pointer Dereference").
+    4. **Action Precision**: Keep the specific `crash` commands and argument hints accurate. Do not generalize commands to the point of uselessness.
+    5. **Consolidation Strategy**: Merge ONLY truly identical steps. If there is a variation, keep both as separate branches.
 
     # Output Requirement
     - Output strictly according to the JSON Schema.
@@ -286,8 +289,11 @@ def main():
         "md/6348992.md",
         "md/7086442.md",
         "md/3870151.md",
-        # "md/7019939.md",
-        # "md/7041099.md",
+        "md/7019939.md",
+        "md/7041099.md",
+        # "md/5764681.md",
+        # "md/6988986.md",
+        # "md/3379041.md",
     ]
 
     dsl_list = []

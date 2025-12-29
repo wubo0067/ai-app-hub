@@ -1,0 +1,112 @@
+{
+  "scenario": "Huge number of negative dentries causing massive shrink_slab() calls leading to soft lockups, rcu_sched CPU stalls, and hard lockup",
+  "symptoms": [
+    "Kernel panic - not syncing: Hard LOCKUP",
+    "NMI watchdog: Watchdog detected hard LOCKUP",
+    "soft lockup messages with native_queued_spin_lock_slowpath in stack trace",
+    "rcu_sched CPU stall warnings",
+    "Stack traces showing __prune_dcache_sb -> prune_dcache_sb -> prune_super -> shrink_slab",
+    "High dentry slab cache usage (e.g., 789GB, 79% of total RAM)",
+    "Massive number of negative dentries in dentry_stat"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "首先检查系统日志中是否有硬锁死和软锁死的记录，这通常是问题的直接表现。需要确认锁死是否与dcache_lru_lock或rcu_node锁相关。",
+      "action": "log | grep -E \"LOCKUP|stall\"",
+      "observation": "发现硬锁死消息 'Kernel panic - not syncing: Hard LOCKUP' 和软锁死消息，以及大量 'native_queued_spin_lock_slowpath' 相关的软锁死记录。"
+    },
+    {
+      "step_number": 2,
+      "thought": "分析导致硬锁死的CPU的堆栈跟踪，确定锁死发生时CPU正在等待哪个自旋锁。通过检查RDI寄存器值可以识别锁地址。",
+      "action": "bt -a | grep \"exception RIP: native_queued_spin_lock_slowpath\" -A5",
+      "observation": "发现CPU 8在等待地址为0xffffffff9b67a980的自旋锁，该锁属于rcu_sched_state结构。"
+    },
+    {
+      "step_number": 3,
+      "thought": "检查rcu_node锁的状态，确认是否被锁定、等待或争用。需要分析自旋锁的计数器值以了解其状态。",
+      "action": "spinlock_t 0xffffffff9b67a980",
+      "observation": "自旋锁计数器值为0x3630101，表示锁被锁定、有等待者且存在争用（bits 25,24,22,21,17,16,8,0被设置）。"
+    },
+    {
+      "step_number": 4,
+      "thought": "检查有多少任务正在等待相同的rcu_node锁，这有助于了解锁争用的严重程度。",
+      "action": "bt -a | grep \"exception RIP: native_queued_spin_lock_slowpath\" -A3 | awk '$5~/RDI:/{print $6}' | sort | uniq -c",
+      "observation": "发现3个任务正在等待相同的rcu_node锁（0xffffffff9b67a980），而120个任务正在等待dcache_lru_lock锁。"
+    },
+    {
+      "step_number": 5,
+      "thought": "检查在APIC定时器中断上下文之前CPU正在执行什么操作。这有助于了解导致rcu_sched CPU停滞的根本原因。",
+      "action": "bt -a | grep \"apic_timer_interrupt\" -B20 -A30",
+      "observation": "发现CPU在中断前正在等待dcache_lru_lock锁，执行路径为：__prune_dcache_sb -> prune_dcache_sb -> prune_super -> shrink_slab。"
+    },
+    {
+      "step_number": 6,
+      "thought": "检查dcache_lru_lock锁的状态和争用情况。这是导致大量任务停滞的关键锁。",
+      "action": "spinlock_t ffffffff9b608c40",
+      "observation": "dcache_lru_lock计数器值为0x3090000，表示锁未被锁定但存在严重争用（bits 25,24,19,16被设置）。"
+    },
+    {
+      "step_number": 7,
+      "thought": "检查系统内存使用情况，特别是slab缓存的使用。需要确认dentry缓存是否异常膨胀。",
+      "action": "kmem -i",
+      "observation": "SLAB缓存占用789GB，占总内存的79%，表明dentry缓存异常膨胀。"
+    },
+    {
+      "step_number": 8,
+      "thought": "详细检查dentry缓存的具体使用情况，确认其大小是否异常。",
+      "action": "kmem -s | awk 'NR>1{printf($1 \"\\t\" $NF \"\\t %8.3f MiB\\n\", $2*$4/2**20)}' | sort -k3nr | column -t | head",
+      "observation": "dentry缓存占用787,229.828 MiB（约768.8 GiB），是系统中最大的slab缓存。"
+    },
+    {
+      "step_number": 9,
+      "thought": "检查dentry统计信息，特别是负dentry的数量，这是问题的根本原因。",
+      "action": "p dentry_stat",
+      "observation": "nr_dentry=4288678520, nr_unused=4288495734, nr_negative=4281697422，表明存在数十亿个负dentry。"
+    },
+    {
+      "step_number": 10,
+      "thought": "检查negative_dentry_limit参数的值，这是控制负dentry数量的关键内核参数。",
+      "action": "p negative_dentry_limit",
+      "observation": "negative_dentry_limit = 0，表示未设置限制，允许负dentry无限增长。"
+    }
+  ],
+  "root_cause_analysis": [
+    {
+      "phenomenon": "硬锁死发生在CPU 8，等待rcu_node锁（0xffffffff9b67a980）",
+      "possible_cause": "多个CPU同时尝试写入大量的rcu_sched CPU停滞消息和调用跟踪，导致rcu_node锁严重争用。"
+    },
+    {
+      "phenomenon": "120个任务等待dcache_lru_lock锁（0xffffffff9b608c40）",
+      "possible_cause": "大量任务同时执行dcache收缩操作以进行页面回收，导致dcache_lru_lock锁严重争用。"
+    },
+    {
+      "phenomenon": "dentry缓存占用789GB（79%总内存）",
+      "possible_cause": "数十亿个负dentry导致dentry缓存异常膨胀，占用大量内存。"
+    },
+    {
+      "phenomenon": "nr_negative=4281697422（42亿个负dentry）",
+      "possible_cause": "negative_dentry_limit参数设置为0，未限制负dentry数量，导致其无限增长。"
+    },
+    {
+      "phenomenon": "调用链：__prune_dcache_sb -> prune_dcache_sb -> prune_super -> shrink_slab",
+      "possible_cause": "内存压力触发页面回收，导致大量调用dcache收缩路径。"
+    },
+    {
+      "phenomenon": "rcu_sched CPU停滞警告",
+      "possible_cause": "dcache_lru_lock锁争用导致多个CPU停滞，触发RCU停滞检测机制。"
+    },
+    {
+      "phenomenon": "soft lockup消息中频繁出现native_queued_spin_lock_slowpath",
+      "possible_cause": "自旋锁争用导致CPU在锁等待循环中停留时间超过阈值。"
+    }
+  ],
+  "data_patterns": [
+    "negative_dentry_limit = 0",
+    "nr_negative = 4281697422",
+    "SLAB = 206838980 pages = 789 GB",
+    "dentry cache = 787229.828 MiB = 768.8 GiB",
+    "spinlock counter 0x3630101 (locked, pending, contended)",
+    "spinlock counter 0x3090000 (contended but not locked)"
+  ]
+}
