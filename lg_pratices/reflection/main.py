@@ -76,14 +76,14 @@ class State(TypedDict):
 
 
 async def generate_node(state: State) -> State:
-    print(f"---> generate node msg: {state['messages']}")
+    print(f"---> generate node msg: {state['messages']}\n")
     res = await generate.ainvoke({"messages": state["messages"]})
-    print(f"<--- generate node res: {res.content}")
+    print(f"<--- generate node res: {res.content}\n")
     return {"messages": [AIMessage(content=res.content)]}
 
 
 async def reflect_node(state: State) -> State:
-    print(f"---> reflect node msg: {state['messages']}")
+    print(f"---> reflect node msg: {state['messages']}\n")
 
     cls_map = {"ai": HumanMessage, "human": AIMessage}
     translated = {
@@ -93,7 +93,7 @@ async def reflect_node(state: State) -> State:
 
     res = await reflect.ainvoke(translated)
 
-    print(f"<--- reflect node res: {res.content}")
+    print(f"<--- reflect node res: {res.content}\n")
     # 我们将此输出视为对生成器的人类反馈。
     return {"messages": [HumanMessage(content=res.content)]}
 
