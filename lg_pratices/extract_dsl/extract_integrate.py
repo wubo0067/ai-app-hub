@@ -142,68 +142,6 @@ class DiagnosisDSL(BaseModel):
     model_config = ConfigDict(populate_by_name=True)  # 替换 Config 类
 
 
-# 1. 简化后的 Branch 定义
-class DiagnosticBranch(BaseModel):
-    """
-    Simplified diagnostic rule: Condition -> Action.
-    """
-
-    # 移除 branch_id，使用列表索引即可
-    # 移除 match_type，默认为语义匹配
-
-    trigger: str = Field(
-        ...,
-        description="The observation from previous step that triggers this action. Keep it concise.",
-    )
-
-    action: str = Field(
-        ...,
-        description="Command template with placeholders, e.g., 'struct spinlock {addr}'.",
-    )
-
-    # 合并 required_variables 和 variable_extraction_hint
-    arg_hints: Optional[str] = Field(
-        None,
-        description="Short syntax defining how to fill placeholders. E.g., 'addr: from RBX register'.",
-    )
-
-    # 缩短 rationale
-    why: str = Field(
-        ...,
-        description="Brief reason for this action.",
-    )
-
-    # 重命名 expected_outcome -> expect
-    expect: str = Field(
-        ...,
-        description="Expected output to look for.",
-    )
-
-    # 简化终止逻辑
-    is_end: bool = Field(
-        False,
-        description="True if this is a root cause conclusion.",
-    )
-
-
-# 2. 简化后的 Dict 定义
-class DiagnosticDict(BaseModel):
-    """
-    Compact diagnostic knowledge base.
-    """
-
-    summary: str = Field(..., description="Brief scenario summary")
-
-    # 缩短字段名
-    init_cmds: List[str] = Field(
-        ..., description="Common initial commands (e.g., 'bt -a', 'sys')."
-    )
-
-    matrix: List[DiagnosticBranch] = Field(..., description="The decision matrix.")
-
-    # 移除 potential_root_causes，因为可以通过遍历 matrix 中 is_end=True 的节点获得
-
-
 # 3. 优化后的 Prompt (侧重于全面性和细节保留，
 # 当前的 Prompt 过于强调“压缩” (Compression) 和“去重” (Deduplication)，
 # 而不是“整合” (Integration) 和“覆盖” (Coverage)。)
@@ -233,6 +171,70 @@ diagnostic_dict_prompt = ChatPromptTemplate.from_template(
     {schema}
 """
 )
+
+
+# 1. 简化后的 Branch 定义
+class DiagnosticBranch(BaseModel):
+    """
+    Simplified diagnostic rule: Condition -> Action.
+    """
+
+    # 移除 branch_id，使用列表索引即可
+    # 移除 match_type，默认为语义匹配
+    # 触发此操作的先前步骤观察结果。请保持简洁。
+    trigger: str = Field(
+        ...,
+        description="The observation from previous step that triggers this action. Keep it concise.",
+    )
+    # 带有占位符的命令模板，例如 'struct spinlock {addr}'。
+    action: str = Field(
+        ...,
+        description="Command template with placeholders, e.g., 'struct spinlock {addr}'.",
+    )
+    # 简短语法定义如何填充占位符。例如，“addr：来自 RBX 寄存器”。
+    # 合并 required_variables 和 variable_extraction_hint
+    arg_hints: Optional[str] = Field(
+        None,
+        description="Short syntax defining how to fill placeholders. E.g., 'addr: from RBX register'.",
+    )
+
+    # 缩短 rationale
+    # 此行动之简要缘由。
+    why: str = Field(
+        ...,
+        description="Brief reason for this action.",
+    )
+
+    # 重命名 expected_outcome -> expect
+    # 预期要寻找的输出结果。
+    expect: str = Field(
+        ...,
+        description="Expected output to look for.",
+    )
+
+    # 简化终止逻辑
+    is_end: bool = Field(
+        False,
+        description="True if this is a root cause conclusion.",
+    )
+
+
+# 2. 简化后的 Dict 定义
+class DiagnosticDict(BaseModel):
+    """
+    Compact diagnostic knowledge base.
+    """
+
+    summary: str = Field(..., description="Brief scenario summary")
+
+    # 缩短字段名
+    init_cmds: List[str] = Field(
+        ..., description="Common initial commands (e.g., 'bt -a', 'sys')."
+    )
+
+    matrix: List[DiagnosticBranch] = Field(..., description="The decision matrix.")
+
+    # 移除 potential_root_causes，因为可以通过遍历 matrix 中 is_end=True 的节点获得
 
 
 class LoggingCallbackHandler(BaseCallbackHandler):
