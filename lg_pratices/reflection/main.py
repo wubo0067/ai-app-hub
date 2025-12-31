@@ -8,6 +8,7 @@ from langgraph.graph import END, StateGraph, START
 from langgraph.checkpoint.memory import InMemorySaver
 from typing import TypedDict, Annotated
 import asyncio
+import json
 
 langchain.debug = True
 
@@ -76,14 +77,28 @@ class State(TypedDict):
 
 
 async def generate_node(state: State) -> State:
-    print(f"---> generate node msg: {state['messages']}\n")
+    log_json = lambda label, data: print(
+        json.dumps({label: data}, ensure_ascii=False, indent=2)
+    )
+
+    log_json(
+        "generate_node_msg----->",
+        [{"type": msg.type, "content": msg.content} for msg in state["messages"]],
+    )
     res = await generate.ainvoke({"messages": state["messages"]})
-    print(f"<--- generate node res: {res.content}\n")
+    log_json("<-----generate_node_res", res.content)
     return {"messages": [AIMessage(content=res.content)]}
 
 
 async def reflect_node(state: State) -> State:
-    print(f"---> reflect node msg: {state['messages']}\n")
+    log_json = lambda label, data: print(
+        json.dumps({label: data}, ensure_ascii=False, indent=2)
+    )
+
+    log_json(
+        "reflect_node_msg------>",
+        [{"type": msg.type, "content": msg.content} for msg in state["messages"]],
+    )
 
     cls_map = {"ai": HumanMessage, "human": AIMessage}
     translated = {
@@ -93,7 +108,8 @@ async def reflect_node(state: State) -> State:
 
     res = await reflect.ainvoke(translated)
 
-    print(f"<--- reflect node res: {res.content}\n")
+    log_json("<-----reflect_node_res", res.content)
+    # print(f"<--- reflect node res: {res.content}\n")
     # 我们将此输出视为对生成器的人类反馈。
     return {"messages": [HumanMessage(content=res.content)]}
 
@@ -101,6 +117,7 @@ async def reflect_node(state: State) -> State:
 def should_continue(state: State):
     if len(state["messages"]) > 4:
         # 迭代 3 轮结束
+        print("Reached maximum reflection iterations. Ending.")
         return END
     return "reflect"
 
@@ -114,16 +131,21 @@ async def main():
     builder.add_node("generate", generate_node)
     builder.add_node("reflect", reflect_node)
     builder.add_edge(START, "generate")
-    builder.add_conditional_edges("generate", should_continue, ["reflect", END])
+    builder.add_conditional_edges("generate",
+    , ["reflect", END])
     builder.add_edge("reflect", "generate")
-
+    # 添加短期记忆，记录每轮对话
     memory = InMemorySaver()
+
+    # 返回的是一个 RunnableGraph（可执行图）对象，也就是一个图实例
     graph = builder.compile(checkpointer=memory)
     # 线程标识：thread_id 作为唯一标识符，用于在检查点存储器中区分不同的执行流程
     # 状态追踪：InMemorySaver 使用这个 ID 来保存和检索特定线程的状态
     # 多实例支持：允许多个并发的图执行实例，各自维护独立的状态
     config = {"configurable": {"thread_id": "1"}}
 
+    # memory 可以跨越多个执行实例（也即是 builder.compile 返回的对象），保持状态一致性
+    # !state 只能在一个示例的 invoke 或 astream 调用中使用
     async for event in graph.astream(
         {
             "messages": [
@@ -140,6 +162,8 @@ async def main():
         pass
 
     state = graph.get_state(config)
+    # 打印 state 类型 langgraph.types.StateSnapshot
+    print(f"Final state type: {type(state)}")
     ChatPromptTemplate.from_messages(state.values["messages"]).pretty_print()
 
 
