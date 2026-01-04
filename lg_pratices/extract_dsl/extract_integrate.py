@@ -10,61 +10,62 @@ from pydantic import BaseModel, Field, ConfigDict
 import operator
 
 extract_dsl_prompt = ChatPromptTemplate.from_template(
-    """You are a senior Linux kernel diagnostics expert...
+    """You are a senior Linux kernel diagnostics expert extracting diagnostic logic from documentation.
 
     # Task
-    Analyze the provided Markdown document to extract diagnostic logic, specific 'crash' tool commands, ,
-    and data patterns. Your goal is to generate a structured JSON that a ReAct Agent can use to perform step-by-step ,
-    troubleshooting.
+    Extract ALL diagnostic commands, steps, and metadata from the markdown document into structured JSON.
 
-    # STRICT LANGUAGE RULE
-    - The entire JSON response MUST be in English.
-    - Translate all Chinese analysis from the source document into professional technical English.
+    # Extraction Rules
 
-    # Content Guidelines
-    1. **Thought**: Explain the technical reasoning. Why check this specific data? What kernel subsystem is involved?
-    2. **Action**: Must be a valid 'crash' utility command (e.g., 'bt', 'struct', 'rd', 'irq').
-    3. **Observation**: Describe the specific abnormal indicators (e.g., 'owner field is NULL', 'value exceeds 0xFFFFF').
-    4. **Symptoms**: List specific keywords or stack trace symbols that identify this issue.
+    ## 1. Workflow Steps - Extract EVERY Command
+    Scan the document and extract ALL crash commands in the order they appear:
 
-    # Output Format Requirement
-    - Output MUST be a valid JSON string.
-    - DO NOT include markdown code blocks (e.g., no ```json).
-    - Language: Please provide the content in **Chinese** (especially for 'thought' and 'scenario'), 、
-        but keep technical terms and commands in English.
+    **For each command found:**
+    - **step_number**: Sequential number (1, 2, 3...)
+    - **thought**: Brief reason for this check (5-15 words, extract from surrounding text)
+    - **action**: EXACT command as written (preserve all flags, pipes, awk, grep)
+    - **observation**: Key indicator to find (5-12 words, from doc or output snippet)
 
-    # JSON Schema:
-    {{
-    "type": "object",
-    "properties": {{
-        "scenario": {{ "type": "string", "description": "Problem classification" }},
-        "symptoms": {{ "type": "array", "items": {{ "type": "string" }}, "description": "Key patterns like 'panic', 'divide error', or specific function names" }},
-        "workflow": {{
-        "type": "array",
-        "items": {{
-            "type": "object",
-            "properties": {{
-            "step_number": {{ "type": "integer" }},
-            "thought": {{ "type": "string", "description": "Logic/Reasoning in Chinese" }},
-            "action": {{ "type": "string", "description": "The exact crash command to run" }},
-            "observation": {{ "type": "string", "description": "What abnormal result confirms the theory" }}
-            }},
-            "required": ["step_number", "thought", "action", "observation"]
-        }}
-        }},
-        "root_cause_analysis": {{
-        "type": "array",
-        "items": {{
-            "type": "object",
-            "properties": {{
-            "phenomenon": {{ "type": "string" }},
-            "possible_cause": {{ "type": "string" }}
-            }}
-        }}
-        }}
-    }},
-    "required": ["scenario", "symptoms", "workflow", "root_cause_analysis"]
-    }}
+    **Command patterns to find:**
+    - `crash>` prefix: `crash> bt -a`
+    - Inline mentions: "run `spinlock_t <addr>`"
+    - Code blocks with commands
+    - Piped commands: Keep the ENTIRE pipe chain intact
+
+    **Examples:**
+    - Document: "crash> foreach UN bt | awk '/{{#[1-4]/}} {{print $3,$5}}'"
+      Extract: `{{"action": "foreach UN bt | awk '/{{#[1-4]/}} {{print $3,$5}}'"}}` (keep complete)
+
+    - Document: "Check timer base: crash> struct tvec_base.timer_jiffies 0xffff8840691a8000"
+      Extract: `{{"thought": "Check timer base lag", "action": "struct tvec_base.timer_jiffies 0xffff8840691a8000"}}`
+
+    ## 2. Symptoms - Extract Trigger Keywords
+    Find 3-7 specific symptoms from "Issue" or panic message section:
+    - Stack trace symbols (e.g., "RIP: _spin_lock_irqsave")
+    - Error messages (e.g., "Watchdog detected hard LOCKUP")
+    - Panic strings
+
+    ## 3. Root Cause Analysis - DIRECT EXTRACTION ONLY
+    **DO NOT summarize or interpret.**
+
+    Find section titled "Root Cause" or similar headings:
+    - Extract each bullet point or paragraph AS-IS
+    - Keep original wording verbatim
+    - Create one entry per distinct cause/phenomenon mentioned
+
+    # Quality Checks
+    - Workflow must have AT LEAST as many steps as crash commands in document
+    - Do NOT merge similar commands - keep all distinct instances
+    - Preserve exact syntax including addresses, filters, pipe chains
+    - Root cause entries must use original document wording
+
+    # Output Format
+    - Valid JSON only (no markdown code blocks)
+    - English only
+    - Use abbreviations where clear (e.g., "addr", "ptr", "CPU")
+
+    # Output JSON Schema:
+    {schema}
 
     # Input Content:
     {markdown_content}
@@ -82,7 +83,7 @@ class DiagnosticStep(BaseModel):
     )
     thought: str = Field(
         ...,
-        description="The expert's logical reasoning (in Chinese as requested) explaining why this action is performed.",
+        description="The expert's logical reasoning (in English) explaining why this action is performed.",
     )
     action: str = Field(
         ...,
@@ -91,21 +92,6 @@ class DiagnosticStep(BaseModel):
     observation: str = Field(
         ...,
         description="The expected abnormal indicators or key metrics to look for in the action output.",
-    )
-
-
-class RootCauseMapping(BaseModel):
-    """
-    The mapping between observed phenomena and their potential root causes.
-    """
-
-    phenomenon: str = Field(
-        ...,
-        description="A key abnormal phenomenon observed during the diagnostic process.",
-    )
-    possible_cause: str = Field(
-        ...,
-        description="The underlying logic or potential root cause corresponding to the phenomenon.",
     )
 
 
@@ -129,14 +115,9 @@ class DiagnosisDSL(BaseModel):
         description="The structured investigation workflow. The Agent will execute these steps sequentially.",
     )
 
-    root_cause_analysis: List[RootCauseMapping] = Field(
+    root_cause_analysis: List[str] = Field(
         ...,
-        description="The mapping table between extracted phenomena and their causes from the document.",
-    )
-
-    data_patterns: Optional[List[str]] = Field(
-        None,
-        description="Specific numerical patterns mentioned in the document, such as flag bits, offsets, or timeout thresholds.",
+        description="A list of root cause analysis statements extracted from the document.",
     )
 
     model_config = ConfigDict(populate_by_name=True)  # 替换 Config 类
@@ -289,13 +270,11 @@ def main():
 
     md_list = [
         "md/6348992.md",
-        "md/7086442.md",
         "md/3870151.md",
-        "md/7019939.md",
         "md/7041099.md",
-        # "md/5764681.md",
-        # "md/6988986.md",
-        # "md/3379041.md",
+        "md/5764681.md",
+        "md/6988986.md",
+        "md/3379041.md",
     ]
 
     dsl_list = []
@@ -317,10 +296,15 @@ def main():
             markdown_content = f.read()
 
         extract_dsl = extract_dsl_prompt | llm.with_structured_output(
-            DiagnosisDSL, method="function_calling"
+            DiagnosisDSL, method="json_mode"  # 改用 json_mode
         )
-
-        response = extract_dsl.invoke({"markdown_content": markdown_content})
+        dsl_schema = DiagnosisDSL.model_json_schema()
+        response = extract_dsl.invoke(
+            {
+                "markdown_content": markdown_content,
+                "schema": json.dumps(dsl_schema, indent=2),
+            }
+        )
 
         # 存储为字典对象，方便后续处理
         if isinstance(response, DiagnosisDSL):

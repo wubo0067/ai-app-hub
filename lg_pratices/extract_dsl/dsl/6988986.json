@@ -1,0 +1,166 @@
+{
+  "scenario": "Hard lockup due to data race with out-of-tree fl2000 module",
+  "symptoms": [
+    "WARNING: CPU: 4 PID: 9179 at include/linux/kref.h:52 fl2000_device_probe+0x304/0x3e0 [fl2000]",
+    "NMI watchdog: Watchdog detected hard LOCKUP on cpu 4",
+    "RIP: native_queued_spin_lock_slowpath+0x122/0x200",
+    "Kernel panic - not syncing: Hard LOCKUP",
+    "WARN_ON_ONCE(atomic_inc_return(&kref->refcount) < 2)"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Examine the SCSI device associated with the timed-out command",
+      "action": "px ((struct scsi_cmnd *)0xffff92207591ea00)->device",
+      "observation": "SCSI device pointer at 0xffff921a2b81c800"
+    },
+    {
+      "step_number": 2,
+      "thought": "Get the SCSI host from the device",
+      "action": "px ((struct scsi_cmnd *)0xffff92207591ea00)->device->host",
+      "observation": "Scsi_Host pointer at 0xffff921a2b8b8000"
+    },
+    {
+      "step_number": 3,
+      "thought": "Display host and device information",
+      "action": "HOST      DRIVER\nNAME      NAME                   Scsi_Host                shost_data               hostdata                \n---------------------------------------------------------------------------------------------------\nhost0     usb_storage            ffff921a2b8b8000                        0         ffff921a2b8b8740\n\n   Driver version      : None\n   Taints bitmask      : 0x0\n\n   host_busy           : 1\n   host_blocked        : 0\n   host_failed         : 0\n   host_self_blocked   : 0\n   shost_state         : SHOST_RUNNING\n   eh_deadline         : -1 (off, not supported by driver)\n   max_lun             : 8\n   cmd_per_lun         : 1\n   work_q_name         : \n\nHOST      DRIVER\nNAME      NAME                   Scsi_Host                shost_data               hostdata                \n---------------------------------------------------------------------------------------------------\nhost0     usb_storage            ffff921a2b8b8000                        0         ffff921a2b8b8740\n\nDEV NAME     scsi_device         H:C:T:L      VENDOR/MODEL               DEVICE STATE           IOREQ-CNT  IODONE-CNT          IOERR-CNT\n----------------------------------------------------------------------------------------------------------------------------------------\nsdc          ffff921a2b81c800    0:0:0:0                                 SDEV_RUNNING                  93          91  (  2)           0",
+      "observation": "SCSI device sdc in SDEV_RUNNING state with pending commands"
+    },
+    {
+      "step_number": 4,
+      "thought": "Check for SCSI command issues",
+      "action": "scsishow --check",
+      "observation": "WARNING: scsi_cmnd 0xffff92207591ea00 on scsi_device 0xffff921a2b81c800 (0:0:0:0) older than its timeout: EH or stalled queue?"
+    },
+    {
+      "step_number": 5,
+      "thought": "Check SCSI command timing information",
+      "action": "scsishow --time",
+      "observation": "scsi_cmnd ffff92207591ea00 on scsi_device 0xffff921a2b81c800 (0:0:0:0) is unknown, deadline: -16187 cmnd-alloc: -46187 rq-alloc: -46187"
+    },
+    {
+      "step_number": 6,
+      "thought": "Get the abort handler callback function",
+      "action": "px ((struct scsi_cmnd *)0xffff92207591ea00)->device->host->hostt->eh_abort_handler",
+      "observation": "Abort handler at 0xffffffffc02e3d60 <command_abort>"
+    },
+    {
+      "step_number": 7,
+      "thought": "Get the Scsi_Host pointer again",
+      "action": "px ((struct scsi_cmnd *)0xffff92207591ea00)->device->host",
+      "observation": "Scsi_Host pointer at 0xffff921a2b8b8000"
+    },
+    {
+      "step_number": 8,
+      "thought": "Get the us_data structure from hostdata",
+      "action": "px ((struct us_data *)((struct scsi_cmnd *)0xffff92207591ea00)->device->host->hostdata)",
+      "observation": "us_data pointer at 0xffff921a2b8b8740"
+    },
+    {
+      "step_number": 9,
+      "thought": "Check Scsi_Host hostdata offset",
+      "action": "Scsi_Host.hostdata -ox",
+      "observation": "struct Scsi_Host { [0x740] unsigned long hostdata[]; }"
+    },
+    {
+      "step_number": 10,
+      "thought": "Calculate base address from hostdata",
+      "action": "px 0xffff921a2b8b8740-0x740",
+      "observation": "Base address 0xffff921a2b8b8000"
+    },
+    {
+      "step_number": 11,
+      "thought": "Get the host lock spinlock",
+      "action": "px ((struct Scsi_Host *)0xffff921a2b8b8000)->host_lock",
+      "observation": "host_lock at 0xffff921a2b8b8050"
+    },
+    {
+      "step_number": 12,
+      "thought": "Get address of completion notify structure",
+      "action": "px &((struct us_data *)((struct scsi_cmnd *)0xffff92207591ea00)->device->host->hostdata)->notify",
+      "observation": "Completion pointer at 0xffff921a2b8b88b0"
+    },
+    {
+      "step_number": 13,
+      "thought": "Examine the completion structure",
+      "action": "px ((struct us_data *)((struct scsi_cmnd *)0xffff92207591ea00)->device->host->hostdata)->notify",
+      "observation": "Completion with done=0x0 and wait.lock.val.counter=0x218928"
+    },
+    {
+      "step_number": 14,
+      "thought": "Get address of completion wait lock",
+      "action": "px &((struct us_data *)((struct scsi_cmnd *)0xffff92207591ea00)->device->host->hostdata)->notify->wait.lock",
+      "observation": "Spinlock pointer at 0xffff921a2b8b88b8"
+    },
+    {
+      "step_number": 15,
+      "thought": "Examine the completion wait lock spinlock",
+      "action": "px ((struct us_data *)((struct scsi_cmnd *)0xffff92207591ea00)->device->host->hostdata)->notify->wait.lock",
+      "observation": "Spinlock val.counter = 0x218928"
+    },
+    {
+      "step_number": 16,
+      "thought": "Analyze spinlock value bitwise",
+      "action": "eval -b 0x218928",
+      "observation": "Binary: 0000000000000000000000000000000000000000001000011000100100101000, bits set: 21 16 15 11 8 5 3"
+    },
+    {
+      "step_number": 17,
+      "thought": "Check kernel memory allocation for spinlock address",
+      "action": "kmem ffff921a2b8b88b8",
+      "observation": "CACHE: kmalloc-4096, SLAB: ffffd8c145ae2e00, MEMORY: ffff921a2b8b8000"
+    },
+    {
+      "step_number": 18,
+      "thought": "Disassemble at the lock contention point",
+      "action": "dis -lr ffffffffa1317bd2",
+      "observation": "Code at native_queued_spin_lock_slowpath+290: mov 0x8(%r8),%eax"
+    },
+    {
+      "step_number": 19,
+      "thought": "Check per-CPU mcs_nodes for CPU 4",
+      "action": "p mcs_nodes",
+      "observation": "PER-CPU ADDRESSES: [4]: ffff9220de91b8c0"
+    },
+    {
+      "step_number": 20,
+      "thought": "Examine mcs_spinlock structure",
+      "action": "mcs_spinlock ffff9220de91b8c0",
+      "observation": "struct mcs_spinlock { next = 0x0, locked = 0, count = 1 }"
+    },
+    {
+      "step_number": 21,
+      "thought": "Check kernel memory allocation again",
+      "action": "kmem ffff921a2b8b88b8",
+      "observation": "CACHE: kmalloc-4096, SLAB: ffffd8c145ae2e00, MEMORY: ffff921a2b8b8000"
+    },
+    {
+      "step_number": 22,
+      "thought": "Get us_data pointer from hostdata",
+      "action": "px ((struct scsi_cmnd *)0xffff92207591ea00)->device->host->hostdata",
+      "observation": "us_data at 0xffff921a2b8b8740"
+    },
+    {
+      "step_number": 23,
+      "thought": "Get address of completion wait lock again",
+      "action": "px &((struct us_data *)0xffff921a2b8b8740)->notify->wait.lock",
+      "observation": "Spinlock pointer at 0xffff921a2b8b88b8"
+    },
+    {
+      "step_number": 24,
+      "thought": "Dump memory contents around us_data",
+      "action": "rd 0xffff921a2b8b8740 73",
+      "observation": "Memory dump showing spinlock val at 0xffff921a2b8b88b0+8 = 0xffff921a00218928"
+    },
+    {
+      "step_number": 25,
+      "thought": "Check kernel memory for the suspicious address",
+      "action": "kmem ffff921a00218928",
+      "observation": "ZONE: Normal, AREA: 4096k, PAGE: ffffd8c145008600, PHYSICAL: 140218000"
+    }
+  ],
+  "root_cause_analysis": [
+    "A hard lockup is defined as a bug that causes the CPU to loop in kernel mode without giving other tasks a chance to run for more than 10 seconds.",
+    "In this case, the spinlock is not actually a spinlock but overwritten illegally due to some possible data race that is possibly caused by fl2000"
+  ]
+}

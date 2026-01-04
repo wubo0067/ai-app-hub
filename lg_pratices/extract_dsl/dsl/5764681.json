@@ -1,0 +1,98 @@
+{
+  "scenario": "Multiple hard lockups with MCE events",
+  "symptoms": [
+    "NMI watchdog: Watchdog detected hard LOCKUP on cpu 32",
+    "Kernel panic - not syncing: Hard LOCKUP",
+    "NMI watchdog: Watchdog detected hard LOCKUP on cpu 62",
+    "NMI watchdog: BUG: soft lockup - CPU#23 stuck for 23s! [titanagent:2336749]",
+    "mce: [Hardware Error]: Machine check events logged",
+    "CMCI storm detected: switching to poll mode",
+    "INFO: NMI handler (perf_event_nmi_handler) took too long to run"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Check kernel log for lockup messages",
+      "action": "log | grep LOCKUP",
+      "observation": "Hard LOCKUP on CPU 32 and 62, soft lockup on CPU 23"
+    },
+    {
+      "step_number": 2,
+      "thought": "Identify zone involved in CPU 32 lockup",
+      "action": "kmem -z | grep ffff88b5fffda000",
+      "observation": "Zone 'Normal' at address ffff88b5fffda000"
+    },
+    {
+      "step_number": 3,
+      "thought": "Examine zone->lock spinlock address",
+      "action": "px &((struct zone *)0xffff88b5fffda000)->lock",
+      "observation": "Spinlock at 0xffff88b5fffda068"
+    },
+    {
+      "step_number": 4,
+      "thought": "Check per-CPU pageset for CPU 28",
+      "action": "per_cpu_pageset.pcp 0x1fdd8:28",
+      "observation": "PCP structure at ffff88bddf31fdd8 with empty lists"
+    },
+    {
+      "step_number": 5,
+      "thought": "Count pages in MIGRATE_MOVABLE list",
+      "action": "list -H ffff88bddf31fd38 -o page.lru -s page.index | paste - - | wc -l",
+      "observation": "115 pages in the list"
+    },
+    {
+      "step_number": 6,
+      "thought": "Examine list head structure",
+      "action": "list_head ffff88bddf31fd38",
+      "observation": "List head with next/prev pointers"
+    },
+    {
+      "step_number": 7,
+      "thought": "Check runqueue for CPU 8",
+      "action": "runq -c 8",
+      "observation": "CPU 8 runqueue at ffff88addfa1ac80 with tasks"
+    },
+    {
+      "step_number": 8,
+      "thought": "Examine rq->lock spinlock address",
+      "action": "px &((struct rq *)0xffff88addfa1ac80)->lock",
+      "observation": "Spinlock at 0xffff88addfa1ac80"
+    },
+    {
+      "step_number": 9,
+      "thought": "Disassemble set_next_entity function",
+      "action": "dis -lr ffffffff938e2b84",
+      "observation": "Code at set_next_entity+20 in fair.c"
+    },
+    {
+      "step_number": 10,
+      "thought": "Get pick_next_task function pointer",
+      "action": "px ((struct sched_class *)0xffffffff9401e3c0)->pick_next_task",
+      "observation": "Function pointer to pick_next_task_fair"
+    },
+    {
+      "step_number": 11,
+      "thought": "Resolve symbol address",
+      "action": "sym 0xffffffff938e99b0",
+      "observation": "pick_next_task_fair at fair.c:4850"
+    },
+    {
+      "step_number": 12,
+      "thought": "Check kernel log for all messages",
+      "action": "log",
+      "observation": "MCE events logged for 97 days before lockups"
+    },
+    {
+      "step_number": 13,
+      "thought": "Check runqueue timestamp delays",
+      "action": "runq -T",
+      "observation": "Significant delays on many CPUs up to 25 seconds"
+    }
+  ],
+  "root_cause_analysis": [
+    "A root cause is unknown at this time.",
+    "Multiple hard lockups occurred on multiple CPUs on which tasks were running different code paths that had nothing to do with each other.",
+    "Lots of MCE events were being logged and also hrtimer/perf interrupts were taking too long time to be processed during the time frame of the occurrence of the soft lockup followed by the multiple hard lockups.",
+    "It may be possible that some faulty hardware was causing some CPUs to be getting slow or stalled on which tasks were processing some jobs with zone->lock or rq->lock spinlocks being held hence the soft/hard lockups."
+  ]
+}

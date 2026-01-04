@@ -1,5 +1,5 @@
 {
-  "summary": "Comprehensive diagnostic matrix for Linux kernel lockup scenarios covering hard/soft lockups, timer discrepancies, spinlock deadlocks, race conditions, memory pressure, hardware errors, and third-party module issues.",
+  "summary": "Comprehensive diagnostic matrix for Linux kernel lockup scenarios covering hard/soft lockups, timer discrepancies, spinlock deadlocks, race conditions, memory pressure, hardware errors, third-party module issues (fl2000, splxmod), page writeback stalls, kvm_lock_spinning, SCSI timeouts, and MCS spinlock contention.",
   "init_cmds": [
     "sys -i",
     "bt -a",
@@ -311,6 +311,110 @@
       "why": "Examine spinlock structure",
       "expect": "Spinlock with head/tail values showing contention",
       "is_end": true
+    },
+    {
+      "trigger": "WARNING: CPU: {N} PID: {PID} at include/linux/kref.h:52 fl2000_device_probe+0x304/0x3e0 [fl2000]",
+      "action": "px ((struct scsi_cmnd *){addr})->device",
+      "arg_hints": "addr: scsi_cmnd address from context",
+      "why": "Examine SCSI device associated with timed-out command",
+      "expect": "SCSI device pointer",
+      "is_end": false
+    },
+    {
+      "trigger": "SCSI command older than its timeout",
+      "action": "scsishow --check",
+      "arg_hints": null,
+      "why": "Check for SCSI command issues",
+      "expect": "WARNING about EH or stalled queue",
+      "is_end": false
+    },
+    {
+      "trigger": "Spinlock val.counter = {value} (not typical pattern)",
+      "action": "eval -b {value}",
+      "arg_hints": "value: spinlock counter value from context",
+      "why": "Analyze spinlock value bitwise for unusual patterns",
+      "expect": "Binary representation showing unusual bit pattern",
+      "is_end": false
+    },
+    {
+      "trigger": "rcu_sched detected stalls on CPUs/tasks: {N}",
+      "action": "bt -c {N}",
+      "arg_hints": "N: CPU number from stall message",
+      "why": "Get backtrace for stalled CPU to identify blocking task",
+      "expect": "vsapiapp stuck at kvm_lock_spinning and ioctlMod",
+      "is_end": false
+    },
+    {
+      "trigger": "Tasks stuck in TASK_UNINTERRUPTIBLE state for >120 seconds",
+      "action": "ps -m|grep UN",
+      "arg_hints": null,
+      "why": "List top UNINTERRUPTIBLE state tasks to identify hung processes",
+      "expect": "Multiple tasks in UN state for >2 minutes",
+      "is_end": false
+    },
+    {
+      "trigger": "vsapiapp stuck at kvm_lock_spinning",
+      "action": "p klock_waiting:{cpu}",
+      "arg_hints": "cpu: CPU where vsapiapp is running",
+      "why": "Get klock_waiting structure for specific CPU to check lock status",
+      "expect": "lock address and want value showing contention",
+      "is_end": false
+    },
+    {
+      "trigger": "kthreadd stuck in schedule",
+      "action": "runq -c {cpu}",
+      "arg_hints": "cpu: CPU where kthreadd should run",
+      "why": "Check runqueue for CPU to see what's blocking kthreadd",
+      "expect": "vsapiapp currently running on CPU, preventing kthreadd from executing",
+      "is_end": false
+    },
+    {
+      "trigger": "Tasks waiting for page writeback completion",
+      "action": "kmem {page_addr}",
+      "arg_hints": "page_addr: from wait_bit_queue key flags",
+      "why": "Examine memory page for writeback status to identify I/O stalls",
+      "expect": "Page has writeback flag set (PG_writeback = 13)",
+      "is_end": false
+    },
+    {
+      "trigger": "sys_close replaced with closeHook",
+      "action": "sys -c | head",
+      "arg_hints": null,
+      "why": "Check system call table for modifications by third-party modules",
+      "expect": "sys_close replaced with closeHook at syscall 3 (splxmod module)",
+      "is_end": false
+    },
+    {
+      "trigger": "kworker waiting at wait_for_completion in kthread_create_on_node",
+      "action": "p kthreadd_task",
+      "arg_hints": null,
+      "why": "Get kthreadd_task pointer to check kthreadd status",
+      "expect": "kthreadd_task at specific address, showing kthreadd is blocked",
+      "is_end": false
+    },
+    {
+      "trigger": "Host lock spinlock contention in SCSI subsystem",
+      "action": "px ((struct Scsi_Host *){addr})->host_lock",
+      "arg_hints": "addr: Scsi_Host address from context",
+      "why": "Examine host lock spinlock for SCSI host contention",
+      "expect": "host_lock address showing spinlock location",
+      "is_end": false
+    },
+    {
+      "trigger": "Completion wait lock spinlock with unusual value",
+      "action": "px ((struct us_data *)((struct scsi_cmnd *){addr})->device->host->hostdata)->notify->wait.lock",
+      "arg_hints": "addr: scsi_cmnd address from context",
+      "why": "Check completion wait lock spinlock value for unusual patterns",
+      "expect": "Spinlock val.counter with non-standard value (e.g., 0x218928)",
+      "is_end": false
+    },
+    {
+      "trigger": "MCS spinlock structure analysis needed",
+      "action": "mcs_spinlock {addr}",
+      "arg_hints": "addr: MCS spinlock node address from backtrace",
+      "why": "Examine MCS spinlock structure for queue-based locking issues",
+      "expect": "struct mcs_spinlock with next, locked, and count values",
+      "is_end": false
     }
   ]
 }

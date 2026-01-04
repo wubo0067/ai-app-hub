@@ -1,0 +1,341 @@
+{
+  "scenario": "System hangs where lots of tasks waiting for page writeback to complete where vsapiapp is blocking in spinlock and prevent kthreadd from taking the CPU",
+  "symptoms": [
+    "rcu_sched detected stalls on CPUs/tasks: { 3}",
+    "exception RIP: native_halt+5",
+    "kvm_lock_spinning at ffffffff8105259a",
+    "ioctlMod at ffffffffa04988eb [splxmod]",
+    "closeHook at ffffffffa049a9cb [splxmod]",
+    "Tasks stuck in TASK_UNINTERRUPTIBLE state for >120 seconds",
+    "System hangs with tasks waiting for page writeback completion"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Check system information and dump file details",
+      "action": "sys",
+      "observation": "System configuration and crash environment"
+    },
+    {
+      "step_number": 2,
+      "thought": "Get detailed system information including DMI data",
+      "action": "sys -i",
+      "observation": "Hardware and BIOS information"
+    },
+    {
+      "step_number": 3,
+      "thought": "Search for lockup, LOCKUP, blocked tasks, or rcu_sched stalls in kernel log",
+      "action": "log | grep -e lockup -e LOCKUP -e blocked -e rcu_sched",
+      "observation": "rcu_sched detected stalls on CPU 3"
+    },
+    {
+      "step_number": 4,
+      "thought": "Get backtrace for CPU 3 to see what's running",
+      "action": "bt -c 3",
+      "observation": "vsapiapp stuck at kvm_lock_spinning and ioctlMod"
+    },
+    {
+      "step_number": 5,
+      "thought": "Get process details for vsapiapp PID 11361",
+      "action": "ps -a 11361",
+      "observation": "vsapiapp from TrendMicro Server Protect for Linux"
+    },
+    {
+      "step_number": 6,
+      "thought": "Check what device the task is performing ioctl on",
+      "action": "files -d 0xffff8800b39f79c0",
+      "observation": "Device /dev/splxdev"
+    },
+    {
+      "step_number": 7,
+      "thought": "Find mount information for the device's superblock",
+      "action": "mount | grep -e MOUNT -e ffff8801394a8000",
+      "observation": "devtmpfs mounted at /dev"
+    },
+    {
+      "step_number": 8,
+      "thought": "Check task state statistics",
+      "action": "ps -S",
+      "observation": "5 RUNNING, 7 WAITING, 161 INTERRUPTIBLE, 15 UNINTERRUPTIBLE"
+    },
+    {
+      "step_number": 9,
+      "thought": "List top UNINTERRUPTIBLE state tasks",
+      "action": "ps -m|grep UN",
+      "observation": "15 tasks in UN state, many for >2 minutes"
+    },
+    {
+      "step_number": 10,
+      "thought": "Check hung task timeout configuration",
+      "action": "p sysctl_hung_task_timeout_secs",
+      "observation": "Timeout set to 120 seconds"
+    },
+    {
+      "step_number": 11,
+      "thought": "Check hung task warnings configuration",
+      "action": "pd sysctl_hung_task_warnings",
+      "observation": "Warnings set to 10"
+    },
+    {
+      "step_number": 12,
+      "thought": "Find khungtaskd kernel thread",
+      "action": "ps khungtaskd",
+      "observation": "khungtaskd PID 45 on CPU 3"
+    },
+    {
+      "step_number": 13,
+      "thought": "Get backtrace for khungtaskd",
+      "action": "bt 45",
+      "observation": "khungtaskd stuck in schedule"
+    },
+    {
+      "step_number": 14,
+      "thought": "Set context to oldest UN state task (PID 2472)",
+      "action": "set 2472",
+      "observation": "nginx task in TASK_UNINTERRUPTIBLE state"
+    },
+    {
+      "step_number": 15,
+      "thought": "Search for lockup messages in log",
+      "action": "log | grep lockup",
+      "observation": "No lockup messages found"
+    },
+    {
+      "step_number": 16,
+      "thought": "Get backtrace for oldest UN state task",
+      "action": "bt",
+      "observation": "nginx stuck at closeHook from splxmod"
+    },
+    {
+      "step_number": 17,
+      "thought": "Check system call table for modifications",
+      "action": "sys -c | head",
+      "observation": "sys_close replaced with closeHook at syscall 3"
+    },
+    {
+      "step_number": 18,
+      "thought": "Find symbol for closeHook function",
+      "action": "sym closeHook",
+      "observation": "closeHook at ffffffffa049a3b0 in splxmod"
+    },
+    {
+      "step_number": 19,
+      "thought": "Check if splxmod module is loaded",
+      "action": "mod | grep splxmod",
+      "observation": "splxmod present but not loaded"
+    },
+    {
+      "step_number": 20,
+      "thought": "Get module details for splxmod",
+      "action": "struct module.name,version,srcversion,sig_ok ffffffffa04ad2c0",
+      "observation": "splxmod module details including srcversion"
+    },
+    {
+      "step_number": 21,
+      "thought": "Set context to 2nd oldest UN state task (PID 11364)",
+      "action": "set 11364",
+      "observation": "vsapiapp task in TASK_UNINTERRUPTIBLE state"
+    },
+    {
+      "step_number": 22,
+      "thought": "Get backtrace for vsapiapp waiting on I/O",
+      "action": "bt",
+      "observation": "vsapiapp waiting on page writeback via io_schedule"
+    },
+    {
+      "step_number": 23,
+      "thought": "Check files for dentry address",
+      "action": "files -d ffff880005011b40",
+      "observation": "File /opt/TrendMicro/SProtectLinux/SPLX.tmp/VSM5Q009.4JA"
+    },
+    {
+      "step_number": 24,
+      "thought": "Find mount information for the file's superblock",
+      "action": "mount | grep -e MOUNT -e ffff880035fec800",
+      "observation": "XFS filesystem on /dev/mapper/rhel-root"
+    },
+    {
+      "step_number": 25,
+      "thought": "Examine memory page for writeback status",
+      "action": "kmem ffffea000461c780",
+      "observation": "Page has writeback flag set"
+    },
+    {
+      "step_number": 26,
+      "thought": "Get enum value for PG_writeback flag",
+      "action": "enum PG_writeback",
+      "observation": "PG_writeback = 13"
+    },
+    {
+      "step_number": 27,
+      "thought": "Check wait_bit_queue key flags",
+      "action": "px ((struct wait_bit_queue *)0xffff880137fd7ca0)->key.flags",
+      "observation": "Flags pointer to page address"
+    },
+    {
+      "step_number": 28,
+      "thought": "Read memory at the flags address",
+      "action": "rd 0xffffea000461c780",
+      "observation": "Memory value 002fffff0000282c"
+    },
+    {
+      "step_number": 29,
+      "thought": "Evaluate binary representation of flags",
+      "action": "eval -b 002fffff0000282c",
+      "observation": "Bit 13 (PG_writeback) is set"
+    },
+    {
+      "step_number": 30,
+      "thought": "Test logical expression for wait loop",
+      "action": "px (1 && !0)",
+      "observation": "Returns 1 (true)"
+    },
+    {
+      "step_number": 31,
+      "thought": "Check device I/O statistics",
+      "action": "dev -d",
+      "observation": "50 I/Os in-flight on /dev/vda (15 async, 35 sync)"
+    },
+    {
+      "step_number": 32,
+      "thought": "Set context to kworker task (PID 12632)",
+      "action": "set 12632",
+      "observation": "kworker/2:0 in TASK_UNINTERRUPTIBLE state"
+    },
+    {
+      "step_number": 33,
+      "thought": "Get backtrace for kworker waiting",
+      "action": "bt",
+      "observation": "kworker waiting at wait_for_completion in kthread_create_on_node"
+    },
+    {
+      "step_number": 34,
+      "thought": "Disassemble around kthread_create_on_node",
+      "action": "dis -lr ffffffff81097108 | tail",
+      "observation": "Assembly code showing wait_for_completion call"
+    },
+    {
+      "step_number": 35,
+      "thought": "Get kthreadd_task pointer",
+      "action": "p kthreadd_task",
+      "observation": "kthreadd_task at 0xffff880139b10b60"
+    },
+    {
+      "step_number": 36,
+      "thought": "Check kthreadd process status",
+      "action": "ps -m 2",
+      "observation": "kthreadd in WAITING state on CPU 3"
+    },
+    {
+      "step_number": 37,
+      "thought": "Get backtrace for kthreadd",
+      "action": "bt 0xffff880139b10b60",
+      "observation": "kthreadd stuck in schedule"
+    },
+    {
+      "step_number": 38,
+      "thought": "Check runqueue for CPU 3",
+      "action": "runq -c 3",
+      "observation": "vsapiapp currently running on CPU 3"
+    },
+    {
+      "step_number": 39,
+      "thought": "Set context to vsapiapp on CPU 3 (PID 11361)",
+      "action": "set 11361",
+      "observation": "vsapiapp in TASK_RUNNING state on CPU 3"
+    },
+    {
+      "step_number": 40,
+      "thought": "Get backtrace for vsapiapp on CPU 3",
+      "action": "bt",
+      "observation": "vsapiapp stuck at kvm_lock_spinning from ioctlMod"
+    },
+    {
+      "step_number": 41,
+      "thought": "Check per-CPU klock_waiting structure",
+      "action": "p klock_waiting",
+      "observation": "PER-CPU struct kvm_lock_waiting addresses"
+    },
+    {
+      "step_number": 42,
+      "thought": "Get klock_waiting for CPU 3",
+      "action": "p klock_waiting:3",
+      "observation": "lock at 0xffff8800b4ddfe88, want = 46290"
+    },
+    {
+      "step_number": 43,
+      "thought": "Get kvm_lock_spinning function address",
+      "action": "p kvm_lock_spinning",
+      "observation": "Function at 0xffffffff81052510"
+    },
+    {
+      "step_number": 44,
+      "thought": "Examine spinlock structure",
+      "action": "arch_spinlock 0xffff8800b4ddfe88",
+      "observation": "Spinlock with head=53372, tail=33053"
+    },
+    {
+      "step_number": 45,
+      "thought": "Get process details again for vsapiapp",
+      "action": "ps -a 11361",
+      "observation": "vsapiapp environment variables"
+    },
+    {
+      "step_number": 46,
+      "thought": "Get function prototype for do_vfs_ioctl",
+      "action": "whatis do_vfs_ioctl",
+      "observation": "Function signature"
+    },
+    {
+      "step_number": 47,
+      "thought": "Disassemble sys_ioctl function",
+      "action": "dis -r ffffffff811d9cf1|tail",
+      "observation": "Assembly code around sys_ioctl"
+    },
+    {
+      "step_number": 48,
+      "thought": "Disassemble do_vfs_ioctl function",
+      "action": "dis -r ffffffff811d9a75|head",
+      "observation": "Assembly code start of do_vfs_ioctl"
+    },
+    {
+      "step_number": 49,
+      "thought": "Calculate address for file structure",
+      "action": "px (0xffff880137847f30-5*8)",
+      "observation": "Address 0xffff880137847f08"
+    },
+    {
+      "step_number": 50,
+      "thought": "Read memory at calculated address",
+      "action": "rd 0xffff880137847f08",
+      "observation": "Value ffff88007bd48c00"
+    },
+    {
+      "step_number": 51,
+      "thought": "Get file path from file structure",
+      "action": "struct file.f_path ffff88007bd48c00",
+      "observation": "File path components"
+    },
+    {
+      "step_number": 52,
+      "thought": "Check device file for the dentry",
+      "action": "files -d 0xffff8800b39f79c0",
+      "observation": "/dev/splxdev device file"
+    },
+    {
+      "step_number": 53,
+      "thought": "Check kthreadd status again",
+      "action": "ps -m 2",
+      "observation": "kthreadd in WAITING state for ~2 minutes"
+    }
+  ],
+  "root_cause_analysis": [
+    "Lots of tasks are waiting for page writeback to comple.",
+    "Those tasks are waiting calling io_schedule() and waiting until another part of the kernel complete what they wait for.",
+    "kworkers will complete what those tasks are waiting for to complete.",
+    "At that time kworkers are calling kthread_create_on_node --> wait_for_completion() and waiting for the completion.",
+    "kthreadd will complete what those kworkers are waiting for to complete.",
+    "At that time vsapiapp calling ioctlMod() from the 3rd party module [splxmod] and calling kvm_lock_spinning() and waiting on spinlock.",
+    "At that time kthreadd is waking up on the CPU where vsapiapp is waiting on spinlock and blocking."
+  ]
+}

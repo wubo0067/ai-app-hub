@@ -1,89 +1,155 @@
 {
-  "scenario": "Soft/Hard Lockup due to race between ring_buffer_detach() and ring_buffer_wakeup()",
+  "scenario": "Soft lockup or Hard lockup occurs due to race between ring_buffer_detach() and ring_buffer_wakeup()",
   "symptoms": [
-    "NMI watchdog: BUG: soft lockup",
-    "NMI watchdog: Watchdog detected hard LOCKUP",
-    "perf_event_wakeup in stack trace",
-    "ring_buffer_wakeup in stack trace",
-    "list_for_each_entry_rcu stuck in loop",
-    "CPU stuck in perf_event_wakeup with interrupts disabled"
+    "NMI watchdog: BUG: soft lockup - CPU#0 stuck for 22s! [capsule8-sensor:2144]",
+    "NMI watchdog: Watchdog detected hard LOCKUP on cpu 23",
+    "Kernel panic - not syncing: softlockup: hung tasks",
+    "Kernel panic - not syncing: Hard LOCKUP",
+    "RIP: generic_exec_single+0xfa",
+    "RIP: _raw_spin_lock_irqsave+0x26",
+    "RIP: __wake_up+0x49"
   ],
   "workflow": [
     {
       "step_number": 1,
-      "thought": "首先检查系统是否出现软锁死或硬锁死，通过查看panic消息和堆栈跟踪确认是否涉及perf子系统。需要检查CPU 0是否在等待IPI响应，而其他CPU是否在perf_event_wakeup中循环。",
-      "action": "log | grep -i lockup",
-      "observation": "找到'NMI watchdog: BUG: soft lockup'或'NMI watchdog: Watchdog detected hard LOCKUP'消息，确认锁死类型。"
+      "thought": "Check system information and panic details",
+      "action": "sys -i",
+      "observation": "DMI BIOS vendor, version, date, and system vendor"
     },
     {
       "step_number": 2,
-      "thought": "分析主锁死CPU的堆栈跟踪，查看是否卡在perf_event_wakeup或ring_buffer_wakeup函数中。这通常表明存在环形缓冲区事件列表的循环问题。",
+      "thought": "Get backtrace of the panicked task",
       "action": "bt",
-      "observation": "堆栈显示perf_event_wakeup -> ring_buffer_wakeup -> list_for_each_entry_rcu循环，CPU处于中断禁用状态。"
+      "observation": "Stack trace showing generic_exec_single+0xfa and waiting on IPI"
     },
     {
       "step_number": 3,
-      "thought": "检查其他CPU的状态，特别是那些可能正在处理irq_work的CPU。需要确认是否有CPU在perf_event_wakeup中循环且中断被禁用。",
-      "action": "bt -a",
-      "observation": "发现多个CPU的堆栈，其中一些卡在perf_event_wakeup中，且RFLAGS显示中断被禁用（如00000046）。"
+      "thought": "Check backtrace for CPU 1 to see why IPI not handled",
+      "action": "bt -c 1",
+      "observation": "CPU 1 stuck in perf_event_wakeup() with interrupts disabled"
     },
     {
       "step_number": 4,
-      "thought": "分析ring_buffer结构，检查event_list是否为空或存在循环引用。这是问题的关键：当ring_buffer_detach()和ring_buffer_wakeup()竞争时，event_list可能处于不一致状态。",
-      "action": "struct ring_buffer <rb_address>",
-      "observation": "event_list字段显示next和prev指针可能指向自身或无效地址，而不是初始的rb地址。"
+      "thought": "Disassemble __wake_up to find panic location",
+      "action": "dis -r __wake_up+0x49 | tail",
+      "observation": "Panic at pop %r14 instruction after spin_unlock_irqrestore"
     },
     {
       "step_number": 5,
-      "thought": "检查具体的perf_event结构，验证rb_entry链表是否正确链接到ring_buffer的event_list。需要确认是否存在断开连接或循环引用。",
-      "action": "struct perf_event <event_address>",
-      "observation": "rb_entry.next和rb_entry.prev可能不指向ring_buffer的event_list头，表明链表已损坏。"
+      "thought": "Extract exception RIP lines from backtrace",
+      "action": "bt | awk '/exception RIP/,/IRQ stack/'",
+      "observation": "Exception RIP: __wake_up+0x49 with interrupts disabled"
     },
     {
       "step_number": 6,
-      "thought": "验证wait_queue_head_t的状态，确认是否为空队列。这有助于判断是否在唤醒空等待队列时出现问题。",
-      "action": "struct wait_queue_head_t <waitq_address>",
-      "observation": "task_list显示为空（next和prev指向自身），但lock可能被持有（counter=0x1）。"
+      "thought": "Disassemble irq_work_run to understand execution flow",
+      "action": "dis -r ffffffff8116ae89",
+      "observation": "irq_work_run calling irq_work_run_list with raised_list"
     },
     {
       "step_number": 7,
-      "thought": "检查perf_event的pending字段，确认是否有未处理的irq_work。这可能导致perf_pending_event被重复调用。",
-      "action": "struct irq_work <pending_address>",
-      "observation": "irq_work结构显示func指向perf_pending_event，且可能处于待处理状态。"
+      "thought": "Check system information for lockup details",
+      "action": "sys | grep -i -e load -e node -e rel -e date -e panic -e cpus ;",
+      "observation": "CPU count, date, load average, nodename, release, panic message"
     },
     {
       "step_number": 8,
-      "thought": "分析汇编代码级别的问题，确认list_for_each_entry_rcu循环中的比较逻辑。检查R12寄存器（存储rb地址）和RAX寄存器（存储当前event地址）是否相等。",
-      "action": "dis -r perf_event_wakeup+0x70",
-      "observation": "汇编代码显示比较指令（cmp %rax,%r12）可能永远不相等，导致无限循环。"
+      "thought": "Search log for lockup messages",
+      "action": "log | grep -i lockup",
+      "observation": "Watchdog detected hard LOCKUP and Kernel panic messages"
+    },
+    {
+      "step_number": 9,
+      "thought": "Get backtrace of locked up task",
+      "action": "bt",
+      "observation": "Stack trace showing perf_event_wakeup+0x45 exception"
+    },
+    {
+      "step_number": 10,
+      "thought": "Evaluate RFLAGS value to check interrupt status",
+      "action": "eval -b 0x00000086",
+      "observation": "Bits 7, 2, 1 set indicating interrupt flags"
+    },
+    {
+      "step_number": 11,
+      "thought": "Disassemble perf_pending_event to see call chain",
+      "action": "dis -r ffffffff8112a447 | tail",
+      "observation": "perf_pending_event calling perf_event_wakeup"
+    },
+    {
+      "step_number": 12,
+      "thought": "Disassemble perf_event_wakeup function start",
+      "action": "dis perf_event_wakeup | head",
+      "observation": "Function prologue with push instructions"
+    },
+    {
+      "step_number": 13,
+      "thought": "Calculate and read perf_event pointer from stack",
+      "action": "p (0xffff8810b89c3f40 - 0x8*2)",
+      "observation": "Address 0xffff8810b89c3f30 containing perf_event pointer"
+    },
+    {
+      "step_number": 14,
+      "thought": "Read memory at calculated address",
+      "action": "rd 0xffff8810b89c3f30",
+      "observation": "Value ffff88206563d000 (perf_event address)"
+    },
+    {
+      "step_number": 15,
+      "thought": "Check perf_event pending irq_work structure",
+      "action": "perf_event.pending -o ffff88206563d000",
+      "observation": "irq_work at offset ffff88206563d2c0"
+    },
+    {
+      "step_number": 16,
+      "thought": "Examine irq_work structure",
+      "action": "irq_work ffff88206563d2c0",
+      "observation": "next=0x2, func=perf_pending_event"
+    },
+    {
+      "step_number": 17,
+      "thought": "Check perf_event waitq structure",
+      "action": "perf_event.waitq ffff88206563d000 -o",
+      "observation": "waitq at offset ffff88206563d290"
+    },
+    {
+      "step_number": 18,
+      "thought": "Examine wait queue status",
+      "action": "waitq ffff88206563d290",
+      "observation": "Wait queue is empty"
+    },
+    {
+      "step_number": 19,
+      "thought": "Get backtrace showing spin_lock_irqsave exception",
+      "action": "bt",
+      "observation": "Exception RIP: _raw_spin_lock_irqsave+0x26 in __wake_up"
+    },
+    {
+      "step_number": 20,
+      "thought": "Examine ring_buffer event_list",
+      "action": "ring_buffer.event_list 0xffff9a062fe50068",
+      "observation": "event_list next=0x0, prev=0x0 (empty list)"
+    },
+    {
+      "step_number": 21,
+      "thought": "Examine wait_queue_head_t structure",
+      "action": "wait_queue_head_t ffff9a05dae122a8",
+      "observation": "lock counter=0x1, task_list circular"
+    },
+    {
+      "step_number": 22,
+      "thought": "Check perf_event waitq offset",
+      "action": "perf_event.waitq 0xffff9a05dae12000 -ox",
+      "observation": "waitq at ffff9a05dae122a8 matches wake_up parameter"
+    },
+    {
+      "step_number": 23,
+      "thought": "Check perf_event rb_entry list pointers",
+      "action": "perf_event.rb_entry 0xffff9a05dae12000",
+      "observation": "rb_entry next/prev point to same address, not initial rb"
     }
   ],
   "root_cause_analysis": [
-    {
-      "phenomenon": "CPU在perf_event_wakeup中无限循环，中断被禁用",
-      "possible_cause": "ring_buffer的event_list链表损坏，list_for_each_entry_rcu无法找到终止条件"
-    },
-    {
-      "phenomenon": "ring_buffer.event_list为空但perf_event.rb_entry指向自身",
-      "possible_cause": "ring_buffer_detach()在ring_buffer_wakeup()遍历链表时修改了链表结构"
-    },
-    {
-      "phenomenon": "多个CPU同时卡在perf_event_wakeup中",
-      "possible_cause": "竞争条件导致多个CPU同时遍历损坏的链表"
-    },
-    {
-      "phenomenon": "RFLAGS显示中断被禁用（00000046）",
-      "possible_cause": "perf_event_wakeup在持有自旋锁时被NMI中断，无法处理IPI"
-    },
-    {
-      "phenomenon": "CPU 0等待IPI响应，CPU 1在perf_event_wakeup中循环",
-      "possible_cause": "CPU 1中断被禁用，无法处理CPU 0发送的IPI请求"
-    }
-  ],
-  "data_patterns": [
-    "00000046 (中断禁用标志)",
-    "0x298 (perf_event中rb字段的偏移)",
-    "0x68 (ring_buffer中event_list字段的偏移)",
-    "0x2a8 (perf_event中waitq字段的偏移)"
+    "Below commit will fix this issue https://lore.kernel.org/patchwork/patch/465937/"
   ]
 }
