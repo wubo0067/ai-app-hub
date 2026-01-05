@@ -1,0 +1,314 @@
+{
+  "summary": "Comprehensive diagnostic matrix for Linux kernel Hard LOCKUP scenarios",
+  "init_cmds": [
+    "sys -i",
+    "log | grep -e lockup -e LOCKUP -e blocked -e rcu_sched",
+    "bt -c {cpu}"
+  ],
+  "matrix": [
+    {
+      "trigger": "System hangs with tasks waiting for page writeback completion",
+      "action": "kmem {addr}",
+      "arg_hints": "addr: memory page address from backtrace",
+      "why": "Check kernel memory allocation for spinlock or data structure",
+      "expect": "Memory contents showing allocation type and owner",
+      "is_end": false
+    },
+    {
+      "trigger": "Need mount information for device superblock",
+      "action": "mount | grep -e MOUNT -e {addr}",
+      "arg_hints": "addr: superblock address from memory",
+      "why": "Find mount details for device",
+      "expect": "Mount information for filesystem",
+      "is_end": false
+    },
+    {
+      "trigger": "Module {modname} involved in lockup",
+      "action": "struct module.name,version,srcversion,sig_ok {addr}",
+      "arg_hints": "addr: module address from backtrace",
+      "why": "Get module details for analysis",
+      "expect": "Module information and signature status",
+      "is_end": false
+    },
+    {
+      "trigger": "Exception RIP at {offset}",
+      "action": "px {offset}",
+      "arg_hints": "offset: RIP value from exception",
+      "why": "Examine instruction at exception point",
+      "expect": "Assembly code at fault location",
+      "is_end": false
+    },
+    {
+      "trigger": "KVM lock spinning detected",
+      "action": "struct kvm_vcpu {addr}",
+      "arg_hints": "addr: kvm_vcpu address from backtrace",
+      "why": "Inspect KVM virtual CPU state",
+      "expect": "KVM vCPU structure details",
+      "is_end": false
+    },
+    {
+      "trigger": "Ioctl or close hook functions in module",
+      "action": "struct file_operations {addr}",
+      "arg_hints": "addr: file_operations address from module",
+      "why": "Check file operation hooks",
+      "expect": "Function pointers for ioctl/close",
+      "is_end": false
+    },
+    {
+      "trigger": "RIP: generic_exec_single+{offset}",
+      "action": "dis -r generic_exec_single+{offset} | tail",
+      "arg_hints": "offset: RIP offset from panic message",
+      "why": "Disassemble function to find panic location",
+      "expect": "Assembly code showing instruction at panic",
+      "is_end": false
+    },
+    {
+      "trigger": "Need to examine memory at specific address {addr}",
+      "action": "rd {addr}",
+      "arg_hints": "addr: Calculated address from registers or stack",
+      "why": "Read memory at calculated address",
+      "expect": "Memory contents at specified location",
+      "is_end": false
+    },
+    {
+      "trigger": "Check perf_event pending irq_work structure",
+      "action": "perf_event.pending -o {addr}",
+      "arg_hints": "addr: Address from backtrace or registers",
+      "why": "Check perf_event pending irq_work structure",
+      "expect": "Pending work structure details",
+      "is_end": false
+    },
+    {
+      "trigger": "Need to disassemble __wake_up function",
+      "action": "dis -r __wake_up+{offset} | tail",
+      "arg_hints": "offset: Offset from backtrace or registers",
+      "why": "Disassemble __wake_up to find panic location",
+      "expect": "Assembly code showing instruction at panic",
+      "is_end": false
+    },
+    {
+      "trigger": "Identify zone involved in CPU {cpu} lockup",
+      "action": "kmem -z | grep {addr}",
+      "arg_hints": "addr: Zone address from memory analysis",
+      "why": "Identify zone involved in CPU lockup",
+      "expect": "Zone information matching the address",
+      "is_end": false
+    },
+    {
+      "trigger": "Get pick_next_task function pointer",
+      "action": "px ((struct sched_class *){addr})->pick_next_task",
+      "arg_hints": "addr: sched_class pointer address",
+      "why": "Get pick_next_task function pointer",
+      "expect": "Function pointer value",
+      "is_end": false
+    },
+    {
+      "trigger": "Examine zone->lock spinlock address",
+      "action": "px &((struct zone *){addr})->lock",
+      "arg_hints": "addr: Zone structure address",
+      "why": "Examine zone->lock spinlock address",
+      "expect": "Spinlock address within zone structure",
+      "is_end": false
+    },
+    {
+      "trigger": "Check runqueue for CPU {cpu}",
+      "action": "runq -c {cpu}",
+      "arg_hints": "cpu: CPU number to check",
+      "why": "Check runqueue for specific CPU",
+      "expect": "Runqueue contents and task list",
+      "is_end": false
+    },
+    {
+      "trigger": "mce: [Hardware Error]: Machine check events logged",
+      "action": "log | grep mce",
+      "arg_hints": null,
+      "why": "Check kernel log for MCE events",
+      "expect": "Machine check error details and timestamps",
+      "is_end": false
+    },
+    {
+      "trigger": "Tasks in uninterruptible sleep state",
+      "action": "foreach UN ps -m",
+      "arg_hints": "UN: from ps output showing D state",
+      "why": "Identify processes stuck in D state",
+      "expect": "List of processes in uninterruptible sleep",
+      "is_end": false
+    },
+    {
+      "trigger": "Analyze backtraces of uninterruptible tasks",
+      "action": "foreach UN bt | awk '/#[1-4] /{print $3,$5}' | paste - - - -",
+      "arg_hints": "UN: from ps output showing D state",
+      "why": "Check what's blocking D state processes",
+      "expect": "Common functions across stuck processes",
+      "is_end": false
+    },
+    {
+      "trigger": "Check logical volume status",
+      "action": "dmshow --lvs",
+      "arg_hints": null,
+      "why": "Examine device mapper logical volumes",
+      "expect": "Logical volume status and mappings",
+      "is_end": false
+    },
+    {
+      "trigger": "Check request queue timeout timer status",
+      "action": "struct request_queue.timeout {addr}",
+      "arg_hints": "addr: request_queue address from backtrace",
+      "why": "Examine block device timeout settings",
+      "expect": "Timeout value and work timer status",
+      "is_end": false
+    },
+    {
+      "trigger": "Examine timed out SCSI commands",
+      "action": "scsishow --t",
+      "arg_hints": null,
+      "why": "Check for stuck SCSI operations",
+      "expect": "SCSI commands with timeout status",
+      "is_end": false
+    },
+    {
+      "trigger": "Task looping in spinlock in kernel mode",
+      "action": "kmem -i",
+      "arg_hints": null,
+      "why": "Check kernel memory allocation status",
+      "expect": "Memory usage and allocation patterns",
+      "is_end": false
+    },
+    {
+      "trigger": "tvec_base values way behind current jiffies",
+      "action": "struct tvec_base {addr}",
+      "arg_hints": "addr: tvec_base address from timer code",
+      "why": "Examine timer wheel structure state",
+      "expect": "Timer values and pending timers",
+      "is_end": false
+    },
+    {
+      "trigger": "Exception RIP: _spin_lock_irqsave+{offset}",
+      "action": "dis -l _spin_lock_irqsave+{offset}",
+      "arg_hints": "offset: RIP offset from panic message",
+      "why": "Disassemble spinlock instruction location",
+      "expect": "Assembly code at lock location",
+      "is_end": false
+    },
+    {
+      "trigger": "All CPUs show timer discrepancies",
+      "action": "foreach cpu struct tvec_base {addr}",
+      "arg_hints": "addr: per-cpu tvec_base addresses",
+      "why": "Compare timer states across CPUs",
+      "expect": "Timer values consistency across CPUs",
+      "is_end": false
+    },
+    {
+      "trigger": "Need to examine specific kernel structure",
+      "action": "struct {modname} {addr}",
+      "arg_hints": "modname: structure name, addr: structure address",
+      "why": "Inspect kernel data structure contents",
+      "expect": "Structure field values and state",
+      "is_end": false
+    },
+    {
+      "trigger": "Process ID mentioned in lockup warning",
+      "action": "px {pid}",
+      "arg_hints": "pid: process ID from ps output",
+      "why": "Examine process state at time of lockup",
+      "expect": "Process structure showing state and resources",
+      "is_end": false
+    },
+    {
+      "trigger": "SCSI device involved in timeout or lockup",
+      "action": "px ((struct scsi_cmnd *){addr})->device",
+      "arg_hints": "addr: from SCSI command pointer in trace",
+      "why": "Examine the SCSI device associated with timed-out command",
+      "expect": "Device structure showing host and target information",
+      "is_end": false
+    },
+    {
+      "trigger": "Need to examine SCSI host structure details",
+      "action": "struct Scsi_Host.hostdata -ox",
+      "arg_hints": null,
+      "why": "Check Scsi_Host hostdata offset for driver-specific data",
+      "expect": "Offset value for hostdata field in Scsi_Host",
+      "is_end": false
+    },
+    {
+      "trigger": "Module-specific function appears in lockup stack",
+      "action": "struct {modname}_device_probe",
+      "arg_hints": "modname: from module name in warning message",
+      "why": "Examine module's device probe function structure",
+      "expect": "Function layout showing potential race conditions",
+      "is_end": false
+    },
+    {
+      "trigger": "Need to display SCSI host and device information",
+      "action": "HOST      DRIVER\nNAME      NAME                   Scsi_Host",
+      "arg_hints": null,
+      "why": "Display host and device information for SCSI subsystem",
+      "expect": "List of SCSI hosts and their associated drivers",
+      "is_end": false
+    },
+    {
+      "trigger": "WARNING about kref refcount in module function",
+      "action": "struct kref.refcount -ox",
+      "arg_hints": null,
+      "why": "Check kref refcount field offset for atomic operations",
+      "expect": "Offset of refcount field within kref structure",
+      "is_end": false
+    },
+    {
+      "trigger": "Spinlock function in RIP register during lockup",
+      "action": "struct spinlock -ox",
+      "arg_hints": null,
+      "why": "Examine spinlock structure layout for lock contention",
+      "expect": "Spinlock structure showing lock state fields",
+      "is_end": false
+    },
+    {
+      "trigger": "Soft lockup messages with RIP: native_queued_spin_lock_slowpath",
+      "action": "log | awk '/soft lockup/,/Code:/' | grep RIP",
+      "arg_hints": null,
+      "why": "Check for soft lockup messages before hard lockup",
+      "expect": "RIP addresses pointing to spinlock functions",
+      "is_end": false
+    },
+    {
+      "trigger": "Check spinlock status and contention",
+      "action": "spinlock_t {addr}",
+      "arg_hints": "addr: spinlock address from RIP analysis",
+      "why": "Examine spinlock state and contention",
+      "expect": "Spinlock owner and waiters information",
+      "is_end": false
+    },
+    {
+      "trigger": "rcu_sched CPU stalls detected on multiple CPUs",
+      "action": "list -o rcu_state.flavors -H {addr}",
+      "arg_hints": "addr: rcu_state address from kernel symbols",
+      "why": "List rcu_state flavors to check RCU stalls",
+      "expect": "RCU state information and stall details",
+      "is_end": false
+    },
+    {
+      "trigger": "Massive calls to shrink_slab() in stack traces",
+      "action": "bt -a | grep -A 10 shrink_slab",
+      "arg_hints": null,
+      "why": "Check for shrink_slab() calls in backtraces",
+      "expect": "Multiple processes calling shrink_slab() functions",
+      "is_end": false
+    },
+    {
+      "trigger": "Examine dentry cache operations in backtraces",
+      "action": "bt -a | grep -E \"prune_dcache_sb|__prune_dcache_sb\"",
+      "arg_hints": null,
+      "why": "Check for dentry cache pruning operations",
+      "expect": "Processes stuck in dentry cache pruning",
+      "is_end": false
+    },
+    {
+      "trigger": "Check kernel log for lockup patterns",
+      "action": "log | grep -E \"LOCKUP|stall|lockup\"",
+      "arg_hints": null,
+      "why": "Search for lockup-related messages in kernel log",
+      "expect": "Lockup, stall, or watchdog messages",
+      "is_end": false
+    }
+  ]
+}
