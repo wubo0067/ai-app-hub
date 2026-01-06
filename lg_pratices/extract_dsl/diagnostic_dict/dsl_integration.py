@@ -287,6 +287,8 @@ def create_workflow_summary(workflows: List[Dict[str, Any]]) -> str:
                 action = step.get("action", "").lower()
 
                 if any(
+                    # 遍历关键字列表 ["sys", "system", "hardware", "bios", "dmi"]
+                    # 对每个 word，检查 word in thought or word in action，只要有一个关键字出现，any() 就返回 True
                     word in thought or word in action
                     for word in ["sys", "system", "hardware", "bios", "dmi"]
                 ):
