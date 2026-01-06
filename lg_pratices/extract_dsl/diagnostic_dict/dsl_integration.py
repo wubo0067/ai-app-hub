@@ -812,8 +812,13 @@ def integrate_dsl_files(
         logger.error("需要提供 API 密钥")
         return None
 
+    # 数据抽取/分析	1.0
     llm = ChatOpenAI(
-        api_key=api_key, base_url=base_url, model=model, temperature=0, streaming=False
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        temperature=1.0,
+        streaming=False,
     )
 
     # 创建处理链

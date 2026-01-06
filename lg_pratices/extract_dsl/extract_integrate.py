@@ -265,7 +265,7 @@ def main():
         api_key="sk-b5480f840a794c69a0af1732459f3ae4",  # type: ignore
         base_url="https://api.deepseek.com",
         model="deepseek-chat",
-        temperature=0,  # temperature 的作用是控制生成文本的随机性，值越低，生成的文本越确定和一致
+        temperature=1.0,  # 数据抽取/分析	1.0
     )
 
     md_list = [

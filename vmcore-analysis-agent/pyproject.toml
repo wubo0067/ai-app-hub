@@ -1,0 +1,16 @@
+[project]
+name = "vmcore-analysis-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "ipython>=9.8.0",
+    "langchain>=1.2.0",
+    "langchain-openai>=1.1.5",
+    "langgraph>=1.0.5",
+    "langgraph-cli[inmem]>=0.4.11",
+    "pyppeteer>=2.0.0",
+    "watchdog>=6.0.0",
+    "pyyaml>=6.0.1",
+]
