@@ -13,4 +13,7 @@ dependencies = [
     "pyppeteer>=2.0.0",
     "watchdog>=6.0.0",
     "pyyaml>=6.0.1",
+    "langchain-mcp-adapters>=0.2.1",
+    "fastmcp>=2.12.5",
+    "distro>=1.9.0",
 ]

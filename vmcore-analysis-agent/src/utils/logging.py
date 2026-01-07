@@ -11,7 +11,12 @@ def custom_path_filter(path):
     idx = path.find(project_root)
     if idx != -1:
         # Extract the portion of the path after the project root
-        path = path[idx + len(project_root) :]
+        path = path[
+            idx + len(project_root) + 1 :
+        ]  # +1 to include the separator after project root
+    else:
+        # If project root is not found, return the basename of the file
+        path = os.path.basename(path)
     return path
 
 
@@ -31,16 +36,28 @@ def setup_logger(log_filename="va-agent.log", log_dir="logs"):
     # Define the log file path
     log_filepath = os.path.join(log_dir, log_filename)
 
-    # Define the logging configuration
-    logging.setLogRecordFactory(CustomLogRecord)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] [%(module)s] [%(pathname)s]: %(message)s",
-        handlers=[logging.StreamHandler(), logging.FileHandler(log_filepath)],
-    )
+    # Get or create logger
+    logger_instance = logging.getLogger("vmcore_analysis_agent")
 
-    # Return the configured logger
-    return logging.getLogger()
+    # Avoid adding handlers multiple times if logger already exists
+    if not logger_instance.handlers:
+        # Define the logging configuration
+        logger_instance = logging.getLogger("vmcore_analysis_agent")
+        logging.setLogRecordFactory(CustomLogRecord)  # Only set once globally
+        handler = logging.FileHandler(log_filepath)
+        formatter = logging.Formatter(
+            "%(asctime)s [%(levelname)s] [%(module)s] [%(pathname)s]: %(message)s"
+        )
+        handler.setFormatter(formatter)
+        logger_instance.addHandler(handler)
+        logger_instance.setLevel(logging.INFO)
+
+        # Also add console handler for debugging
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger_instance.addHandler(console_handler)
+
+    return logger_instance
 
 
 # Global logger object
