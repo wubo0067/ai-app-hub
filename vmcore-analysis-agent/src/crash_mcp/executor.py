@@ -26,12 +26,12 @@ def run_crash_command_rhel9(command, vmcore_path, vmlinux_path, verbose=False):
     )
     stdout, stderr = process.communicate(input=command + "\nquit\n")
 
-    if verbose:
-        logger.info(
-            "Raw output for '{command}' on RHEL 9:\n{output}".format(
-                command=command, output=stdout
-            )
-        )
+    # if verbose:
+    #     logger.info(
+    #         "Raw output for '{command}' on RHEL 9:\n{output}".format(
+    #             command=command, output=stdout
+    #         )
+    #     )
 
     if process.returncode != 0:
         err = "Crash command '{command}' failed with error:\n{error}".format(

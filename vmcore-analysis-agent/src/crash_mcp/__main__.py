@@ -21,6 +21,8 @@ async def main():
     tool_names = set()
     result = ""
 
+    test_cmds = {"sys": "sys -i", "bt": "bt -c 0"}
+
     try:
         async with crash_client.session("crash") as session:
             logger.info("Session established")
@@ -29,16 +31,17 @@ async def main():
                 tool_names.add(tool.name)
                 logger.info(f"Loaded tool: {tool.name}")
 
-            sys_tool = next((t for t in tools if t.name == "sys"), None)
-            if sys_tool:
-                logger.info("Executing 'sys -i' command using 'sys' tool")
-                result = await sys_tool.ainvoke(
-                    {
-                        "command": "sys -i",
-                        "vmcore_path": "/var/crash/127.0.0.1-2026-01-07-16:46:03/vmcore",
-                        "vmlinux_path": "/usr/lib/debug/lib/modules/5.14.0-611.9.1.el9_7.x86_64/vmlinux",
-                    }
-                )
+            for name, command in test_cmds.items():
+                sys_tool = next((t for t in tools if t.name == name), None)
+                if sys_tool:
+                    logger.info(f"Executing '{command}' command using '{name}' tool")
+                    result = await sys_tool.ainvoke(
+                        {
+                            "command": command,
+                            "vmcore_path": "/var/crash/127.0.0.1-2026-01-07-16:46:03/vmcore",
+                            "vmlinux_path": "/usr/lib/debug/lib/modules/5.14.0-611.9.1.el9_7.x86_64/vmlinux",
+                        }
+                    )
     except Exception as e:
         logger.error(f"Error establishing session: {e}")
         raise
