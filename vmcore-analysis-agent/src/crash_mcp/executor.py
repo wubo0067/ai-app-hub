@@ -1,5 +1,8 @@
 import subprocess
-from utils.logging import logger
+from src.utils.logging import logger
+from src.utils.os import get_linux_distro_version
+
+distro, version = get_linux_distro_version()
 
 
 def run_crash_command_rhel9(command, vmcore_path, vmlinux_path, verbose=False):
@@ -87,17 +90,18 @@ def run_crash_command_rhel9(command, vmcore_path, vmlinux_path, verbose=False):
     return output
 
 
-def run_crash_command(
-    command, vmcore_path, vmlinux_path, distro, version, verbose=False
-):
-    """Run a crash command on the given vmcore and vmlinux files.
+def run_crash_command(full_subcmd, vmcore_path, vmlinux_path, verbose=False):
+    """Run a crash subcommand on the given vmcore and vmlinux files.
     Args:
-        command (str): The crash command to run.
+        full_subcmd (str): The crash subcommand to run.
         vmcore_path (str): The path to the vmcore file.
         vmlinux_path (str): The path to the vmlinux file.
-        distro (str): The Linux distribution name.
-        version (str): The major version of the Linux distribution.
     Returns:
         str: The output of the crash command.
     """
-    pass
+
+    # 工具运行的 OS 环境和版本
+    if distro == "rhel" and int(version) == 9:
+        return run_crash_command_rhel9(full_subcmd, vmcore_path, vmlinux_path, verbose)
+    else:
+        return "functionality for other distros/versions not yet implemented."
