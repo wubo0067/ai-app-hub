@@ -1,6 +1,7 @@
 from langchain_openai import ChatOpenAI
-from .config import config_manager
-from .logging import logger
+from src.mcp_tools.crash.client import crash_tools
+from src.utils.config import config_manager
+from src.utils.logging import logger
 
 
 def create_llm():

@@ -15,13 +15,13 @@ from .client import crash_client
 #     logger.info("Completed RHEL9 crash test")
 
 
-# python -m src.crash_mcp
+# python -m src.mcp_tools.crash
 async def main():
     logger.info("Starting crash MCP client")
     tool_names = set()
     result = ""
 
-    test_cmds = {"sys": "sys -i", "bt": "bt -c 0"}
+    test_cmds: dict[str, str] = {"sys": "sys -i", "bt": "bt -c 0"}
 
     try:
         async with crash_client.session("crash") as session:

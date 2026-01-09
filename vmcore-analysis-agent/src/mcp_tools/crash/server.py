@@ -5,7 +5,6 @@ from .executor import run_crash_command
 
 crash_server = FastMCP(
     "crash_server",
-    log_level="ERROR",
     instructions="This server provides crash analysis tools for Linux vmcore files.",
 )
 
@@ -165,4 +164,4 @@ for cmd_info in commands:
     register_crash_tool(*cmd_info)
 
 if __name__ == "__main__":
-    crash_server.run(transport="stdio")
+    crash_server.run(transport="stdio", show_banner=False)
