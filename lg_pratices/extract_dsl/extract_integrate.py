@@ -8,61 +8,84 @@ from langchain_core.documents import Document
 from langchain_core.callbacks import BaseCallbackHandler
 from pydantic import BaseModel, Field, ConfigDict
 import operator
+import re
 
 extract_dsl_prompt = ChatPromptTemplate.from_template(
     """You are a senior Linux kernel diagnostics expert extracting diagnostic logic from documentation.
 
     # Task
-    Extract ALL diagnostic commands, steps, and metadata from the markdown document into structured JSON.
+    Extract ALL diagnostic commands, steps, and metadata from markdown into structured JSON.
 
     # Extraction Rules
 
-    ## 1. Workflow Steps - Extract EVERY Command
-    Scan the document and extract ALL crash commands in the order they appear:
+    ## 1. Workflow Steps
+    Extract ALL crash commands in order they appear:
 
-    **For each command found:**
-    - **step_number**: Sequential number (1, 2, 3...)
-    - **thought**: Brief reason for this check (5-15 words, extract from surrounding text)
-    - **action**: EXACT command as written (preserve all flags, pipes, awk, grep)
-    - **observation**: Key indicator to find (5-12 words, from doc or output snippet)
+    **For each command:**
+    - **step_number**: Sequential (1, 2, 3...)
+    - **thought**: Brief reason (5-15 words from context)
+    - **action**: EXACT command (preserve flags, pipes, awk, grep)
+    - **observation**: Key indicator to find (5-12 words)
 
-    **Command patterns to find:**
-    - `crash>` prefix: `crash> bt -a`
-    - Inline mentions: "run `spinlock_t <addr>`"
-    - Code blocks with commands
-    - Piped commands: Keep the ENTIRE pipe chain intact
+    **Deduplication:** NEVER extract same command twice (e.g., "bt" only once). Exception: Different args = different commands ("bt" ≠ "bt -c 1" ≠ "bt -a").
 
-    **Examples:**
-    - Document: "crash> foreach UN bt | awk '/{{#[1-4]/}} {{print $3,$5}}'"
-      Extract: `{{"action": "foreach UN bt | awk '/{{#[1-4]/}} {{print $3,$5}}'"}}` (keep complete)
+    **Command Patterns:**
+    - Prefixed: `crash> bt -a`
+    - Inline: "run `spinlock_t <addr>`"
+        - **VALIDATION RULE (MANDATORY):** Before extracting ANY command, check first character:
+            * If starts with `<`, `>`, `|`, `&` → SKIP (shell operator, not crash command)
+            * If first word NOT in whitelist → SKIP
+            * ONLY extract if first word matches whitelist exactly
+        - **ACTION FORMAT RULE:**
+            * For lines starting with `crash>`, STRIP the `crash>` prefix and leading spaces; the remaining text MUST start with a whitelist keyword — otherwise SKIP the line.
+            * For inline mentions (e.g., "run `spinlock_t <addr>`"), ensure the first token is a whitelist keyword or `struct` for structure ops — otherwise SKIP.
+            * Never include the literal `crash>` prefix in the `action` field.
 
-    - Document: "Check timer base: crash> struct tvec_base.timer_jiffies 0xffff8840691a8000"
-      Extract: `{{"thought": "Check timer base lag", "action": "struct tvec_base.timer_jiffies 0xffff8840691a8000"}}`
+        - **STRUCT RULE (CRITICAL):** Use `struct` ONLY for C structure/field inspection:
+            * `spinlock_t <addr>` → `struct spinlock_t <addr>`
+            * `thread_info.flags <addr>` → `struct thread_info.flags <addr>`
+            * Pattern `type.field` or `type <addr>` → use `struct`.
+            * Disambiguation: If the first token is a whitelisted crash subcommand other than `struct` (e.g., waitq, task, timer, list, kmem), TREAT IT AS A COMMAND and DO NOT prepend `struct`.
+            * Heuristic: Treat `X <addr>` as a C type only when `X` is NOT in the whitelist (except `struct` itself).
+            * Auto-normalize: If the first token is NOT in the whitelist and matches a C identifier or `identifier.field(,field)*`, PREPEND `struct ` automatically so that the action becomes valid (e.g., `thread_info.flags <addr>` → `struct thread_info.flags <addr>`).
 
-    ## 2. Symptoms - Extract Trigger Keywords
-    Find 3-7 specific symptoms from "Issue" or panic message section:
+        - **WHITELIST (STRICT):** ONLY extract commands starting with: [alias, ascii, bpf, bt, btop, dev, dis, eval, exit, extend, files, foreach, fuser, gdb, help, ipcs, irq, kmem, list, log, mach, mod, mount, net, p, ps, pte, ptob, ptov, rd, repeat, runq, sbitmapq, search, set, sig, struct, swap, sym, sys, task, timer, tree, union, vm, vtop, waitq, whatis, wr]
+            - Common subset (preferred): [bt, p, struct, foreach, dis, task, ps, rd]
+            - Optional first-token regex (if supported): `^(alias|ascii|bpf|bt|btop|dev|dis|eval|exit|extend|files|foreach|fuser|gdb|help|ipcs|irq|kmem|list|log|mach|mod|mount|net|p|ps|pte|ptob|ptov|rd|repeat|runq|sbitmapq|search|set|sig|struct|swap|sym|sys|task|timer|tree|union|vm|vtop|waitq|whatis|wr)$`
+
+    - **FORBIDDEN:** NEVER extract:
+      * Extension commands: dmshow, scsishow, lsblk, lsmod
+      * Shell redirects/operators: Any command starting with `<`, `>`, `|`, `&`, `&&`, `||`
+      * Shell utilities: cat, echo, sed (unless after | from crash command)
+      * ANY command where first word is NOT in whitelist
+
+    - **Pipes:** Keep ENTIRE pipe chain intact ONLY when attached to valid crash command (e.g., "bt | grep" ✓, "< file | awk" ✗)
+
+    **Examples (Light):**
+    ✓ "crash> bt -a | grep exception" → `{{"action": "bt -a | grep exception"}}` (first word "bt" is in whitelist)
+    ✓ "crash> waitq ffff9a05dae122a8" → `{{"action": "waitq ffff9a05dae122a8"}}` ("waitq" is a crash command, do NOT add `struct`)
+    ✗ "crash> struct waitq ffff9a05dae122a8" → DO NOT EXTRACT (invalid: `struct` applied to a crash subcommand)
+    ✗ "< tjiffies | paste - - | awk '{{...}}'" → DO NOT EXTRACT (starts with shell redirect; not a crash command)
+
+    ## 2. Symptoms
+    Extract 2-3 specific symptoms from "Issue" or panic section:
     - Stack trace symbols (e.g., "RIP: _spin_lock_irqsave")
     - Error messages (e.g., "Watchdog detected hard LOCKUP")
     - Panic strings
 
-    ## 3. Root Cause Analysis - DIRECT EXTRACTION ONLY
-    **DO NOT summarize or interpret.**
-
-    Find section titled "Root Cause" or similar headings:
-    - Extract each bullet point or paragraph AS-IS
+    ## 3. Root Cause Analysis
+    Extract AS-IS from "Root Cause" section (NO summarizing):
+    - One entry per distinct cause/point
     - Keep original wording verbatim
-    - Create one entry per distinct cause/phenomenon mentioned
 
     # Quality Checks
-    - Workflow must have AT LEAST as many steps as crash commands in document
-    - Do NOT merge similar commands - keep all distinct instances
-    - Preserve exact syntax including addresses, filters, pipe chains
-    - Root cause entries must use original document wording
-
-    # Output Format
-    - Valid JSON only (no markdown code blocks)
-    - English only
-    - Use abbreviations where clear (e.g., "addr", "ptr", "CPU")
+    - Step count ≥ crash command count in document
+    - **Every action MUST start with a whitelist keyword** (validate: first word in [alias, ascii, bpf, bt, ...])
+    - Reject patterns like `struct <command> ...` where `<command>` is a known crash subcommand (e.g., `struct waitq ...`).
+    - **No action can start with shell operators** (validate: first char NOT in [<, >, |, &])
+    - **Actions are ONLY taken from `crash>` lines or validated inline mentions** (apply ACTION FORMAT RULE strictly)
+    - Preserve exact syntax (addresses, filters, pipes)
+    - Root cause uses original document wording
 
     # Output JSON Schema:
     {schema}
@@ -87,7 +110,7 @@ class DiagnosticStep(BaseModel):
     )
     action: str = Field(
         ...,
-        description="The specific command to execute in the crash utility, e.g., 'bt -a' or 'struct spinlock_t <address>'.",
+        description="The command execute in the crash utility, e.g., 'bt -a' or 'struct spinlock_t <address>'",
     )
     observation: str = Field(
         ...,
@@ -101,6 +124,10 @@ class DiagnosisDSL(BaseModel):
     Designed to transform unstructured documents into a machine-executable DSL for ReAct Agents.
     """
 
+    os: str = Field(
+        ...,
+        description="The operating system or kernel version this diagnostic flow is designed for. ex: 'Red Hat Enterprise Linux 8'",
+    )
     scenario: str = Field(
         ...,
         description="The specific problem scenario this diagnostic flow applies to (e.g., 'Spinlock Deadlock').",
@@ -121,101 +148,6 @@ class DiagnosisDSL(BaseModel):
     )
 
     model_config = ConfigDict(populate_by_name=True)  # 替换 Config 类
-
-
-# 3. 优化后的 Prompt (侧重于全面性和细节保留，
-# 当前的 Prompt 过于强调“压缩” (Compression) 和“去重” (Deduplication)，
-# 而不是“整合” (Integration) 和“覆盖” (Coverage)。)
-diagnostic_dict_prompt = ChatPromptTemplate.from_template(
-    """You are a Linux Kernel Diagnostic Architect. Build a COMPREHENSIVE decision matrix.
-
-    # Task
-    Integrate {count} diagnostic workflows into a unified, master "Condition -> Action" rule set.
-    Your goal is to create a knowledge base that covers ALL distinct scenarios and edge cases found in the input data.
-
-    # Input Data
-    {retrieved_dsl_list_json}
-
-    # Integration Guidelines
-    1. **Maximize Coverage**: Do NOT over-simplify. Ensure that every unique diagnostic path and specific check from the inputs is represented in the matrix.
-    2. **Preserve Nuance**: If two workflows look similar but check different fields or have different thresholds, create a BRANCH based on the specific symptom or trigger. Do not merge them if it loses technical accuracy.
-    3. **Trigger Specificity**: The `trigger` must be specific enough to distinguish between different scenarios (e.g., distinguish "General Panic" from "Null Pointer Dereference").
-    4. **Action Precision**: Keep the specific `crash` commands and argument hints accurate. Do not generalize commands to the point of uselessness.
-    5. **Consolidation Strategy**: Merge ONLY truly identical steps. If there is a variation, keep both as separate branches.
-
-    # Output Requirement
-    - Output strictly according to the JSON Schema.
-    - **Language**: English.
-    - **Fix**: Ensure double curly braces are used for placeholders in the prompt examples, but single braces in the JSON output.
-
-    # Output JSON Schema
-    {schema}
-"""
-)
-
-
-# 1. 简化后的 Branch 定义
-class DiagnosticBranch(BaseModel):
-    """
-    Simplified diagnostic rule: Condition -> Action.
-    """
-
-    # 移除 branch_id，使用列表索引即可
-    # 移除 match_type，默认为语义匹配
-    # 触发此操作的先前步骤观察结果。请保持简洁。
-    trigger: str = Field(
-        ...,
-        description="The observation from previous step that triggers this action. Keep it concise.",
-    )
-    # 带有占位符的命令模板，例如 'struct spinlock {addr}'。
-    action: str = Field(
-        ...,
-        description="Command template with placeholders, e.g., 'struct spinlock {addr}'.",
-    )
-    # 简短语法定义如何填充占位符。例如，“addr：来自 RBX 寄存器”。
-    # 合并 required_variables 和 variable_extraction_hint
-    arg_hints: Optional[str] = Field(
-        None,
-        description="Short syntax defining how to fill placeholders. E.g., 'addr: from RBX register'.",
-    )
-
-    # 缩短 rationale
-    # 此行动之简要缘由。
-    why: str = Field(
-        ...,
-        description="Brief reason for this action.",
-    )
-
-    # 重命名 expected_outcome -> expect
-    # 预期要寻找的输出结果。
-    expect: str = Field(
-        ...,
-        description="Expected output to look for.",
-    )
-
-    # 简化终止逻辑
-    is_end: bool = Field(
-        False,
-        description="True if this is a root cause conclusion.",
-    )
-
-
-# 2. 简化后的 Dict 定义
-class DiagnosticDict(BaseModel):
-    """
-    Compact diagnostic knowledge base.
-    """
-
-    summary: str = Field(..., description="Brief scenario summary")
-
-    # 缩短字段名
-    init_cmds: List[str] = Field(
-        ..., description="Common initial commands (e.g., 'bt -a', 'sys')."
-    )
-
-    matrix: List[DiagnosticBranch] = Field(..., description="The decision matrix.")
-
-    # 移除 potential_root_causes，因为可以通过遍历 matrix 中 is_end=True 的节点获得
 
 
 class LoggingCallbackHandler(BaseCallbackHandler):
@@ -265,7 +197,7 @@ def main():
         api_key="sk-b5480f840a794c69a0af1732459f3ae4",  # type: ignore
         base_url="https://api.deepseek.com",
         model="deepseek-chat",
-        temperature=1.0,  # 数据抽取/分析	1.0
+        temperature=0,  # 数据抽取/分析	1.0
     )
 
     md_list = [
@@ -273,8 +205,8 @@ def main():
         "md/3870151.md",
         "md/7041099.md",
         "md/5764681.md",
-        "md/6988986.md",
-        "md/3379041.md",
+        # "md/6988986.md",
+        # "md/3379041.md",
     ]
 
     dsl_list = []
@@ -319,6 +251,110 @@ def main():
 
         dsl_list.append(dsl_dict)
 
+        # 运行后处理规范化：
+        WHITELIST = {
+            "alias",
+            "ascii",
+            "bpf",
+            "bt",
+            "btop",
+            "dev",
+            "dis",
+            "eval",
+            "exit",
+            "extend",
+            "files",
+            "foreach",
+            "fuser",
+            "gdb",
+            "help",
+            "ipcs",
+            "irq",
+            "kmem",
+            "list",
+            "log",
+            "mach",
+            "mod",
+            "mount",
+            "net",
+            "p",
+            "ps",
+            "pte",
+            "ptob",
+            "ptov",
+            "rd",
+            "repeat",
+            "runq",
+            "sbitmapq",
+            "search",
+            "set",
+            "sig",
+            "struct",
+            "swap",
+            "sym",
+            "sys",
+            "task",
+            "timer",
+            "tree",
+            "union",
+            "vm",
+            "vtop",
+            "waitq",
+            "whatis",
+            "wr",
+        }
+
+        def _first_token(s: str) -> str:
+            s = s.strip()
+            # split on whitespace; keep pipes as part of rest
+            return s.split()[0] if s else ""
+
+        def _looks_like_struct_token(tok: str) -> bool:
+            # C identifier or identifier.field[,field]*
+            return bool(
+                re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_,]+)?", tok)
+            )
+
+        def normalize_action(act: str) -> str:
+            if not act:
+                return act
+            s = act.strip()
+            # Strip accidental leading 'crash>' if any
+            if s.startswith("crash>"):
+                s = s[len("crash>") :].lstrip()
+
+            # If starts with shell operator, leave as-is (will be filtered by rules elsewhere)
+            if s[:1] in {"<", ">", "|", "&"}:
+                return s
+
+            tok = _first_token(s)
+            # If already starts with 'struct' but next token is a whitelisted command, drop 'struct '
+            if tok == "struct":
+                parts = s.split(maxsplit=2)
+                if len(parts) >= 2 and parts[1] in WHITELIST and parts[1] != "struct":
+                    # remove leading 'struct '
+                    s = s[len("struct ") :]
+                    tok = _first_token(s)
+                else:
+                    return s
+
+            # If token is whitelisted, keep
+            if tok in WHITELIST:
+                return s
+
+            # If token is not whitelisted but looks like a C struct/field, prepend 'struct '
+            if _looks_like_struct_token(tok):
+                s = f"struct {s}"
+                return s
+
+            return s
+
+        if isinstance(dsl_dict, dict) and isinstance(dsl_dict.get("workflow"), list):
+            for step in dsl_dict["workflow"]:
+                if isinstance(step, dict) and isinstance(step.get("action"), str):
+                    normalized = normalize_action(step["action"])
+                    step["action"] = normalized
+
         # 保存为 JSON 文件
         dsl_data = json.dumps(dsl_dict, ensure_ascii=False, indent=2)
         # 将 dsl_data 写入文件
@@ -331,67 +367,6 @@ def main():
         print(f"Extracted DSL from {md_path}")
 
         # # 1. 提取用于检索的语义特征 (指纹)
-
-    # 整合多个 DSL 成为 DiagnosticKnowledgeLibrary
-    print(f"Extracted {len(dsl_list)} DSL documents.")
-
-    dd_schema = DiagnosticDict.model_json_schema()
-
-    diagnostic_dict = diagnostic_dict_prompt | llm.with_structured_output(
-        DiagnosticDict, method="json_mode"  # 改用 json_mode
-    )
-
-    print("\n开始整合诊断知识库...")
-    print(f"DSL 案例数量：{len(dsl_list)}")
-
-    # 将字典列表转换为 JSON 字符串用于 prompt
-    dsl_list_json = json.dumps(dsl_list, ensure_ascii=False, indent=2)
-
-    # # 先测试不带结构化输出的 LLM 调用，看看原始响应
-    # print("\n=== 测试：调用 LLM 获取原始响应 ===")
-    # test_chain = diagnostic_knowledge_prompt | llm
-    # test_response = test_chain.invoke(
-    #     {
-    #         "retrieved_dsl_list_json": dsl_list_json,
-    #         "count": len(dsl_list),
-    #         "schema": json.dumps(library_schema, indent=2),
-    #     }
-    # )
-    # print(f"test_response:{test_response}")
-
-    try:
-        diagnostic_dict_response = diagnostic_dict.invoke(
-            {
-                "retrieved_dsl_list_json": dsl_list_json,
-                "count": len(dsl_list),
-                "schema": json.dumps(dd_schema, indent=2),
-            },
-            config={"callbacks": [LoggingCallbackHandler()]},
-        )
-
-        # 如果 diagnostic_dict_response 不为 None，json 格式输出
-        if diagnostic_dict_response is not None and isinstance(
-            diagnostic_dict_response, DiagnosticDict
-        ):
-            # 使用 model_dump_json() 直接转换为 JSON 字符串
-            diagnostic_dict_json = diagnostic_dict_response.model_dump_json(indent=2)
-            # 将 JSON 字符串写入 dsl 目录下的 diagnostic_knowledge_library.json 文件
-            with open(
-                os.path.join("dsl", "diagnostic_knowledge_library.json"),
-                "w",
-                encoding="utf-8",
-            ) as f:
-                f.write(diagnostic_dict_json)
-        else:
-            print(f"错误：整合知识库失败！")
-
-    except Exception as e:
-        print(f"\n错误：整合知识库失败！")
-        print(f"异常类型：{type(e).__name__}")
-        print(f"异常信息：{str(e)}")
-        import traceback
-
-        traceback.print_exc()
 
 
 if __name__ == "__main__":
