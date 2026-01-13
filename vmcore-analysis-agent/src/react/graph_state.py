@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import Annotated, Optional, TypedDict, Union, cast
 from langgraph.graph import add_messages
 from langgraph.graph.message import AnyMessage
+from .src.utils.logging import logger
 
 
 def add_and_trim_messages(
@@ -17,6 +18,9 @@ def add_and_trim_messages(
     # 注意：实际场景中可能需要保留 SystemMessage (第一条)，这里做简单切片演示
     max_len = 20
     if len(merged) > max_len:
+        logger.info(
+            f"Trimming messages from {len(merged)} to {max_len} to maintain window size."
+        )
         return merged[-max_len:]
     return merged
 
