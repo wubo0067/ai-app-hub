@@ -11,6 +11,19 @@ crash_tool_node = "crash_tool_node"
 gather_vmcore_detail_node = "gather_vmcore_detail_node"
 llm_analysis_node = "llm_analysis_node"
 
+DEFAULT_CRASH_COMMANDS: list[str] = [
+    "sys",
+    "bt -a",
+    "ps -a",
+    "runq",
+    "dev -i",
+    "swap",
+    "timer",
+    "sig",
+    "mach",
+    "ipcs",
+    "waitq",
+]
 
 async def _invoke_tool(tool, cmd: str, state: AgentState) -> str:
     """Invoke a crash MCP tool for a given command safely.
@@ -50,7 +63,7 @@ async def gather_vmcore_detail(
 
             # 为每个命令选择匹配的工具（按前缀匹配），并构建任务
             tasks: List[Tuple[str, asyncio.Future]] = []
-            for cmd in state.default_crash_cmd:
+            for cmd in DEFAULT_CRASH_COMMANDS:
                 tool = next(
                     (t for t in tools if cmd.startswith(getattr(t, "name", ""))), None
                 )
