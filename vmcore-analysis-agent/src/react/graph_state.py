@@ -1,7 +1,8 @@
 from dataclasses import dataclass, field
-from typing import Annotated, Optional, TypedDict, Union, cast
+from typing import Annotated, Optional, TypedDict, Union, cast, Sequence
 from langgraph.graph import add_messages
 from langgraph.graph.message import AnyMessage
+from operator import add
 from src.utils.logging import logger
 
 
@@ -52,11 +53,12 @@ class AgentState(TypedDict):
     vmlinux_path: str
 
     # 消息历史 (带自动修剪)
-    messages: Annotated[list[AnyMessage], add_and_trim_messages]
+    messages: Annotated[Sequence[AnyMessage], add_and_trim_messages] = field(
+        default_factory=list
+    )
 
-    # 分析控制
-    analysis_steps: int
-    max_analysis_steps: int
+    # step_count: int = 0, 每次分析步骤增加 1，operator.add
+    step_count: Annotated[int, add] = field(default=0)
 
     # 分析结果
     agent_answer: str

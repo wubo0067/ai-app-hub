@@ -1,3 +1,9 @@
+"""
+VMCore 分析 Agent 边（路由）逻辑
+
+定义节点之间的转换条件和路由规则。
+"""
+
 from typing import Literal
 from .graph_state import AgentState
 from .nodes import llm_analysis_node, gather_vmcore_detail_node, crash_tool_node
@@ -7,40 +13,54 @@ from src.utils.logging import logger
 
 def should_continue(state: AgentState) -> str:
     """
-    根据当前 AgentState 决定是继续 LLM 分析还是结束流程。
-    """
-    last_message = state.messages[-1] if state.messages else None
-    error_state = state.error
+    根据当前 AgentState 决定下一步执行的节点。
 
-    # 1. 任意已标记的错误：直接结束
+    路由逻辑：
+    1. 如果有错误 -> __end__
+    2. 如果最后一条消息不是 AIMessage -> __end__
+    3. 如果 AIMessage 没有 tool_calls -> __end__
+    4. 如果有 tool_calls -> crash_tool_node
+    5. 其他情况 -> llm_analysis_node
+
+    Args:
+        state: AgentState 字典
+
+    Returns:
+        str: 下一个节点名称或 "__end__"
+    """
+    # ✅ 修复：使用字典访问方式而不是属性访问
+    messages = state.get("messages", [])
+    error_state = state.get("error")
+
+    last_message = messages[-1] if messages else None
+
+    # 1. 检查错误状态
     if error_state and error_state.get("is_error"):
         node = error_state.get("node", "<unknown>")
         msg = error_state.get("message", "")
-        logger.error(f"jump from node:{node} to node:__end__ due to error:{msg}")
+        logger.error(f"Routing to __end__ from node '{node}' due to error: {msg}")
         return "__end__"
 
-    # 2. 达到最大分析步数：结束
-    if state.analysis_steps >= state.max_analysis_steps:
-        logger.error(
-            f"Reached max analysis steps ({state.analysis_steps}). Ending analysis."
+    # 2. 如果没有消息，继续 LLM 分析
+    if last_message is None:
+        logger.info("No messages yet, routing to llm_analysis_node")
+        return llm_analysis_node
+
+    # 3. 检查消息类型
+    if not isinstance(last_message, AIMessage):
+        logger.warning(
+            f"Last message is {type(last_message).__name__}, not AIMessage. "
+            f"Routing to llm_analysis_node"
         )
-        return "__end__"
+        return llm_analysis_node
 
-    # 3. 输出消息类型不对：记录错误并结束
-    if last_message is not None and not isinstance(last_message, AIMessage):
-        state.error = {
-            "message": (
-                f"Expected AIMessage in output edges, "
-                f"but got {type(last_message).__name__}"
-            ),
-            "node": llm_analysis_node,
-            "is_error": True,
-        }
-        logger.error(
-            f"jump from node:{llm_analysis_node} to node:__end__ "
-            f"due to error:{state.error['message']}"
-        )
-        return "__end__"
+    # 4. 检查是否有工具调用
+    tool_calls = getattr(last_message, "tool_calls", None) or []
 
-    # 4. 正常情况：进入 llm_analysis_node
-    return llm_analysis_node
+    if tool_calls:
+        logger.info(f"Found {len(tool_calls)} tool calls, routing to crash_tool_node")
+        return crash_tool_node
+    else:
+        # 没有工具调用，说明 LLM 给出了最终答案
+        logger.info("No tool calls in AIMessage, analysis complete. Routing to __end__")
+        return "__end__"

@@ -29,7 +29,3 @@ def create_llm():
     except Exception as e:
         logger.error(f"Failed to create LLM instance: {e}")
         raise
-
-
-# Using function to create llm instance
-llm = create_llm()

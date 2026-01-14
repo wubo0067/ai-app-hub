@@ -1,4 +1,12 @@
+"""
+Crash MCP 服务器实现
+
+此模块使用 FastMCP 框架创建一个 MCP 服务器，提供 crash 工具的各种子命令。
+每个 crash 子命令都被注册为一个独立的 MCP 工具。
+"""
+
 import os
+from typing import Annotated
 from pydantic import Field
 from fastmcp import FastMCP
 from .executor import run_crash_command
@@ -16,23 +24,25 @@ def register_crash_tool(name: str, syntax: str, example: str, summary: str):
     """
 
     @crash_server.tool(name=name)
-    def crash_func(
-        command: str = Field(
-            ...,
-            description=(
-                f"The full '{name}' command string to execute.\n"
-                f"Syntax: {syntax}\n"
-                f"Example: {example}\n"
-                "IMPORTANT: Replace placeholders with actual values and do not include brackets '[]'."
+    async def crash_tool_func(
+        command: Annotated[
+            str,
+            Field(
+                description=(
+                    f"The full '{name}' command string to execute.\n"
+                    f"Syntax: {syntax}\n"
+                    f"Example: {example}\n"
+                    "IMPORTANT: Replace placeholders with actual values and do not include brackets '[]'."
+                ),
             ),
-        ),
-        vmcore_path: str = Field(
-            ..., description="The absolute path to the vmcore file."
-        ),
-        vmlinux_path: str = Field(
-            ..., description="The absolute path to the vmlinux file."
-        ),
-    ):
+        ],
+        vmcore_path: Annotated[
+            str, Field(description="The absolute path to the vmcore file.")
+        ],
+        vmlinux_path: Annotated[
+            str, Field(description="The absolute path to the vmlinux file.")
+        ],
+    ) -> str:
         """统一执行逻辑"""
         # 统一的执行逻辑
         try:
@@ -42,10 +52,10 @@ def register_crash_tool(name: str, syntax: str, example: str, summary: str):
             return f"Failed to execute crash command: {str(e)}"
 
     # 修改文档字符串，FastMCP 会将其作为工具描述
-    crash_func.__doc__ = f"{summary} (Crash Subcommand: {name})"
+    crash_tool_func.__doc__ = f"{summary} (Crash Subcommand: {name})"
     # 修改函数名以防冲突（虽然 FastMCP 主要看 tool(name=...)）
-    crash_func.__name__ = f"crash_{name}"
-    return crash_func
+    crash_tool_func.__name__ = f"crash_{name}"
+    return crash_tool_func
 
 
 # 统一格式：(name, syntax, example, summary)
@@ -156,6 +166,30 @@ commands = [
         "foreach bt",
         "This command allows for an examination of various kernel data associated \
             with any, or all, tasks in the system, without having to set the context to each targeted task",
+    ),
+    (
+        "timer",
+        "timer [-r][-C cpu]",
+        "timer -r",
+        "This command displays the timer queue entries",
+    ),
+    (
+        "swap",
+        "swap",
+        "swap",
+        "This command displays information for each configured swap device.",
+    ),
+    (
+        "sig",
+        "sig [[-l] | [-s sigset]] | [-g] [pid | taskp] ...",
+        "sig -g 2578",
+        "This command displays signal-handling data of one or more tasks.",
+    ),
+    (
+        "mach",
+        "mach [-m | -c -[xd] | -o]",
+        "mach",
+        "This command displays data specific to a machine type.",
     ),
 ]
 

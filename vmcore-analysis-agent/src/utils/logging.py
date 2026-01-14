@@ -46,7 +46,7 @@ def setup_logger(log_filename="va-agent.log", log_dir="logs"):
         logging.setLogRecordFactory(CustomLogRecord)  # Only set once globally
         handler = logging.FileHandler(log_filepath)
         formatter = logging.Formatter(
-            "%(asctime)s [%(levelname)s] [%(module)s] [%(pathname)s]: %(message)s"
+            "%(asctime)s [%(levelname)s] [%(module)s] [%(pathname)s:%(lineno)d]: %(message)s"
         )
         handler.setFormatter(formatter)
         logger_instance.addHandler(handler)
