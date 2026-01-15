@@ -1,0 +1,146 @@
+{
+  "os": "Red Hat Enterprise Linux 7",
+  "scenario": "Soft lockup or Hard lockup due to race between ring_buffer_detach() and ring_buffer_wakeup()",
+  "symptoms": [
+    "NMI watchdog: BUG: soft lockup - CPU#0 stuck for 22s!",
+    "Watchdog detected hard LOCKUP on cpu 23",
+    "Kernel panic - not syncing: softlockup: hung tasks"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Check system information and panic details",
+      "action": "sys -i",
+      "observation": "System BIOS, vendor, and product details"
+    },
+    {
+      "step_number": 2,
+      "thought": "Examine backtrace of the panicked task",
+      "action": "bt",
+      "observation": "Stack trace showing generic_exec_single+0xfa and IPI waiting"
+    },
+    {
+      "step_number": 3,
+      "thought": "Check backtrace of CPU 1 to see why IPI not handled",
+      "action": "bt -c 1",
+      "observation": "CPU 1 stuck in perf_event_wakeup() with interrupts disabled"
+    },
+    {
+      "step_number": 4,
+      "thought": "Disassemble __wake_up to understand panic location",
+      "action": "dis -r __wake_up+0x49 | tail",
+      "observation": "Panic at pop %r14 instruction after spin_unlock_irqrestore"
+    },
+    {
+      "step_number": 5,
+      "thought": "Filter backtrace to show exception context",
+      "action": "bt | awk '/exception RIP/,/IRQ stack/'",
+      "observation": "Exception RIP at __wake_up+0x49 with interrupts disabled"
+    },
+    {
+      "step_number": 6,
+      "thought": "Disassemble irq_work_run to understand execution flow",
+      "action": "dis -r ffffffff8116ae89",
+      "observation": "irq_work_run calling irq_work_run_list with interrupts disabled"
+    },
+    {
+      "step_number": 7,
+      "thought": "Check system information for lockup details",
+      "action": "sys | grep -i -e load -e node -e rel -e date -e panic -e cpus",
+      "observation": "System load, release, panic message, and CPU count"
+    },
+    {
+      "step_number": 8,
+      "thought": "Search log for lockup messages",
+      "action": "log | grep -i lockup",
+      "observation": "Watchdog detected hard LOCKUP messages"
+    },
+    {
+      "step_number": 9,
+      "thought": "Examine backtrace of CPU 42 hard lockup",
+      "action": "bt",
+      "observation": "Stack showing perf_event_wakeup+0x45 in NMI exception"
+    },
+    {
+      "step_number": 10,
+      "thought": "Evaluate RFLAGS value to understand interrupt state",
+      "action": "eval -b 0x00000086",
+      "observation": "Binary flags showing interrupt status bits"
+    },
+    {
+      "step_number": 11,
+      "thought": "Disassemble perf_pending_event to see call chain",
+      "action": "dis -r ffffffff8112a447 | tail",
+      "observation": "perf_pending_event calling perf_event_wakeup"
+    },
+    {
+      "step_number": 12,
+      "thought": "Disassemble perf_event_wakeup function header",
+      "action": "dis perf_event_wakeup | head",
+      "observation": "Function prologue with register pushes"
+    },
+    {
+      "step_number": 13,
+      "thought": "Calculate and read stack frame to find perf_event",
+      "action": "p (0xffff8810b89c3f40 - 0x8*2)",
+      "observation": "Address calculation for stack frame"
+    },
+    {
+      "step_number": 14,
+      "thought": "Read memory at calculated stack address",
+      "action": "rd 0xffff8810b89c3f30",
+      "observation": "perf_event address ffff88206563d000"
+    },
+    {
+      "step_number": 15,
+      "thought": "Examine perf_event.pending field offset",
+      "action": "struct perf_event.pending -o ffff88206563d000",
+      "observation": "pending field at offset ffff88206563d2c0"
+    },
+    {
+      "step_number": 16,
+      "thought": "Inspect irq_work structure at pending address",
+      "action": "struct irq_work ffff88206563d2c0",
+      "observation": "irq_work with func pointing to perf_pending_event"
+    },
+    {
+      "step_number": 17,
+      "thought": "Check perf_event.waitq field offset",
+      "action": "struct perf_event.waitq ffff88206563d000 -o",
+      "observation": "waitq field at offset ffff88206563d290"
+    },
+    {
+      "step_number": 18,
+      "thought": "Examine wait queue status",
+      "action": "waitq ffff88206563d290",
+      "observation": "Wait queue is empty"
+    },
+    {
+      "step_number": 19,
+      "thought": "Examine ring_buffer.event_list for empty list",
+      "action": "struct ring_buffer.event_list 0xffff9a062fe50068",
+      "observation": "event_list next and prev pointers are NULL"
+    },
+    {
+      "step_number": 20,
+      "thought": "Inspect wait_queue_head_t structure",
+      "action": "struct wait_queue_head_t ffff9a05dae122a8",
+      "observation": "wait queue lock and task_list pointers"
+    },
+    {
+      "step_number": 21,
+      "thought": "Check perf_event.waitq field with offset and hex",
+      "action": "struct perf_event.waitq 0xffff9a05dae12000 -ox",
+      "observation": "waitq field matches wait_queue_head_t address"
+    },
+    {
+      "step_number": 22,
+      "thought": "Examine perf_event.rb_entry list pointers",
+      "action": "struct perf_event.rb_entry 0xffff9a05dae12000",
+      "observation": "rb_entry points to itself, not initial rb"
+    }
+  ],
+  "root_cause_analysis": [
+    "Below commit will fix this issue https://lore.kernel.org/patchwork/patch/465937/"
+  ]
+}

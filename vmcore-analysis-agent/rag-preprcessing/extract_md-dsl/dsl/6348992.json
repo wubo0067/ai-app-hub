@@ -1,0 +1,137 @@
+{
+  "os": "Red Hat Enterprise Linux 6.10.z kernel-2.6.32-754.39.1.el6",
+  "scenario": "Hard lockup due to spinlock deadlock with timer discrepancy",
+  "symptoms": [
+    "Watchdog detected hard LOCKUP on cpu 22",
+    "exception RIP: _spin_lock_irqsave+50",
+    "Kernel panic - not syncing: Hard LOCKUP"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Check system information and BIOS version",
+      "action": "sys -i",
+      "observation": "BIOS date and vendor information"
+    },
+    {
+      "step_number": 2,
+      "thought": "Examine tasks in uninterruptible sleep state",
+      "action": "foreach UN ps -m",
+      "observation": "Tasks stuck in I/O wait on CPU 22"
+    },
+    {
+      "step_number": 3,
+      "thought": "Analyze backtraces of uninterruptible tasks",
+      "action": "foreach UN bt | awk '/#[1-4] /{print $3,$5}' | paste - - - - | column -t",
+      "observation": "Tasks waiting on sync_page and I/O operations"
+    },
+    {
+      "step_number": 4,
+      "thought": "Check SCSI commands for timeout issues",
+      "action": "struct scsishow --t",
+      "observation": "Active SCSI commands with negative deadlines"
+    },
+    {
+      "step_number": 5,
+      "thought": "Examine request queue timeout timer",
+      "action": "struct request_queue.timeout ffff8810637aa338",
+      "observation": "Timer not expired due to tvec_base lag"
+    },
+    {
+      "step_number": 6,
+      "thought": "Check timer base values for CPU 72",
+      "action": "struct tvec_base.timer_jiffies,next_timer 0xffff8840691a8000",
+      "observation": "timer_jiffies far behind current jiffies"
+    },
+    {
+      "step_number": 7,
+      "thought": "Get current jiffies value",
+      "action": "p jiffies",
+      "observation": "Current jiffies value for comparison"
+    },
+    {
+      "step_number": 8,
+      "thought": "Identify tvec_base for CPU 72",
+      "action": "p tvec_bases:72",
+      "observation": "tvec_base pointer for CPU 72"
+    },
+    {
+      "step_number": 9,
+      "thought": "Check backtrace for CPU 72",
+      "action": "bt -c 72",
+      "observation": "CPU 72 idle in mwait_idle_with_hints"
+    },
+    {
+      "step_number": 10,
+      "thought": "Examine spinlock state causing deadlock",
+      "action": "struct spinlock_t ffff8820b8915a80",
+      "observation": "Spinlock with 2 interested callers"
+    },
+    {
+      "step_number": 11,
+      "thought": "Read memory to find hrtimer address",
+      "action": "rd -x 0xffff8810693abe88",
+      "observation": "hrtimer address from stack"
+    },
+    {
+      "step_number": 12,
+      "thought": "Calculate spinlock address from hrtimer",
+      "action": "struct px &((struct hrtimer *)0xffff8820b8915b80)->base->cpu_base->lock",
+      "observation": "Spinlock address matches deadlock location"
+    },
+    {
+      "step_number": 13,
+      "thought": "Disassemble hrtimer_try_to_cancel function",
+      "action": "dis -lr ffffffff810b15ab",
+      "observation": "Function calls __remove_hrtimer"
+    },
+    {
+      "step_number": 14,
+      "thought": "Disassemble mwait_idle_with_hints function",
+      "action": "dis -lr ffffffff810156d4",
+      "observation": "Function calls __mwait when not rescheduled"
+    },
+    {
+      "step_number": 15,
+      "thought": "Check thread_info flags for swapper task",
+      "action": "struct thread_info.flags 0xffff8810693a8000",
+      "observation": "Flags show no need_resched bit set"
+    },
+    {
+      "step_number": 16,
+      "thought": "Check preempt_count for swapper task",
+      "action": "task | grep preempt",
+      "observation": "preempt_count = 0 (should not be preemptable)"
+    },
+    {
+      "step_number": 17,
+      "thought": "Analyze all timer bases for lag",
+      "action": "p tvec_bases:a | awk '{print \"struct tvec_base.timer_jiffies \" $9}' >tjiffies",
+      "observation": "Generate commands to check all timer bases"
+    },
+    {
+      "step_number": 18,
+      "thought": "Count exception RIP patterns across all CPUs",
+      "action": "bt -a | grep \"exception RIP:\" | sort | uniq -c | sort -k1nr",
+      "observation": "64 CPUs in mwait_idle_with_hints"
+    },
+    {
+      "step_number": 19,
+      "thought": "Check watchdog thread affinity masks",
+      "action": "foreach 'watchdog/*' task -R cpus_allowed.bits | paste - - - | awk '$8~/watchdog\\//' | awk '{c=\"\";for(i=1;i<12;i++)c=c $i\" \";print c}'",
+      "observation": "Watchdog threads 64-79 have empty affinity masks"
+    },
+    {
+      "step_number": 20,
+      "thought": "Verify bit interpretation for CPU 63 affinity",
+      "action": "eval -b 0x8000000000000000 | grep bits",
+      "observation": "Bit 63 set for CPU 63 watchdog thread"
+    }
+  ],
+  "root_cause_analysis": [
+    "The exact root cause is unknown at this time.",
+    "The hard lockup occurred on the CPU on which the task is looping in the spinlock in kernel mode without giving other tasks a chance to run for more than 60 seconds.",
+    "At that time another task had taken that spinlock and was running CPU idle routine.",
+    "At that time, almost all CPUs' tvec_base values were way behind the current jiffies value with the only exception of the one CPU on which the hard lockup occurred."
+  ]
+}

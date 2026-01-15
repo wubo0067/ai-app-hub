@@ -201,29 +201,31 @@ def main():
     )
 
     md_list = [
-        "md/6348992.md",
-        "md/3870151.md",
-        "md/7041099.md",
-        "md/5764681.md",
-        # "md/6988986.md",
-        # "md/3379041.md",
+        "../data/md/6348992.md",
+        "../data/md/3870151.md",
+        "../data/md/7041099.md",
+        # "../data/md/5764681.md",
+        # "../data/md/6988986.md",
+        # "../data/md/3379041.md",
     ]
 
-    dsl_list = []
+    # dsl_list = []
 
     for md_path in md_list:
         # 判断 dsl 目录下是否已经存在对应的 json 文件，存在则跳过
         output_path = os.path.join(
-            "dsl", os.path.basename(md_path).replace(".md", ".json")
+            "../data/dsl", os.path.basename(md_path).replace(".md", ".json")
         )
         if os.path.exists(output_path):
             print(f"跳过已存在的文件：{output_path}")
-            with open(output_path, "r", encoding="utf-8") as f:
-                dsl_data = f.read()
-                dsl_list.append(dsl_data)
+            # with open(output_path, "r", encoding="utf-8") as f:
+            #     dsl_data = f.read()
+            #     dsl_list.append(dsl_data)
             continue
 
         # 打开 md 目录下下 7086442.md 文件，读取内容
+        print(f"Read from md:{md_path}")
+
         with open(md_path, "r", encoding="utf-8") as f:
             markdown_content = f.read()
 
@@ -237,6 +239,7 @@ def main():
                 "schema": json.dumps(dsl_schema, indent=2),
             }
         )
+        print(f"Extracted DSL from md:{md_path} by LLM")
 
         # 存储为字典对象，方便后续处理
         if isinstance(response, DiagnosisDSL):
@@ -249,7 +252,7 @@ def main():
             # 其他情况，抛出错误
             raise TypeError(f"Expected DiagnosisDSL or dict, got {type(response)}")
 
-        dsl_list.append(dsl_dict)
+        # dsl_list.append(dsl_dict)
 
         # 运行后处理规范化：
         WHITELIST = {
@@ -358,13 +361,13 @@ def main():
         # 保存为 JSON 文件
         dsl_data = json.dumps(dsl_dict, ensure_ascii=False, indent=2)
         # 将 dsl_data 写入文件
-        output_path = os.path.join(
-            "dsl", os.path.basename(md_path).replace(".md", ".json")
-        )
+        # output_path = os.path.join(
+        #     "../data/dsl", os.path.basename(md_path).replace(".md", ".json")
+        # )
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(dsl_data)
 
-        print(f"Extracted DSL from {md_path}")
+        print(f"Saved extracted DSL to: {output_path}")
 
         # # 1. 提取用于检索的语义特征 (指纹)
 

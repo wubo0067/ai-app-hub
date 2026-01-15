@@ -1,0 +1,167 @@
+{
+  "os": "Red Hat Enterprise Linux 7.9.z - kernel-3.10.0-1160.99.1.el7.x86_64",
+  "scenario": "Huge number of negative dentries cause massive calls to shrink_slab() --> prune_super() --> prune_dcache_sb() --> __prune_dcache_sb() and soft lockups, rcu_sched CPU stalls, and a hard lockup",
+  "symptoms": [
+    "Kernel panic - not syncing: Hard LOCKUP",
+    "NMI watchdog: Watchdog detected hard LOCKUP on cpu 8",
+    "Soft lockups with RIP: native_queued_spin_lock_slowpath+0x122/0x200"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Check kernel log for lockup messages to confirm the crash cause",
+      "action": "log | grep LOCKUP",
+      "observation": "Hard LOCKUP messages indicating watchdog detection"
+    },
+    {
+      "step_number": 2,
+      "thought": "Examine soft lockup patterns to identify spinlock contention",
+      "action": "log | awk '/soft lockup/,/Code:/' | grep RIP",
+      "observation": "Multiple soft lockups at native_queued_spin_lock_slowpath"
+    },
+    {
+      "step_number": 3,
+      "thought": "Get backtrace of all tasks to see which spinlocks are contended",
+      "action": "bt -a | grep \"exception RIP: native_queued_spin_lock_slowpath\" -A3 | awk '$5~/RDI:/{print $6}' | sort | uniq -c",
+      "observation": "Count of tasks stuck on different spinlock addresses"
+    },
+    {
+      "step_number": 4,
+      "thought": "Disassemble rcu_check_callbacks to identify spinlock address",
+      "action": "dis -lr ffffffff9ab646e9",
+      "observation": "Instruction calling _raw_spin_lock_irqsave with RDI register"
+    },
+    {
+      "step_number": 5,
+      "thought": "Check what the spinlock at address ffffffff9b67a980 is",
+      "action": "struct px &((struct rcu_node *)0xffffffff9b67a980)->lock",
+      "observation": "Spinlock is rnp->lock in rcu_sched_state"
+    },
+    {
+      "step_number": 6,
+      "thought": "Examine the spinlock state to understand contention",
+      "action": "struct spinlock_t 0xffffffff9b67a980",
+      "observation": "Spinlock is locked, pending, and contended"
+    },
+    {
+      "step_number": 7,
+      "thought": "Analyze the lock value to understand its state",
+      "action": "eval -b 0x3630101",
+      "observation": "Binary representation showing lock bits set"
+    },
+    {
+      "step_number": 8,
+      "thought": "Check CPU 4's stack to understand rcu_sched stall processing",
+      "action": "dis -lr ffffffff9ab645e2",
+      "observation": "Instruction in print_cpu_stall calling raw_spin_lock_irqsave"
+    },
+    {
+      "step_number": 9,
+      "thought": "Identify the rcu_state structure for rcu_sched",
+      "action": "p rcu_state",
+      "observation": "Address of rcu_sched_state structure"
+    },
+    {
+      "step_number": 10,
+      "thought": "Examine the rcu_node structure within rcu_sched_state",
+      "action": "struct px &((struct rcu_state * const) 0xffffffff9b67a380)->node[0]",
+      "observation": "Address of first rcu_node in rcu_sched_state"
+    },
+    {
+      "step_number": 11,
+      "thought": "Check the list of rcu_state flavors",
+      "action": "struct px &rcu_struct_flavors",
+      "observation": "Address of rcu_struct_flavors list head"
+    },
+    {
+      "step_number": 12,
+      "thought": "List rcu_state flavors to see what's being processed",
+      "action": "list -o rcu_state.flavors -H 0xffffffff9b665b20",
+      "observation": "List of rcu_state structures including rcu_sched"
+    },
+    {
+      "step_number": 13,
+      "thought": "Examine memory content to see what's being written",
+      "action": "x/s 0xffffffff9ba34ba0",
+      "observation": "Text showing rcu_sched stall messages being written"
+    },
+    {
+      "step_number": 14,
+      "thought": "Disassemble __prune_dcache_sb to identify dcache_lru_lock",
+      "action": "dis -lr ffffffff9ac75a19",
+      "observation": "Instruction calling _raw_spin_lock with dcache_lru_lock address"
+    },
+    {
+      "step_number": 15,
+      "thought": "Identify the symbol for the spinlock address",
+      "action": "sym 0xffffffff9b608c40",
+      "observation": "Symbol shows it's dcache_lru_lock"
+    },
+    {
+      "step_number": 16,
+      "thought": "Examine the state of dcache_lru_lock spinlock",
+      "action": "struct spinlock_t ffffffff9b608c40",
+      "observation": "dcache_lru_lock spinlock state showing contention"
+    },
+    {
+      "step_number": 17,
+      "thought": "Analyze the lock value to understand contention level",
+      "action": "eval -b 0x3090000",
+      "observation": "Binary representation showing contention bits"
+    },
+    {
+      "step_number": 18,
+      "thought": "Check MCS spinlock nodes for dcache_lru_lock waiters",
+      "action": "bt -a | grep \"exception RIP: native_queued_spin_lock_slowpath\" -A4 | grep \"RDI: ffffffff9b608c40\" -A1 | awk '$3~/R8:/{print $4}' > nodes.txt",
+      "observation": "Extract MCS node addresses to file for analysis"
+    },
+    {
+      "step_number": 19,
+      "thought": "Disassemble native_queued_spin_lock_slowpath to understand wait loop",
+      "action": "dis -lr ffffffff9ab1ec42",
+      "observation": "Instruction in wait loop for MCS spinlock"
+    },
+    {
+      "step_number": 20,
+      "thought": "Examine MCS spinlock structure for a waiting CPU",
+      "action": "struct mcs_spinlock ffff914d3e11b8c0",
+      "observation": "MCS spinlock showing next pointer and locked state"
+    },
+    {
+      "step_number": 21,
+      "thought": "Check overall kernel memory usage to identify slab bloat",
+      "action": "kmem -i",
+      "observation": "SLAB using 79% of total memory (789 GB)"
+    },
+    {
+      "step_number": 22,
+      "thought": "List slab caches sorted by size to identify largest consumers",
+      "action": "kmem -s | awk 'NR>1{printf($1 \"\\t\" $NF \"\\t %8.3f MiB\\n\", $2*$4/2**20)}' | sort -k3nr | column -t | head",
+      "observation": "dentry cache using 787229 MiB (largest consumer)"
+    },
+    {
+      "step_number": 23,
+      "thought": "Check dentry cache specifically for size details",
+      "action": "kmem -s dentry | awk 'NR>1{printf($1 \"\\t\" $NF \"\\t %8.3f GiB\\n\", $2*$4/2**30)}' | sort -k3nr | column -t | head",
+      "observation": "dentry cache using 768.779 GiB"
+    },
+    {
+      "step_number": 24,
+      "thought": "Examine dentry statistics to see negative dentry count",
+      "action": "p dentry_stat",
+      "observation": "nr_negative = 4281697422, showing huge negative dentry count"
+    },
+    {
+      "step_number": 25,
+      "thought": "Check negative_dentry_limit value to see if it's set",
+      "action": "p negative_dentry_limit",
+      "observation": "negative_dentry_limit = 0 (should be 10 for 1% of RAM)"
+    }
+  ],
+  "root_cause_analysis": [
+    "Lots of CPUs were getting busy with slab shrinking for page reclaiming. The dentry slab cache was quite largely bloated due to a huge number of negative dentries at that time.",
+    "Soft lockups happened on lots of CPUs that were getting stuck waiting on dcache_lru_lock spinlock before carrying out slab shrinking for page reclaiming.",
+    "This caused the rcu_sched CPU stalls detected on multiple CPUs in the subsequent APIC timer interrupt contexts.",
+    "Since it's quite time consuming to write a huge amount of rcu_sched messages and call traces to the console and also it has to be done with the rnp->lock spinlock being held, the rnp->lock spinlock was severely contended and caused the CPU to invoke the hard lockup and the crash in the end."
+  ]
+}
