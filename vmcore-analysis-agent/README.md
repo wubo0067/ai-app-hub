@@ -6,7 +6,7 @@
 
 VMCore Analysis Agent 是一个结合了 RAG（检索增强生成）和 ReAct（推理与行动）框架的智能诊断系统。它能够：
 
-1. **从 RHEL 官方文档中提取诊断逻辑**：将非结构化的故障排除文档转化为结构化的诊断知识库
+1. **从 RHEL 官方文档中提取诊断逻辑**：将非结构化的故障排除文档转化为结构化的诊断知识库，将 rhel engineer 的经验进行沉淀
 2. **自动化 vmcore 分析**：通过智能代理自动执行 crash 工具命令，分析内核转储文件
 3. **提供诊断建议**：基于历史案例和诊断知识库，给出问题根因分析和解决方案
 
@@ -247,7 +247,7 @@ flowchart TD
 
 ### 2.1 代理架构
 
-基于 LangGraph 的 ReAct（推理-行动）代理，包含五个核心节点：
+基于 LangGraph 的 ReAct（推理 - 行动）代理，包含五个核心节点：
 
 1. **gather_vmcore_detail_node**：收集 vmcore 基础信息
 2. **retrieval_rag_node**：从 RAG 检索诊断知识库
