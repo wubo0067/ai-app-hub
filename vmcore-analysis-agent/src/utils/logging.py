@@ -50,7 +50,7 @@ def setup_logger(log_filename="va-agent.log", log_dir="logs"):
         )
         handler.setFormatter(formatter)
         logger_instance.addHandler(handler)
-        logger_instance.setLevel(logging.INFO)
+        logger_instance.setLevel(logging.DEBUG)
 
         # Also add console handler for debugging
         console_handler = logging.StreamHandler()

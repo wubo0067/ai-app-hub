@@ -9,6 +9,7 @@ VMCore 分析 Agent 图构建模块
 4. 循环执行 2-3 直到得出最终结论或达到递归限制
 """
 
+import os
 from functools import partial
 from typing import List
 
@@ -116,9 +117,10 @@ def create_agent_graph(llm, tools_list: List):
     builder.add_conditional_edges(
         gather_vmcore_detail_node,
         should_continue,
+        [llm_analysis_node, "__end__"],
     )
     logger.debug(
-        f"Added conditional edge: {gather_vmcore_detail_node} -> should_continue"
+        f"Added conditional edge: {gather_vmcore_detail_node} -> [llm_analysis_node, __end__]"
     )
 
     # 条件边 2：LLM 分析后根据决策结果路由
@@ -129,11 +131,14 @@ def create_agent_graph(llm, tools_list: List):
     builder.add_conditional_edges(
         llm_analysis_node,
         should_continue,
+        [crash_tool_node, "__end__"],
     )
-    logger.debug(f"Added conditional edge: {llm_analysis_node} -> should_continue")
+    logger.debug(
+        f"Added conditional edge: {llm_analysis_node} -> [crash_tool_node, __end__]"
+    )
 
-    # 注意：crash_tool_node 执行完成后会自动返回 llm_analysis_node
-    # 这是通过 should_continue 函数中的逻辑实现的
+    builder.add_edge(crash_tool_node, llm_analysis_node)
+    logger.debug(f"Added edge: {crash_tool_node} -> {llm_analysis_node}")
 
     # =========================================================================
     # 5. 编译图
@@ -145,11 +150,16 @@ def create_agent_graph(llm, tools_list: List):
     )
     logger.info("✅ Agent graph compiled successfully.")
 
-    # 可选：在调试模式下打印图结构（需要 graphviz 支持）
-    # try:
-    #     from IPython.display import Image, display
-    #     display(Image(graph.get_graph().draw_mermaid_png()))
-    # except Exception as e:
-    #     logger.debug(f"Could not display graph visualization: {e}")
+    # 可选：在调试模式下保存图结构到文件（需要 graphviz 支持）
+    try:
+        graph_png = graph.get_graph().draw_mermaid_png()
+        output_path = os.path.join(
+            os.path.dirname(__file__), "../../graph_visualization.png"
+        )
+        with open(output_path, "wb") as f:
+            f.write(graph_png)
+        logger.info(f"Graph visualization saved to: {output_path}")
+    except Exception as e:
+        logger.error(f"Could not display graph visualization: {e}")
 
     return graph

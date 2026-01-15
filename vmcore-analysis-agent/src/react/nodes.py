@@ -150,7 +150,7 @@ async def gather_vmcore_detail(state: AgentState) -> dict:
 
     # 格式化输出为 prompt
     vmcore_output = "".join(crash_output_parts)
-    prompt = vmcore_detail_prompt().format(vmcore_detail=vmcore_output)
+    prompt = vmcore_detail_prompt().format(vmcore_base_info=vmcore_output)
 
     logger.info(f"{gather_vmcore_detail_node} completed successfully.")
     return {
