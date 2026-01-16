@@ -1,0 +1,51 @@
+{
+  "os": "Red Hat Enterprise Linux 8.7",
+  "scenario": "Soft lockup/hard lockup during out-of-tree kernel module loading/unloading",
+  "symptoms": [
+    "watchdog: BUG: soft lockup - CPU#1 stuck for 134s! [insmod:1141]",
+    "RIP: 0010:native_queued_spin_lock_slowpath+0x24/0x1c0",
+    "Kernel panic - not syncing: Hard LOCKUP"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Check kernel version to confirm affected release",
+      "action": "sys | grep -e RELEASE",
+      "observation": "RELEASE: 4.18.0-425.3.1.el8.x86_64"
+    },
+    {
+      "step_number": 2,
+      "thought": "Examine paravirt_patch_template structure size",
+      "action": "struct px sizeof (struct paravirt_patch_template)",
+      "observation": "Size should be 0x320 in affected kernel"
+    },
+    {
+      "step_number": 3,
+      "thought": "Display paravirt_patch_template layout",
+      "action": "struct paravirt_patch_template -ox",
+      "observation": "pv_lock_ops offset at 0x2f0 (should be 0x2e8 in older kernels)"
+    },
+    {
+      "step_number": 4,
+      "thought": "Check pv_mmu_ops structure size",
+      "action": "struct px sizeof (struct pv_mmu_ops)",
+      "observation": "Size should be 0x188 (increased by 8 bytes)"
+    },
+    {
+      "step_number": 5,
+      "thought": "Examine pv_mmu_ops for new notify_page_enc_status_changed",
+      "action": "struct pv_mmu_ops -ox | head -n 5",
+      "observation": "notify_page_enc_status_changed at offset 0x8"
+    },
+    {
+      "step_number": 6,
+      "thought": "Verify pv_lock_ops offset in template",
+      "action": "struct paravirt_patch_template.pv_lock_ops -ox",
+      "observation": "pv_lock_ops at offset 0x2f0 (mismatched with older modules)"
+    }
+  ],
+  "root_cause_analysis": [
+    "An out-of-tree (O) kernel module built using the kernel-devel version lower than 4.18.0-425.3.1.el8 may fail to load/unload with soft lockup/hard lockup panic or hang the system running RHEL-8.7 kernel version 4.18.0-425.3.1.el8 due to change of the function pointer offsets in the pv_lock_ops structure within the paravirt_patch_template structure.",
+    "In the RHEL-8.7 kernel version 4.18.0-425.3.1.el8, the insertion of a new method pointer notify_page_enc_status_changed into pv_mmu_ops structure increased its size by 8 bytes. This change pushed all the method pointers in pv_mmu_ops and pv_lock_ops off by 8, leading to soft lockup/hard lockup when an older kernel module is performing a locking operation."
+  ]
+}

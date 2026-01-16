@@ -200,13 +200,21 @@ def main():
         temperature=0,  # 数据抽取/分析	1.0
     )
 
+    #  grep -il "Hard lockup" *.md \
+    #   | xargs grep -il "soft lockup" \
+    #   | sort -u \
+    #   | xargs -I{} stat -c "%s %n" {} \
+    #   | sort -nr \
+    #   | awk '{print $2}'
     md_list = [
-        "../data/md/6348992.md",
+        "../data/md/6985596.md",
         "../data/md/3870151.md",
+        "../data/md/7019939.md",
         "../data/md/7041099.md",
-        # "../data/md/5764681.md",
-        # "../data/md/6988986.md",
-        # "../data/md/3379041.md",
+        "../data/md/5764681.md",
+        "../data/md/3379041.md",
+        "../data/md/5618071.md",
+        "../data/md/7084075.md",
     ]
 
     # dsl_list = []

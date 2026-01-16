@@ -191,6 +191,12 @@ commands = [
         "mach",
         "This command displays data specific to a machine type.",
     ),
+    (
+        "mod",
+        "mod -s module [objfile] | -d module | -S [directory] [-D|-t|-r|-R|-o|-g]",
+        "mod -s dm_mod",
+        "module information and loading of symbols and debugging data",
+    ),
 ]
 
 # 批量注册

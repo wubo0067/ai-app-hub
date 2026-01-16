@@ -1,0 +1,141 @@
+{
+  "os": "Red Hat Enterprise Linux 7.9.z - kernel-3.10.0-1160.2.2.el7.x86_64",
+  "scenario": "Hard lockup on CPU with task stuck waiting on qwrlock spinlock",
+  "symptoms": [
+    "Kernel panic - not syncing: Hard LOCKUP",
+    "NMI watchdog: Watchdog detected hard LOCKUP on cpu 5",
+    "Exception RIP: queued_write_lock_slowpath+98"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Check watchdog threshold to understand lockup timing",
+      "action": "p watchdog_thresh",
+      "observation": "watchdog_thresh = 30 seconds"
+    },
+    {
+      "step_number": 2,
+      "thought": "Examine task stuck on CPU 5 to understand context",
+      "action": "bt -a",
+      "observation": "Task stuck in queued_write_lock_slowpath at RIP ffffffff97917812"
+    },
+    {
+      "step_number": 3,
+      "thought": "Disassemble the lock function to see instruction details",
+      "action": "dis -lr ffffffff97917812",
+      "observation": "Instruction at queued_write_lock_slowpath+98: mov (%rbx),%eax"
+    },
+    {
+      "step_number": 4,
+      "thought": "Identify the lock address from task context",
+      "action": "p &tasklist_lock",
+      "observation": "tasklist_lock at 0xffffffff98407080"
+    },
+    {
+      "step_number": 5,
+      "thought": "Examine lock structure to understand state",
+      "action": "p tasklist_lock",
+      "observation": "Lock has counter = 0x101 in cnts field"
+    },
+    {
+      "step_number": 6,
+      "thought": "Check lock's internal spinlock state",
+      "action": "struct px ((struct qrwlock *) 0xffffffff98407080)->lock",
+      "observation": "Lock val.counter = 0x1690101"
+    },
+    {
+      "step_number": 7,
+      "thought": "Analyze bit pattern of lock value",
+      "action": "eval -b 0x1690101",
+      "observation": "Bits set: 24 22 21 19 16 8 0 - lock is locked, pending, contended"
+    },
+    {
+      "step_number": 8,
+      "thought": "Find other tasks waiting on same lock",
+      "action": "bt -a | grep \"RDI: ffffffff98407084\" -B8 | grep PID",
+      "observation": "Tasks on CPUs 24, 45, 55, 58 waiting on lock"
+    },
+    {
+      "step_number": 9,
+      "thought": "Examine internal qrwlock structure for reader/writer state",
+      "action": "struct __qrwlock 0xffffffff98407080",
+      "observation": "wmode = 0x1 (writer waiting), rcnts shows reader count"
+    },
+    {
+      "step_number": 10,
+      "thought": "Identify function at address from CPU 13's RAX register",
+      "action": "sym ffffffffc03f5a90",
+      "observation": "mlx5_eq_async_int [mlx5_core] function"
+    },
+    {
+      "step_number": 11,
+      "thought": "Disassemble do_wait function to see lock usage",
+      "action": "dis -lr ffffffff978a1090",
+      "observation": "do_wait calls wait_consider_task at line 1564"
+    },
+    {
+      "step_number": 12,
+      "thought": "Examine wait_opts structure for task waiting details",
+      "action": "struct wait_opts 0xffff96dff97efec8",
+      "observation": "wait_opts shows wo_flags = 4, child_wait structure"
+    },
+    {
+      "step_number": 13,
+      "thought": "Get address of children list from task structure",
+      "action": "struct px &((struct task_struct *)0xffff96da42379080)->children",
+      "observation": "Children list at 0xffff96da42379548"
+    },
+    {
+      "step_number": 14,
+      "thought": "List tasks in children list to identify related processes",
+      "action": "list -o task_struct.sibling -H 0xffff96da42379548",
+      "observation": "Four task addresses in children list"
+    },
+    {
+      "step_number": 15,
+      "thought": "Show process status for tasks in children list",
+      "action": "ps ffff95de757c4200 ffff95de757c6300 ffff95de757c2100 ffff95de757c5280",
+      "observation": "ps, grep, grep, awk tasks with different states"
+    },
+    {
+      "step_number": 16,
+      "thought": "Get backtraces for all tasks in children list",
+      "action": "bt ffff95de757c4200 ffff95de757c6300 ffff95de757c2100 ffff95de757c5280",
+      "observation": "All tasks in exit paths, awk task stuck in lock"
+    },
+    {
+      "step_number": 17,
+      "thought": "Check kernel log for rcu_sched stall patterns",
+      "action": "log -t | grep rcu_sched | awk '{print $6 \" \" $7 \" \" $8}' | sort | uniq -c",
+      "observation": "105 stalls on CPU 5, 1 on CPU 37"
+    },
+    {
+      "step_number": 18,
+      "thought": "Check kernel log for soft lockup patterns",
+      "action": "log -t | grep soft\\ lockup | awk '{print $7}' | sort | uniq -c",
+      "observation": "224 soft lockups on CPU#5"
+    },
+    {
+      "step_number": 19,
+      "thought": "Check for blocked task messages in log",
+      "action": "log | grep blocked",
+      "observation": "Multiple tasks blocked for >120 seconds"
+    },
+    {
+      "step_number": 20,
+      "thought": "List loaded modules to identify third-party drivers",
+      "action": "mod -t",
+      "observation": "Mellanox modules mlx_compat, mlx5_core, mlx5_ib loaded"
+    },
+    {
+      "step_number": 21,
+      "thought": "Check runqueue timestamps for CPU lag",
+      "action": "runq -T | awk '$3^/0.00/'",
+      "observation": "CPU 5: 18821.87 secs time lag"
+    }
+  ],
+  "root_cause_analysis": [
+    "Unknown at this time.",
+    "Since the issue went away and never came back after disabling CPU 5, it would be reasonable and proper to believe that the issue was faulty CPU."
+  ]
+}

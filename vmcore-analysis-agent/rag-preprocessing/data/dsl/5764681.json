@@ -1,0 +1,88 @@
+{
+  "os": "Red Hat Enterprise Linux 7.7 (kernel-3.10.0-1062.21.1.el7)",
+  "scenario": "Multiple hard lockups with MCE events",
+  "symptoms": [
+    "NMI watchdog: Watchdog detected hard LOCKUP on cpu 32",
+    "NMI watchdog: Watchdog detected hard LOCKUP on cpu 62",
+    "Kernel panic - not syncing: Hard LOCKUP"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Check kernel log for lockup messages",
+      "action": "log | grep LOCKUP",
+      "observation": "Hard lockup messages on CPUs 32 and 62"
+    },
+    {
+      "step_number": 2,
+      "thought": "Find zone information for address",
+      "action": "kmem -z | grep ffff88b5fffda000",
+      "observation": "Zone 'Normal' at specified address"
+    },
+    {
+      "step_number": 3,
+      "thought": "Examine zone lock spinlock address",
+      "action": "struct px &((struct zone *)0xffff88b5fffda000)->lock",
+      "observation": "Spinlock address 0xffff88b5fffda068"
+    },
+    {
+      "step_number": 4,
+      "thought": "Check per-CPU pageset for CPU 28",
+      "action": "struct per_cpu_pageset.pcp 0x1fdd8:28",
+      "observation": "PCP structure details for CPU 28"
+    },
+    {
+      "step_number": 5,
+      "thought": "Count pages in MIGRATE_MOVABLE list",
+      "action": "list -H ffff88bddf31fd38 -o page.lru -s page.index | paste - - | wc -l",
+      "observation": "115 pages in the list"
+    },
+    {
+      "step_number": 6,
+      "thought": "Examine list head structure",
+      "action": "struct list_head ffff88bddf31fd38",
+      "observation": "List head next and prev pointers"
+    },
+    {
+      "step_number": 7,
+      "thought": "Check runqueue for CPU 8",
+      "action": "runq -c 8",
+      "observation": "CPU 8 runqueue with current and queued tasks"
+    },
+    {
+      "step_number": 8,
+      "thought": "Examine runqueue lock address",
+      "action": "struct px &((struct rq *)0xffff88addfa1ac80)->lock",
+      "observation": "Runqueue lock at 0xffff88addfa1ac80"
+    },
+    {
+      "step_number": 9,
+      "thought": "Disassemble set_next_entity function",
+      "action": "dis -lr ffffffff938e2b84",
+      "observation": "Code location in set_next_entity function"
+    },
+    {
+      "step_number": 10,
+      "thought": "Check for soft lockup messages",
+      "action": "log | grep -e LOCKUP -e lockup",
+      "observation": "Soft lockup on CPU 23 before hard lockups"
+    },
+    {
+      "step_number": 11,
+      "thought": "Examine full kernel log for MCE events",
+      "action": "log",
+      "observation": "Multiple MCE events logged over 97 days"
+    },
+    {
+      "step_number": 12,
+      "thought": "Check runqueue timestamp delays",
+      "action": "runq -T",
+      "observation": "Significant timestamp delays on many CPUs"
+    }
+  ],
+  "root_cause_analysis": [
+    "Multiple hard lockups occurred on multiple CPUs on which tasks were running different code paths that had nothing to do with each other.",
+    "Lots of MCE events were being logged and also hrtimer/perf interrupts were taking too long time to be processed during the time frame of the occurrence of the soft lockup followed by the multiple hard lockups.",
+    "It may be possible that some faulty hardware was causing some CPUs to be getting slow or stalled on which tasks were processing some jobs with zone->lock or rq->lock spinlocks being held hence the soft/hard lockups."
+  ]
+}

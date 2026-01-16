@@ -2,177 +2,240 @@
   "summary": "Comprehensive diagnostic matrix for Linux kernel Hard LOCKUP scenarios",
   "init_cmds": [
     "sys -i",
-    "bt",
-    "ps",
-    "log | grep -i -e lockup -e LOCKUP -e rcu_sched",
-    "foreach UN ps -m",
-    "foreach UN bt | awk '/#[1-4] /{print $3,$5}' | paste - - - - | column -t",
     "bt -c {cpu}",
-    "arch_spinlock {addr}",
-    "struct task_struct {addr}",
-    "struct timer_list {addr}",
-    "struct ring_buffer {addr}",
-    "struct ring_buffer_per_cpu {addr}"
+    "log | grep -e lockup -e LOCKUP -e blocked -e rcu_sched"
   ],
   "matrix": [
     {
-      "trigger": "Watchdog detected hard LOCKUP on cpu {cpu}",
-      "action": "bt -c {cpu}",
-      "arg_hints": "cpu: CPU number from lockup message",
-      "why": "Examine what's running on the locked CPU",
-      "expect": "Stack trace showing stuck function or spinlock",
+      "trigger": "System hangs with tasks waiting for page writeback",
+      "action": "kmem {addr}",
+      "arg_hints": "addr: from memory page references in logs or stack traces",
+      "why": "Examine kernel memory page for writeback issues",
+      "expect": "Page flags showing writeback in progress or blocked",
       "is_end": false
     },
     {
-      "trigger": "Soft lockup detected on cpu {cpu}",
-      "action": "bt -c {cpu}",
-      "arg_hints": "cpu: CPU number from lockup message",
-      "why": "Examine what's running on the locked CPU",
-      "expect": "Stack trace showing stuck function or spinlock",
-      "is_end": false
-    },
-    {
-      "trigger": "Kernel panic - not syncing: softlockup: hung tasks",
-      "action": "ps",
+      "trigger": "Multiple tasks in TASK_UNINTERRUPTIBLE state for >120 seconds",
+      "action": "ps | grep UNINTERRUPTIBLE",
       "arg_hints": null,
-      "why": "List all tasks to identify hung processes",
-      "expect": "Tasks in D (uninterruptible) or R (running) state",
+      "why": "Find all blocked processes",
+      "expect": "List of processes stuck in UNINTERRUPTIBLE state",
       "is_end": false
     },
     {
-      "trigger": "Tasks in uninterruptible sleep state",
+      "trigger": "Examine module structure for {modname}",
+      "action": "struct module.name,version,srcversion,sig_ok {addr}",
+      "arg_hints": "modname: module name from stack trace, addr: module address",
+      "why": "Check module metadata and signature",
+      "expect": "Module structure with name, version, and signature status",
+      "is_end": false
+    },
+    {
+      "trigger": "Examine specific structure field offset",
+      "action": "struct perf_event.pending -o {addr}",
+      "arg_hints": "addr: structure address from backtrace",
+      "why": "Check pending field in perf_event structure",
+      "expect": "Field offset and value at given address",
+      "is_end": false
+    },
+    {
+      "trigger": "Disassemble function at specific offset",
+      "action": "dis -r __wake_up+{offset} | tail",
+      "arg_hints": "offset: from panic or backtrace location",
+      "why": "Understand code at panic location",
+      "expect": "Assembly instructions around crash point",
+      "is_end": false
+    },
+    {
+      "trigger": "Read raw memory value for spinlock",
+      "action": "rd -x -32 {addr}",
+      "arg_hints": "addr: spinlock address from backtrace",
+      "why": "Check raw spinlock value",
+      "expect": "Hex value showing lock state",
+      "is_end": false
+    },
+    {
+      "trigger": "Examine spinlock structure details",
+      "action": "struct px ((struct qspinlock *)&((spinlock_t *){addr}...",
+      "arg_hints": "addr: spinlock address from memory read",
+      "why": "Inspect spinlock structure fields",
+      "expect": "Spinlock structure with lock values",
+      "is_end": false
+    },
+    {
+      "trigger": "Check watchdog timing configuration",
+      "action": "p watchdog_thresh",
+      "arg_hints": null,
+      "why": "Verify watchdog threshold for lockup timing",
+      "expect": "Watchdog threshold value in seconds",
+      "is_end": false
+    },
+    {
+      "trigger": "Need zone information for address {addr}",
+      "action": "kmem -z | grep {addr}",
+      "arg_hints": "addr: from stack trace or register",
+      "why": "Find zone information for address",
+      "expect": "Zone details including name and flags",
+      "is_end": false
+    },
+    {
+      "trigger": "Examine zone lock spinlock at address {addr}",
+      "action": "struct px &((struct zone *){addr})->lock",
+      "arg_hints": "addr: zone address from kmem -z",
+      "why": "Examine zone lock spinlock address",
+      "expect": "Spinlock structure showing owner and state",
+      "is_end": false
+    },
+    {
+      "trigger": "Check runqueue for CPU {cpu}",
+      "action": "runq -c {cpu}",
+      "arg_hints": "cpu: CPU number from lockup message",
+      "why": "Check runqueue for CPU",
+      "expect": "List of tasks scheduled on that CPU",
+      "is_end": false
+    },
+    {
+      "trigger": "Analyze backtraces of uninterruptible tasks for patterns",
+      "action": "foreach UN bt | awk '/#[1-4] /{print $3,$5}' | paste - - - -",
+      "arg_hints": null,
+      "why": "Analyze backtraces of uninterruptible tasks",
+      "expect": "Common function patterns across stuck tasks",
+      "is_end": false
+    },
+    {
+      "trigger": "Examine tasks in uninterruptible state",
       "action": "foreach UN ps -m",
       "arg_hints": null,
-      "why": "Examine tasks stuck in D state",
-      "expect": "List of tasks in D state with memory addresses",
+      "why": "Examine uninterruptible tasks for I/O bottlenecks",
+      "expect": "Task details showing potential I/O waits",
       "is_end": false
     },
     {
-      "trigger": "Need to analyze uninterruptible tasks backtraces",
-      "action": "foreach UN bt | awk '/#[1-4] /{print $3,$5}' | paste - - - - | column -t",
+      "trigger": "Check device mapper logical volumes",
+      "action": "struct dmshow --lvs",
       "arg_hints": null,
-      "why": "Extract top frames from D state task backtraces",
-      "expect": "Formatted top frames showing common stuck functions",
+      "why": "Check device mapper logical volumes for storage issues",
+      "expect": "Logical volume status and mappings",
       "is_end": false
     },
     {
-      "trigger": "Backtrace shows spin_lock_irqsave at {addr}",
-      "action": "arch_spinlock {addr}",
-      "arg_hints": "addr: spinlock address from RDI register in backtrace",
-      "why": "Check spinlock contention state and waiter information",
-      "expect": "Spinlock head/tail values showing contention pattern",
-      "is_end": false
-    },
-    {
-      "trigger": "Backtrace shows task_struct at {addr}",
-      "action": "struct task_struct {addr}",
-      "arg_hints": "addr: task_struct address from backtrace",
-      "why": "Examine task state, flags, and scheduling information",
-      "expect": "Task state, flags, and pending signals",
-      "is_end": false
-    },
-    {
-      "trigger": "Backtrace shows timer_list at {addr}",
-      "action": "struct timer_list {addr}",
-      "arg_hints": "addr: timer_list address from backtrace",
-      "why": "Check timer expiration and callback function",
-      "expect": "Timer expiration time and callback function pointer",
-      "is_end": false
-    },
-    {
-      "trigger": "Backtrace shows ring_buffer at {addr}",
-      "action": "struct ring_buffer {addr}",
-      "arg_hints": "addr: ring_buffer address from backtrace",
-      "why": "Examine ring buffer state and per-CPU pointers",
-      "expect": "Ring buffer size, per-CPU buffer pointers",
-      "is_end": false
-    },
-    {
-      "trigger": "Backtrace shows ring_buffer_per_cpu at {addr}",
-      "action": "struct ring_buffer_per_cpu {addr}",
-      "arg_hints": "addr: ring_buffer_per_cpu address from backtrace",
-      "why": "Check per-CPU ring buffer reader/writer positions",
-      "expect": "Reader and writer positions, buffer state",
-      "is_end": false
-    },
-    {
-      "trigger": "Need to check system information",
-      "action": "sys -i",
+      "trigger": "Examine SCSI commands for timeout issues",
+      "action": "struct scsishow --t",
       "arg_hints": null,
-      "why": "Get kernel version, BIOS, and system configuration",
-      "expect": "Kernel version, BIOS version, system uptime",
+      "why": "Examine SCSI commands for timeout issues",
+      "expect": "SCSI command status and timeout information",
       "is_end": false
     },
     {
-      "trigger": "Search for lockup-related messages in kernel log",
-      "action": "log | grep -i -e lockup -e LOCKUP -e rcu_sched",
+      "trigger": "Get current jiffies counter value",
+      "action": "p jiffies",
       "arg_hints": null,
-      "why": "Find lockup detection messages and RCU stall warnings",
-      "expect": "Lockup messages with CPU numbers and timestamps",
+      "why": "Get current jiffies counter value",
+      "expect": "Current jiffies value for timing analysis",
       "is_end": false
     },
     {
-      "trigger": "Need to examine backtrace of panicked task",
-      "action": "bt",
+      "trigger": "Check kernel version to confirm affected release",
+      "action": "sys | grep -e RELEASE",
       "arg_hints": null,
-      "why": "Get stack trace of the currently selected task",
-      "expect": "Complete stack trace with function addresses",
+      "why": "Check kernel version",
+      "expect": "Kernel release version string",
       "is_end": false
     },
     {
-      "trigger": "Need to check backtrace for CPU {cpu}",
-      "action": "bt -c {cpu}",
-      "arg_hints": "cpu: CPU number from lockup or other task",
-      "why": "Examine what was running on another CPU",
-      "expect": "Stack trace showing other side of potential deadlock",
+      "trigger": "Examine pv_mmu_ops structure",
+      "action": "struct pv_mmu_ops -ox | head -n 5",
+      "arg_hints": null,
+      "why": "Examine pv_mmu_ops for notify_page_enc_status_changed",
+      "expect": "pv_mmu_ops structure with function pointers",
       "is_end": false
     },
     {
-      "trigger": "Backtrace shows module {modname} functions",
-      "action": "mod -s {modname}",
-      "arg_hints": "modname: Module name from backtrace function symbols",
-      "why": "Check module information and loaded addresses",
-      "expect": "Module base address, size, and state",
+      "trigger": "Check pv_mmu_ops structure size",
+      "action": "struct px sizeof (struct pv_mmu_ops)",
+      "arg_hints": null,
+      "why": "Check pv_mmu_ops structure size",
+      "expect": "Size of pv_mmu_ops structure in bytes",
       "is_end": false
     },
     {
-      "trigger": "Need to examine memory at address {addr}",
-      "action": "rd -x {addr} {offset}",
-      "arg_hints": "addr: Memory address from backtrace or structure, offset: 0x10 or 0x20",
-      "why": "Dump raw memory contents for analysis",
-      "expect": "Hex dump of memory contents",
+      "trigger": "Examine paravirt_patch_template structure size",
+      "action": "struct px sizeof (struct paravirt_patch_template)",
+      "arg_hints": null,
+      "why": "Examine paravirt_patch_template structure size",
+      "expect": "Size of paravirt_patch_template structure",
       "is_end": false
     },
     {
-      "trigger": "Task shows device {device} in backtrace",
-      "action": "dev -d {device}",
-      "arg_hints": "device: Device name from backtrace or task info",
-      "why": "Check device driver and state information",
-      "expect": "Device driver, major/minor numbers, state",
+      "trigger": "Need to identify lock address from task context",
+      "action": "p &tasklist_lock",
+      "arg_hints": "addr: from task structure or stack trace",
+      "why": "Find specific lock address causing contention",
+      "expect": "Memory address of contended lock",
       "is_end": false
     },
     {
-      "trigger": "Need to examine process PID {pid}",
-      "action": "struct task_struct {addr}",
-      "arg_hints": "addr: task_struct address from ps output for PID {pid}",
-      "why": "Examine specific process state and resources",
-      "expect": "Task state, flags, and resource usage",
+      "trigger": "Disassemble function to find spinlock address",
+      "action": "dis -lr {addr}",
+      "arg_hints": "addr: RIP address from exception message",
+      "why": "Disassemble lock function to see instruction flow",
+      "expect": "Assembly code showing lock acquisition sequence",
       "is_end": false
     },
     {
-      "trigger": "Backtrace shows function at offset {offset}",
-      "action": "dis -l {addr}",
-      "arg_hints": "addr: Function address from backtrace minus {offset}",
-      "why": "Disassemble function to examine code path",
-      "expect": "Assembly instructions around the crash point",
+      "trigger": "Need to examine memory content at address",
+      "action": "x/s {addr}",
+      "arg_hints": "addr: from register or stack trace",
+      "why": "Check what data is being accessed",
+      "expect": "String or data structure content",
       "is_end": false
     },
     {
-      "trigger": "Need to check CPU {cpu} registers",
-      "action": "reg -c {cpu}",
-      "arg_hints": "cpu: CPU number from lockup message",
-      "why": "Examine register state at lockup time",
-      "expect": "Register values including RIP, RSP, RDI",
+      "trigger": "Check RCU state during lockup",
+      "action": "list -o rcu_state.flavors -H {addr}",
+      "arg_hints": "addr: rcu_state address from symbols",
+      "why": "Examine RCU processing status",
+      "expect": "RCU flavors and their states",
+      "is_end": false
+    },
+    {
+      "trigger": "Analyze lock value state",
+      "action": "eval -b {addr}",
+      "arg_hints": "addr: lock address from disassembly",
+      "why": "Check lock ownership and contention",
+      "expect": "Lock value showing owner/waiter",
+      "is_end": false
+    },
+    {
+      "trigger": "Kernel log contains soft lockup or RCU stall messages",
+      "action": "log|grep -e \"soft lockup\" -e \"INFO: rcu_sched\" -e \"Hard LOCKUP\"",
+      "arg_hints": null,
+      "why": "Search for lockup and RCU stall messages in kernel log",
+      "expect": "Messages indicating lockup type and timing",
+      "is_end": false
+    },
+    {
+      "trigger": "Need to identify process owning console during panic",
+      "action": "ps ffff8d786de08000",
+      "arg_hints": "addr: console owner process address from kernel structures",
+      "why": "Find process that owned console at panic time",
+      "expect": "Process details including PID and command",
+      "is_end": false
+    },
+    {
+      "trigger": "Check loaded kernel modules and taint status",
+      "action": "struct modt",
+      "arg_hints": null,
+      "why": "Examine loaded modules and kernel taint flags",
+      "expect": "Module list with taint status indicators",
+      "is_end": false
+    },
+    {
+      "trigger": "Compare current and saved CPU interrupt counts",
+      "action": "!comm -12 __hrtimer_interrupts __hrtimer_interrupts_saved",
+      "arg_hints": null,
+      "why": "Find common CPUs between current and saved interrupt counts",
+      "expect": "List of CPUs with matching interrupt counts",
       "is_end": false
     }
   ]

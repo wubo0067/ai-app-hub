@@ -1,0 +1,129 @@
+{
+  "os": "Red Hat Enterprise Linux 7.7 (kernel-3.10.0-1062.18.1.el7)",
+  "scenario": "Spinlock Deadlock",
+  "symptoms": [
+    "NMI watchdog: BUG: soft lockup - CPU#26 stuck for 23s! [ptlrpcd_00_00:12056]",
+    "INFO: rcu_sched self-detected stall on CPU",
+    "Kernel panic - not syncing: Hard LOCKUP"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Check kernel log for lockup messages",
+      "action": "log | grep LOCKUP",
+      "observation": "Hard LOCKUP detected on CPU 62"
+    },
+    {
+      "step_number": 2,
+      "thought": "Verify watchdog threshold setting",
+      "action": "p watchdog_thresh",
+      "observation": "Watchdog threshold is 10 seconds"
+    },
+    {
+      "step_number": 3,
+      "thought": "Check timer interrupts on affected CPU",
+      "action": "p hrtimer_interrupts:62",
+      "observation": "Timer interrupt count matches saved value"
+    },
+    {
+      "step_number": 4,
+      "thought": "Examine timer queue on CPU 62",
+      "action": "timer -r -C 62",
+      "observation": "Watchdog timer expired 17 seconds ago"
+    },
+    {
+      "step_number": 5,
+      "thought": "Get backtrace of crashing task",
+      "action": "bt",
+      "observation": "CPU 62 stuck in native_queued_spin_lock_slowpath"
+    },
+    {
+      "step_number": 6,
+      "thought": "Check all CPUs for spinlock contention",
+      "action": "bt -a | grep -A3 \"exception RIP: native_queued_spin_lock_slowpath\" | grep -oE 'RDI: ffff.{12}' | sort | uniq -c",
+      "observation": "64 CPUs stuck on spinlock 0xffff9a8ccb95ab80"
+    },
+    {
+      "step_number": 7,
+      "thought": "Examine the spinlock structure",
+      "action": "struct px ((struct qspinlock *)&((spinlock_t *)0xffff9a8ccb95ab80)->rlock.raw_lock)",
+      "observation": "Spinlock is a qspinlock at address"
+    },
+    {
+      "step_number": 8,
+      "thought": "Read raw spinlock value",
+      "action": "rd -x -32 0xffff9a8ccb95ab80",
+      "observation": "Spinlock value shows tail CPU/index bits"
+    },
+    {
+      "step_number": 9,
+      "thought": "Analyze spinlock bitfields",
+      "action": "eval -b 0xa10000",
+      "observation": "Bits 23, 21, 16 set indicating tail CPU"
+    },
+    {
+      "step_number": 10,
+      "thought": "Disassemble libcfs function",
+      "action": "dis -r ffffffffc0be9788",
+      "observation": "cfs_percpt_lock calls _raw_spin_lock"
+    },
+    {
+      "step_number": 11,
+      "thought": "Get symbol information",
+      "action": "sym cfs_percpt_lock",
+      "observation": "Function is in libcfs module"
+    },
+    {
+      "step_number": 12,
+      "thought": "Check module status",
+      "action": "mod | grep libcfs",
+      "observation": "libcfs module is not loaded"
+    },
+    {
+      "step_number": 13,
+      "thought": "Get module details",
+      "action": "struct module.name,version,srcversion,sig_ok ffffffffc0bfed60",
+      "observation": "libcfs version 0.7.1, no signature"
+    },
+    {
+      "step_number": 14,
+      "thought": "Check for other contended spinlocks",
+      "action": "bt -a | grep -A3 \"exception RIP: native_queued_spin_lock_slowpath\" | grep -oE 'RDI: ffff.{12}' | sort | uniq -c",
+      "observation": "15 CPUs stuck on spinlock 0xffffffffa6a79f80"
+    },
+    {
+      "step_number": 15,
+      "thought": "Disassemble RCU function",
+      "action": "dis -lr ffffffffa5f581ab",
+      "observation": "rcu_dump_cpu_stacks calls _raw_spin_lock_irqsave"
+    },
+    {
+      "step_number": 16,
+      "thought": "Identify RCU spinlock",
+      "action": "kmem 0xffffffffa6a79f80",
+      "observation": "Address is rcu_sched_state+0x400"
+    },
+    {
+      "step_number": 17,
+      "thought": "Get spinlock field address",
+      "action": "struct px &((struct rcu_node *)0xffffffffa6a79f80)->lock",
+      "observation": "Spinlock is at same address"
+    },
+    {
+      "step_number": 18,
+      "thought": "Check RCU stall messages",
+      "action": "log | grep rcu_sched",
+      "observation": "Multiple rcu_sched stall detections"
+    },
+    {
+      "step_number": 19,
+      "thought": "Examine boot command line",
+      "action": "p saved_command_line",
+      "observation": "Console set to serial port ttyS0"
+    }
+  ],
+  "root_cause_analysis": [
+    "A complete root cause is unknown at this time.",
+    "It may be possible that some bug in libcfs is causing a deadlock or a contention on a spinlock that should be taken around ptlrpc_unregister_reply()->LNetMDUnlink()->cfs_percpt_lock()."
+  ]
+}

@@ -1,0 +1,142 @@
+{
+  "os": "Red Hat Enterprise Linux 8.2",
+  "scenario": "Kernel detects soft lockup at net_rx_action",
+  "symptoms": [
+    "watchdog: BUG: soft lockup - CPU#6 stuck for 23s! [NetworkManager:1081]",
+    "RIP: 0010:net_rx_action+0x11a/0x3b0",
+    "Kernel panic - not syncing: Hard LOCKUP"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Check loaded kernel modules and their taint status",
+      "action": "struct modt",
+      "observation": "Identify tainted modules like igb with O flag"
+    },
+    {
+      "step_number": 2,
+      "thought": "Search kernel log for lockup and RCU stall messages",
+      "action": "log|grep -e \"soft lockup\" -e \"INFO: rcu_sched\" -e \"Hard LOCKUP\"",
+      "observation": "Find repeated soft lockups and eventual hard lockup panic"
+    },
+    {
+      "step_number": 3,
+      "thought": "Compare hrtimer interrupt counts to identify CPU",
+      "action": "struct pd hrtimer_interrupts:a|awk '{print ($2\" \"$6)}' > __hrtimer_interrupts",
+      "observation": "Capture current hrtimer interrupt counts per CPU"
+    },
+    {
+      "step_number": 4,
+      "thought": "Compare with saved hrtimer interrupt counts",
+      "action": "struct pd hrtimer_interrupts_saved:a|awk '{print ($2\" \"$6)}' > __hrtimer_interrupts_saved",
+      "observation": "Capture saved hrtimer interrupt counts per CPU"
+    },
+    {
+      "step_number": 5,
+      "thought": "Find common CPUs between current and saved counts",
+      "action": "!comm -12 __hrtimer_interrupts __hrtimer_interrupts_saved",
+      "observation": "Identify CPUs with matching interrupt counts"
+    },
+    {
+      "step_number": 6,
+      "thought": "Examine backtrace of CPU 4 to understand panic context",
+      "action": "bt -c4",
+      "observation": "Check panic call chain and exception RIP at vprintk_emit"
+    },
+    {
+      "step_number": 7,
+      "thought": "Disassemble vprintk_emit to understand spinlock issue",
+      "action": "dis -rl ffffffff8e918f07",
+      "observation": "Examine console_owner and console_waiter access patterns"
+    },
+    {
+      "step_number": 8,
+      "thought": "Inspect console_owner_lock spinlock state",
+      "action": "struct raw_spinlock ffffffff9041d730",
+      "observation": "Check if console_owner_lock is locked (counter != 0)"
+    },
+    {
+      "step_number": 9,
+      "thought": "Examine console_waiter value",
+      "action": "rd 0xffffffff9041d720",
+      "observation": "Check if console_waiter is true (non-zero)"
+    },
+    {
+      "step_number": 10,
+      "thought": "Examine console_owner value",
+      "action": "rd 0xffffffff9041d728",
+      "observation": "Get task address of console owner"
+    },
+    {
+      "step_number": 11,
+      "thought": "Identify process owning the console",
+      "action": "ps ffff8d786de08000",
+      "observation": "Find PID 1081 (NetworkManager) as console owner"
+    },
+    {
+      "step_number": 12,
+      "thought": "Switch to NetworkManager process context",
+      "action": "set 1081",
+      "observation": "Set current process to PID 1081 for examination"
+    },
+    {
+      "step_number": 13,
+      "thought": "Get backtrace of NetworkManager process",
+      "action": "bt",
+      "observation": "Examine stack showing net_rx_action deadlock"
+    },
+    {
+      "step_number": 14,
+      "thought": "Disassemble net_rx_action to understand poll_owner lock",
+      "action": "dis -rl ffffffff8ef1567a",
+      "observation": "Examine cmpxchg instruction for napi->poll_owner"
+    },
+    {
+      "step_number": 15,
+      "thought": "Check napi_struct poll_owner field offset",
+      "action": "struct napi_struct.poll_owner -xo",
+      "observation": "Verify poll_owner field offset is 0x28"
+    },
+    {
+      "step_number": 16,
+      "thought": "Calculate poll_owner address from napi pointer",
+      "action": "struct px 0xffff8d786d673c50+0x28",
+      "observation": "Get address of napi->poll_owner field"
+    },
+    {
+      "step_number": 17,
+      "thought": "Examine current poll_owner value",
+      "action": "rd 0xffff8d786d673c78",
+      "observation": "Check poll_owner value (should be CPU 6)"
+    },
+    {
+      "step_number": 18,
+      "thought": "Disassemble netpoll_poll_dev to understand poll_napi",
+      "action": "dis -rl ffffffff8ef48163|tail",
+      "observation": "Examine napi->poll call in netpoll_poll_dev"
+    },
+    {
+      "step_number": 19,
+      "thought": "Disassemble igb_poll function start",
+      "action": "dis -r ffffffffc04d9c7c|head",
+      "observation": "Check igb_poll function prologue"
+    },
+    {
+      "step_number": 20,
+      "thought": "Examine napi pointer from stack frame",
+      "action": "struct px 0xffffb848c1a07180-0x8*6",
+      "observation": "Calculate address containing napi pointer"
+    },
+    {
+      "step_number": 21,
+      "thought": "Verify napi pointer value",
+      "action": "rd 0xffffb848c1a07150",
+      "observation": "Confirm napi pointer matches earlier value"
+    }
+  ],
+  "root_cause_analysis": [
+    "netpoll_poll_dev calls igb_poll() with napi->poll_owner locking.",
+    "However, net_rx_action() called by igb_poll tries to lock the napi->poll_owner itself.",
+    "This deadlock issue was probably caused because the 3rd party igb module did unexpected behavior or invocation."
+  ]
+}
