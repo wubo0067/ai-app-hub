@@ -69,6 +69,32 @@ class DiagnosticKnowledge(BaseModel):
 # LLM Prompt 模板
 # ============================================================================
 
+CRASH_CORE_COMMANDS = [
+    "bt",
+    "log",
+    "sys",
+    "ps",
+    "files",
+    "mod",
+    "struct",
+    "kmem",
+    "dis",
+    "rd",
+    "px",
+    "search",
+    "runq",
+    "timer",
+    "mount",
+    "set",
+    "foreach",
+    "dev",
+    "irq",
+    "task",
+    "net",
+    "vm",
+    "swap",
+]
+
 DIAGNOSTIC_INTEGRATION_PROMPT = ChatPromptTemplate.from_template(
     """You are a Linux Kernel Diagnostic Architect creating a vmcore diagnostic knowledge base.
 
@@ -76,7 +102,9 @@ DIAGNOSTIC_INTEGRATION_PROMPT = ChatPromptTemplate.from_template(
 Extract diagnostic knowledge from Linux kernel hard lockup analysis workflows into a structured diagnostic matrix.
 
 # CRITICAL RULES
-1. **ACTION EXTRACTION FROM DSL ONLY**: Actions MUST be extracted STRICTLY from the DSL JSON files. Do NOT invent new commands or use system commands (like cat, ps, iostat, ifconfig, df, mpstat, etc.). Only use crash utility commands found in the DSL files (e.g., bt, kmem, struct, px, log, sys, etc.).
+1. **ACTION EXTRACTION FROM DSL ONLY**: Actions MUST be extracted STRICTLY from the DSL JSON files.
+   ONLY use crash utility commands (e.g., bt, files, kmem, struct, px, log, sys, mod, dis, etc.).
+   **PRIORITY COMMANDS** (must not be omitted): {priority_cmds}
 2. **NO HARDCODED VALUES**: Replace specific values with placeholders: {{addr}}, {{cpu}}, {{pid}}, {{offset}}, {{modname}}, {{device}}
 3. **STRUCTURED OUTPUT**: Output must conform to the provided Pydantic BaseModel schema.
 4. **MAXIMUM COVERAGE**: Extract knowledge from EVERY thought in workflow steps. Generate at least one diagnostic branch per thought.
@@ -263,110 +291,28 @@ def create_workflow_summary(workflows: List[Dict[str, Any]]) -> str:
             f"Extracted diagnostic steps: {workflow.get('step_count', 0)}"
         )
 
-        # 添加更多步骤作为示例，确保覆盖不同类型的诊断思想
+        # 添加所有步骤，确保 LLM 能够看到完整的诊断逻辑
         steps = workflow.get("extracted_steps", [])
         if steps:
-            summary_parts.append(
-                "Sample diagnostic thoughts (ensuring maximum coverage):"
-            )
+            summary_parts.append("Diagnostic thoughts and actions (ALL steps):")
 
-            # 分类步骤以便更好地展示多样性
-            step_categories = {
-                "system_info": [],
-                "backtrace": [],
-                "memory": [],
-                "process": [],
-                "log": [],
-                "structure": [],
-                "other": [],
-            }
-
-            # 分类步骤
-            for step in steps:
-                thought = step.get("thought", "").lower()
-                action = step.get("action", "").lower()
-
-                if any(
-                    # 遍历关键字列表 ["sys", "system", "hardware", "bios", "dmi"]
-                    # 对每个 word，检查 word in thought or word in action，只要有一个关键字出现，any() 就返回 True
-                    word in thought or word in action
-                    for word in ["sys", "system", "hardware", "bios", "dmi"]
-                ):
-                    step_categories["system_info"].append(step)
-                elif any(
-                    word in thought or word in action
-                    for word in ["bt", "backtrace", "stack", "trace"]
-                ):
-                    step_categories["backtrace"].append(step)
-                elif any(
-                    word in thought or word in action
-                    for word in ["memory", "kmem", "rd", "dump", "page"]
-                ):
-                    step_categories["memory"].append(step)
-                elif any(
-                    word in thought or word in action
-                    for word in ["ps", "process", "task", "pid", "thread"]
-                ):
-                    step_categories["process"].append(step)
-                elif any(
-                    word in thought or word in action
-                    for word in ["log", "grep", "search", "message"]
-                ):
-                    step_categories["log"].append(step)
-                elif any(
-                    word in thought or word in action
-                    for word in [
-                        "struct",
-                        "px",
-                        "arch_spinlock",
-                        "spinlock",
-                        "wait_bit",
-                    ]
-                ):
-                    step_categories["structure"].append(step)
-                else:
-                    step_categories["other"].append(step)
-
-            # 从每个类别中选择代表性步骤，确保总步骤数不超过 6 个（减少 token 使用）
-            max_total_steps = min(6, len(steps))
-            selected_steps = []
-
-            # 首先确保每个非空类别至少有一个代表
-            for category in step_categories:
-                if step_categories[category] and len(selected_steps) < max_total_steps:
-                    # 取该类别的第一个步骤
-                    selected_steps.append(step_categories[category][0])
-
-            # 如果还有空间，从所有步骤中均匀选择
-            if len(selected_steps) < max_total_steps:
-                # 计算每个步骤应该选择的间隔
-                step_interval = max(
-                    1, len(steps) // (max_total_steps - len(selected_steps))
-                )
-                for idx in range(0, len(steps), step_interval):
-                    if len(selected_steps) >= max_total_steps:
-                        break
-                    step = steps[idx]
-                    # 避免重复
-                    if step not in selected_steps:
-                        selected_steps.append(step)
-
-            # 显示选中的步骤（简化格式，减少 token 使用）
-            for j, step in enumerate(selected_steps[:max_total_steps]):
-                # 简化显示格式，减少不必要的文本
+            # 直接遍历所有步骤，不再进行分类过滤
+            for j, step in enumerate(steps):
+                # 简化显示格式
                 thought_preview = (
-                    step["thought"][:80] + "..."
-                    if len(step["thought"]) > 80
+                    step["thought"][:150] + "..."
+                    if len(step["thought"]) > 150
                     else step["thought"]
                 )
                 action_preview = (
-                    step["action"][:60] + "..."
-                    if len(step["action"]) > 60
+                    step["action"][:100] + "..."
+                    if len(step["action"]) > 100
                     else step["action"]
                 )
+
                 summary_parts.append(f"  {j+1}. Thought: {thought_preview}")
                 summary_parts.append(f"     Action: {action_preview}")
-                # 不再显示 observation_preview 以节省 token
+                # 移除 observation_preview 以节省 token，只要 thought 和 action 足够
                 summary_parts.append("")  # 步骤间空行
 
         summary_parts.append("")  # 工作流间空行分隔
@@ -594,20 +540,41 @@ def _is_command_variant(cmd1: str, cmd2: str) -> bool:
 
 
 def validate_diagnostic_knowledge(
-    knowledge: DiagnosticKnowledge, total_workflow_steps: int = 0
+    knowledge: DiagnosticKnowledge,
+    total_workflow_steps: int = 0,
+    source_workflows: List[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """
-    验证诊断知识库的质量。
-
-    Args:
-        knowledge: 诊断知识库
-        total_workflow_steps: 所有 DSL 文件中的总工作流步骤数，用于计算覆盖率
-
-    Returns:
-        验证结果
-    """
+    """验证诊断知识库，检查核心命令覆盖率"""
     issues = []
     warnings = []
+
+    # 收集源工作流中的所有命令
+    source_commands = set()
+    if source_workflows:
+        for workflow in source_workflows:
+            for step in workflow.get("extracted_steps", []):
+                cmd = step.get("action", "").split()[0]
+                if cmd:
+                    source_commands.add(cmd)
+
+    # 收集知识库中的所有命令
+    kb_commands = set()
+    for branch in knowledge.matrix:
+        cmd = branch.action.split()[0].replace("{{", "").replace("}}", "")
+        kb_commands.add(cmd)
+
+    for cmd in knowledge.init_cmds:
+        kb_cmd = cmd.split()[0]
+        kb_commands.add(kb_cmd)
+
+    # 检查缺失的命令
+    missing_commands = source_commands - kb_commands
+    if missing_commands:
+        warnings.append(
+            f"以下源工作流命令未被提取：{', '.join(sorted(missing_commands))}"
+        )
+
+    # ... 现有验证逻辑 ...
 
     # 检查 init_cmds 数量（根据提示词调整为 2-3 个）
     init_cmd_count = len(knowledge.init_cmds)
@@ -839,9 +806,16 @@ def integrate_dsl_files(
         workflow_summary = create_workflow_summary(chunk)
 
         try:
+            # 准备所有必需的变量
+            prompt_vars = {
+                "workflow_summary": workflow_summary,
+                "schema": schema_json,
+                "priority_cmds": ", ".join(CRASH_CORE_COMMANDS),
+            }
+
             # 调用 LLM
             knowledge_chunk = chain.invoke(
-                {"workflow_summary": workflow_summary, "schema": schema_json},
+                prompt_vars,
                 config={"callbacks": [LoggingCallbackHandler()]},
             )
 
@@ -882,11 +856,11 @@ def integrate_dsl_files(
         )
 
     # 保存结果
-    output_path = os.path.join(os.path.dirname(dsl_dir), output_file)
+    # output_path = os.path.join(os.path.dirname(dsl_dir), output_file)
     try:
-        with open(output_path, "w", encoding="utf-8") as f:
+        with open(output_file, "w", encoding="utf-8") as f:
             f.write(merged_knowledge.model_dump_json(indent=2))
-        logger.info(f"诊断知识库已保存到：{output_path}")
+        logger.info(f"诊断知识库已保存到：{output_file}")
     except Exception as e:
         logger.error(f"保存文件失败：{e}")
         return None
@@ -930,6 +904,7 @@ def main():
     parser.add_argument(
         "--api-key",
         type=str,
+        default="sk-b5480f840a794c69a0af1732459f3ae4",
         help="DeepSeek API 密钥。如果未提供，将尝试从环境变量 DEEPSEEK_API_KEY 读取",
     )
 
@@ -977,10 +952,19 @@ def main():
     logger.info(f"  输出文件：{args.output}")
     logger.info(f"  模型：{args.model}")
 
+    # 判断输出目录是否存在
+    output_dir = os.path.dirname(os.path.join(os.path.curdir, args.output))
+    if not os.path.exists(output_dir):
+        # 报错，退出
+        logger.error(f"输出目录不存在：{output_dir}，请先创建该目录")
+        return 1
+    output_file = os.path.join(os.path.curdir, args.output)
+    logger.info(f"输出路径：{output_file}")
+
     # 执行整合
     result = integrate_dsl_files(
         dsl_dir=dsl_dir,
-        output_file=args.output,
+        output_file=output_file,
         api_key=api_key,
         base_url=args.base_url,
         model=args.model,
@@ -1045,9 +1029,7 @@ def main():
             )
             print(f"     目的：{branch.why}")
 
-        print(
-            f"\n💾 结果已保存到：{os.path.join(os.path.dirname(dsl_dir), args.output)}"
-        )
+        print(f"\n💾 结果已保存到：{output_file}")
         print(f"{'='*60}")
 
         return 0

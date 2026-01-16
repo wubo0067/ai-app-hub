@@ -1,0 +1,141 @@
+{
+  "os": "Red Hat Enterprise Linux 6.8",
+  "scenario": "Soft lockup involving NFS and fscache after kernel update",
+  "symptoms": [
+    "BUG: soft lockup - CPU#6 stuck for 68s! [perl:1207]",
+    "RIP: _spin_unlock_irqrestore+0x17/0x20",
+    "Call Trace includes __fscache_disable_cookie+0x123/0x200 [fscache]"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Examine the disassembly around the crash RIP to understand the instruction context.",
+      "action": "dis -lr _spin_unlock_irqrestore+0x17 | tail -20",
+      "observation": "Check for source lines and instruction details at the crash point."
+    },
+    {
+      "step_number": 2,
+      "thought": "Get the backtrace of the crashing task to see the call chain.",
+      "action": "bt",
+      "observation": "Identify frames leading to __fscache_disable_cookie and nfs_fscache_open_file."
+    },
+    {
+      "step_number": 3,
+      "thought": "Disassemble around __fscache_disable_cookie to see the code path.",
+      "action": "dis -lr ffffffffa03b0063 | tail --lines=20",
+      "observation": "Look for atomic_dec_and_test and wait_on_atomic_t calls on cookie->n_active."
+    },
+    {
+      "step_number": 4,
+      "thought": "Check the runqueue of the affected CPU to see what tasks are scheduled.",
+      "action": "runq -c 8",
+      "observation": "Verify the current task and other tasks on CPU 8's runqueue."
+    },
+    {
+      "step_number": 5,
+      "thought": "Compare runqueue clocks to see how far behind CPU 8 is.",
+      "action": "struct rq.clock ffff880028296ec0",
+      "observation": "Check the clock value for CPU 8's runqueue."
+    },
+    {
+      "step_number": 6,
+      "thought": "Compare with CPU 0's clock to calculate the delay.",
+      "action": "struct rq.clock ffff880028216ec0",
+      "observation": "Get CPU 0's clock for comparison."
+    },
+    {
+      "step_number": 7,
+      "thought": "List tasks in uninterruptible sleep to find blocked processes.",
+      "action": "ps -m | grep UN",
+      "observation": "Identify tasks stuck in UN state and their wait times."
+    },
+    {
+      "step_number": 8,
+      "thought": "Get backtraces for specific blocked tasks to understand their stalls.",
+      "action": "foreach 13474 2828 111 27989 2823 bt",
+      "observation": "Examine stack traces of key blocked tasks for common patterns."
+    },
+    {
+      "step_number": 9,
+      "thought": "Check backtrace of a specific NFS-related blocked task.",
+      "action": "bt 1742",
+      "observation": "See if task 1742 is stuck in NFS file operations."
+    },
+    {
+      "step_number": 10,
+      "thought": "Examine cachefilesd process stuck in filesystem operations.",
+      "action": "bt 2742",
+      "observation": "Check if cachefilesd is blocked on ext4 journal access."
+    },
+    {
+      "step_number": 11,
+      "thought": "Get the inode and file pointers from the crashing task's stack.",
+      "action": "bt -f | grep nfs_file_open",
+      "observation": "Locate the stack frame for nfs_file_open to find saved registers."
+    },
+    {
+      "step_number": 12,
+      "thought": "Read the saved struct file pointer from the stack.",
+      "action": "rd 0xffff880160717ce8",
+      "observation": "Retrieve the file pointer value stored on the stack."
+    },
+    {
+      "step_number": 13,
+      "thought": "Examine the file structure to get its path and mount info.",
+      "action": "p (struct file *)0xffff88016738cbc0",
+      "observation": "Inspect the file structure for f_path details."
+    },
+    {
+      "step_number": 14,
+      "thought": "Get the dentry and inode from the file to identify the file.",
+      "action": "files -d 0xffff880174d2b740",
+      "observation": "Show the dentry, inode, and path for the file."
+    },
+    {
+      "step_number": 15,
+      "thought": "Find the mount point for the file's vfsmount.",
+      "action": "mount | grep ffff88022bf717c0",
+      "observation": "Confirm the NFS mount details for the file."
+    },
+    {
+      "step_number": 16,
+      "thought": "Read the saved struct inode pointer from the stack.",
+      "action": "rd 0xffff880160717cf0",
+      "observation": "Retrieve the inode pointer value stored on the stack."
+    },
+    {
+      "step_number": 17,
+      "thought": "Get the nfs_inode structure from the inode to find fscache cookie.",
+      "action": "p (struct nfs_inode *)0xffff880174d598b0",
+      "observation": "Access the nfs_inode containing the fscache cookie pointer."
+    },
+    {
+      "step_number": 18,
+      "thought": "Check the fscache_cookie's n_active counter value.",
+      "action": "p $25->fscache->n_active",
+      "observation": "Verify that n_active.counter is non-zero (e.g., 1)."
+    },
+    {
+      "step_number": 19,
+      "thought": "Examine the full fscache_cookie structure for details.",
+      "action": "struct fscache_cookie ffff88017899bd70",
+      "observation": "Inspect cookie fields like usage, flags, and backing_objects."
+    },
+    {
+      "step_number": 20,
+      "thought": "Search for other tasks referencing the same inode or cookie.",
+      "action": "search -t ffff880174d59a78",
+      "observation": "Check if any other tasks have this inode address in their stacks."
+    },
+    {
+      "step_number": 21,
+      "thought": "Search for other tasks referencing the fscache_cookie.",
+      "action": "search -t ffff88017899bd70",
+      "observation": "Check if any other tasks have this cookie address in their stacks."
+    }
+  ],
+  "root_cause_analysis": [
+    "Some condition leads to a seemingly indefinite non-zero value of fscache_cookie.n_active which is the \"number of active users of netfs ptrs\". This causes a soft lockup inside fscache module __fscache_disable_cookie function when an attempt is made to wait for this value to go to 0. One of the following two possibilities seem likely: 1) Either an over increment or fail to decrement fscache_cookie->n_active 2) Some other active thread in the system / vmcore causes fscache_cookie->n_active to never become 0.",
+    "The following commit is missing from RHEL6 which would avoid the softlockup and allow other processes to run. It is possible the following commit may resolve the soft lockup, or that other patches will be required."
+  ]
+}

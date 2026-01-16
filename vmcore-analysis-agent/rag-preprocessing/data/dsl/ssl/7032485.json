@@ -1,0 +1,120 @@
+{
+  "os": "Red Hat Enterprise Linux 8.8.z - kernel-4.18.0-477.36.1.el8_8",
+  "scenario": "Massive iteration in find_get_entry() causes huge number of soft lockups and rcu_sched CPU stalls",
+  "symptoms": [
+    "rcu: INFO: rcu_sched self-detected stall on CPU",
+    "watchdog: BUG: soft lockup - CPU#5 stuck for 22s! [TaniumCX:2821175]",
+    "BUG: Bad page map in process TaniumCX"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Examine the disassembly of find_get_entry at the RIP offset to understand the code flow.",
+      "action": "dis -lr find_get_entry+0x77",
+      "observation": "Check for the 'repeat:' label and 'goto repeat' branches in the function."
+    },
+    {
+      "step_number": 2,
+      "thought": "Inspect the page returned by xas_load to see its state.",
+      "action": "kmem ffffe925e6a9ac00",
+      "observation": "Look for page flags and mapping to determine if it's freed or corrupted."
+    },
+    {
+      "step_number": 3,
+      "thought": "Check the _refcount field of the page to see if it's zero (freed).",
+      "action": "struct px ((struct page *)0xffffe925e6a9ac00)->_refcount",
+      "observation": "Verify if counter is zero, indicating the page is freed."
+    },
+    {
+      "step_number": 4,
+      "thought": "Analyze kernel log for soft lockup patterns and RIP addresses.",
+      "action": "log -t | awk '/soft lockup/,/RIP:/' | grep RIP | sort | uniq -c",
+      "observation": "Count occurrences of RIP addresses to identify looping patterns."
+    },
+    {
+      "step_number": 5,
+      "thought": "Disassemble find_get_entry at another offset to see atomic operations.",
+      "action": "dis -lr find_get_entry+0x80",
+      "observation": "Examine atomic_fetch_add_unless and page_ref_add_unless logic."
+    },
+    {
+      "step_number": 6,
+      "thought": "List tasks stuck in UNinterruptible state due to RCU stalls.",
+      "action": "foreach UN ps -m",
+      "observation": "Identify tasks waiting for RCU grace period with high CPU times."
+    },
+    {
+      "step_number": 7,
+      "thought": "Disassemble xas_load at the RIP offset to understand XArray traversal.",
+      "action": "dis -lr xas_load+0x43",
+      "observation": "Check xas_descend and node slot access for the corrupted page."
+    },
+    {
+      "step_number": 8,
+      "thought": "Examine the xa_state structure to understand XArray state.",
+      "action": "struct xa_state ffffc012eb5ffc90",
+      "observation": "Verify xa_index, xa_offset, and xa_node values."
+    },
+    {
+      "step_number": 9,
+      "thought": "Check the XArray node slot that points to the corrupted page.",
+      "action": "struct px ((struct xa_node *)0xffff9c894ab5e910)->slots[0xc]",
+      "observation": "Confirm the slot contains the freed page address."
+    },
+    {
+      "step_number": 10,
+      "thought": "Verify the page's mapping to identify the associated file.",
+      "action": "struct px ((struct page *)0xffffe925e6a9ac00)->mapping",
+      "observation": "Check if mapping points to a valid address_space."
+    },
+    {
+      "step_number": 11,
+      "thought": "Find the dentry for the file from the file structure.",
+      "action": "struct px ((struct file *)0xffff9c8a5ef85500)->f_path->dentry",
+      "observation": "Get dentry address to resolve the file path."
+    },
+    {
+      "step_number": 12,
+      "thought": "Resolve the dentry to a full file path.",
+      "action": "files -d 0xffff9c8b0b497d40",
+      "observation": "Identify the file name and path causing the issue."
+    },
+    {
+      "step_number": 13,
+      "thought": "Check the filesystem mount for the corrupted file.",
+      "action": "mount | awk 'NR==1||$2~/ffff9c8a5827a800/'",
+      "observation": "Confirm the filesystem type and mount point."
+    },
+    {
+      "step_number": 14,
+      "thought": "Verify the file's mapping matches the page's mapping.",
+      "action": "struct px ((struct file *)0xffff9c8a5ef85500)->f_mapping",
+      "observation": "Ensure consistency between file and page mappings."
+    },
+    {
+      "step_number": 15,
+      "thought": "Check current panic_on_taint kernel parameter value.",
+      "action": "p panic_on_taint",
+      "observation": "See if panic_on_taint is enabled (non-zero)."
+    },
+    {
+      "step_number": 16,
+      "thought": "Check current sysctl_panic_on_rcu_stall kernel parameter.",
+      "action": "p sysctl_panic_on_rcu_stall",
+      "observation": "Determine if panic on RCU stall is configured."
+    },
+    {
+      "step_number": 17,
+      "thought": "Check current softlockup_panic kernel parameter.",
+      "action": "p softlockup_panic",
+      "observation": "Determine if panic on soft lockup is enabled."
+    }
+  ],
+  "root_cause_analysis": [
+    "Looks like the story begins with the following \"Bad page...\" messages that are indicative of page corruption.",
+    "Since the page is corrupted and in inconsistent state, that causes us to iterating between 'repeat:' and 'goto repeat' in find_get_entry() indefinitely.",
+    "The page corruption happened due to some bug that is not immediately identifiable at this time.",
+    "And then, 77 seconds later, in generic file read routine, we were getting stuck upon finding/getting a page cache entry from the address_space of the page that was corrupted and in inconsistent state.",
+    "Since we were iterating between 'goto repeat' and 'repeat:' in find_get_entry() after rcu_read_lock(), the VM got hung up with lots of rcu_schec CPU stall messages and soft lockup messages."
+  ]
+}

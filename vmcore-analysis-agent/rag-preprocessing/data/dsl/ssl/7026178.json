@@ -1,0 +1,137 @@
+{
+  "os": "Red Hat Enterprise Linux 8.4.z for Power, Little Endian",
+  "scenario": "Spinlock Deadlock with CPU Stalls",
+  "symptoms": [
+    "watchdog: BUG: soft lockup - CPU#19 stuck for 23s! [migration/19:127]",
+    "rcu: INFO: rcu_sched detected stalls on CPUs/tasks:",
+    "CPU 8 didn't respond to backtrace IPI, inspecting paca."
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Search kernel log for soft lockup and rcu_sched stall messages",
+      "action": "log | grep -e rcu_sched\\ detected -e soft\\ lockup",
+      "observation": "Multiple soft lockup messages and rcu_sched CPU stall messages"
+    },
+    {
+      "step_number": 2,
+      "thought": "Examine multi_stop_data structure to understand CPU stop operation",
+      "action": "struct multi_stop_data c000001fc7ef3910",
+      "observation": "active_cpus field pointing to cpumask structure"
+    },
+    {
+      "step_number": 3,
+      "thought": "Check cpumask to see which CPUs are active",
+      "action": "struct cpumask 0xc000000000f24f10",
+      "observation": "bits field showing CPU 8 is set"
+    },
+    {
+      "step_number": 4,
+      "thought": "Evaluate binary value to confirm CPU 8 is the active CPU",
+      "action": "eval -b 256",
+      "observation": "Binary shows bit 8 is set (CPU 8)"
+    },
+    {
+      "step_number": 5,
+      "thought": "Check per-CPU call_single_queue for pending IPI requests",
+      "action": "p call_single_queue:a | paste - - - | awk '$(NF-1)!~/0x0/'",
+      "observation": "Only CPU 8 has pending items in call_single_queue"
+    },
+    {
+      "step_number": 6,
+      "thought": "Examine pending call_single_data_t structures for CPU 8",
+      "action": "list -s call_single_data_t 0xc009fff000d665e0 | grep func",
+      "observation": "Multiple do_exit_flush_lazy_tlb and cpu_get_purr functions pending"
+    },
+    {
+      "step_number": 7,
+      "thought": "Check active CPUs in another multi_stop_data instance",
+      "action": "struct multi_stop_data.active_cpus c0000017f68d7150",
+      "observation": "active_cpus field pointing to different cpumask"
+    },
+    {
+      "step_number": 8,
+      "thought": "Examine second cpumask structure",
+      "action": "struct cpumask 0xc000000000f27710",
+      "observation": "bits field showing CPU 48 is set"
+    },
+    {
+      "step_number": 9,
+      "thought": "Evaluate binary value to confirm CPU 48 is set",
+      "action": "eval -b 281474976710656",
+      "observation": "Binary shows bit 48 is set (CPU 48)"
+    },
+    {
+      "step_number": 10,
+      "thought": "Get backtrace of CPU 8 to see what it's doing",
+      "action": "bt",
+      "observation": "CPU 8 stuck in plpar_hcall_norets+28, __spin_yield+148"
+    },
+    {
+      "step_number": 11,
+      "thought": "Check process state for task on CPU 8",
+      "action": "ps -m c000000c25b0d800",
+      "observation": "Task is in WAIT state on CPU 8"
+    },
+    {
+      "step_number": 12,
+      "thought": "Disassemble update_blocked_averages to see spinlock call",
+      "action": "dis -lr c0000000001c6f80",
+      "observation": "Call to _raw_spin_lock_irqsave at offset"
+    },
+    {
+      "step_number": 13,
+      "thought": "Find runqueue for CPU 63",
+      "action": "runq | grep c000001ffda69d80",
+      "observation": "CPU 63 runqueue address found"
+    },
+    {
+      "step_number": 14,
+      "thought": "Get address of rq.lock spinlock for CPU 63",
+      "action": "struct px &((struct rq *)0xc000001ffda69d80)->lock",
+      "observation": "Address of raw_spinlock_t structure"
+    },
+    {
+      "step_number": 15,
+      "thought": "Examine the actual spinlock value",
+      "action": "struct px ((struct rq *)0xc000001ffda69d80)->lock",
+      "observation": "slock = 0x0 (spinlock is not locked)"
+    },
+    {
+      "step_number": 16,
+      "thought": "Disassemble __spin_yield to see hypervisor call",
+      "action": "dis -lr __spin_yield+148",
+      "observation": "Call to plpar_hcall_norets at offset"
+    },
+    {
+      "step_number": 17,
+      "thought": "Disassemble plpar_hcall_norets to see current execution point",
+      "action": "dis -lr plpar_hcall_norets+28",
+      "observation": "At lwz instruction after hypervisor call"
+    },
+    {
+      "step_number": 18,
+      "thought": "Check timer queue for CPU 8 to see overdue timers",
+      "action": "timer -r -C 8",
+      "observation": "Multiple overdue timers in hrtimer queue"
+    },
+    {
+      "step_number": 19,
+      "thought": "Check sysctl setting for rcu stall panic",
+      "action": "p sysctl_panic_on_rcu_stall",
+      "observation": "sysctl_panic_on_rcu_stall = 0"
+    },
+    {
+      "step_number": 20,
+      "thought": "Check sysctl setting for softlockup panic",
+      "action": "p softlockup_panic",
+      "observation": "softlockup_panic = 0"
+    }
+  ],
+  "root_cause_analysis": [
+    "The CPU is not processing timer interrupts properly due to some hardware glitch.",
+    "CPU 8 is somehow going wrong with taking the rq.lock spinlock of CPU 63. It's getting stuck waiting on the spinlock that is not being locked.",
+    "Due to this problematic condition, it's not able to process timer interrupts properly and thus many overdue timers are in hrtimer queue.",
+    "The issue is of faulty hardware (CPU 8)."
+  ]
+}

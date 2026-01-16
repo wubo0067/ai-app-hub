@@ -1,0 +1,142 @@
+{
+  "os": "Red Hat Enterprise Linux 8.7",
+  "scenario": "System hangs with soft lockup and rcu_sched CPU stall warning after kernel update",
+  "symptoms": [
+    "watchdog: BUG: soft lockup - CPU#7 stuck for 22s! [modprobe:3779]",
+    "rcu: INFO: rcu_sched self-detected stall on CPU",
+    "RIP: native_queued_spin_lock_slowpath+0x24/0x1c0"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Check the version of the running kernel",
+      "action": "sys | grep -e RELEASE",
+      "observation": "RELEASE: 4.18.0-425.13.1.el8_7.x86_64"
+    },
+    {
+      "step_number": 2,
+      "thought": "Check kernel ring buffer for soft lockup warnings",
+      "action": "log | grep BUG: | tail",
+      "observation": "watchdog: BUG: soft lockup - CPU#7 stuck for 22s! [modprobe:3779]"
+    },
+    {
+      "step_number": 3,
+      "thought": "Count occurrences of soft lockup warnings",
+      "action": "log | grep BUG: | awk '{print $(NF-4) , $(NF)}' | sort -nr | sort | uniq -c | sort -nr",
+      "observation": "226 CPU#7 [modprobe:3779]"
+    },
+    {
+      "step_number": 4,
+      "thought": "Check for rcu_sched CPU stall warnings",
+      "action": "log | grep INFO: | head -n 5",
+      "observation": "rcu: INFO: rcu_sched self-detected stall on CPU"
+    },
+    {
+      "step_number": 5,
+      "thought": "Verify the modprobe task details",
+      "action": "set 3779",
+      "observation": "PID: 3779 COMMAND: \"modprobe\" CPU: 7 STATE: TASK_RUNNING (ACTIVE)"
+    },
+    {
+      "step_number": 6,
+      "thought": "Check process status with memory info",
+      "action": "ps -m 3779",
+      "observation": "[RU] PID: 3779 TASK: ffff91fb1ac24000 CPU: 7 COMMAND: \"modprobe\""
+    },
+    {
+      "step_number": 7,
+      "thought": "Get backtrace of the modprobe task",
+      "action": "bt -T",
+      "observation": "PID: 3779 TASK: ffff91fb1ac24000 CPU: 7 COMMAND: \"modprobe\""
+    },
+    {
+      "step_number": 8,
+      "thought": "Identify system call being executed",
+      "action": "sys -c 0x0000000000000139",
+      "observation": "NUM 313 SYSTEM CALL __x64_sys_finit_module"
+    },
+    {
+      "step_number": 9,
+      "thought": "Check file descriptor for module being loaded",
+      "action": "files -R 0000000000000003",
+      "observation": "FD 3 REG /usr/lib/modules/4.18.0-425.3.1.el8.x86_64/extra/usm/oracleoks.ko"
+    },
+    {
+      "step_number": 10,
+      "thought": "Disassemble the spinlock acquisition function",
+      "action": "dis -rl ffffffffc09b6ae0",
+      "observation": "KsAcquireSpinLock_debug function calling _raw_spin_lock"
+    },
+    {
+      "step_number": 11,
+      "thought": "Disassemble the _raw_spin_lock function",
+      "action": "dis -rl ffffffffb53f14ee",
+      "observation": "_raw_spin_lock calling native_queued_spin_lock_slowpath"
+    },
+    {
+      "step_number": 12,
+      "thought": "Search for the native_queued_spin_lock_slowpath address",
+      "action": "search 0xffffffffb4b55d20",
+      "observation": "Multiple occurrences including ffffffffb6238500"
+    },
+    {
+      "step_number": 13,
+      "thought": "Check kernel memory for pv_lock_ops structure",
+      "action": "kmem ffffffffb6238500",
+      "observation": "ffffffffb6238500 (D) pv_lock_ops"
+    },
+    {
+      "step_number": 14,
+      "thought": "Get backtraces of all active tasks on each CPU",
+      "action": "bt -a",
+      "observation": "CPU 7: modprobe stuck in KsAcquireSpinLock_debug"
+    },
+    {
+      "step_number": 15,
+      "thought": "Check module taints and details",
+      "action": "mod -t | grep -e NAME -e oracleoks",
+      "observation": "oracleoks POE"
+    },
+    {
+      "step_number": 16,
+      "thought": "Get module information",
+      "action": "mod | grep -e NAME -e oracleoks",
+      "observation": "MODULE oracleoks BASE ffffffffc09a7000 SIZE 827392"
+    },
+    {
+      "step_number": 17,
+      "thought": "Inspect module structure details",
+      "action": "struct module.state,name,version,srcversion,rhelversion,sig_ok 0xffffffffc0a3fb80",
+      "observation": "state = MODULE_STATE_COMING, name = \"oracleoks\", sig_ok = false"
+    },
+    {
+      "step_number": 18,
+      "thought": "Check file details for symlink to oracleoks module",
+      "action": "files -d 0xffff91fd99c12b40",
+      "observation": "LNK /usr/lib/modules/4.18.0-425.13.1.el8_7.x86_64/weak-updates/usm/oracleoks.ko"
+    },
+    {
+      "step_number": 19,
+      "thought": "Inspect inode details of symlink",
+      "action": "struct inode.i_ino,i_size,i_nlink 0xffff91fd99c93860",
+      "observation": "i_ino = 2499, i_size = 61, i_nlink = 1"
+    },
+    {
+      "step_number": 20,
+      "thought": "Check file details for actual oracleoks module",
+      "action": "files -d 0xffff91fd99c12300",
+      "observation": "REG /usr/lib/modules/4.18.0-425.3.1.el8.x86_64/extra/usm/oracleoks.ko"
+    },
+    {
+      "step_number": 21,
+      "thought": "Inspect inode details of actual module file",
+      "action": "struct inode.i_ino,i_size,i_nlink 0xffff91fd99c96720",
+      "observation": "i_ino = 16799073, i_size = 22038200, i_nlink = 1"
+    }
+  ],
+  "root_cause_analysis": [
+    "The fix of kABI breakage in struct pv_mmu_ops reported via private Bug ID: #2144161#2152206 has a side effect on third-party kernel modules built on top of RHEL-8.7 GA kernel version 4.18.0-425.3.1.el8.",
+    "The version of the third-party module [oracleoks] linked to the kernel version 4.18.0-425.10.1.el8_7 or higher is incompatible.",
+    "The [oracleoks] kernel module file inside 4.18.0-425.13.1.el8_7.x86_64/weak-updates/usm directory is a symlink to the [oracleoks] kernel module inside 4.18.0-425.3.1.el8.x86_64/extra/usm directory."
+  ]
+}

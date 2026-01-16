@@ -1,0 +1,110 @@
+{
+  "os": "Red Hat Enterprise Linux 6.4",
+  "scenario": "soft lockups on xfsdatad",
+  "symptoms": [
+    "BUG: soft lockup - CPU#12 stuck for 67s! [xfsdatad/12:4514]",
+    "RIP: _spin_unlock_irqrestore+0x17/0x20",
+    "PANIC: \"Kernel panic - not syncing: softlockup: hung tasks\""
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Examine backtrace of the xfsdatad task to understand execution flow",
+      "action": "bt",
+      "observation": "Stack trace showing _spin_unlock_irqrestore and wake_up functions"
+    },
+    {
+      "step_number": 2,
+      "thought": "Inspect wait queue structure at the address from registers",
+      "action": "struct wait_queue_head_t ffff88105c412dc8",
+      "observation": "Wait queue lock state and task list pointers"
+    },
+    {
+      "step_number": 3,
+      "thought": "Check which processes are currently runnable on CPU0",
+      "action": "ps",
+      "observation": "Only idle tasks and few kernel threads on CPU0"
+    },
+    {
+      "step_number": 4,
+      "thought": "Examine runqueue state to see task scheduling",
+      "action": "runq",
+      "observation": "CPU0 runqueue shows xfsdatad as current with watchdog queued"
+    },
+    {
+      "step_number": 5,
+      "thought": "Compare runqueue clocks to detect CPU stall",
+      "action": "struct rq.clock ffff880045816700",
+      "observation": "CPU0 clock value for timing comparison"
+    },
+    {
+      "step_number": 6,
+      "thought": "Compare with other CPU clocks to detect stall",
+      "action": "struct rq.clock ffff880045836700",
+      "observation": "CPU1 clock value showing time difference"
+    },
+    {
+      "step_number": 7,
+      "thought": "Calculate time difference between CPU runqueues",
+      "action": "struct pd (1614756576933118-1614680665240476)/1000000000",
+      "observation": "75 second difference indicating CPU0 stall"
+    },
+    {
+      "step_number": 8,
+      "thought": "Count tasks stuck in io_schedule across all processes",
+      "action": "foreach bt | grep io_schedule | wc",
+      "observation": "267 tasks currently in io_schedule()"
+    },
+    {
+      "step_number": 9,
+      "thought": "Count nfsd tasks to identify potential source",
+      "action": "ps | grep \"\\[nfsd\\]\" | wc -l",
+      "observation": "256 nfsd tasks present on system"
+    },
+    {
+      "step_number": 10,
+      "thought": "Check if nfsd tasks are stuck in io_schedule",
+      "action": "foreach bt | grep -A2 \"COMMAND: \\\"nfsd\\\"\" | grep io_schedule | wc -l",
+      "observation": "All 256 nfsd tasks in io_schedule()"
+    },
+    {
+      "step_number": 11,
+      "thought": "Check module taint status for third-party drivers",
+      "action": "mod -t",
+      "observation": "Multiple third-party (U) tainted modules loaded"
+    },
+    {
+      "step_number": 12,
+      "thought": "Switch to watchdog task to examine its scheduling",
+      "action": "set 6",
+      "observation": "Watchdog task PID 6 in TASK_RUNNING state"
+    },
+    {
+      "step_number": 13,
+      "thought": "Examine watchdog task scheduling information",
+      "action": "task -R sched_info",
+      "observation": "Watchdog last_queued time matches runqueue clock"
+    },
+    {
+      "step_number": 14,
+      "thought": "Switch to xfsdatad task to examine its scheduling",
+      "action": "set 4639",
+      "observation": "xfsdatad task PID 4639 in TASK_RUNNING (PANIC)"
+    },
+    {
+      "step_number": 15,
+      "thought": "Examine xfsdatad task scheduling information",
+      "action": "task -R sched_info",
+      "observation": "xfsdatad last_arrival time and run_delay"
+    },
+    {
+      "step_number": 16,
+      "thought": "Calculate how long xfsdatad has been on CPU",
+      "action": "struct pd (1614680665240476-1614680664313581)",
+      "observation": "927 microseconds since last arrival"
+    }
+  ],
+  "root_cause_analysis": [
+    "It appears that there were a lot of tasks waiting for page writeback to complete and the xfsdatad task had to wake all of them up while holding a spinlock with interrupts disabled and it took longer than expected and triggered the soft lockup watchdog to think the CPU was stuck."
+  ]
+}

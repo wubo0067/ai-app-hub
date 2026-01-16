@@ -200,29 +200,25 @@ def main():
         temperature=0,  # 数据抽取/分析	1.0
     )
 
-    #  grep -il "Hard lockup" *.md \
-    #   | xargs grep -il "soft lockup" \
-    #   | sort -u \
+    # grep -ril "soft lockup" . \
+    #   | xargs grep -L "hard lockup" \
     #   | xargs -I{} stat -c "%s %n" {} \
     #   | sort -nr \
-    #   | awk '{print $2}'
-    md_list = [
-        "../data/md/6985596.md",
-        "../data/md/3870151.md",
-        "../data/md/7019939.md",
-        "../data/md/7041099.md",
-        "../data/md/5764681.md",
-        "../data/md/3379041.md",
-        "../data/md/5618071.md",
-        "../data/md/7084075.md",
-    ]
+    #   | head -n 6 \
+    #   | awk '{print $2}' \
+    #   | xargs -I{} cp {} /tmp/softlockup/
+
+    # 从 ../data/md/ssl 目录获取所有 .md 文件
+    out_dsl_dir = "../data/dsl/ssl"
+    md_dir = "../data/md/ssl"
+    md_list = [os.path.join(md_dir, f) for f in os.listdir(md_dir) if f.endswith(".md")]
 
     # dsl_list = []
 
     for md_path in md_list:
         # 判断 dsl 目录下是否已经存在对应的 json 文件，存在则跳过
         output_path = os.path.join(
-            "../data/dsl", os.path.basename(md_path).replace(".md", ".json")
+            out_dsl_dir, os.path.basename(md_path).replace(".md", ".json")
         )
         if os.path.exists(output_path):
             print(f"跳过已存在的文件：{output_path}")

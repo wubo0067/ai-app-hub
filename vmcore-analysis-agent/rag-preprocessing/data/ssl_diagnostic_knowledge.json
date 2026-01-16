@@ -1,0 +1,538 @@
+{
+  "summary": "Comprehensive diagnostic matrix for Linux kernel Hard LOCKUP scenarios",
+  "init_cmds": [
+    "sys -i",
+    "log | grep -i lockup",
+    "ps -m | grep UN"
+  ],
+  "matrix": [
+    {
+      "trigger": "RIP: {function}+{offset} in lockup message",
+      "action": "dis -lr {function}+{offset} | tail -20",
+      "arg_hints": "function, offset: from RIP field",
+      "why": "Examine disassembly around crash RIP for instruction context",
+      "expect": "Assembly code showing problematic instruction",
+      "is_end": false
+    },
+    {
+      "trigger": "Call Trace includes {function}+{offset} from {modname}",
+      "action": "dis -lr {addr} | tail --lines=20",
+      "arg_hints": "addr: calculate from function+offset",
+      "why": "Disassemble around suspicious function to see code path",
+      "expect": "Assembly code showing function implementation",
+      "is_end": false
+    },
+    {
+      "trigger": "Lockup on CPU#{cpu} with stuck task",
+      "action": "runq -c {cpu}",
+      "arg_hints": "cpu: CPU number from lockup message",
+      "why": "Check runqueue of affected CPU for scheduled tasks",
+      "expect": "List of tasks on CPU runqueue",
+      "is_end": false
+    },
+    {
+      "trigger": "Need to compare CPU clock delays",
+      "action": "struct rq.clock {addr}",
+      "arg_hints": "addr: rq address from runq output",
+      "why": "Get CPU clock value to calculate scheduling delay",
+      "expect": "Clock values for time difference calculation",
+      "is_end": false
+    },
+    {
+      "trigger": "Multiple tasks in uninterruptible sleep",
+      "action": "foreach {pid1} {pid2} {pid3} bt",
+      "arg_hints": "pid: from ps -m | grep UN output",
+      "why": "Get backtraces for blocked tasks to understand stalls",
+      "expect": "Stack traces showing where tasks are blocked",
+      "is_end": false
+    },
+    {
+      "trigger": "Need file/inode pointers from task stack",
+      "action": "bt -f | grep {pattern}",
+      "arg_hints": "pattern: function name like nfs_file_open",
+      "why": "Find file operation pointers in stack frames",
+      "expect": "Stack addresses containing file/inode pointers",
+      "is_end": false
+    },
+    {
+      "trigger": "Memory address {addr} contains pointer value",
+      "action": "rd {addr}",
+      "arg_hints": "addr: from stack trace or previous output",
+      "why": "Read memory at address to get pointer value",
+      "expect": "Pointer value that can be cast to struct",
+      "is_end": false
+    },
+    {
+      "trigger": "Pointer {addr} to struct file needs examination",
+      "action": "p (struct file *){addr}",
+      "arg_hints": "addr: file pointer from stack or memory",
+      "why": "Examine file structure for path and mount info",
+      "expect": "File structure details including f_path",
+      "is_end": false
+    },
+    {
+      "trigger": "Need dentry and inode from file pointer {addr}",
+      "action": "files -d {addr}",
+      "arg_hints": "addr: file pointer from p (struct file *) output",
+      "why": "Get dentry and inode to identify the file",
+      "expect": "Dentry and inode information for the file",
+      "is_end": false
+    },
+    {
+      "trigger": "Need mount point for vfsmount {addr}",
+      "action": "mount | grep {addr}",
+      "arg_hints": "addr: vfsmount pointer from files output",
+      "why": "Find mount point for file's vfsmount",
+      "expect": "Mount information showing filesystem type",
+      "is_end": false
+    },
+    {
+      "trigger": "Pointer {addr} to inode needs casting",
+      "action": "p (struct nfs_inode *){addr}",
+      "arg_hints": "addr: inode pointer from stack or files output",
+      "why": "Cast to filesystem-specific inode for cookie access",
+      "expect": "nfs_inode structure with fscache field",
+      "is_end": false
+    },
+    {
+      "trigger": "Need to check fscache_cookie.n_active counter",
+      "action": "p ${reg}->fscache->n_active",
+      "arg_hints": "reg: register containing cookie pointer",
+      "why": "Check active reference count on fscache cookie",
+      "expect": "Integer value of n_active counter",
+      "is_end": false
+    },
+    {
+      "trigger": "Need full fscache_cookie structure details",
+      "action": "struct fscache_cookie {addr}",
+      "arg_hints": "addr: cookie pointer from previous examination",
+      "why": "Examine complete cookie structure for details",
+      "expect": "Full fscache_cookie structure dump",
+      "is_end": false
+    },
+    {
+      "trigger": "Search for tasks referencing address {addr}",
+      "action": "search -t {addr}",
+      "arg_hints": "addr: inode or cookie address to search for",
+      "why": "Find other tasks using same inode or cookie",
+      "expect": "List of tasks referencing the address",
+      "is_end": false
+    },
+    {
+      "trigger": "Backtrace needed for CPU#{cpu}",
+      "action": "bt -c {cpu}",
+      "arg_hints": "cpu: CPU number from lockup or system info",
+      "why": "Check backtrace of specific CPU to see its state",
+      "expect": "Stack trace showing CPU execution context",
+      "is_end": false
+    },
+    {
+      "trigger": "Filter backtrace for exception context",
+      "action": "bt | awk '/exception RIP/,/IRQ stack/'",
+      "arg_hints": null,
+      "why": "Extract exception RIP and IRQ stack sections",
+      "expect": "Filtered backtrace showing exception context",
+      "is_end": false
+    },
+    {
+      "trigger": "Disassemble function at {addr}",
+      "action": "dis -r {addr}",
+      "arg_hints": "addr: function address from backtrace",
+      "why": "Disassemble function to understand execution flow",
+      "expect": "Assembly code of the function",
+      "is_end": false
+    },
+    {
+      "trigger": "Check specific system info fields",
+      "action": "sys | grep -i -e load -e node -e rel -e date -e panic -e cpus ;",
+      "arg_hints": null,
+      "why": "Get specific system metrics for diagnosis",
+      "expect": "Filtered system information output",
+      "is_end": false
+    },
+    {
+      "trigger": "Confirm binary value matches expected CPU mask",
+      "action": "eval -b {value}",
+      "arg_hints": "value: RFLAGS value from register dump",
+      "why": "Check interrupt state from RFLAGS register",
+      "expect": "Binary representation showing interrupt flag",
+      "is_end": false
+    },
+    {
+      "trigger": "Calculate address offset from base {addr}",
+      "action": "p ({addr} - {offset})",
+      "arg_hints": "addr: base address, offset: field offset",
+      "why": "Calculate structure address from member pointer",
+      "expect": "Calculated base address",
+      "is_end": false
+    },
+    {
+      "trigger": "Check struct field offset for {struct}.{field}",
+      "action": "struct {struct}.{field} -o {addr}",
+      "arg_hints": "addr: instance address of the struct",
+      "why": "Get field offset within structure",
+      "expect": "Offset value in decimal",
+      "is_end": false
+    },
+    {
+      "trigger": "Examine wait queue at {addr}",
+      "action": "waitq {addr}",
+      "arg_hints": "addr: wait queue head pointer",
+      "why": "Check if wait queue is empty or has waiters",
+      "expect": "Wait queue state and waiters list",
+      "is_end": false
+    },
+    {
+      "trigger": "Check struct field with hex offset",
+      "action": "struct {struct}.{field} {addr} -ox",
+      "arg_hints": "addr: structure base address",
+      "why": "Examine structure field with hex offset output",
+      "expect": "Field value with hex offset",
+      "is_end": false
+    },
+    {
+      "trigger": "Examine list entry {struct}.{list_field}",
+      "action": "struct {struct}.{list_field} {addr}",
+      "arg_hints": "addr: structure containing list head",
+      "why": "Check list state for circular or broken lists",
+      "expect": "List head with next/prev pointers",
+      "is_end": false
+    },
+    {
+      "trigger": "Inspect irq_work structure at {addr}",
+      "action": "struct irq_work {addr}",
+      "arg_hints": "addr: irq_work pointer from context",
+      "why": "Examine irq_work for function pointer",
+      "expect": "irq_work structure with flags and func",
+      "is_end": false
+    },
+    {
+      "trigger": "Need to inspect wait queue structure",
+      "action": "struct wait_queue_head_t {addr}",
+      "arg_hints": "addr: wait queue head pointer",
+      "why": "Check wait queue state for blocked tasks",
+      "expect": "wait_queue_head_t with lock and task_list",
+      "is_end": false
+    },
+    {
+      "trigger": "Examine runqueue state",
+      "action": "runq",
+      "arg_hints": null,
+      "why": "Check task scheduling status",
+      "expect": "Runqueue contents and task states",
+      "is_end": false
+    },
+    {
+      "trigger": "Count tasks stuck in specific function",
+      "action": "foreach bt | grep {function} | wc",
+      "arg_hints": "function: From backtrace analysis",
+      "why": "Identify widespread blocking patterns",
+      "expect": "Count of affected tasks",
+      "is_end": false
+    },
+    {
+      "trigger": "Check module taint status",
+      "action": "mod -t",
+      "arg_hints": null,
+      "why": "Identify third-party driver issues",
+      "expect": "Module list with taint flags",
+      "is_end": false
+    },
+    {
+      "trigger": "Switch to specific task context",
+      "action": "set {pid}",
+      "arg_hints": "pid: Process ID from ps or lockup",
+      "why": "Examine specific task details",
+      "expect": "Context switched to target task",
+      "is_end": false
+    },
+    {
+      "trigger": "Examine task scheduling information",
+      "action": "task -R sched_info",
+      "arg_hints": null,
+      "why": "Check task scheduling history",
+      "expect": "Scheduling statistics and timestamps",
+      "is_end": false
+    },
+    {
+      "trigger": "Calculate time differences",
+      "action": "struct pd {calculation}",
+      "arg_hints": "calculation: Time value expression",
+      "why": "Measure task execution duration",
+      "expect": "Time difference in seconds",
+      "is_end": false
+    },
+    {
+      "trigger": "Check kernel version",
+      "action": "sys | grep -e RELEASE",
+      "arg_hints": null,
+      "why": "Verify running kernel version",
+      "expect": "Kernel release information",
+      "is_end": false
+    },
+    {
+      "trigger": "Check for CPU stall warnings",
+      "action": "log | grep INFO: | head -n 5",
+      "arg_hints": null,
+      "why": "Look for RCU stall messages",
+      "expect": "Recent stall warning messages",
+      "is_end": false
+    },
+    {
+      "trigger": "Get detailed backtrace",
+      "action": "bt -T",
+      "arg_hints": null,
+      "why": "Full backtrace with thread info",
+      "expect": "Complete stack trace with threads",
+      "is_end": false
+    },
+    {
+      "trigger": "Identify system call",
+      "action": "sys -c {syscall}",
+      "arg_hints": "syscall: System call number",
+      "why": "Check which system call is executing",
+      "expect": "System call name and details",
+      "is_end": false
+    },
+    {
+      "trigger": "Check file descriptors",
+      "action": "files -R {fd}",
+      "arg_hints": "fd: File descriptor number",
+      "why": "Examine open files for process",
+      "expect": "File descriptor information",
+      "is_end": false
+    },
+    {
+      "trigger": "Disassemble function",
+      "action": "dis -rl {addr}",
+      "arg_hints": "addr: Function address",
+      "why": "Examine assembly code of function",
+      "expect": "Disassembled function instructions",
+      "is_end": false
+    },
+    {
+      "trigger": "Search for address in memory",
+      "action": "search {addr}",
+      "arg_hints": "addr: Memory address to search",
+      "why": "Find references to specific address",
+      "expect": "Memory locations containing address",
+      "is_end": false
+    },
+    {
+      "trigger": "Inspect page at {addr} to see its state",
+      "action": "kmem {addr}",
+      "arg_hints": "addr: Memory address",
+      "why": "Examine page structure and metadata",
+      "expect": "Page structure with flags and counters",
+      "is_end": false
+    },
+    {
+      "trigger": "Get backtraces for all CPUs",
+      "action": "bt -a",
+      "arg_hints": null,
+      "why": "Check all CPU execution states",
+      "expect": "Backtraces from all CPUs",
+      "is_end": false
+    },
+    {
+      "trigger": "Get module information",
+      "action": "mod | grep -e NAME -e {modname}",
+      "arg_hints": "modname: Module name pattern",
+      "why": "Find specific module details",
+      "expect": "Module information matching pattern",
+      "is_end": false
+    },
+    {
+      "trigger": "Inspect module structure",
+      "action": "struct module.state,name,version,srcversion,rhelversion,sig_ok {addr}",
+      "arg_hints": "addr: Module structure address",
+      "why": "Examine module metadata and state",
+      "expect": "Module structure field values",
+      "is_end": false
+    },
+    {
+      "trigger": "Inspect inode details",
+      "action": "struct inode.i_ino,i_size,i_nlink {addr}",
+      "arg_hints": "addr: Inode structure address",
+      "why": "Check file system object metadata",
+      "expect": "Inode structure field values",
+      "is_end": false
+    },
+    {
+      "trigger": "CPU {cpu} stuck in multi-stop operation or migration",
+      "action": "struct multi_stop_data {addr}",
+      "arg_hints": "addr: from backtrace or CPU state",
+      "why": "Examine CPU stop operation structure",
+      "expect": "multi_stop_data fields showing active CPUs",
+      "is_end": false
+    },
+    {
+      "trigger": "Need to check which CPUs are active in cpumask",
+      "action": "struct cpumask {addr}",
+      "arg_hints": "addr: from multi_stop_data or system state",
+      "why": "Check CPU mask for active processors",
+      "expect": "cpumask bits showing active CPU set",
+      "is_end": false
+    },
+    {
+      "trigger": "Check pending IPI requests on call_single_queue",
+      "action": "p call_single_queue:a | paste - - - | awk '$(NF-1)!~/0x0/'",
+      "arg_hints": null,
+      "why": "Examine per-CPU IPI request queue",
+      "expect": "Non-zero call_single_data entries",
+      "is_end": false
+    },
+    {
+      "trigger": "Examine pending call_single_data structures for CPU {cpu}",
+      "action": "list -s call_single_data_t {addr} | grep func",
+      "arg_hints": "addr: from call_single_queue output",
+      "why": "Check IPI request function pointers",
+      "expect": "Function addresses in call_single_data",
+      "is_end": false
+    },
+    {
+      "trigger": "Check process state for task on CPU {cpu}",
+      "action": "ps -m {addr}",
+      "arg_hints": "addr: task address from backtrace",
+      "why": "Examine task state and scheduling info",
+      "expect": "Task state (RUNNING, UNINTERRUPTIBLE, etc)",
+      "is_end": false
+    },
+    {
+      "trigger": "Disassemble function at {offset} to analyze code flow",
+      "action": "dis -lr {addr}",
+      "arg_hints": "addr: function address with offset",
+      "why": "Examine assembly code at stuck point",
+      "expect": "Instruction sequence showing execution path",
+      "is_end": false
+    },
+    {
+      "trigger": "Find runqueue for CPU {cpu}",
+      "action": "runq | grep {addr}",
+      "arg_hints": "addr: runqueue address from system",
+      "why": "Check CPU runqueue for scheduling state",
+      "expect": "Runqueue structure with task list",
+      "is_end": false
+    },
+    {
+      "trigger": "Get address of rq.lock spinlock for CPU {cpu}",
+      "action": "struct px &((struct rq *){addr})->lock",
+      "arg_hints": "addr: runqueue address",
+      "why": "Extract spinlock address from runqueue",
+      "expect": "Memory address of rq.lock field",
+      "is_end": false
+    },
+    {
+      "trigger": "Examine spinlock value at {addr}",
+      "action": "struct px ((struct rq *){addr})->lock",
+      "arg_hints": "addr: runqueue or lock address",
+      "why": "Check current spinlock state",
+      "expect": "Spinlock value (locked/unlocked state)",
+      "is_end": false
+    },
+    {
+      "trigger": "Check timer queue for CPU {cpu} for overdue timers",
+      "action": "timer -r -C {cpu}",
+      "arg_hints": "cpu: CPU number from lockup",
+      "why": "Examine timer expiration on stuck CPU",
+      "expect": "Timer list showing pending/expired timers",
+      "is_end": false
+    },
+    {
+      "trigger": "Check sysctl setting for rcu stall panic",
+      "action": "p sysctl_panic_on_rcu_stall",
+      "arg_hints": null,
+      "why": "Verify RCU stall panic configuration",
+      "expect": "sysctl_panic_on_rcu_stall value (0 or 1)",
+      "is_end": false
+    },
+    {
+      "trigger": "Check sysctl setting for softlockup panic",
+      "action": "p softlockup_panic",
+      "arg_hints": null,
+      "why": "Verify softlockup panic configuration",
+      "expect": "softlockup_panic value (0 or 1)",
+      "is_end": false
+    },
+    {
+      "trigger": "Analyze kernel log for soft lockup patterns and RIP addresses",
+      "action": "log -t | awk '/soft lockup/,/RIP:/' | grep RIP | sort | uniq -c",
+      "arg_hints": null,
+      "why": "Extract RIP addresses from lockup messages",
+      "expect": "Sorted RIP addresses with occurrence counts",
+      "is_end": false
+    },
+    {
+      "trigger": "List tasks stuck in UNINTERRUPTIBLE state due to RCU stalls",
+      "action": "foreach UN ps -m",
+      "arg_hints": null,
+      "why": "Find all UNINTERRUPTIBLE tasks",
+      "expect": "List of tasks in UN state",
+      "is_end": false
+    },
+    {
+      "trigger": "Check _refcount field of page at {addr}",
+      "action": "struct px ((struct page *){addr})->_refcount",
+      "arg_hints": "addr: page address",
+      "why": "Verify page reference count",
+      "expect": "_refcount value (0 if freed)",
+      "is_end": false
+    },
+    {
+      "trigger": "Examine xa_state structure at {addr}",
+      "action": "struct xa_state {addr}",
+      "arg_hints": "addr: from backtrace or XArray operation",
+      "why": "Check XArray traversal state",
+      "expect": "xa_state fields showing XArray position",
+      "is_end": false
+    },
+    {
+      "trigger": "Check XArray node slot at index {index}",
+      "action": "struct px ((struct xa_node *){addr})->slots[{index}]",
+      "arg_hints": "addr: xa_node address, index: slot number",
+      "why": "Examine XArray slot pointing to page",
+      "expect": "Slot value (page pointer or special value)",
+      "is_end": false
+    },
+    {
+      "trigger": "Verify page mapping to identify associated file",
+      "action": "struct px ((struct page *){addr})->mapping",
+      "arg_hints": "addr: page address",
+      "why": "Check page's address_space mapping",
+      "expect": "mapping pointer (address_space or anon_vma)",
+      "is_end": false
+    },
+    {
+      "trigger": "Find dentry for file from file structure",
+      "action": "struct px ((struct file *){addr})->f_path->dentry",
+      "arg_hints": "addr: file structure address",
+      "why": "Extract dentry from file structure",
+      "expect": "dentry pointer for file",
+      "is_end": false
+    },
+    {
+      "trigger": "Check filesystem mount for file at {addr}",
+      "action": "mount | awk 'NR==1||$2~/{addr}/'",
+      "arg_hints": "addr: mount point or vfsmount address",
+      "why": "Find filesystem mount information",
+      "expect": "Mount entry matching the address",
+      "is_end": false
+    },
+    {
+      "trigger": "Verify file mapping matches page mapping",
+      "action": "struct px ((struct file *){addr})->f_mapping",
+      "arg_hints": "addr: file structure address",
+      "why": "Check file's address_space mapping",
+      "expect": "f_mapping pointer matching page mapping",
+      "is_end": false
+    },
+    {
+      "trigger": "Check panic_on_taint kernel parameter",
+      "action": "p panic_on_taint",
+      "arg_hints": null,
+      "why": "Verify taint-based panic configuration",
+      "expect": "panic_on_taint value",
+      "is_end": false
+    }
+  ]
+}
