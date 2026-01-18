@@ -1,0 +1,77 @@
+这是一个非常典型的 Hard Lockup 导致的联级 Soft Lockup 或者 IPI (Inter-Processor Interrupt) 等待超时 现象。尽管你将软锁死线程绑定到了 CPU 2，但问题出现在 CPU 6 上，其根本原因在于 CPU 2 禁用中断后，导致其他 CPU（如 CPU 6）发出的跨 CPU 调用（IPI）无法得到响应。
+
+核心原因：CPU 2 禁用了中断，导致 CPU 6 发送的 IPI 请求卡死。
+
+详细分析
+1. CPU 6 在做什么？
+从堆栈来看，CPU 6 正在执行 insmod 进程（加载模块）：
+
+do_init_module -> module_enable_ro: 模块加载完成后，内核尝试将模块的内存区域设置为只读（RO）。
+set_memory_ro -> change_page_attr_set_clr: 修改页表属性。
+_vm_unmap_aliases -> __purge_vmap_area_lazy: 清理不再使用的 vmap 区域。
+on_each_cpu_cond_mask -> smp_call_function_many_cond: 这是一个关键点。
+smp_call_function_many_cond 会向其他 CPU 发送 IPI（处理器间中断），要求它们执行某个回调函数（通常是刷新 TLB）。这是一种同步操作，调用者（CPU 6）会等待目标 CPU 完成操作。
+
+2. CPU 2 在做什么？
+你的模块代码中：
+
+CPU 2 运行了这个线程，并且长期禁用了中断 (local_irq_disable)。
+这意味着 CPU 2 无法响应任何中断，包括来自 CPU 6 的 IPI 请求。
+
+3. 事故现场还原
+用户执行 insmod。
+CPU 6 执行 insmod 代码，到达模块初始化的最后阶段 (module_enable_ro)。
+CPU 6 需要刷新全局 TLB（或其他跨核操作），于是调用 smp_call_function_many_cond 向所有其他 CPU（包括 CPU 2）发送 IPI 中断。
+CPU 6 send IPI 后，进入 busy wait 循环，等待其他 CPU 响应并完成任务。
+CPU 2 此时正在执行你的 soft_lockup_simulation 线程，且处于 local_irq_disable() 状态。它屏蔽了中断，因此无法收到或处理来自 CPU 6 的 IPI。
+CPU 6 一直在等 CPU 2 的回应，但 CPU 2 永远不会回应。
+CPU 6 在 smp_call_function_many_cond 里卡死了（死循环等待）。
+Watchdog 检测到 CPU 6 长期卡死（虽然 CPU 6 没关中断，但他一直在忙等），于是报出了 Soft Lockup on CPU 6。
+因为 CPU 6 没关中断，它的 Watchdog 定时器还能触发，所以你能看到 CPU 6 的报错。
+而 CPU 2 关了中断，它的 Watchdog 中断也处理不了，所以 CPU 2 反而可能不会报 Soft Lockup（或者报 Hard Lockup，取决于 NMI Watchdog 的配置）。
+
+并不是 insmod 导致的 soft lockup，而是 CPU 2 拒收 IPI 导致 CPU 6 被“连累”了
+你看到的堆栈完全验证了这一点：
+
+CPU 6 就死在这个函数里，死在等待其他 CPU 响应上。
+
+结论
+虽然你本意是想让 CPU 2 发生 Soft Lockup，但因为你不仅占用了 CPU 还不让它处理中断，导致全系统依赖跨核同步的操作（如 TLB flush）全部卡死。insmod 刚好触发了一次全局 TLB flush。
+
+这其实不仅是 Soft Lockup，这在某种意义上已经造成了 System Hard Hang 的部分症状。
+
+修正建议（如果你只想模拟单纯的 Soft Lockup 而不影响其他 CPU）：
+不要禁用中断，只禁用抢占。
+
+将 local_irq_disable() 改为 preempt_disable()。
+这样 CPU 2 会一直跑你的死循环（不让出 CPU），但它仍然能响应中断（包括 IPI）。这样 CPU 6 发来的 TLB flush 请求能被处理，系统不会卡死在同步上，最终 Watchdog 会因为 CPU 2 长期不调度而报出 CPU 2 的 Soft Lockup。
+
+我可以帮你修改代码，将 local_irq_disable 替换为 preempt_disable 吗？
+
+
+RIP 是模块的偏移地址
+
+crash> bt
+PID: 6544 TASK: ffff9cd366fd3980 CPU: 2 COMMAND: "soft_lockup_kth"
+#0 [ffffb4c74053cd68] machine_kexec at ffffffff82a76ec7
+#1 [ffffb4c74053cdc0] __crash_kexec at ffffffff82bea4fa
+#2 [ffffb4c74053ce80] panic at ffffffff835fc53e
+#3 [ffffb4c74053cf00] watchdog_timer_fn.cold at ffffffff83607d18
+#4 [ffffb4c74053cf28] __hrtimer_run_queues at ffffffff82bc2737
+#5 [ffffb4c74053cf88] hrtimer_interrupt at ffffffff82bc317c
+#6 [ffffb4c74053cfd8] __sysvec_apic_timer_interrupt at ffffffff82a6c17c
+#7 [ffffb4c74053cff0] sysvec_apic_timer_interrupt at ffffffff83653c7d
+--- <IRQ stack> ---
+RIP: 0000000000000010 RSP: 0000000000000018 RFLAGS: ffffb4c74006ff08
+RAX: 0000000000000000 RBX: 0000000000000040 RCX: 000000000001cff8
+RDX: ffff9cd66de9f880 RSI: ffff9cd66de9f880 RDI: ffffffffffffffff
+RBP: ffff9cd366fd3980 R8: 000000000001cff7 R9: 80000000ffff8712
+R10: 0000000000ffff0a R11: 0000000000000000 R12: ffff9cd34e475600
+R13: ffffb4c747d53d08 R14: ffff9cd366399800 R15: ffffffffc0efd010
+ORIG_RAX: ffffffffc0efd076 CS: 0297 SS: ffffffffc0efd06a
+
+crash> sym soft_lockup_simulation
+ffffffffc0efd010 (t) soft_lockup_simulation [soft_lockup_module] /home/calmwu/Program/vmcore-analysis-agent/simulate-crash/soft_lockup/soft_lockup_module.c: 100
+crash> mod -s soft_lockup_module /home/calmwu/Program/vmcore-analysis-agent/simulate-crash/soft_lockup/soft_lockup_module.ko
+     MODULE       NAME                                     BASE           SIZE  OBJECT FILE
+ffffffffc0eff080  soft_lockup_module                 ffffffffc0efd000    16384  /home/calmwu/Program/vmcore-analysis-agent/simulate-crash/soft_lockup/soft_lockup_module.ko
