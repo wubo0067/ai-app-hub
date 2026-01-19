@@ -20,12 +20,11 @@ from src.utils.logging import logger
 from .graph_state import AgentState
 from .nodes import (
     gather_vmcore_detail,
-    call_llm_analysis,
     call_crash_tool,
-    llm_analysis_node,
     gather_vmcore_detail_node,
     crash_tool_node,
 )
+from .llm_node import call_llm_analysis, llm_analysis_node
 from .edges import should_continue
 
 

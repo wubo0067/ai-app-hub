@@ -1,5 +1,10 @@
 from typing import Optional, List, Literal
 from pydantic import BaseModel, Field
+from langchain_core.messages import AIMessage
+from .graph_state import AgentState
+from src.utils.logging import logger
+
+llm_analysis_node = "llm_analysis_node"
 
 
 class ToolCall(BaseModel):
@@ -35,3 +40,39 @@ class VMCoreAnalysisStep(BaseModel):
     final_diagnosis: Optional[str] = Field(
         None, description="Detailed final root cause and evidence."
     )
+
+
+async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
+    """
+    调用 LLM 分析节点，根据收集到的 vmcore 信息进行智能分析。
+
+    此节点接收前序节点收集的诊断信息，通过 LLM 进行分析并决定：
+    1. 是否需要执行更多 crash 命令获取详细信息
+    2. 是否已有足够信息给出诊断结论
+
+    Args:
+        state: AgentState，包含历史消息和上下文
+        llm_with_tools: 绑定了工具的 LLM 实例
+
+    Returns:
+        dict: 包含 messages、error 和 step_count 的状态更新
+    """
+    logger.info(
+        f"Starting {llm_analysis_node} node execution (step {state.get('step_count', 0)})..."
+    )
+
+    # TODO: 实现 LLM 调用逻辑
+    # 1. 提取历史消息
+    # 2. 调用 llm_with_tools.ainvoke(messages)
+    # 3. 解析 LLM 响应（工具调用 or 最终答案）
+    # 4. 返回对应的状态更新
+
+    return {
+        "step_count": 1,
+        "messages": [
+            AIMessage(
+                content=f"LLM analysis step {state.get('step_count', 0)} - analyzing vmcore data..."
+            )
+        ],
+        "error": None,
+    }
