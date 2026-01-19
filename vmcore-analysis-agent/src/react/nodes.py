@@ -9,6 +9,7 @@ VMCore 分析 Agent 节点实现
 """
 
 import asyncio
+import re
 from typing import List, Tuple
 
 from langchain_core.messages import HumanMessage, ToolMessage, AIMessage
@@ -30,17 +31,17 @@ llm_analysis_node = "llm_analysis_node"
 # 默认 crash 命令集合
 # =========================================================================
 DEFAULT_CRASH_COMMANDS: list[str] = [
-    "sys",  # 系统信息
+    "sys -i",  # 系统信息
     "bt",  # 所有线程的堆栈回溯
     # "ps -a",  # 进程列表
-    "runq",  # 运行队列
+    # "runq",  # 运行队列
     # "dev -i",  # 设备信息
-    "swap",  # 交换空间
-    "timer",  # 定时器信息
-    "sig",  # 信号处理
-    "mach",  # 机器相关信息
-    "ipcs",  # IPC 信息
-    "waitq",  # 等待队列
+    # "swap",  # 交换空间
+    # "timer",  # 定时器信息
+    # "sig",  # 信号处理
+    # "mach",  # 机器相关信息
+    # "ipcs",  # IPC 信息
+    # "waitq",  # 等待队列
 ]
 
 
@@ -96,6 +97,10 @@ async def gather_vmcore_detail(state: AgentState) -> dict:
     crash_output_parts: List[str] = []
     logger.info(f"Starting {gather_vmcore_detail_node} node execution...")
 
+    pid = 0
+    cpu = 0
+    command = ""
+
     try:
         # 创建 MCP 会话并获取工具列表
         async with crash_client.session("crash") as session:
@@ -129,6 +134,28 @@ async def gather_vmcore_detail(state: AgentState) -> dict:
 
                 # 汇总结果
                 for (cmd, _), output in zip(tasks, results):
+                    # 从 bt 输出中提取 vmcore-dmesg.txt 的查找特征
+                    # 如果命令是 bt, 从 bt 的输出内容中提取"PID: XX CPU: XXX COMMAND: \"XXXX\""这三个值
+                    if cmd.startswith("bt"):
+                        # 提取 PID, CPU, COMMAND 行
+                        for line in output.splitlines():
+                            if line.startswith("PID:"):
+                                # 从这一行中用正则表达式提取值放到变量 pid, cpu, command
+                                # example: PID: 5658     TASK: ffff8a1603193a00  CPU: 1    COMMAND: "soft_lockup_kth"
+                                #
+
+                                match = re.search(
+                                    r"PID:\s+(\d+)\s+TASK:\s+\S+\s+CPU:\s+(\d+)\s+COMMAND:\s+\"([^\"]+)\"",
+                                    line,
+                                )
+                                if match:
+                                    pid = int(match.group(1))
+                                    cpu = int(match.group(2))
+                                    command = match.group(3)
+                                    logger.debug(
+                                        f"Extracted from bt - PID: {pid}, CPU: {cpu}, COMMAND: {command}"
+                                    )
+                                break
                     crash_output_parts.append(f"$ {cmd}\n{output}\n\n")
 
                 logger.info(f"Successfully executed {len(tasks)} tool invocations.")
@@ -148,9 +175,45 @@ async def gather_vmcore_detail(state: AgentState) -> dict:
             },
         }
 
+    # 读取 vmcore-dmesg.txt 有效内容，找到一行 CPU: cpu PID: pid Comm: command, 提取这一行前面 5 行，后面 30 行的内容
+    try:
+        with open(
+            state["vmcore_dmesg_path"], "r", encoding="utf-8", errors="ignore"
+        ) as f:
+            dmesg_lines = f.readlines()
+
+        dmesg_output_parts: List[str] = []
+        pattern = re.compile(
+            rf"CPU:\s*{cpu}.*PID:\s*{pid}.*Comm:\s*{re.escape(command)}"
+        )
+        for i, line in enumerate(dmesg_lines):
+            if pattern.search(line):
+                start = max(0, i - 5)
+                end = min(len(dmesg_lines), i + 30)
+                dmesg_output_parts.extend(dmesg_lines[start:end])
+                break
+
+        if dmesg_output_parts:
+            crash_output_parts.append(
+                f"$ vmcore-dmesg.txt (extracted around CPU:{cpu} PID:{pid} Comm:{command})\n"
+            )
+            crash_output_parts.append("".join(dmesg_output_parts))
+            crash_output_parts.append("\n\n")
+            logger.info(
+                f"Extracted vmcore-dmesg.txt content around CPU:{cpu} PID:{pid} Comm:{command}."
+            )
+        else:
+            logger.warning(
+                f"No matching line found in vmcore-dmesg.txt for CPU:{cpu} PID:{pid} Comm:{command}."
+            )
+    except Exception as exc:
+        logger.error(
+            f"Failed to read or process vmcore-dmesg.txt: {exc}", exc_info=True
+        )
+
     # 格式化输出为 prompt
-    vmcore_output = "".join(crash_output_parts)
-    prompt = vmcore_detail_prompt().format(vmcore_base_info=vmcore_output)
+    vmcore_init_info = "".join(crash_output_parts)
+    prompt = vmcore_detail_prompt().format(init_info=vmcore_init_info)
 
     logger.info(f"{gather_vmcore_detail_node} completed successfully.")
     return {

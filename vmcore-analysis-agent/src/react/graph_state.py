@@ -51,6 +51,7 @@ class AgentState(TypedDict):
     # 核心路径配置
     vmcore_path: str
     vmlinux_path: str
+    vmcore_dmesg_path: str
 
     # 消息历史 (带自动修剪)
     messages: Annotated[Sequence[AnyMessage], add_and_trim_messages] = field(

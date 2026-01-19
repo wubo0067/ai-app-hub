@@ -20,6 +20,7 @@ def create_llm():
             api_key=str(api_key),
             base_url=str(base_url),
             model=str(model_name),
+            max_tokens=8000,
             temperature=float(
                 temperature
             ),  # https://api-docs.deepseek.com/zh-cn/quick_start/parameter_settings
