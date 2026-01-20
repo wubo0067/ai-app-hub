@@ -3,7 +3,7 @@ VMCore 分析 Agent 图构建模块
 
 此模块负责创建和编译 LangGraph 状态图，定义节点之间的转换关系和执行流程。
 整体流程：
-1. 收集 vmcore 基础信息 (gather_vmcore_detail_node)
+1. 收集 vmcore 基础信息 (collect_crash_init_data_node)
 2. LLM 分析并决策下一步行动 (llm_analysis_node)
 3. 执行 crash 工具调用 (crash_tool_node)
 4. 循环执行 2-3 直到得出最终结论或达到递归限制
@@ -19,11 +19,11 @@ from langgraph.checkpoint.memory import InMemorySaver
 from src.utils.logging import logger
 from .graph_state import AgentState
 from .nodes import (
-    gather_vmcore_detail,
+    collect_crash_init_data,
     call_llm_analysis,
     call_crash_tool,
     llm_analysis_node,
-    gather_vmcore_detail_node,
+    collect_crash_init_data_node,
     crash_tool_node,
 )
 from .edges import should_continue
@@ -46,13 +46,13 @@ def create_agent_graph(llm, tools_list: List):
         - 通过条件边（conditional_edges）实现智能路由决策
 
     节点说明：
-        - gather_vmcore_detail_node: 初始节点，收集 vmcore 基础诊断信息
+        - collect_crash_init_data_node: 初始节点，收集 vmcore 基础诊断信息
         - llm_analysis_node: LLM 分析节点，根据当前信息生成下一步计划
         - crash_tool_node: 工具执行节点，调用 crash 命令获取详细信息
 
     边说明：
-        - START -> gather_vmcore_detail_node: 固定起点
-        - gather_vmcore_detail_node -> should_continue: 根据收集结果决定下一步
+        - START -> collect_crash_init_data_node: 固定起点
+        - collect_crash_init_data_node -> should_continue: 根据收集结果决定下一步
         - llm_analysis_node -> should_continue: 根据 LLM 决策决定继续或结束
         - crash_tool_node -> llm_analysis_node: 工具执行后返回 LLM 分析
     """
@@ -99,15 +99,15 @@ def create_agent_graph(llm, tools_list: List):
 
     # 添加节点 3：收集 vmcore 详细信息节点
     # 初始节点，执行默认的 crash 命令集合收集基础信息
-    builder.add_node(gather_vmcore_detail_node, gather_vmcore_detail)
-    logger.debug(f"Added node: {gather_vmcore_detail_node}")
+    builder.add_node(collect_crash_init_data_node, collect_crash_init_data)
+    logger.debug(f"Added node: {collect_crash_init_data_node}")
 
     # =========================================================================
     # 4. 定义节点之间的边（执行流程）
     # =========================================================================
     # 固定边：图的入口点，从 START 直接进入信息收集节点
-    builder.add_edge(START, gather_vmcore_detail_node)
-    logger.debug(f"Added edge: START -> {gather_vmcore_detail_node}")
+    builder.add_edge(START, collect_crash_init_data_node)
+    logger.debug(f"Added edge: START -> {collect_crash_init_data_node}")
 
     # 条件边 1：信息收集完成后根据状态决定下一步
     # should_continue 函数会检查：
@@ -115,12 +115,12 @@ def create_agent_graph(llm, tools_list: List):
     #   - 是否已有最终答案 -> END
     #   - 否则 -> llm_analysis_node（继续分析）
     builder.add_conditional_edges(
-        gather_vmcore_detail_node,
+        collect_crash_init_data_node,
         should_continue,
         [llm_analysis_node, "__end__"],
     )
     logger.debug(
-        f"Added conditional edge: {gather_vmcore_detail_node} -> [llm_analysis_node, __end__]"
+        f"Added conditional edge: {collect_crash_init_data_node} -> [llm_analysis_node, __end__]"
     )
 
     # 条件边 2：LLM 分析后根据决策结果路由

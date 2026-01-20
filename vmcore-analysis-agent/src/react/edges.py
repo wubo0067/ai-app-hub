@@ -6,7 +6,7 @@ VMCore 分析 Agent 边（路由）逻辑
 
 from typing import Literal
 from .graph_state import AgentState
-from .nodes import llm_analysis_node, gather_vmcore_detail_node, crash_tool_node
+from .nodes import llm_analysis_node, collect_crash_init_data_node, crash_tool_node
 from langchain_core.messages import AIMessage
 from src.utils.logging import logger
 

@@ -3,7 +3,7 @@ VMCore 分析 Agent 节点实现
 
 此模块定义了 LangGraph 中各个节点的具体执行逻辑。
 包括：
-1. gather_vmcore_detail: 收集 vmcore 基础诊断信息
+1. collect_crash_init_data: 收集 vmcore 基础诊断信息
 2. call_llm_analysis: LLM 分析节点
 3. call_crash_tool: 执行 crash 工具调用
 """
@@ -24,7 +24,7 @@ from src.mcp_tools.crash.client import crash_client
 # 节点名称常量定义
 # =========================================================================
 crash_tool_node = "crash_tool_node"
-gather_vmcore_detail_node = "gather_vmcore_detail_node"
+collect_crash_init_data_node = "collect_crash_init_data_node"
 llm_analysis_node = "llm_analysis_node"
 
 # =========================================================================
@@ -74,7 +74,7 @@ async def _invoke_tool(tool, cmd: str, state: AgentState) -> str:
         return error_msg
 
 
-async def gather_vmcore_detail(state: AgentState) -> dict:
+async def collect_crash_init_data(state: AgentState) -> dict:
     """
     执行默认 crash 命令集合并汇总输出为 ToolMessage。
 
@@ -95,11 +95,12 @@ async def gather_vmcore_detail(state: AgentState) -> dict:
         dict: 包含 messages、error 和 step_count 的状态更新
     """
     crash_output_parts: List[str] = []
-    logger.info(f"Starting {gather_vmcore_detail_node} node execution...")
+    logger.info(f"Starting {collect_crash_init_data_node} node execution...")
 
     pid = 0
     cpu = 0
     command = ""
+    found_panic_task = False
 
     try:
         # 创建 MCP 会话并获取工具列表
@@ -126,24 +127,26 @@ async def gather_vmcore_detail(state: AgentState) -> dict:
                     logger.warning(f"No tool found for command: {cmd}")
 
             if tasks:
-                # 并发执行所有工具调用
+                # 并发执行所有工具调用，允许单个任务失败而不影响整体
                 logger.info(f"Executing {len(tasks)} tool invocations concurrently...")
                 results = await asyncio.gather(
-                    *(task for _, task in tasks), return_exceptions=False
+                    *(task for _, task in tasks), return_exceptions=True
                 )
 
                 # 汇总结果
                 for (cmd, _), output in zip(tasks, results):
+                    if isinstance(output, Exception):
+                        error_msg = (
+                            f"$ {cmd}\n[error] Execution failed: {str(output)}\n\n"
+                        )
+                        crash_output_parts.append(error_msg)
+                        logger.error(f"Tool execution failed for '{cmd}': {output}")
+                        continue
+
                     # 从 bt 输出中提取 vmcore-dmesg.txt 的查找特征
-                    # 如果命令是 bt, 从 bt 的输出内容中提取"PID: XX CPU: XXX COMMAND: \"XXXX\""这三个值
-                    if cmd.startswith("bt"):
-                        # 提取 PID, CPU, COMMAND 行
+                    if cmd.startswith("bt") and not found_panic_task:
                         for line in output.splitlines():
                             if line.startswith("PID:"):
-                                # 从这一行中用正则表达式提取值放到变量 pid, cpu, command
-                                # example: PID: 5658     TASK: ffff8a1603193a00  CPU: 1    COMMAND: "soft_lockup_kth"
-                                #
-
                                 match = re.search(
                                     r"PID:\s+(\d+)\s+TASK:\s+\S+\s+CPU:\s+(\d+)\s+COMMAND:\s+\"([^\"]+)\"",
                                     line,
@@ -152,70 +155,88 @@ async def gather_vmcore_detail(state: AgentState) -> dict:
                                     pid = int(match.group(1))
                                     cpu = int(match.group(2))
                                     command = match.group(3)
+                                    found_panic_task = True
                                     logger.debug(
                                         f"Extracted from bt - PID: {pid}, CPU: {cpu}, COMMAND: {command}"
                                     )
-                                break
+                                    break  # 只提取第一个（通常是崩溃现场）
+
                     crash_output_parts.append(f"$ {cmd}\n{output}\n\n")
 
-                logger.info(f"Successfully executed {len(tasks)} tool invocations.")
+                logger.info(
+                    f"Successfully executed tools. Valid results: {len(crash_output_parts)}"
+                )
             else:
                 logger.warning("No tools were executed (all commands failed to match).")
 
     except Exception as exc:
         # 严重错误：返回错误状态
-        error_msg = f"Critical error in {gather_vmcore_detail_node}: {exc}"
+        error_msg = f"Critical error in {collect_crash_init_data_node}: {exc}"
         logger.error(error_msg, exc_info=True)
         return {
             "step_count": 1,
             "error": {
                 "message": str(exc),
-                "node": gather_vmcore_detail_node,
+                "node": collect_crash_init_data_node,
                 "is_error": True,
             },
         }
 
-    # 读取 vmcore-dmesg.txt 有效内容，找到一行 CPU: cpu PID: pid Comm: command, 提取这一行前面 5 行，后面 30 行的内容
-    try:
-        with open(
-            state["vmcore_dmesg_path"], "r", encoding="utf-8", errors="ignore"
-        ) as f:
-            dmesg_lines = f.readlines()
+    # 只有在成功提取到关键信息后，才去处理 dmesg
+    if found_panic_task:
 
-        dmesg_output_parts: List[str] = []
-        pattern = re.compile(
-            rf"CPU:\s*{cpu}.*PID:\s*{pid}.*Comm:\s*{re.escape(command)}"
-        )
-        for i, line in enumerate(dmesg_lines):
-            if pattern.search(line):
-                start = max(0, i - 5)
-                end = min(len(dmesg_lines), i + 30)
-                dmesg_output_parts.extend(dmesg_lines[start:end])
-                break
+        def _read_dmesg_context(path: str, t_cpu: int, t_pid: int, t_comm: str) -> str:
+            """Synchronous helper to read dmesg, to be run in a thread."""
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    dmesg_lines = f.readlines()
 
-        if dmesg_output_parts:
-            crash_output_parts.append(
-                f"$ vmcore-dmesg.txt (extracted around CPU:{cpu} PID:{pid} Comm:{command})\n"
+                esc_comm = re.escape(t_comm)
+                pattern = re.compile(
+                    rf"CPU:\s*{t_cpu}.*PID:\s*{t_pid}.*Comm:\s*{esc_comm}"
+                )
+
+                for i, line in enumerate(dmesg_lines):
+                    if pattern.search(line):
+                        start = max(0, i - 5)
+                        end = min(len(dmesg_lines), i + 30)
+                        return (
+                            f"$ vmcore-dmesg.txt (extracted around CPU:{t_cpu} PID:{t_pid} Comm:{t_comm})\n"
+                            + "".join(dmesg_lines[start:end])
+                            + "\n\n"
+                        )
+                return ""
+            except Exception as e:
+                logger.error(f"Failed to read dmesg: {e}")
+                return ""
+
+        # 在线程池中执行文件 IO，避免阻塞事件循环
+        try:
+            dmesg_output = await asyncio.to_thread(
+                _read_dmesg_context, state["vmcore_dmesg_path"], cpu, pid, command
             )
-            crash_output_parts.append("".join(dmesg_output_parts))
-            crash_output_parts.append("\n\n")
-            logger.info(
-                f"Extracted vmcore-dmesg.txt content around CPU:{cpu} PID:{pid} Comm:{command}."
-            )
-        else:
-            logger.warning(
-                f"No matching line found in vmcore-dmesg.txt for CPU:{cpu} PID:{pid} Comm:{command}."
-            )
-    except Exception as exc:
-        logger.error(
-            f"Failed to read or process vmcore-dmesg.txt: {exc}", exc_info=True
+
+            if dmesg_output:
+                crash_output_parts.append(dmesg_output)
+                logger.info(
+                    f"Extracted vmcore-dmesg.txt content around CPU:{cpu} PID:{pid} Comm:{command}."
+                )
+            else:
+                logger.warning(
+                    f"No matching line found in vmcore-dmesg.txt for CPU:{cpu} PID:{pid} Comm:{command}."
+                )
+        except Exception as exc:
+            logger.error(f"Error during dmesg extraction: {exc}", exc_info=True)
+    else:
+        logger.warning(
+            "Skipping vmcore-dmesg.txt extraction: match info (PID/CPU/COMMAND) not found in 'bt' output."
         )
 
     # 格式化输出为 prompt
     vmcore_init_info = "".join(crash_output_parts)
     prompt = vmcore_detail_prompt().format(init_info=vmcore_init_info)
 
-    logger.info(f"{gather_vmcore_detail_node} completed successfully.")
+    logger.info(f"{collect_crash_init_data_node} completed successfully.")
     return {
         "messages": [HumanMessage(content=prompt)],
         "error": None,
