@@ -74,11 +74,8 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         ),
     )
 
-    # TODO: 实现 LLM 调用逻辑
-    # 1. 提取历史消息
-    # 2. 调用 llm_with_tools.ainvoke(messages)
-    # 3. 解析 LLM 响应（工具调用 or 最终答案）
-    # 4. 返回对应的状态更新
+    # 核心原因：LLM 是无状态的
+    # LLM 本身没有记忆。每次调用 invoke() 都是一个独立的 API 请求，LLM 不会"记住"之前的对话。这和我们使用的聊天界面不同：
 
     return {
         "step_count": 1,
