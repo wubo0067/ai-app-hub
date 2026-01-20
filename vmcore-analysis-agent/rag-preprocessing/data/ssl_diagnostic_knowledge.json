@@ -1,5 +1,5 @@
 {
-  "summary": "Comprehensive diagnostic matrix for Linux kernel Hard LOCKUP scenarios",
+  "summary": "Comprehensive diagnostic matrix for Linux kernel crash scenarios",
   "init_cmds": [
     "sys -i",
     "log | grep -i lockup",

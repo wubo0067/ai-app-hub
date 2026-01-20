@@ -16,7 +16,7 @@ from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_mcp_adapters.tools import load_mcp_tools
 from src.utils.logging import logger
 from .graph_state import AgentState
-from .prompts import vmcore_detail_prompt
+from .prompts import crash_init_data_prompt
 from src.mcp_tools.crash.client import crash_client
 
 
@@ -233,7 +233,7 @@ async def collect_crash_init_data(state: AgentState) -> dict:
 
     # 格式化输出为 prompt
     vmcore_init_info = "".join(crash_output_parts)
-    prompt = vmcore_detail_prompt().format(init_info=vmcore_init_info)
+    prompt = crash_init_data_prompt().format(init_info=vmcore_init_info)
 
     logger.info(f"{collect_crash_init_data_node} completed successfully.")
     return {

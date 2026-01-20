@@ -1,8 +1,11 @@
+import json
 from typing import Optional, List, Literal
 from pydantic import BaseModel, Field
 from langchain_core.messages import AIMessage
 from .graph_state import AgentState
 from src.utils.logging import logger
+from src.rag.retrival import diagnostic_knowledge_base
+from .prompts import analysis_crash_prompt
 
 llm_analysis_node = "llm_analysis_node"
 
@@ -59,6 +62,16 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
     """
     logger.info(
         f"Starting {llm_analysis_node} node execution (step {state.get('step_count', 0)})..."
+    )
+    # diagnostic_knowledge_base json 格式化为字符串
+
+    system_message = analysis_crash_prompt().format(
+        diagnostic_knowledge_base=json.dumps(
+            diagnostic_knowledge_base, indent=2, ensure_ascii=False
+        ),
+        VMCoreAnalysisStep_Schema=json.dumps(
+            VMCoreAnalysisStep.model_json_schema(), indent=2
+        ),
     )
 
     # TODO: 实现 LLM 调用逻辑

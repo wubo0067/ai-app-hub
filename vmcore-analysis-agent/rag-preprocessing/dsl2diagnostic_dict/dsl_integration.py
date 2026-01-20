@@ -49,10 +49,10 @@ class DiagnosticBranch(BaseModel):
 
 
 class DiagnosticKnowledge(BaseModel):
-    """Comprehensive diagnostic knowledge base for Hard LOCKUP vmcore analysis."""
+    """Comprehensive diagnostic knowledge base for Linux kernel crash analysis."""
 
     summary: str = Field(
-        "Comprehensive diagnostic matrix for Linux kernel Hard LOCKUP scenarios",
+        "Comprehensive diagnostic matrix for Linux kernel crash scenarios",
         description="Fixed summary for the diagnostic knowledge base.",
     )
     init_cmds: List[str] = Field(
