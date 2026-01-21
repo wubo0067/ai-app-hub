@@ -16,17 +16,19 @@ class GraphLoggingCallback(BaseCallbackHandler):
         self, serialized: Dict[str, Any], inputs: Dict[str, Any], **kwargs: Any
     ) -> None:
         """当整个图开始执行时调用"""
-        logger.info("=" * 80)
-        logger.info("🚀 Graph execution started")
-        logger.info(f"Initial inputs: {self._format_inputs(inputs)}")
-        logger.info("=" * 80)
+        # logger.info("=" * 80)
+        # logger.info("🚀 Graph execution started")
+        # logger.info(f"Initial inputs: {self._format_inputs(inputs)}")
+        # logger.info("=" * 80)
+        pass
 
     def on_chain_end(self, outputs: Dict[str, Any], **kwargs: Any) -> None:
         """当整个图执行结束时调用"""
-        logger.info("=" * 80)
-        logger.info("✅ Graph execution completed")
-        logger.info(f"Final outputs: {self._format_outputs(outputs)}")
-        logger.info("=" * 80)
+        # logger.info("=" * 80)
+        # logger.info("✅ Graph execution completed")
+        # logger.info(f"Final outputs: {self._format_outputs(outputs)}")
+        # logger.info("=" * 80)
+        pass
 
     def on_chain_error(self, error: Exception, **kwargs: Any) -> None:
         """当图执行出错时调用"""
@@ -47,8 +49,9 @@ class GraphLoggingCallback(BaseCallbackHandler):
 
     def on_tool_end(self, output: str, **kwargs: Any) -> None:
         """当工具执行结束时调用"""
-        logger.info(f"  ✓ Tool completed")
-        logger.debug(f"    Output: {output[:200]}...")  # 只显示前 200 字符
+        # logger.info(f"  ✓ Tool completed")
+        # logger.debug(f"    Output: {output[:200]}...")  # 只显示前 200 字符
+        pass
 
     def on_tool_error(self, error: Exception, **kwargs: Any) -> None:
         """当工具执行出错时调用"""
@@ -58,8 +61,9 @@ class GraphLoggingCallback(BaseCallbackHandler):
         self, serialized: Dict[str, Any], prompts: List[str], **kwargs: Any
     ) -> None:
         """当 LLM 开始调用时"""
-        logger.info(f"  🤖 LLM invocation started")
-        logger.debug(f"    Prompts count: {len(prompts)}")
+        # logger.info(f"  🤖 LLM invocation started")
+        # logger.debug(f"    Prompts count: {len(prompts)}")
+        pass
 
     def on_llm_end(self, response: Any, **kwargs: Any) -> None:
         """当 LLM 调用结束时"""

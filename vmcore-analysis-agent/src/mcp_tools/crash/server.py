@@ -197,6 +197,12 @@ commands = [
         "mod -s dm_mod",
         "module information and loading of symbols and debugging data",
     ),
+    (
+        "rd",
+        "rd [-adDsSupxmfNR][-8|-16|-32|-64][-o offs][-e addr][-r file][address|symbol] [count]",
+        "rd -a linux_banner",
+        "This command displays the contents of memory, with the output formatted in several different manners",
+    ),
 ]
 
 # 批量注册

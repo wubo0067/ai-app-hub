@@ -10,7 +10,7 @@ VMCore 分析 Agent 节点实现
 
 import asyncio
 import re
-from typing import List, Tuple
+from typing import List, Tuple, Any
 
 from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_mcp_adapters.tools import load_mcp_tools
@@ -25,6 +25,7 @@ from src.mcp_tools.crash.client import crash_client
 # =========================================================================
 crash_tool_node = "crash_tool_node"
 collect_crash_init_data_node = "collect_crash_init_data_node"
+llm_analysis_node = "llm_analysis_node"
 
 # =========================================================================
 # 默认 crash 命令集合
@@ -66,11 +67,64 @@ async def _invoke_tool(tool, cmd: str, state: AgentState) -> str:
             }
         )
         logger.debug(f"Tool invocation succeeded for: {cmd}")
-        return result
+
+        # 处理可能返回的列表结构（LangChain MCP 工具通常返回 [{'type': 'text', 'text': '...'}]）
+        if isinstance(result, list):
+            text_parts = [
+                item.get("text", "")
+                for item in result
+                if isinstance(item, dict) and item.get("type") == "text"
+            ]
+            return "".join(text_parts).strip()
+
+        return str(result).strip()
     except Exception as exc:
         error_msg = f"[error] Tool invocation failed for '{cmd}': {exc}"
         logger.error(error_msg)
         return error_msg
+
+
+async def dispatch_crash_commands(
+    commands: List[str], state: AgentState
+) -> List[Tuple[str, Any]]:
+    """
+    匹配工具并并发执行 crash 命令。
+    此函数会管理 MCP 会话的生命周期。
+
+    Args:
+        commands: 待执行的命令列表
+        state: 当前 Agent 状态
+
+    Returns:
+        List[Tuple[str, Any]]: [(命令，结果)]
+    """
+    tasks: List[Tuple[str, asyncio.Task]] = []
+
+    # 创建 MCP 会话并获取工具列表
+    async with crash_client.session("crash") as session:
+        tools = await load_mcp_tools(session)
+        logger.info(f"Retrieved {len(tools)} tools from MCP client.")
+
+        for cmd in commands:
+            # 按命令前缀匹配工具
+            tool = next(
+                (t for t in tools if cmd.startswith(getattr(t, "name", ""))),
+                None,
+            )
+            if tool:
+                tasks.append((cmd, asyncio.create_task(_invoke_tool(tool, cmd, state))))
+                logger.debug(f"Matched tool for command: {cmd}")
+            else:
+                logger.warning(f"No tool found for command: {cmd}")
+
+        results = []
+        if tasks:
+            logger.info(f"Executing {len(tasks)} tool invocations concurrently...")
+            results = await asyncio.gather(
+                *(task for _, task in tasks), return_exceptions=True
+            )
+
+    return list(zip([cmd for cmd, _ in tasks], results))
 
 
 async def collect_crash_init_data(state: AgentState) -> dict:
@@ -102,71 +156,43 @@ async def collect_crash_init_data(state: AgentState) -> dict:
     found_panic_task = False
 
     try:
-        # 创建 MCP 会话并获取工具列表
-        async with crash_client.session("crash") as session:
-            tools = await load_mcp_tools(session)
-            logger.info(f"Retrieved {len(tools)} tools from MCP client.")
+        # 委托给 dispatch_crash_commands 处理工具加载和执行
+        matched_results = await dispatch_crash_commands(DEFAULT_CRASH_COMMANDS, state)
 
-            # 为每个命令匹配工具并创建异步任务
-            tasks: List[Tuple[str, asyncio.Task]] = []
-            for cmd in DEFAULT_CRASH_COMMANDS:
-                # 按命令前缀匹配工具（例如 "bt -a" 匹配 "bt" 工具）
-                tool = next(
-                    (t for t in tools if cmd.startswith(getattr(t, "name", ""))),
-                    None,
-                )
-                if tool:
-                    tasks.append(
-                        (cmd, asyncio.create_task(_invoke_tool(tool, cmd, state)))
-                    )
-                    logger.debug(f"Matched tool for command: {cmd}")
-                else:
-                    warning_msg = f"$ {cmd}\n[warn] No matching crash tool found.\n\n"
-                    crash_output_parts.append(warning_msg)
-                    logger.warning(f"No tool found for command: {cmd}")
+        if matched_results:
+            # 汇总结果
+            for cmd, output in matched_results:
+                if isinstance(output, Exception):
+                    error_msg = f"$ {cmd}\n[error] Execution failed: {str(output)}\n\n"
+                    crash_output_parts.append(error_msg)
+                    logger.error(f"Tool execution failed for '{cmd}': {output}")
+                    continue
 
-            if tasks:
-                # 并发执行所有工具调用，允许单个任务失败而不影响整体
-                logger.info(f"Executing {len(tasks)} tool invocations concurrently...")
-                results = await asyncio.gather(
-                    *(task for _, task in tasks), return_exceptions=True
-                )
-
-                # 汇总结果
-                for (cmd, _), output in zip(tasks, results):
-                    if isinstance(output, Exception):
-                        error_msg = (
-                            f"$ {cmd}\n[error] Execution failed: {str(output)}\n\n"
-                        )
-                        crash_output_parts.append(error_msg)
-                        logger.error(f"Tool execution failed for '{cmd}': {output}")
-                        continue
-
-                    # 从 bt 输出中提取 vmcore-dmesg.txt 的查找特征
-                    if cmd.startswith("bt") and not found_panic_task:
-                        for line in output.splitlines():
-                            if line.startswith("PID:"):
-                                match = re.search(
-                                    r"PID:\s+(\d+)\s+TASK:\s+\S+\s+CPU:\s+(\d+)\s+COMMAND:\s+\"([^\"]+)\"",
-                                    line,
+                # 从 bt 输出中提取 vmcore-dmesg.txt 的查找特征
+                if cmd.startswith("bt") and not found_panic_task:
+                    for line in output.splitlines():
+                        if line.startswith("PID:"):
+                            match = re.search(
+                                r"PID:\s+(\d+)\s+TASK:\s+\S+\s+CPU:\s+(\d+)\s+COMMAND:\s+\"([^\"]+)\"",
+                                line,
+                            )
+                            if match:
+                                pid = int(match.group(1))
+                                cpu = int(match.group(2))
+                                command = match.group(3)
+                                found_panic_task = True
+                                logger.debug(
+                                    f"Extracted from bt - PID: {pid}, CPU: {cpu}, COMMAND: {command}"
                                 )
-                                if match:
-                                    pid = int(match.group(1))
-                                    cpu = int(match.group(2))
-                                    command = match.group(3)
-                                    found_panic_task = True
-                                    logger.debug(
-                                        f"Extracted from bt - PID: {pid}, CPU: {cpu}, COMMAND: {command}"
-                                    )
-                                    break  # 只提取第一个（通常是崩溃现场）
+                                break  # 只提取第一个（通常是崩溃现场）
 
-                    crash_output_parts.append(f"$ {cmd}\n{output}\n\n")
+                crash_output_parts.append(f"$ {cmd}\n{output}\n\n")
 
-                logger.info(
-                    f"Successfully executed tools. Valid results: {len(crash_output_parts)}"
-                )
-            else:
-                logger.warning("No tools were executed (all commands failed to match).")
+            logger.info(
+                f"Successfully executed tools. Valid results: {len(crash_output_parts)}"
+            )
+        else:
+            logger.warning("No tools were executed (all commands failed to match).")
 
     except Exception as exc:
         # 严重错误：返回错误状态
@@ -218,7 +244,7 @@ async def collect_crash_init_data(state: AgentState) -> dict:
             if dmesg_output:
                 crash_output_parts.append(dmesg_output)
                 logger.info(
-                    f"Extracted vmcore-dmesg.txt content around CPU:{cpu} PID:{pid} Comm:{command}."
+                    f"Extracted vmcore-dmesg.txt content around CPU:{cpu} PID:{pid} Comm:{command}. dmesg_output: {dmesg_output}"
                 )
             else:
                 logger.warning(
@@ -246,9 +272,10 @@ async def collect_crash_init_data(state: AgentState) -> dict:
 async def call_crash_tool(state: AgentState) -> dict:
     """
     根据 LLM 返回的分析决策，执行具体的 crash 工具调用。
+    支持处理一次响应中的多个工具调用。
 
-    此节点从 LLM 的响应中提取工具调用请求，执行对应的 crash 命令，
-    并将结果返回给 LLM 进行进一步分析。
+    此节点从 LLM 的响应中提取所有工具调用请求，并发执行对应的 crash 命令，
+    并为每个调用生成对应的 ToolMessage 返回给 LLM。
 
     Args:
         state: AgentState，包含 LLM 的工具调用请求
@@ -260,19 +287,80 @@ async def call_crash_tool(state: AgentState) -> dict:
         f"Starting {crash_tool_node} node execution (step {state.get('step_count', 0)})..."
     )
 
-    # TODO: 实现工具调用逻辑
-    # 1. 从 state.messages 中提取最后一条 AIMessage
-    # 2. 解析其中的 tool_calls
-    # 3. 调用对应的 MCP 工具
-    # 4. 将结果包装为 ToolMessage 返回
+    last_message = state["messages"][-1]
+    tool_messages = []
+
+    # 提取所有工具调用的命令，准备批量执行
+    # 为了后续能将结果匹配回 tool_call_id，我们需要维护一个映射或顺序
+    tool_calls_data = []  # List[(tool_call_id, command_string)]
+    commands_to_run = []  # List[str]
+
+    try:
+        if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+            for tool_call in last_message.tool_calls:
+                tool_call_id = tool_call["id"]
+                name = tool_call["name"]
+                args = tool_call.get("args", {})
+
+                # 拼接命令：假设 args 的值即为参数，按顺序拼接
+                args_str = (
+                    " ".join(str(v) for v in args.values())
+                    if isinstance(args, dict)
+                    else str(args)
+                )
+                full_cmd = f"{name} {args_str}".strip()
+
+                tool_calls_data.append((tool_call_id, full_cmd))
+                commands_to_run.append(full_cmd)
+
+                logger.debug(
+                    f"Processing tool call: {name} (ID: {tool_call_id}) -> Cmd: {full_cmd}"
+                )
+
+            # 使用公共函数批量执行命令
+            if commands_to_run:
+                matched_results = await dispatch_crash_commands(commands_to_run, state)
+                # matched_results 是 List[(cmd, output)]，只包含成功匹配并执行的结果
+
+                # 将结果映射回 ToolMessage
+                for tool_call_id, original_cmd in tool_calls_data:
+                    found_result = False
+
+                    # 在执行结果中查找匹配的命令
+                    # 注意：如果命令重复，这里可能会总是取到第一个结果。
+                    # 但对于 crash 工具来说，只要命令完全一致，结果通常是一样的。
+                    for r_cmd, r_output in matched_results:
+                        if r_cmd == original_cmd:
+                            content = str(r_output)
+                            if isinstance(r_output, Exception):
+                                content = f"[error] Execution failed: {r_output}"
+                            tool_messages.append(
+                                ToolMessage(content=content, tool_call_id=tool_call_id)
+                            )
+                            found_result = True
+                            # 找到一个就可以停止内层循环，进入下一个 tool_call
+                            # 实际上这可以处理重复命令的情况：每个 tool_call 都能匹配到结果
+                            break
+
+                    if not found_result:
+                        # 没在结果里找到，说明 tool 没匹配上（因为 dispatch_crash_commands 会忽略未匹配的命令）
+                        msg = f"[error] No matching crash tool found for command: {original_cmd}"
+                        tool_messages.append(
+                            ToolMessage(content=msg, tool_call_id=tool_call_id)
+                        )
+
+    except Exception as exc:
+        logger.error(f"Critical error in call_crash_tool: {exc}", exc_info=True)
+        # 即使发生严重错误，也尽量返回一个空的或错误的消息以避免流程卡死
+        return {
+            "step_count": 1,
+            "error": {"message": str(exc), "node": crash_tool_node, "is_error": True},
+        }
+
+    logger.info(f"Generated {len(tool_messages)} tool messages.")
 
     return {
         "step_count": 1,
-        "messages": [
-            ToolMessage(
-                content=f"Crash tool execution step {state.get('step_count', 0)} - results here...",
-                tool_call_id="example_tool_call_id",
-            )
-        ],
+        "messages": tool_messages,
         "error": None,
     }

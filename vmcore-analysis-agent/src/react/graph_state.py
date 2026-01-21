@@ -1,29 +1,27 @@
 from dataclasses import dataclass, field
 from typing import Annotated, Optional, TypedDict, Union, cast, Sequence
-from langgraph.graph import add_messages
-from langgraph.graph.message import AnyMessage
+from langgraph.graph import MessagesState
 from operator import add
-from src.utils.logging import logger
 
 
-def add_and_trim_messages(
-    left: list[AnyMessage], right: Union[list[AnyMessage], AnyMessage]
-) -> list[AnyMessage]:
-    """
-    基于 LangGraph 的 add_messages 进行合并，但增加了窗口限制。
-    """
-    # 1. 先使用标准 add_messages 处理 ID 去重和合并
-    merged = cast(list[AnyMessage], add_messages(left, right))  # type: ignore
+# def add_and_trim_messages(
+#     left: list[AnyMessage], right: Union[list[AnyMessage], AnyMessage]
+# ) -> list[AnyMessage]:
+#     """
+#     基于 LangGraph 的 add_messages 进行合并，但增加了窗口限制。
+#     """
+#     # 1. 先使用标准 add_messages 处理 ID 去重和合并
+#     merged = cast(list[AnyMessage], add_messages(left, right))  # type: ignore
 
-    # 2. 保留最近的 N 条消息
-    # 注意：实际场景中可能需要保留 SystemMessage (第一条)，这里做简单切片演示
-    max_len = 20
-    if len(merged) > max_len:
-        logger.info(
-            f"Trimming messages from {len(merged)} to {max_len} to maintain window size."
-        )
-        return merged[-max_len:]
-    return merged
+#     # 2. 保留最近的 N 条消息
+#     # 注意：实际场景中可能需要保留 SystemMessage (第一条)，这里做简单切片演示
+#     max_len = 20
+#     if len(merged) > max_len:
+#         logger.info(
+#             f"Trimming messages from {len(merged)} to {max_len} to maintain window size."
+#         )
+#         return merged[-max_len:]
+#     return merged
 
 
 class AgentError(TypedDict):
@@ -41,7 +39,7 @@ class AgentError(TypedDict):
     is_error: bool
 
 
-class AgentState(TypedDict):
+class AgentState(MessagesState):
     """
     VMCore 分析 Agent 的状态定义，扩展自 MessagesState。
 
@@ -52,11 +50,6 @@ class AgentState(TypedDict):
     vmcore_path: str
     vmlinux_path: str
     vmcore_dmesg_path: str
-
-    # 消息历史 (带自动修剪)
-    messages: Annotated[Sequence[AnyMessage], add_and_trim_messages] = field(
-        default_factory=list
-    )
 
     # step_count: int = 0, 每次分析步骤增加 1，operator.add
     step_count: Annotated[int, add] = field(default=0)

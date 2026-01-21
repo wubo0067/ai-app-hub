@@ -1,6 +1,5 @@
 import os
 import json
-from pydantic import parse_raw_as
 from .diagnostic_knowledge_base import DiagnosticKnowledgeBase
 
 
@@ -14,12 +13,18 @@ def _init_diagnostic_knowledge_base() -> DiagnosticKnowledgeBase:
     )
     diagnostic_knowledge_base_path = os.path.normpath(diagnostic_knowledge_base_path)
 
+    # 添加调试日志
+    if not os.path.exists(diagnostic_knowledge_base_path):
+        raise FileNotFoundError(
+            f"Knowledge base file not found, please check the path.:{diagnostic_knowledge_base_path}"
+        )
+
     # 同步读取 JSON 文件并解析为 DiagnosticKnowledgeBase 实例
     with open(diagnostic_knowledge_base_path, mode="r", encoding="utf-8") as f:
         content = f.read()
-        diagnostic_knowledge_base = parse_raw_as(DiagnosticKnowledgeBase, content)
+        diagnostic_knowledge_base = DiagnosticKnowledgeBase.model_validate_json(content)
     return diagnostic_knowledge_base
 
 
 # 全局变量，在模块被导入时自动初始化，且只执行一次
-diagnostic_knowledge = _init_diagnostic_knowledge_base()
+dkb = _init_diagnostic_knowledge_base()

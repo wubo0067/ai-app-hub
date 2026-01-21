@@ -36,7 +36,7 @@ async def main():
     # 使用回调配置
     thread = {"configurable": {"thread_id": "2"}}
     config = {
-        "recursion_limit": 5,
+        "recursion_limit": 10,
         "callbacks": [graph_logging_callback],
         **thread,
     }
@@ -44,8 +44,9 @@ async def main():
     try:
         async for event in agent_graph.astream(
             {
-                "vmcore_path": "/var/crash/127.0.0.1-2026-01-07-16:46:03/vmcore",
+                "vmcore_path": "/var/crash/127.0.0.1-2026-01-19-17:24:54/vmcore",
                 "vmlinux_path": "/usr/lib/debug/lib/modules/5.14.0-611.9.1.el9_7.x86_64/vmlinux",
+                "vmcore_dmesg_path": "/var/crash/127.0.0.1-2026-01-19-17:24:54/vmcore-dmesg.txt",
             },
             config=config,
         ):

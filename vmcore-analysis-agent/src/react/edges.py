@@ -5,22 +5,15 @@ VMCore 分析 Agent 边（路由）逻辑
 """
 
 from typing import Literal
+from langchain_core.messages import AIMessage, HumanMessage
 from .graph_state import AgentState
-from .nodes import llm_analysis_node, collect_crash_init_data_node, crash_tool_node
-from langchain_core.messages import AIMessage
 from src.utils.logging import logger
+from .nodes import crash_tool_node, llm_analysis_node
 
 
 def should_continue(state: AgentState) -> str:
     """
     根据当前 AgentState 决定下一步执行的节点。
-
-    路由逻辑：
-    1. 如果有错误 -> __end__
-    2. 如果最后一条消息不是 AIMessage -> __end__
-    3. 如果 AIMessage 没有 tool_calls -> __end__
-    4. 如果有 tool_calls -> crash_tool_node
-    5. 其他情况 -> llm_analysis_node
 
     Args:
         state: AgentState 字典
@@ -41,26 +34,27 @@ def should_continue(state: AgentState) -> str:
         logger.error(f"Routing to __end__ from node '{node}' due to error: {msg}")
         return "__end__"
 
-    # 2. 如果没有消息，继续 LLM 分析
-    if last_message is None:
-        logger.info("No messages yet, routing to llm_analysis_node")
+    # 2. 根据消息类型判断路由
+    if isinstance(last_message, AIMessage):
+        tool_calls = getattr(last_message, "tool_calls", None) or []
+        if tool_calls:
+            logger.info(
+                f"Found {len(tool_calls)} tool calls, routing to {crash_tool_node}"
+            )
+            return crash_tool_node
+        else:
+            logger.info(
+                "No tool calls in AIMessage, analysis complete. Routing to __end__"
+            )
+            return "__end__"
+
+    # 3. 如果是 HumanMessage (初始收集完成)，路由到分析节点
+    if isinstance(last_message, HumanMessage):
+        logger.info(f"Initial data collected, routing to {llm_analysis_node}")
         return llm_analysis_node
 
-    # 3. 检查消息类型
-    if not isinstance(last_message, AIMessage):
-        logger.warning(
-            f"Last message is {type(last_message).__name__}, not AIMessage. "
-            f"Routing to llm_analysis_node"
-        )
-        return llm_analysis_node
-
-    # 4. 检查是否有工具调用
-    tool_calls = getattr(last_message, "tool_calls", None) or []
-
-    if tool_calls:
-        logger.info(f"Found {len(tool_calls)} tool calls, routing to crash_tool_node")
-        return crash_tool_node
-    else:
-        # 没有工具调用，说明 LLM 给出了最终答案
-        logger.info("No tool calls in AIMessage, analysis complete. Routing to __end__")
-        return "__end__"
+    # 4. 默认安全回退
+    logger.warning(
+        f"Unexpected message type/state: {type(last_message)}, routing to __end__"
+    )
+    return "__end__"
