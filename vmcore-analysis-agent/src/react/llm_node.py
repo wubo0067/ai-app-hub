@@ -1,6 +1,6 @@
 import json
-from typing import Optional, List, Literal, cast
-from pydantic import BaseModel, Field
+from typing import Optional, List, Literal, cast, Any, Dict
+from pydantic import BaseModel, Field, model_validator
 from langchain_core.messages import AIMessage, SystemMessage
 from .graph_state import AgentState
 from .nodes import llm_analysis_node
@@ -14,6 +14,25 @@ class ToolCall(BaseModel):
         ..., description="The crash command (e.g., 'dis', 'rd', 'struct')."
     )
     arguments: List[str] = Field(default_factory=list, description="Command arguments.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def fix_malformed_action(cls, data: Any) -> Any:
+        """修复 LLM 输出的常见格式错误"""
+        if isinstance(data, dict):
+            # 修复：{"command_name": "ps", ["-m"]} -> {"command_name": "ps", "arguments": ["-m"]}
+            if "command_name" in data and "arguments" not in data:
+                # 查找字典中除 command_name 外的列表值
+                for key, value in list(data.items()):
+                    if isinstance(value, list):
+                        data["arguments"] = value
+                        if key != "command_name":
+                            del data[key]
+                        break
+                # 如果还是没有 arguments，设置为空列表
+                if "arguments" not in data:
+                    data["arguments"] = []
+        return data
 
 
 class VMCoreAnalysisStep(BaseModel):

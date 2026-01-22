@@ -23,6 +23,12 @@ Check if the current crash context (RIP, function name, or panic string) matches
 If NO DKB pattern matches, or the DKB path is exhausted without a conclusion,
 you MUST act as a kernel expert using this systematic fallback protocol:
 
+# Expert Execution Guidelines (Optimization)
+1. **Loop & Stall Diagnosis**: If you suspect an infinite loop or CPU stall (e.g., Soft Lockup):
+   - **Go Broad**: Do NOT rely on `tail` or `head` with small counts. Disassemble the entire function or at least 50+ lines around the RIP immediately to see jump destinations (e.g., `dis -lr <RIP> 50`).
+   - **Context is Key**: Always look for backward jumps (e.g., `jmp`, `jne` to a previous address) which indicate a loop structure.
+2. **Efficiency**: Avoid "incremental" probing. If a command provides insufficient context, your next step should be to significantly increase the search range or switch to a more diagnostic command (like `rd` for variables) rather than repeating the same type of command with minor offset changes.
+
 # Input Context
 - **Initial Info**: Initial `sys`, `bt`, and `vmcore-dmesg` outputs.
 - **History**: The sequence of previous commands and their results.
@@ -35,6 +41,35 @@ you MUST act as a kernel expert using this systematic fallback protocol:
 # Output Format
 You MUST respond using the structured JSON schema provided (VMCoreAnalysisStep).
 {VMCoreAnalysisStep_Schema}
+
+### CRITICAL: JSON Format Requirements
+1. **Output ONLY valid JSON** - No markdown blocks, no DSML tags, no extra text
+2. **The "action" field structure** (if present) MUST be:
+   ```json
+   "action": {{
+     "command_name": "<command>",
+     "arguments": ["<arg1>", "<arg2>"]
+   }}
+   ```
+3. **INCORRECT examples** (DO NOT USE):
+   - `"action": {{"command_name": "ps", ["-m"]}}` ❌ (missing "arguments" key)
+   - `"action": {{"ps", "arguments": ["-m"]}}` ❌ (missing "command_name" key)
+
+### Example Valid Output:
+```json
+{{
+  "step_id": 1,
+  "analysis_path": "general_debugging",
+  "reasoning": "Need to examine the crash backtrace to identify the panic location.",
+  "knowledge_base_hit": null,
+  "action": {{
+    "command_name": "bt",
+    "arguments": ["-a"]
+  }},
+  "is_conclusive": false,
+  "final_diagnosis": null
+}}
+```
 """
 
 
@@ -45,5 +80,7 @@ def crash_init_data_prompt() -> str:
 1.  **`sys -i`**: Basic system info (kernel version, panic string, CPU count).
 2.  **`bt` (Backtrace)**: The call stack of the panic task.
 3.  **`vmcore-dmesg.txt`**: The kernel ring buffer log leading up to the crash.
+4.  **Third-party Kernel Modules**: A list of paths to modules with debugging symbols.
+    - **Action**: If the crash involves any of these modules (check `bt` output), you MUST load the symbols first using: `mod -s <module_name> <path_to_ko_with_debug_info>`.
 {init_info}
 """

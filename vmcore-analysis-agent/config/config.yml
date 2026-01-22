@@ -7,4 +7,4 @@ LANGSMITH_API_KEY: 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
 DEEPSEEK_API_KEY: sk-b5480f840a794c69a0af1732459f3ae4
 LLM_MODEL: deepseek-chat # deepseek-reasoner
 BASE_URL: https://api.deepseek.com
-TEMPERATURE: 1.0
+TEMPERATURE: 0.1

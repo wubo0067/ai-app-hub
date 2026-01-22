@@ -23,7 +23,6 @@ def register_crash_tool(name: str, syntax: str, example: str, summary: str):
     动态创建一个 crash 工具并注册到 crash_server
     """
 
-    @crash_server.tool(name=name)
     async def crash_tool_func(
         command: Annotated[
             str,
@@ -43,7 +42,6 @@ def register_crash_tool(name: str, syntax: str, example: str, summary: str):
             str, Field(description="The absolute path to the vmlinux file.")
         ],
     ) -> str:
-        """统一执行逻辑"""
         # 统一的执行逻辑
         try:
             output = run_crash_command(command, vmcore_path, vmlinux_path, True)
@@ -53,8 +51,11 @@ def register_crash_tool(name: str, syntax: str, example: str, summary: str):
 
     # 修改文档字符串，FastMCP 会将其作为工具描述
     crash_tool_func.__doc__ = f"{summary} (Crash Subcommand: {name})"
-    # 修改函数名以防冲突（虽然 FastMCP 主要看 tool(name=...)）
+    # 修改函数名以防冲突
     crash_tool_func.__name__ = f"crash_{name}"
+
+    # 手动调用 tool 装饰器进行注册，确保 __doc__ 已经被修改
+    crash_server.tool(name=name)(crash_tool_func)
     return crash_tool_func
 
 

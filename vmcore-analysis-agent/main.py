@@ -36,7 +36,7 @@ async def main():
     # 使用回调配置
     thread = {"configurable": {"thread_id": "2"}}
     config = {
-        "recursion_limit": 10,
+        "recursion_limit": 20,
         "callbacks": [graph_logging_callback],
         **thread,
     }
@@ -47,13 +47,16 @@ async def main():
                 "vmcore_path": "/var/crash/127.0.0.1-2026-01-19-17:24:54/vmcore",
                 "vmlinux_path": "/usr/lib/debug/lib/modules/5.14.0-611.9.1.el9_7.x86_64/vmlinux",
                 "vmcore_dmesg_path": "/var/crash/127.0.0.1-2026-01-19-17:24:54/vmcore-dmesg.txt",
+                "debug_symbol_paths": [
+                    "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/soft_lockup/soft_lockup_module.ko",
+                ],
             },
             config=config,
         ):
             for k, v in event.items():
                 if k != "__end__":
-                    logger.info(f"📍 Node: {k}")
-                    logger.debug(f"   Updates: {v}")
+                    logger.info(f"📍 Node: {k} execute complete.")
+                    # logger.debug(f"   Updates: {v}")
     except Exception as e:
         logger.error(f"Agent execution failed: {e}", exc_info=True)
 

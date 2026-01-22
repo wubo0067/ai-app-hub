@@ -48,8 +48,10 @@ class AgentState(MessagesState):
 
     # 核心路径配置
     vmcore_path: str
-    vmlinux_path: str
     vmcore_dmesg_path: str
+    vmlinux_path: str
+    # 第三方内核调试符号路径列表
+    debug_symbol_paths: Sequence[str]
 
     # step_count: int = 0, 每次分析步骤增加 1，operator.add
     step_count: Annotated[int, add] = field(default=0)

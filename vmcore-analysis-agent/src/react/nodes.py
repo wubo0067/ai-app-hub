@@ -257,6 +257,14 @@ async def collect_crash_init_data(state: AgentState) -> dict:
             "Skipping vmcore-dmesg.txt extraction: match info (PID/CPU/COMMAND) not found in 'bt' output."
         )
 
+    if state.get("debug_symbol_paths"):
+        crash_output_parts.append(
+            "$ Third-Party Kernel Modules with Debugging Symbols:\n"
+        )
+        for module_path in state["debug_symbol_paths"]:
+            crash_output_parts.append(f"- {module_path}\n")
+        crash_output_parts.append("\n")
+
     # 格式化输出为 prompt
     vmcore_init_info = "".join(crash_output_parts)
     prompt = crash_init_data_prompt().format(init_info=vmcore_init_info)
