@@ -15,7 +15,13 @@ class ToolCall(BaseModel):
     )
     arguments: List[str] = Field(default_factory=list, description="Command arguments.")
 
+    # 模型验证器，用于修复 LLM 输出的格式错误，作用：定义一个在模型实例化之前运行的验证器
+    # 模式："before" 表示在 Pydantic 解析输入数据到模型字段之前执行
+    # 参数：接收原始输入数据，可以修改后再传递给模型
     @model_validator(mode="before")
+    # 作用：将方法标记为类方法
+    # 访问权限：允许方法通过类而不是实例被调用
+    # 参数：第一个参数是 cls（代表类本身）
     @classmethod
     def fix_malformed_action(cls, data: Any) -> Any:
         """修复 LLM 输出的常见格式错误"""
