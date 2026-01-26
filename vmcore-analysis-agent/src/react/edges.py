@@ -24,6 +24,7 @@ def should_continue(state: AgentState) -> str:
     # ✅ 修复：使用字典访问方式而不是属性访问
     messages = state.get("messages", [])
     error_state = state.get("error")
+    is_last_step = state.get("is_last_step", False)
 
     last_message = messages[-1] if messages else None
 
@@ -38,6 +39,11 @@ def should_continue(state: AgentState) -> str:
     if isinstance(last_message, AIMessage):
         tool_calls = getattr(last_message, "tool_calls", None) or []
         if tool_calls:
+            if is_last_step:
+                logger.warning(
+                    "LLM requested tool calls on the last step. Forcing completion to avoid recursion limit error."
+                )
+                return "__end__"
             logger.info(
                 f"Found {len(tool_calls)} tool calls, routing to {crash_tool_node}"
             )

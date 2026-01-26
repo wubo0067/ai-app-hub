@@ -56,7 +56,9 @@ async def main():
             for k, v in event.items():
                 if k != "__end__":
                     logger.info(f"📍 Node: {k} execute complete.")
-                    # logger.debug(f"   Updates: {v}")
+                    # 打印 token 使用情况
+                    token_usage = agent_graph.get_state(thread).get("token_usage", 0)
+                    logger.info(f"   Token usage so far: {token_usage}")
     except Exception as e:
         logger.error(f"Agent execution failed: {e}", exc_info=True)
 

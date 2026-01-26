@@ -81,6 +81,7 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
     logger.info(
         f"Starting {llm_analysis_node} node execution (step {state.get('step_count', 0)})..."
     )
+    curr_token_usage = 0
 
     # 准备系统消息，包含诊断知识库和输出格式
     system_message = analysis_crash_prompt().format(
@@ -90,20 +91,38 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         ),
     )
 
+    # 检查是否是最后一步 (LangGraph recursion_limit 触发前)
+    # 如果是最后一步，要求 LLM 必须给出最终结论，停止工具调用
+    is_last_step = state.get("is_last_step", False)
+    if is_last_step:
+        logger.warning(
+            f"Agent reached the last step (is_last_step=True). Forcing conclusion."
+        )
+        system_message += (
+            "\n\n[CRITICAL WARNING]\n"
+            "This is your LAST STEP. You have reached the execution limit.\n"
+            "You MUST provide a 'final_diagnosis' based on the information you have gathered so far.\n"
+            "Set 'is_conclusive' to true and do NOT request any further tool calls (action must be null)."
+        )
+
     # 核心原因：LLM 是无状态的
     # LLM 本身没有记忆。每次调用 invoke() 都是一个独立的 API 请求，LLM 不会"记住"之前的对话。这和我们使用的聊天界面不同：
 
     # 每次调用都需要传入完整的上下文消息列表，包括系统消息和之前的对话历史。
     messages_to_send = [SystemMessage(content=system_message), *state["messages"]]
-    # 结构化输出
+    # 结构化输出，设置 include_raw=True 以获取 token 消耗等元数据
     llm_analysis = llm_with_tools.with_structured_output(
-        VMCoreAnalysisStep, method="json_mode"
+        VMCoreAnalysisStep, method="json_mode", include_raw=True
     )
     try:
-        # ✅ 修复：with_structured_output 返回的是 VMCoreAnalysisStep Pydantic 对象
-        analysis_result = cast(
-            VMCoreAnalysisStep, await llm_analysis.ainvoke(messages_to_send)
-        )
+        # 使用 include_raw=True 后，ainvoke 返回包含 'parsed' 和 'raw' 的字典
+        output_data = await llm_analysis.ainvoke(messages_to_send)
+        analysis_result = cast(VMCoreAnalysisStep, output_data["parsed"])
+        raw_message = cast(AIMessage, output_data["raw"])
+
+        # 获取并记录 token 消耗数量
+        usage_metadata = getattr(raw_message, "usage_metadata", {}) or {}
+        curr_token_usage = usage_metadata.get("total_tokens", 0)
 
         # 记录 response
         logger.debug(
@@ -139,6 +158,7 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         logger.error(f"Error during LLM analysis: {e}", exc_info=True)
         return {
             "step_count": 1,
+            "token_usage": curr_token_usage,
             "error": {
                 "message": str(e),
                 "node": llm_analysis_node,
@@ -148,6 +168,7 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
 
     return {
         "step_count": 1,
+        "token_usage": curr_token_usage,
         "messages": [response],
         "error": None,
     }
