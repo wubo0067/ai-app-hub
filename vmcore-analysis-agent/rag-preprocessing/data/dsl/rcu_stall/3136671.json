@@ -1,0 +1,85 @@
+{
+  "os": "Red Hat Enterprise Linux 7.3 and earlier, Red Hat Enterprise Linux 6 with Red Hat MRG v2.0 real time kernel, Red Hat Enterprise Linux 6",
+  "scenario": "System hangs after (Broadcom NICs) \"bnx2x_sp_post: BUG! EQ ring\"",
+  "symptoms": [
+    "kernel: bnx2x: [bnx2x_sp_post:3851(enP4p1s0f0)]BUG! EQ ring full!",
+    "kernel: bnx2x: [bnx2x_sp_post:3853(enP4p1s0f0)]driver assert",
+    "PANIC: \"Oops: System Reset, sig: 6 [#1]\" (check log for details)",
+    "kernel: BUG: soft lockup - CPU#12 stuck for 22s! [migration/12:391]",
+    "kernel: INFO: rcu_sched detected stalls on CPUs/tasks: { 79 107 121 128 131 137 138 139 140 156 158} (detected by 104, t=240067 jiffies, g=77851189, c=77851188, q=0)"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Examine backtrace of oldest failed task to understand semaphore acquisition failure.",
+      "action": "bt 101264",
+      "observation": "Task stuck in rwsem_down_write_failed waiting for write lock."
+    },
+    {
+      "step_number": 2,
+      "thought": "Inspect mmap_sem structure to see semaphore state and waiters.",
+      "action": "struct mm_struct.mmap_sem c00000b778bc6300",
+      "observation": "Semaphore count shows waiters; wait_list contains pending tasks."
+    },
+    {
+      "step_number": 3,
+      "thought": "List all tasks waiting on the semaphore to identify contention.",
+      "action": "list -H c00000b73ca33d00 -s rwsem_waiter.task,type | paste - - -",
+      "observation": "Many tasks waiting for read lock; one task waiting for write lock."
+    },
+    {
+      "step_number": 4,
+      "thought": "Check backtrace of another waiting task to see what holds the semaphore.",
+      "action": "bt 119913",
+      "observation": "Task in migrate_swap trying to stop CPUs while holding mmap_sem."
+    },
+    {
+      "step_number": 5,
+      "thought": "Examine migration_swap_arg structure to understand CPU stop targets.",
+      "action": "struct migration_swap_arg c000003954de7a20",
+      "observation": "Migration swap involves tasks on CPUs 12 and 79."
+    },
+    {
+      "step_number": 6,
+      "thought": "Inspect backtrace of the destination task (PID 10250) on CPU 79.",
+      "action": "bt 10250",
+      "observation": "Task in system reset exception; crash utility confused by endianness."
+    },
+    {
+      "step_number": 7,
+      "thought": "Examine kthread_worker structure to check spinlock state.",
+      "action": "struct -x kthread_worker c000003e3396a3c8",
+      "observation": "Spinlock slock value 0x8000009e indicates locked state."
+    },
+    {
+      "step_number": 8,
+      "thought": "Convert hex lock value to decimal to identify locking CPU.",
+      "action": "struct pd 0x9e",
+      "observation": "Lock value corresponds to CPU 158."
+    },
+    {
+      "step_number": 9,
+      "thought": "Check backtrace of task on CPU 158 to see why it holds the lock.",
+      "action": "bt -c 158",
+      "observation": "Task in wake_up_process spinning because target task is on_cpu."
+    },
+    {
+      "step_number": 10,
+      "thought": "Disassemble wake_up_process to understand spinning loop.",
+      "action": "dis -lr c00000000012a434",
+      "observation": "Code shows while(p->on_cpu) cpu_relax() loop at line 1711."
+    },
+    {
+      "step_number": 11,
+      "thought": "Check task_struct fields for on_cpu and on_rq status of PID 10250.",
+      "action": "task -R `on_cpu`,`on_rq` 10250",
+      "observation": "Task has on_cpu=1 and on_rq=1, indicating it's currently running."
+    }
+  ],
+  "root_cause_analysis": [
+    "The system has found a race condition which can lead to a deadlock condition in the scheduler when one task tries to wake up an already running task.",
+    "This race condition has resulted in one task spinning in a loop while waiting for a second task to stop running.",
+    "But the second task cannot stop running as it is spinning waiting on a spinlock owned by the first task.",
+    "This then resulted in NIC firmware hang."
+  ]
+}

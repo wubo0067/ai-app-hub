@@ -1,0 +1,76 @@
+{
+  "os": "Red Hat Enterprise Linux 8.7",
+  "scenario": "System hangs with rcu_sched CPU stall, hung task, and soft lockup after kernel update with drbd module",
+  "symptoms": [
+    "rcu_sched detected stalls on CPUs/tasks",
+    "INFO: task rpm:2874 blocked for more than 120 seconds",
+    "watchdog: BUG: soft lockup - CPU#3 stuck for 22s! [sshd:4823]"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Check the version of the running kernel",
+      "action": "sys | grep -e RELEASE",
+      "observation": "RELEASE: 4.18.0-425.10.1.el8_7.x86_64"
+    },
+    {
+      "step_number": 2,
+      "thought": "Set context to the drbd worker task",
+      "action": "set 4787",
+      "observation": "PID: 4787 COMMAND: drbd_w_was02d STATE: TASK_RUNNING"
+    },
+    {
+      "step_number": 3,
+      "thought": "Get backtrace with thread information",
+      "action": "bt -T",
+      "observation": "dequeue_work_batch and _raw_spin_lock_irq in call trace"
+    },
+    {
+      "step_number": 4,
+      "thought": "Get backtrace of all active tasks on each CPU",
+      "action": "bt -a",
+      "observation": "Multiple tasks stuck in native_queued_spin_lock_slowpath"
+    },
+    {
+      "step_number": 5,
+      "thought": "Check module information for drbd",
+      "action": "mod -t | grep -e NAME -e drbd",
+      "observation": "drbd module with OE taint"
+    },
+    {
+      "step_number": 6,
+      "thought": "Examine drbd module details",
+      "action": "struct module.state,name,version,srcversion,rhelversion,sig_ok 0xffffffffc0d5e640",
+      "observation": "Module state LIVE, version 9.1.12, rhelversion 8.7"
+    },
+    {
+      "step_number": 7,
+      "thought": "Check filesystem details for drbd.ko symlink",
+      "action": "files -d ffff9dd1d19e5480",
+      "observation": "Symlink to weak-updates/drbd/drbd.ko"
+    },
+    {
+      "step_number": 8,
+      "thought": "Examine inode details of symlink",
+      "action": "struct inode.i_ino,i_size,i_nlink ffff9dd1d1abd620",
+      "observation": "i_size = 57 (symlink size)"
+    },
+    {
+      "step_number": 9,
+      "thought": "Check filesystem details for actual drbd.ko file",
+      "action": "files -d ffff9dd1d19e9240",
+      "observation": "Regular file at extra/drbd/drbd.ko"
+    },
+    {
+      "step_number": 10,
+      "thought": "Examine inode details of actual module file",
+      "action": "struct inode.i_ino,i_size,i_nlink ffff9dd1d1b32ba0",
+      "observation": "i_size = 1325975 (actual module size)"
+    }
+  ],
+  "root_cause_analysis": [
+    "The fix of kABI breakage in struct pv_mmu_ops reported via Private Bug ID: #2144161#2152206 has a side effect on third-party kernel modules built on top of RHEL-8.7 GA kernel version 4.18.0-425.3.1.el8.",
+    "The version of the third-party module [drbd] linked to the kernel version 4.18.0-425.10.1.el8_7 or higher is incompatible.",
+    "The [drbd] kernel module file inside 4.18.0-425.10.1.el8_7.x86_64/weak-updates/drbd directory is a symlink to the [drbd] kernel module inside 4.18.0-425.3.1.el8.x86_64/extra/drbd directory."
+  ]
+}

@@ -1,0 +1,81 @@
+{
+  "os": "RHEL7.3",
+  "scenario": "Server hung trying to acquire spinlock by third party module strmfs_mod",
+  "symptoms": [
+    "RIP: _raw_spin_lock_irqsave+71",
+    "Multiple soft lockup's observed where various vcpus are calling drain_all_pages()",
+    "RIP: smp_call_function_many+514"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Set context to analyze the hung task PID 19227",
+      "action": "set 19227",
+      "observation": "Confirm task state is TASK_RUNNING (ACTIVE)"
+    },
+    {
+      "step_number": 2,
+      "thought": "Examine function addresses for smp_call_function_many",
+      "action": "struct px on_each_cpu_mask",
+      "observation": "Verify address of on_each_cpu_mask function"
+    },
+    {
+      "step_number": 3,
+      "thought": "Check address of smp_call_function_many function",
+      "action": "struct px smp_call_function_many",
+      "observation": "Verify address of smp_call_function_many"
+    },
+    {
+      "step_number": 4,
+      "thought": "Get backtrace of hung task to see call chain",
+      "action": "bt",
+      "observation": "Task stuck in smp_call_function_many waiting for CPU"
+    },
+    {
+      "step_number": 5,
+      "thought": "Inspect per-CPU call function data for CPU 12",
+      "action": "struct px cfd_data:12",
+      "observation": "Check csd and cpumask values for CPU 12"
+    },
+    {
+      "step_number": 6,
+      "thought": "Alternative way to examine call_function_data structure",
+      "action": "struct call_function_data ffff88081d9177c0",
+      "observation": "Verify struct call_function_data contents"
+    },
+    {
+      "step_number": 7,
+      "thought": "Read cpumask value to see which CPUs are targeted",
+      "action": "rd -x 0xffff88017cb2e000",
+      "observation": "Get cpumask bit pattern"
+    },
+    {
+      "step_number": 8,
+      "thought": "Convert cpumask to binary to identify busy CPUs",
+      "action": "eval -b 000000000004a048",
+      "observation": "Identify which CPU bits are set in mask"
+    },
+    {
+      "step_number": 9,
+      "thought": "Check call_single_queue for all CPUs to find pending work",
+      "action": "p call_single_queue:all | grep -e per -e first | paste - -",
+      "observation": "Find CPU with non-empty queue (CPU 13 has work)"
+    },
+    {
+      "step_number": 10,
+      "thought": "Get backtrace of busy CPU 13 to see what's blocking",
+      "action": "bt -c 13",
+      "observation": "CPU 13 stuck in spinlock within strmfs_mod module"
+    },
+    {
+      "step_number": 11,
+      "thought": "Check kernel log for RCU stall messages",
+      "action": "log|grep rcu",
+      "observation": "Multiple RCU stalls detected on CPU 13"
+    }
+  ],
+  "root_cause_analysis": [
+    "The strm11 task was trying to acquire the spinlock inside the function dupb().",
+    "However, the function dupb() is part of a third party [strmfs_mod] kernel module."
+  ]
+}

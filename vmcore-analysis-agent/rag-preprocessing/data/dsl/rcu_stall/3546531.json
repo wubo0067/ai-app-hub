@@ -1,0 +1,134 @@
+{
+  "os": "Red Hat Enterprise Linux 7",
+  "scenario": "System hang due to busy spinlock in AfdgSleepEvent from oracleafd module",
+  "symptoms": [
+    "INFO: rcu_sched detected stalls on CPUs/tasks",
+    "RIP: _raw_spin_lock_irqsave+0x47",
+    "Kernel panic - not syncing: NMI: Not continuing"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Check system information and panic message",
+      "action": "sys | grep -e CPUS -e MACHINE -e PANIC",
+      "observation": "PANIC string and system configuration"
+    },
+    {
+      "step_number": 2,
+      "thought": "Examine kernel ring buffer for error messages",
+      "action": "log",
+      "observation": "RCU stalls and stack traces"
+    },
+    {
+      "step_number": 3,
+      "thought": "Check task state distribution",
+      "action": "ps -S",
+      "observation": "High count of UN (uninterruptable) tasks"
+    },
+    {
+      "step_number": 4,
+      "thought": "Analyze CPU runqueue latency",
+      "action": "runq -T",
+      "observation": "CPU with highest runqueue lag"
+    },
+    {
+      "step_number": 5,
+      "thought": "Examine stack trace of busiest CPU",
+      "action": "bt -c 0",
+      "observation": "Task spinning on spinlock in oracleafd module"
+    },
+    {
+      "step_number": 6,
+      "thought": "Identify SLAB cache for spinlock address",
+      "action": "kmem ffff8801005a10a0",
+      "observation": "Address belongs to user_namespace cache"
+    },
+    {
+      "step_number": 7,
+      "thought": "Check structure field for corruption",
+      "action": "struct user_namespace.uid_map.nr_extents ffff8801005a1068",
+      "observation": "Unexpected value (0x52515354)"
+    },
+    {
+      "step_number": 8,
+      "thought": "Convert hex value to ASCII",
+      "action": "ascii 0x52515354",
+      "observation": "TSQR string (oracleafd signature)"
+    },
+    {
+      "step_number": 9,
+      "thought": "Dump raw memory content of object",
+      "action": "rd ffff8801005a1068 35 -S",
+      "observation": "AFDopenHndl reference in user_namespace object"
+    },
+    {
+      "step_number": 10,
+      "thought": "Check other blocked CPUs",
+      "action": "bt -c 7",
+      "observation": "CPU blocked in smp_call_function_many"
+    },
+    {
+      "step_number": 11,
+      "thought": "Examine call_single_data structure",
+      "action": "struct call_single_data ffff880dc761a880",
+      "observation": "Function pointer and flags"
+    },
+    {
+      "step_number": 12,
+      "thought": "Check per-CPU data",
+      "action": "struct px cfd_data:7",
+      "observation": "csd and cpumask values"
+    },
+    {
+      "step_number": 13,
+      "thought": "Examine cpumask structure",
+      "action": "struct cpumask_t 0xffff880db32c3000",
+      "observation": "Bits set in cpumask"
+    },
+    {
+      "step_number": 14,
+      "thought": "Evaluate binary representation",
+      "action": "eval -b 0xf7f",
+      "observation": "Specific CPU bits set"
+    },
+    {
+      "step_number": 15,
+      "thought": "Check per-CPU call_single_queue",
+      "action": "struct px call_single_queue:0",
+      "observation": "First element in queue"
+    },
+    {
+      "step_number": 16,
+      "thought": "List elements and find specific address",
+      "action": "list 0xffff880dc761a790 | grep -n ffff880dc761a880",
+      "observation": "Position in call_single_queue"
+    },
+    {
+      "step_number": 17,
+      "thought": "Check runqueue for specific CPU",
+      "action": "runq -c 2",
+      "observation": "Current task and runqueue contents"
+    },
+    {
+      "step_number": 18,
+      "thought": "Examine stack trace by task address",
+      "action": "bt 0xffff881024d55080",
+      "observation": "Task spinning on spinlock in oracleafd"
+    },
+    {
+      "step_number": 19,
+      "thought": "Inspect wait_queue_head_t structure",
+      "action": "struct wait_queue_head_t 0xffff880467960d58",
+      "observation": "Lock state and task_list"
+    },
+    {
+      "step_number": 20,
+      "thought": "Identify SLAB cache for wait_queue address",
+      "action": "kmem 0xffff880467960d58",
+      "observation": "Address belongs to user_namespace cache"
+    }
+  ],
+  "root_cause_analysis": [
+    "The SLAB object is at least partially overwritten with the \"oracleafd\"-related signature (the \"TSQR\" ASCII string and the \"AFDopenHndl\" object reference), which may be a race condition of some type where the module uses the SLAB object which doesn't belong to it."
+  ]
+}

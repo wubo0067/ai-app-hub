@@ -209,8 +209,8 @@ def main():
     #   | xargs -I{} cp {} /tmp/softlockup/
 
     # 从 ../data/md/ssl 目录获取所有 .md 文件
-    out_dsl_dir = "../data/dsl/ssl"
-    md_dir = "../data/md/ssl"
+    out_dsl_dir = "../data/dsl/rcu_stall"
+    md_dir = "../data/md/rcu_stall"
     md_list = [os.path.join(md_dir, f) for f in os.listdir(md_dir) if f.endswith(".md")]
 
     # dsl_list = []

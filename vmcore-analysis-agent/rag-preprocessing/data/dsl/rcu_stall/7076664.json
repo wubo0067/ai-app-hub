@@ -1,0 +1,87 @@
+{
+  "os": "Red Hat Enterprise Linux 8",
+  "scenario": "Hard lockup and kernel panic due to excessive console printing by DellEMC PowerFlex (scini) module",
+  "symptoms": [
+    "Kernel panic - not syncing: Hard LOCKUP",
+    "Hard lockup detected on CPU 29 on process rcu_sched",
+    "Soft lockups detected on CPUs 21 and 27, followed by rcu stalls on CPUs 20 and 7"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Check system information and panic message",
+      "action": "sys",
+      "observation": "Panic string 'Kernel panic - not syncing: Hard LOCKUP'"
+    },
+    {
+      "step_number": 2,
+      "thought": "Examine backtrace of rcu_sched process on CPU 29",
+      "action": "bt -sx",
+      "observation": "Stack shows native_queued_spin_lock_slowpath and _raw_spin_lock_irqsave"
+    },
+    {
+      "step_number": 3,
+      "thought": "Compare hrtimer_interrupts values to confirm watchdog detection",
+      "action": "p hrtimer_interrupts_saved:29",
+      "observation": "Value matches hrtimer_interrupts for CPU 29"
+    },
+    {
+      "step_number": 4,
+      "thought": "Check hrtimer_interrupts value for same CPU",
+      "action": "p hrtimer_interrupts:29",
+      "observation": "Value equals hrtimer_interrupts_saved"
+    },
+    {
+      "step_number": 5,
+      "thought": "Resolve symbol address to identify spinlock structure",
+      "action": "sym ffffffff941e4ec0",
+      "observation": "Address corresponds to rcu_state+576"
+    },
+    {
+      "step_number": 6,
+      "thought": "Examine rcu_node.lock structure to check lock state",
+      "action": "struct rcu_node.lock ffffffff941e4ec0 -x",
+      "observation": "Lock shows pending=1, locked=0 in raw_lock"
+    },
+    {
+      "step_number": 7,
+      "thought": "Analyze lock value bitfields for detailed state",
+      "action": "eval -b 0x180100",
+      "observation": "Binary shows bits set at positions 20, 19, 8"
+    },
+    {
+      "step_number": 8,
+      "thought": "Search kernel log for soft lockup messages",
+      "action": "log | grep 'soft lockup'",
+      "observation": "Soft lockups on CPU#21 and CPU#27"
+    },
+    {
+      "step_number": 9,
+      "thought": "Search for rcu stall messages in kernel log",
+      "action": "log | grep -A3 'rcu_sched detected stalls' | grep -v Disconnected | grep -v PowerFlex",
+      "observation": "RCU stalls on CPUs 20 and 7"
+    },
+    {
+      "step_number": 10,
+      "thought": "Count PowerFlex error messages in kernel log",
+      "action": "log | grep 'PowerFlex netSock_GetMyAddress' | wc -l",
+      "observation": "5948 occurrences of the error"
+    },
+    {
+      "step_number": 11,
+      "thought": "Resolve PowerFlex function symbol address",
+      "action": "sym netSock_GetMyAddress",
+      "observation": "Function belongs to scini module"
+    },
+    {
+      "step_number": 12,
+      "thought": "Get detailed module information for scini",
+      "action": "struct emodinfo --details scini | head -n 7",
+      "observation": "Module is DellEMC PowerFlex Version: 3.6.3000.124"
+    }
+  ],
+  "root_cause_analysis": [
+    "The cause of the hang/panic state of the system is excessive printing of errors on the console by DellEMC PowerFlex(scini).",
+    "Different types of errors reported but most of the time it was:PowerFlex netSock_GetMyAddress:1776 :Error: Failed to retrieve socket local address for socket 00000000559ecfe0 with Errno 16."
+  ]
+}

@@ -1,0 +1,147 @@
+{
+  "os": "Red Hat Enterprise Linux 8",
+  "scenario": "Server hung while trying to acquire spinlock by third party module seh_vhcd",
+  "symptoms": [
+    "Server hung trying to acquire spinlock by third party module [seh_vhcd]",
+    "Exception RIP: smp_call_function_single+210",
+    "watchdog: BUG: soft lockup - CPU#1 stuck for 22s! [lsusb:2011933]"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Check task state distribution to understand system load",
+      "action": "ps -S",
+      "observation": "78 RU tasks and 4 UN tasks contributing to load"
+    },
+    {
+      "step_number": 2,
+      "thought": "Examine run queue lengths to identify CPU congestion",
+      "action": "struct rq.cpu,nr_running runqueues:a | paste - - -",
+      "observation": "CPU 1 has 66 tasks in run queue causing load elevation"
+    },
+    {
+      "step_number": 3,
+      "thought": "Inspect run queue contents for CPU 1 to see waiting tasks",
+      "action": "runq -c1",
+      "observation": "Detailed list of 66 tasks waiting in CPU 1 run queue"
+    },
+    {
+      "step_number": 4,
+      "thought": "Get backtrace of lsusb task to identify hang location",
+      "action": "bt -c1",
+      "observation": "Task stuck at smp_call_function_single+210 exception"
+    },
+    {
+      "step_number": 5,
+      "thought": "Disassemble the faulting instruction for detailed analysis",
+      "action": "dis -rl ffffffffa7ba5a12 | tail",
+      "observation": "Instruction at smp_call_function_single+210 shows mov (%rsp),%edx"
+    },
+    {
+      "step_number": 6,
+      "thought": "Check kernel log for lockup messages to confirm soft lockups",
+      "action": "log |grep -c lockup",
+      "observation": "212 lockup messages in system log"
+    },
+    {
+      "step_number": 7,
+      "thought": "Examine recent lockup messages to identify affected processes",
+      "action": "log |grep -i lockup | tail",
+      "observation": "Multiple soft lockups for lsusb process on CPU 1"
+    },
+    {
+      "step_number": 8,
+      "thought": "Check for RCU stalls indicating synchronization issues",
+      "action": "log|grep -c rcu_sched",
+      "observation": "179 rcu_sched stall messages in log"
+    },
+    {
+      "step_number": 9,
+      "thought": "Examine recent RCU stall details for starvation information",
+      "action": "log|grep -i rcu_sched | tail",
+      "observation": "rcu_sched kthread starved for millions of jiffies"
+    },
+    {
+      "step_number": 10,
+      "thought": "Lookup symbol address to identify kernel function",
+      "action": "sym 0xffffffffa7a7cd70",
+      "observation": "Address corresponds to do_flush_tlb_all function"
+    },
+    {
+      "step_number": 11,
+      "thought": "Check runqueue latency to identify stalled CPUs",
+      "action": "runq -T |tail",
+      "observation": "CPU 0 shows 49256.36 secs latency indicating severe stall"
+    },
+    {
+      "step_number": 12,
+      "thought": "Set context to CPU 0 to examine the stalled task",
+      "action": "set -c0",
+      "observation": "Task utnservice (PID 1450) is running on CPU 0"
+    },
+    {
+      "step_number": 13,
+      "thought": "Get backtrace of utnservice task to find hang cause",
+      "action": "bt 1450",
+      "observation": "Task stuck in vhci_get_from_hcd_tx_queue from seh_vhcd module"
+    },
+    {
+      "step_number": 14,
+      "thought": "Examine spinlock function address for reference",
+      "action": "struct px _raw_spin_lock_irqsave",
+      "observation": "_raw_spin_lock_irqsave function address is 0xffffffffa83f1170"
+    },
+    {
+      "step_number": 15,
+      "thought": "Disassemble third party function to see spinlock call",
+      "action": "dis -r ffffffffc08f2983 | tail",
+      "observation": "Function calls _raw_spin_lock_irqsave at offset 158"
+    },
+    {
+      "step_number": 16,
+      "thought": "Disassemble kprobe handler for context",
+      "action": "dis -r ffffffffa7a6c112 |head",
+      "observation": "kprobe_ftrace_handler function prologue"
+    },
+    {
+      "step_number": 17,
+      "thought": "Search backtrace for spinlock calls with context",
+      "action": "bt -f |grep -e _raw_spin_lock_irqsave -B5",
+      "observation": "Stack frame shows _raw_spin_lock_irqsave call context"
+    },
+    {
+      "step_number": 18,
+      "thought": "Examine raw_spinlock_t structure at suspected address",
+      "action": "struct raw_spinlock_t ffff987ead47e000",
+      "observation": "Spinlock shows counter=0, locked=0, not currently held"
+    },
+    {
+      "step_number": 19,
+      "thought": "Lookup symbol for third party function to confirm module",
+      "action": "sym vhci_get_from_hcd_tx_queue",
+      "observation": "Function is within seh_vhcd module code"
+    },
+    {
+      "step_number": 20,
+      "thought": "Check module taints to identify unsigned modules",
+      "action": "mod -t",
+      "observation": "seh_vhcd module has OE taint"
+    },
+    {
+      "step_number": 21,
+      "thought": "Get module details including signature status",
+      "action": "mod |grep -e NAME -e seh_vhcd",
+      "observation": "seh_vhcd module base address and size"
+    },
+    {
+      "step_number": 22,
+      "thought": "Examine module structure for signature verification",
+      "action": "struct module.state,name,version,srcversion,sig_ok ffffffffc08fc600",
+      "observation": "Module sig_ok = false, indicating unsigned module"
+    }
+  ],
+  "root_cause_analysis": [
+    "The task was trying to acquire the spinlock inside the function vhci_get_from_hcd_tx_queue().",
+    "However, the function vhci_get_from_hcd_tx_queue() is part of a third party [seh_vhcd] kernel module."
+  ]
+}

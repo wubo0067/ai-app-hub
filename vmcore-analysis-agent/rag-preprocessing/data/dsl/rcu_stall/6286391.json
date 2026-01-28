@@ -1,0 +1,240 @@
+{
+  "os": "Red Hat Enterprise Linux 8",
+  "scenario": "Timer tree corruption leads to missing wakeup and system freeze",
+  "symptoms": [
+    "Kernel panic - not syncing: NMI: Not continuing",
+    "INFO: task ... blocked for more than 120 seconds",
+    "rcu: INFO: rcu_sched detected stalls on CPUs/tasks"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Check overall system task state summary",
+      "action": "ps -S",
+      "observation": "Count of tasks in each state (RU, IN, ID, PA, UN, ZO)"
+    },
+    {
+      "step_number": 2,
+      "thought": "Examine hung task detection sysctl values",
+      "action": "struct sysctl_hung_task_warnings",
+      "observation": "Number of hung task warnings issued"
+    },
+    {
+      "step_number": 3,
+      "thought": "Check hung task timeout configuration",
+      "action": "struct sysctl_hung_task_timeout_secs",
+      "observation": "Timeout value for hung task detection"
+    },
+    {
+      "step_number": 4,
+      "thought": "Read kernel command line from memory",
+      "action": "rd -a ffff8b023ff97280",
+      "observation": "Boot parameters including isolcpus and nohz settings"
+    },
+    {
+      "step_number": 5,
+      "thought": "List uninterruptible tasks with timestamps",
+      "action": "ps -m | grep UN | tail",
+      "observation": "Recent UN tasks with PIDs and commands"
+    },
+    {
+      "step_number": 6,
+      "thought": "Analyze backtraces of all UN tasks for common patterns",
+      "action": "foreach UN bt | awk '/#4 / { print $3,$5 }' | sort | uniq -c | sort -nr",
+      "observation": "Most frequent blocking functions in UN tasks"
+    },
+    {
+      "step_number": 7,
+      "thought": "Examine specific UN task details",
+      "action": "ps -m 231759",
+      "observation": "Task state and timing information"
+    },
+    {
+      "step_number": 8,
+      "thought": "Disassemble function to understand code flow",
+      "action": "dis -rl ffffffff8b91062a | tail",
+      "observation": "Assembly instructions around inotify_release"
+    },
+    {
+      "step_number": 9,
+      "thought": "Check function prologue for stack usage",
+      "action": "dis -r ffffffff8b90ea16 | head | grep push",
+      "observation": "Register pushes at function entry"
+    },
+    {
+      "step_number": 10,
+      "thought": "Find inotify_release in backtrace frames",
+      "action": "bt -f|grep inoti -B4",
+      "observation": "Stack frame containing inotify_release address"
+    },
+    {
+      "step_number": 11,
+      "thought": "Examine fsnotify_group structure field offset",
+      "action": "struct -ox fsnotify_group.notification_waitq ffff8afeb3877d00",
+      "observation": "Offset of wait queue in structure"
+    },
+    {
+      "step_number": 12,
+      "thought": "Check if wait queue has pending tasks",
+      "action": "waitq ffff8afeb3877d20",
+      "observation": "Empty or non-empty wait queue status"
+    },
+    {
+      "step_number": 13,
+      "thought": "List block devices with statistics",
+      "action": "dev -D",
+      "observation": "Device major numbers, names, and request counts"
+    },
+    {
+      "step_number": 14,
+      "thought": "Check module taint status",
+      "action": "mod -t",
+      "observation": "Module names and taint flags"
+    },
+    {
+      "step_number": 15,
+      "thought": "Examine another UN task details",
+      "action": "ps -m 231800",
+      "observation": "Task state and timing for different PID"
+    },
+    {
+      "step_number": 16,
+      "thought": "Set context to specific task for further analysis",
+      "action": "set 231800",
+      "observation": "Task details including state and CPU"
+    },
+    {
+      "step_number": 17,
+      "thought": "Get backtrace of selected task",
+      "action": "bt",
+      "observation": "Call stack showing blocking functions"
+    },
+    {
+      "step_number": 18,
+      "thought": "List all UN tasks in system",
+      "action": "ps -m | grep UN",
+      "observation": "Complete list of uninterruptible tasks"
+    },
+    {
+      "step_number": 19,
+      "thought": "Check timer tree structure for corruption",
+      "action": "hrtimer_cpu_base.clock_base[0].active.next hrtimer_bases:0",
+      "observation": "Next timer pointer in clock base"
+    },
+    {
+      "step_number": 20,
+      "thought": "Identify CPU handling timer duties",
+      "action": "struct tick_do_timer_cpu",
+      "observation": "CPU number responsible for timer ticks"
+    },
+    {
+      "step_number": 21,
+      "thought": "Check current jiffies counter",
+      "action": "struct jiffies",
+      "observation": "Current jiffies value for timing reference"
+    },
+    {
+      "step_number": 22,
+      "thought": "Verify NOHZ tickless mode status",
+      "action": "struct tick_nohz_enabled",
+      "observation": "Boolean indicating NOHZ mode enabled"
+    },
+    {
+      "step_number": 23,
+      "thought": "Check if full NOHZ mode is running",
+      "action": "struct tick_nohz_full_running",
+      "observation": "Boolean for full NOHZ operation"
+    },
+    {
+      "step_number": 24,
+      "thought": "Get NOHZ full CPU mask address",
+      "action": "struct tick_nohz_full_mask",
+      "observation": "Address of cpumask for NOHZ full CPUs"
+    },
+    {
+      "step_number": 25,
+      "thought": "Examine CPU mask bits",
+      "action": "struct cpumask.bits 0xffff8b023ff96040",
+      "observation": "Bitmask of CPUs in NOHZ full mode"
+    },
+    {
+      "step_number": 26,
+      "thought": "Get RCU nocallback CPU mask",
+      "action": "struct rcu_nocb_mask",
+      "observation": "Address of cpumask for RCU nocallback CPUs"
+    },
+    {
+      "step_number": 27,
+      "thought": "Examine RCU nocallback mask bits",
+      "action": "struct cpumask.bits 0xffff8b023ff96080",
+      "observation": "Bitmask of CPUs with RCU callbacks disabled"
+    },
+    {
+      "step_number": 28,
+      "thought": "Calculate complement of mask for analysis",
+      "action": "eval -b (0xffffffffffffffff - 0xffffffcffffffffc)",
+      "observation": "Bits representing non-isolated CPUs"
+    },
+    {
+      "step_number": 29,
+      "thought": "Examine specific bit in NOHZ mask",
+      "action": "p tick_nohz_full_mask->bits[0]",
+      "observation": "First 64-bit word of NOHZ mask"
+    },
+    {
+      "step_number": 30,
+      "thought": "Check housekeeping CPU mask",
+      "action": "p housekeeping_mask->bits[0]",
+      "observation": "First 64-bit word of housekeeping mask"
+    },
+    {
+      "step_number": 31,
+      "thought": "Verify NOHZ mask value again",
+      "action": "p tick_nohz_full_mask->bits[0]",
+      "observation": "Consistency check of NOHZ mask"
+    },
+    {
+      "step_number": 32,
+      "thought": "Examine run queues for specific CPUs",
+      "action": "runq -c36,37",
+      "observation": "Tasks currently queued on CPUs 36 and 37"
+    },
+    {
+      "step_number": 33,
+      "thought": "List timers for specific CPUs in detail",
+      "action": "timer -C36,37 -r",
+      "observation": "All timers with expiration times and functions"
+    },
+    {
+      "step_number": 34,
+      "thought": "Calculate time difference between current and expiration",
+      "action": "struct pd (41160646000000-70464717671149)/1000000000",
+      "observation": "Time delta in seconds showing overdue timers"
+    },
+    {
+      "step_number": 35,
+      "thought": "Convert seconds to hours for readability",
+      "action": "struct pd 29304/60/60",
+      "observation": "Hours since timer should have expired"
+    },
+    {
+      "step_number": 36,
+      "thought": "Repeat timer examination for confirmation",
+      "action": "timer -C36,37 -r",
+      "observation": "Consistent timer state showing scheduling stall"
+    }
+  ],
+  "root_cause_analysis": [
+    "The commit below will resolve the issue.",
+    "commit 511885d7061eda3eb1faf3f57dcc936ff75863f1",
+    "Author: Davidlohr Bueso <dave@stgolabs.net>",
+    "Date:   Wed Jul 24 08:23:23 2019 -0700",
+    "lib/timerqueue: Rely on rbtree semantics for next timer",
+    "Simplify the timerqueue code by using cached rbtrees and rely on the tree leftmost node semantics to get the timer with earliest expiration time. This is a drop in conversion, and therefore semantics remain untouched.",
+    "The runtime overhead of cached rbtrees is be pretty much the same as the current head->next method, noting that when removing the leftmost node, a common operation for the timerqueue, the rb_next(leftmost) is O(1) as well, so the next timer will either be the right node or its parent. Therefore no extra pointer chasing. Finally, the size of the struct timerqueue_head remains the same.",
+    "Passes several hours of rcutorture.",
+    "Signed-off-by: Davidlohr Bueso <dbueso@suse.de>",
+    "Signed-off-by: Thomas Gleixner <tglx@linutronix.de>",
+    "Link: https://lkml.kernel.org/r/20190724152323.bojciei3muvfxalm@linux-r8p5"
+  ]
+}

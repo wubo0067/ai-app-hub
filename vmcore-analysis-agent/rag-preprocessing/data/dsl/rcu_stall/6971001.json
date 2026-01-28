@@ -1,0 +1,100 @@
+{
+  "os": "Red Hat Enterprise Linux 7.9.z - kernel-3.10.0-1160.59.1.el7",
+  "scenario": "Deadlock between posix_cpu_timer_del() and run_posix_cpu_timers()",
+  "symptoms": [
+    "Kernel panic - not syncing: Hard LOCKUP",
+    "NMI watchdog: Watchdog detected hard LOCKUP on cpu 15",
+    "INFO: rcu_sched detected stalls on CPUs/tasks: { 16 17 25 27 28 33 42}"
+  ],
+  "workflow": [
+    {
+      "step_number": 1,
+      "thought": "Check kernel log for lockup messages",
+      "action": "log | grep LOCKUP",
+      "observation": "Hard LOCKUP messages and kernel panic"
+    },
+    {
+      "step_number": 2,
+      "thought": "Examine backtrace for all CPUs to find lock contention",
+      "action": "bt -a | grep \"exception RIP: native_queued_spin_lock_slowpath\" -A3 | awk '$(NF-1)~/RDI:/&&$NF~/ffffffffb0207084/{print $(NF-1) \" \" $NF}' | uniq -c",
+      "observation": "51 CPUs waiting on tasklist_lock at address ffffffffb0207084"
+    },
+    {
+      "step_number": 3,
+      "thought": "Check tasklist_lock address and status",
+      "action": "p &tasklist_lock",
+      "observation": "Tasklist lock address is ffffffffb0207080"
+    },
+    {
+      "step_number": 4,
+      "thought": "Examine tasklist_lock spinlock value",
+      "action": "struct px ((struct qspinlock *)&((struct qrwlock *)0xffffffffb0207080)->lock)->val",
+      "observation": "Lock value shows 0x90001 (locked, contended)"
+    },
+    {
+      "step_number": 5,
+      "thought": "Analyze binary representation of lock value",
+      "action": "eval -b 0x90001",
+      "observation": "Bits set at positions 19, 16, 0 indicating lock state"
+    },
+    {
+      "step_number": 6,
+      "thought": "Examine specific k_itimer structure's it_lock spinlock",
+      "action": "struct spinlock_t 0xffff936e11da84f8",
+      "observation": "Spinlock value 0x101 (locked with pending bit)"
+    },
+    {
+      "step_number": 7,
+      "thought": "Analyze binary representation of it_lock value",
+      "action": "eval -b 0x101",
+      "observation": "Bits set at positions 8 and 0"
+    },
+    {
+      "step_number": 8,
+      "thought": "Get address of k_itimer's it_lock field",
+      "action": "struct px &((struct k_itimer *)0xffff936e11da84d8)->it_lock",
+      "observation": "it_lock address is 0xffff936e11da84f8"
+    },
+    {
+      "step_number": 9,
+      "thought": "Get address of k_itimer's entry field",
+      "action": "struct px &((struct k_itimer *)0xffff936e11da84d8)->it.cpu.entry",
+      "observation": "Entry address is 0xffff936e11da8530"
+    },
+    {
+      "step_number": 10,
+      "thought": "List entries from specific address",
+      "action": "list -H 0xffff936e3fd03e58",
+      "observation": "List shows ffff936e11da8530"
+    },
+    {
+      "step_number": 11,
+      "thought": "Disassemble around run_posix_cpu_timers function",
+      "action": "dis -lr ffffffffaf6c8ed6",
+      "observation": "Code shows spin_lock(&timer->it_lock) call"
+    },
+    {
+      "step_number": 12,
+      "thought": "Disassemble around mm_update_next_owner function",
+      "action": "dis -lr ffffffffaf6a1600",
+      "observation": "Code shows tasklist_read_lock() call"
+    },
+    {
+      "step_number": 13,
+      "thought": "Disassemble around exit_itimers function",
+      "action": "dis -lr ffffffffaf6c5601",
+      "observation": "Code shows itimer_delete() call chain"
+    },
+    {
+      "step_number": 14,
+      "thought": "Check tasklist_lock+4 address",
+      "action": "struct px ((struct qspinlock *)&((struct qrwlock *)0xffffffffb0207080)->lock)",
+      "observation": "Address is 0xffffffffb0207084"
+    }
+  ],
+  "root_cause_analysis": [
+    "We are trying to take the task_list_lock in posix_cpu_timer_del() with the k_itimer's ->it_lock spinlock having been taken in itimer_delete(). However the tasklist_lock is being held by another task that is getting stuck in run_posix_cpu_timers() waiting on the ->it_lock spinlock that we are holding.DEADLOCK",
+    "The root cause is that RHEL7 is missing the patch from upstream commit 3d7a1427e4ce: posix-timers: Use sighand lock instead of tasklist_lock on timer deletion",
+    "Since timer deletion doesn't actually need tasklist_lock, with this patch, the task that is holding the timer->it_lock spinlock and calling posix_cpu_timer_del() no longer needs to try to take tasklist_lock hence deadlock of this sort no longer happens."
+  ]
+}
