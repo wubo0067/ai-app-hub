@@ -9,7 +9,7 @@ def _init_diagnostic_knowledge_base() -> DiagnosticKnowledgeBase:
     current_dir = os.path.dirname(os.path.abspath(__file__))
     # 构建 JSON 文件的绝对路径
     diagnostic_knowledge_base_path = os.path.join(
-        current_dir, "../../rag-preprocessing/data/ssl_diagnostic_knowledge.json"
+        current_dir, "../../rag-preprocessing/data/rcu_stall_dkb.json"
     )
     diagnostic_knowledge_base_path = os.path.normpath(diagnostic_knowledge_base_path)
 

@@ -1,0 +1,10 @@
+ $ top -d 1
+top - 14:23:20 up 22:31,  2 users,  load average: 2.07, 0.50, 0.16
+Tasks: 315 total,   6 running, 309 sleeping,   0 stopped,   0 zombie
+%Cpu(s):  0.0 us, 40.9 sy,  0.0 ni, 59.1 id,  0.0 wa,  0.0 hi,  0.0 si,  0.0 st
+MiB Mem :   3622.3 total,    350.6 free,   1148.0 used,   2424.6 buff/cache
+MiB Swap:   4012.0 total,   4011.7 free,      0.2 used.   2474.4 avail Mem
+
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+  81115 root      20   0       0      0      0 R 100.0   0.0   0:25.06 rcu_stall_thr
+      1 root      20   0  176556  19152  11148 S   0.0   0.5   0:05.47 systemd
