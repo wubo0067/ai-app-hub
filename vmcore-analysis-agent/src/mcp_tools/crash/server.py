@@ -9,12 +9,37 @@ import os
 from typing import Annotated
 from pydantic import Field
 from fastmcp import FastMCP
-from .executor import run_crash_command
+from .executor import run_crash_command, run_crash_script
 
 crash_server = FastMCP(
     "crash_server",
     instructions="This server provides crash analysis tools for Linux vmcore files.",
 )
+
+
+@crash_server.tool()
+def run_script(
+    script: Annotated[
+        str,
+        Field(
+            description="The full crash script content to execute. Commands separated by newlines."
+        ),
+    ],
+    vmcore_path: Annotated[
+        str, Field(description="The absolute path to the vmcore file.")
+    ],
+    vmlinux_path: Annotated[
+        str, Field(description="The absolute path to the vmlinux file.")
+    ],
+) -> str:
+    """
+    Execute multiple crash commands in a single session.
+    Useful for executing a sequence of commands where state (like loaded modules) needs to be preserved.
+    """
+    try:
+        return run_crash_script(script, vmcore_path, vmlinux_path, True)
+    except Exception as e:
+        return f"Failed to execute crash script: {str(e)}"
 
 
 # 动态注册 crash 子命令工具

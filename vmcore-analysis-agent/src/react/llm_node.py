@@ -1,4 +1,5 @@
 import json
+import re
 from typing import Optional, List, Literal, cast, Any, Dict
 from pydantic import BaseModel, Field, model_validator
 from langchain_core.messages import AIMessage, SystemMessage
@@ -129,6 +130,31 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         # 获取并记录 token 消耗数量
         usage_metadata = getattr(raw_message, "usage_metadata", {}) or {}
         curr_token_usage = usage_metadata.get("total_tokens", 0)
+
+        # 检查解析结果是否为空
+        if analysis_result is None:
+            # 尝试修复常见的 JSON 格式错误
+            # Fix for: "action":{"command_name":"ps",["-m|grep","UN"]} -> "action":{"command_name":"ps","arguments":["-m|grep","UN"]}
+            try:
+                content = raw_message.content
+                pattern = r'("command_name"\s*:\s*"[^"]*"\s*,)\s*(\[)'
+                fixed_content = re.sub(pattern, r'\1 "arguments": \2', content)
+                analysis_result = VMCoreAnalysisStep.model_validate_json(fixed_content)
+                logger.warning(
+                    "Successfully repaired malformed JSON from LLM. "
+                    f"Original: {content[:100]}... Fixed: {fixed_content[:100]}..."
+                )
+            except Exception as repair_err:
+                logger.warning(f"JSON repair failed: {repair_err}")
+
+                parsing_error = output_data.get("parsing_error")
+                error_msg = (
+                    f"Failed to parse LLM output. Raw content: {raw_message.content}"
+                )
+                if parsing_error:
+                    error_msg += f". Parsing error: {parsing_error}"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
 
         # 记录 response
         logger.debug(

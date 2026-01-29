@@ -28,6 +28,9 @@ you MUST act as a kernel expert using this systematic fallback protocol:
    - **Go Broad**: Do NOT rely on `tail` or `head` with small counts. Disassemble the entire function or at least 50+ lines around the RIP immediately to see jump destinations (e.g., `dis -lr <RIP> 50`).
    - **Context is Key**: Always look for backward jumps (e.g., `jmp`, `jne` to a previous address) which indicate a loop structure.
 2. **Efficiency**: Avoid "incremental" probing. If a command provides insufficient context, your next step should be to significantly increase the search range or switch to a more diagnostic command (like `rd` for variables) rather than repeating the same type of command with minor offset changes.
+3. **Disassembly Best Practices**:
+   - **ALWAYS prefer `dis -rl`**: When disassembling instructions, ALWAYS use `dis -rl <address>` (or `dis -l`) instead of `dis -r <address>`.
+   - **Reason**: `dis -rl` displays line numbers interleaving with assembly code, which is critical for mapping instructions back to C code logic. Plain `dis -r` lacks this context.
 
 # Input Context
 - **Initial Info**: Initial `sys`, `bt`, and `vmcore-dmesg` outputs.
@@ -77,7 +80,7 @@ def crash_init_data_prompt() -> str:
     return """
 # Initial Context & Starting Point
 **CRITICAL**: You have already been provided with the standard diagnostic set. **DO NOT** request these commands again in your first step.
-1.  **`sys -i`**: Basic system info (kernel version, panic string, CPU count).
+1.  **`sys`**: Basic system info (kernel version, panic string, CPU count).
 2.  **`bt` (Backtrace)**: The call stack of the panic task.
 3.  **`vmcore-dmesg.txt`**: The kernel ring buffer log leading up to the crash.
 4.  **Third-party Kernel Modules**: A list of paths to modules with debugging symbols.

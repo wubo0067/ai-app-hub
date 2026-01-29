@@ -40,7 +40,7 @@ async def main():
     # 使用回调配置
     thread = {"configurable": {"thread_id": "2"}}
     config = {
-        "recursion_limit": 20,
+        "recursion_limit": 40,
         "callbacks": [graph_logging_callback],
         **thread,
     }
@@ -48,9 +48,9 @@ async def main():
     try:
         async for event in agent_graph.astream(
             {
-                "vmcore_path": "/var/crash/127.0.0.1-2026-01-28-14:23:29/vmcore",
+                "vmcore_path": "/var/crash/127.0.0.1-2026-01-29-15:16:02/vmcore",
                 "vmlinux_path": "/usr/lib/debug/lib/modules/5.14.0-611.9.1.el9_7.x86_64/vmlinux",
-                "vmcore_dmesg_path": "/var/crash/127.0.0.1-2026-01-28-14:23:29/vmcore-dmesg.txt",
+                "vmcore_dmesg_path": "/var/crash/127.0.0.1-2026-01-29-15:16:02/vmcore-dmesg.txt",
                 "debug_symbol_paths": [
                     "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/soft_lockup/soft_lockup_module.ko",
                     "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko",

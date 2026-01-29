@@ -31,7 +31,7 @@ llm_analysis_node = "llm_analysis_node"
 # 默认 crash 命令集合
 # =========================================================================
 DEFAULT_CRASH_COMMANDS: list[str] = [
-    "sys -i",  # 系统信息
+    "sys",  # 系统信息
     "bt",  # 所有线程的堆栈回溯
     # "ps -a",  # 进程列表
     # "runq",  # 运行队列
