@@ -48,12 +48,12 @@ async def main():
     try:
         async for event in agent_graph.astream(
             {
-                "vmcore_path": "/var/crash/127.0.0.1-2026-01-29-15:16:02/vmcore",
-                "vmlinux_path": "/usr/lib/debug/lib/modules/5.14.0-611.9.1.el9_7.x86_64/vmlinux",
-                "vmcore_dmesg_path": "/var/crash/127.0.0.1-2026-01-29-15:16:02/vmcore-dmesg.txt",
+                "vmcore_path": "/home/calmwu/Downloads/Case_04327183/crash/127.0.0.1-2025-12-06-19:45:54/vmcore",
+                "vmlinux_path": "/usr/lib/debug/lib/modules/4.18.0-305.130.1.el8_4.x86_64/vmlinux",
+                "vmcore_dmesg_path": "/home/calmwu/Downloads/Case_04327183/crash/127.0.0.1-2025-12-06-19:45:54/vmcore-dmesg.txt",
                 "debug_symbol_paths": [
-                    "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/soft_lockup/soft_lockup_module.ko",
-                    "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko",
+                    # "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/soft_lockup/soft_lockup_module.ko",
+                    # "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko",
                 ],
             },
             config=config,
