@@ -106,23 +106,68 @@ async def dispatch_crash_commands(
         logger.info(f"Retrieved {len(tools)} tools from MCP client.")
 
         for cmd in commands:
-            # 按命令前缀匹配工具
+            # 命令分解：工具名 + 参数。例如 "run_script mod -s ..." -> tool_name="run_script"
+            parts = cmd.split(" ", 1)
+            tool_name = parts[0]
+            # 注意：实际传递给 invoke 的 command 并不只是剩余参数，
+            # 需要根据工具定义的 schema 构造 payload。
+            # 这里目前的 dispatch_crash_commands 假设所有工具只有一个参数 'command'，值为完整命令行。
+            # 但 run_script 的参数名是 'script'。这就需要差异化处理。
+
+            # 使用精准匹配而不是 startswith，防止 "sys" 匹配到 "systemd" 等（如果有的话）
             tool = next(
-                (t for t in tools if cmd.startswith(getattr(t, "name", ""))),
+                (t for t in tools if t.name == tool_name),
                 None,
             )
+
             if tool:
-                tasks.append((cmd, asyncio.create_task(_invoke_tool(tool, cmd, state))))
-                logger.debug(f"Matched tool for command: {cmd}")
+                # 构造调用载荷
+                payload = {
+                    "vmcore_path": state["vmcore_path"],
+                    "vmlinux_path": state["vmlinux_path"],
+                }
+
+                if tool_name == "run_script":
+                    # run_script 工具需要的参数是 'script'
+                    # 其内容应该是除了工具名之外的所有部分
+                    script_content = parts[1] if len(parts) > 1 else ""
+                    # 之前的 cmd 构造逻辑已经处理了 join，这里直接透传内容即可
+                    # 但需要注意，cmd 是 "run_script line1\nline2..."
+                    payload["script"] = script_content
+                else:
+                    # 其他标准 crash 工具，需要的参数是 'command'，值为完整命令行
+                    payload["command"] = cmd
+
+                tasks.append((cmd, asyncio.create_task(tool.ainvoke(payload))))
+                logger.debug(f"Matched tool '{tool_name}' for input: {cmd[:50]}...")
             else:
                 logger.warning(f"No tool found for command: {cmd}")
 
         results = []
         if tasks:
             logger.info(f"Executing {len(tasks)} tool invocations concurrently...")
-            results = await asyncio.gather(
+            raw_results = await asyncio.gather(
                 *(task for _, task in tasks), return_exceptions=True
             )
+
+            # 处理 MCP 工具返回的结果格式（通常是 [{'type': 'text', 'text': '...'}]）
+            for res in raw_results:
+                if isinstance(res, Exception):
+                    results.append(res)
+                elif isinstance(res, list):
+                    text_parts = [
+                        item.get("text", "")
+                        for item in res
+                        if isinstance(item, dict) and item.get("type") == "text"
+                    ]
+                    # 如果提取到了文本块，拼接并去除首尾空白
+                    if text_parts:
+                        results.append("".join(text_parts).strip())
+                    else:
+                        # 列表非空但未匹配到标准 text 块，兜底转字符串
+                        results.append(str(res).strip() if res else "")
+                else:
+                    results.append(str(res).strip())
 
     return list(zip([cmd for cmd, _ in tasks], results))
 

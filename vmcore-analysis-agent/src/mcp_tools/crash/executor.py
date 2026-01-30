@@ -4,6 +4,29 @@ from src.utils.os import get_linux_distro_version
 
 distro, version = get_linux_distro_version()
 
+CRASH_IGNORE_MARKERS = [
+    "crash ",
+    "Copyright",
+    "GNU gdb (GDB)",
+    "This GDB was configured",
+    "Type",
+    "For help",
+    "please wait...",
+    "NOTE: stdin: not a tty",
+    "quit",
+    "License GPLv3+",
+    "This program",
+    "show copying",
+    "show warranty",
+    "free software",
+    "no warranty",
+    "you are welcome",
+    "certain conditions",
+    "There is NO WARRANTY",
+    "Find the GDB manual",
+    "www.gnu.org",
+]
+
 
 def run_crash_command_rhel9(command, vmcore_path, vmlinux_path, verbose=False):
     """Run a crash command on RHEL 9 systems.
@@ -46,26 +69,7 @@ def run_crash_command_rhel9(command, vmcore_path, vmlinux_path, verbose=False):
     capture = False
 
     for line in lines:
-        if any(
-            keyword in line
-            for keyword in [
-                "crash ",
-                "Copyright",
-                "GNU gdb (GDB)",
-                "This GDB was configured",
-                "Type",
-                "For help",
-                "please wait...",
-                "NOTE: stdin: not a tty",
-                "quit",
-                "License GPLv3+",
-                "This program",
-                "show copying",
-                "show warranty",
-                "free software",
-                "no warranty",
-            ]
-        ):
+        if any(keyword in line for keyword in CRASH_IGNORE_MARKERS):
             continue
 
         if "STATE:" in line:
@@ -129,28 +133,33 @@ def run_crash_script_rhel9(script_content, vmcore_path, vmlinux_path, verbose=Fa
     lines = stdout.splitlines()
     filtered_lines = []
 
-    # 定义需要过滤的 crash 启动横幅和无关信息
-    # 这些是 crash 启动时默认打印的版权、GDB 信息等
-    ignore_markers = [
-        "crash ",
-        "Copyright",
-        "GNU gdb",
-        "This GDB",
-        "Type",
-        "For help",
-        "please wait...",
-        "NOTE: stdin: not a tty",
-        "License GPL",
-        "This program",
-        "show copying",
-        "show warranty",
-        "free software",
-        "no warranty",
+    # 额外的 ignore markers
+    extra_ignore_markers = [
+        "KERNEL:",
+        "DUMPFILE:",
+        "CPUS:",
+        "DATE:",
+        "UPTIME:",
+        "LOAD AVERAGE:",
+        "MEMORY:",
+        "NODENAME:",
+        "SMP:",
+        "TASKS:",
+        "RELEASE:",
+        "VERSION:",
+        "MACHINE",
+        "PID",
+        "PANIC:",
+        "COMMAND",
+        "TASK:",
+        "CPU:",
+        "STATE",
     ]
-
     for line in lines:
         # 过滤包含特定标记的行
-        if any(marker in line for marker in ignore_markers):
+        if any(
+            marker in line for marker in CRASH_IGNORE_MARKERS + extra_ignore_markers
+        ):
             continue
 
         # 过滤回显的 quit 命令
@@ -194,6 +203,8 @@ def run_crash_script(script_content, vmcore_path, vmlinux_path, verbose=False):
         str: The output of the crash script.
     """
     if distro == "rhel" and int(version) == 9:
-        return run_crash_script_rhel9(script_content, vmcore_path, vmlinux_path, verbose)
+        return run_crash_script_rhel9(
+            script_content, vmcore_path, vmlinux_path, verbose
+        )
     else:
         return "functionality for other distros/versions not yet implemented."

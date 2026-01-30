@@ -7,14 +7,16 @@ from .graph_state import AgentState
 from .nodes import llm_analysis_node
 from .prompts import analysis_crash_prompt
 from src.utils.logging import logger
-from src.rag.retrieval import dkb
 
 
 class ToolCall(BaseModel):
     command_name: str = Field(
-        ..., description="The crash command (e.g., 'dis', 'rd', 'struct')."
+        ..., description="The crash command (e.g., 'dis', 'rd') or 'run_script'."
     )
-    arguments: List[str] = Field(default_factory=list, description="Command arguments.")
+    arguments: List[str] = Field(
+        default_factory=list,
+        description="Command arguments. For 'run_script', each string is a separate command line.",
+    )
 
     # 模型验证器，用于修复 LLM 输出的格式错误，作用：定义一个在模型实例化之前运行的验证器
     # 模式："before" 表示在 Pydantic 解析输入数据到模型字段之前执行
@@ -45,18 +47,9 @@ class ToolCall(BaseModel):
 class VMCoreAnalysisStep(BaseModel):
     step_id: int = Field(..., description="Current step sequence number.")
 
-    analysis_path: Literal["knowledge_base", "general_debugging"] = Field(
-        ...,
-        description="Specify if you are following a DKB pattern or using general kernel debugging experts logic.",
-    )
-
     reasoning: str = Field(
         ...,
-        description="Detailed thought process. If general_debugging, explain which kernel subsystem (Memory, FS, Scheduler) you are investigating.",
-    )
-
-    knowledge_base_hit: Optional[str] = Field(
-        None, description="The 'trigger' name from DKB (if applicable)."
+        description="Detailed thought process. Explain which kernel subsystem (Memory, FS, Scheduler) you are investigating and why.",
     )
 
     action: Optional[ToolCall] = Field(
@@ -92,7 +85,6 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
 
     # 准备系统消息，包含诊断知识库和输出格式
     system_message = analysis_crash_prompt().format(
-        diagnostic_knowledge_base=dkb.model_dump_json(indent=2),
         VMCoreAnalysisStep_Schema=json.dumps(
             VMCoreAnalysisStep.model_json_schema(), indent=2
         ),
@@ -168,13 +160,34 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
             logger.info(
                 f"LLM decided to call tool: {analysis_result.action.command_name}"
             )
-            # ✅ 修复：LangChain 的 tool_calls["args"] 必须是 dict，不能是 list
-            # 将参数列表合并为一个字符串，供后续 nodes.py 拼接
-            cmd_args = " ".join(analysis_result.action.arguments)
+
+            # 根据工具类型构建参数
+            tool_name = analysis_result.action.command_name
+            tool_args = {}
+
+            if tool_name == "run_script":
+                # 对于 run_script，将参数列表拼接为换行分隔的脚本
+                script_content = "\n".join(analysis_result.action.arguments)
+                tool_args = {"script": script_content}
+            else:
+                # 对于普通命令，将参数列表拼接为单个命令字符串
+                # 注意：这里我们使用 'command' 作为参数名，以匹配 MCP server 的定义
+                # 之前代码可能使用了 'cmd'，这取决于 nodes.py 的处理。
+                # 为了兼容性，我们可以暂时保留 cmd 或者同时提供（如果允许额外参数）
+                # 但根据规范，应该是 command。此处假设 nodes.py 能透传或已调整。
+                # 修正：为了最稳妥，我们查看之前的代码使用的是 args={"cmd": ...}
+                # 如果 run_script 走的是同样的 tool invoke 路径，我们需要确保参数名正确。
+                cmd_args = " ".join(analysis_result.action.arguments)
+                # 使用 legacy 的 'cmd' 还是标准的 'command'？
+                # 鉴于 run_script 必须用 script，我们这里尝试使用 command 以对齐 server。
+                # 如果之前代码用 cmd 能跑，说明 nodes.py 可能做了映射 command = args['cmd']
+                # 为了安全，我们还是沿用之前的模式，但是 run_script 必须是 script
+                tool_args = {"command": cmd_args}
+
             tool_calls.append(
                 {
-                    "name": analysis_result.action.command_name,
-                    "args": {"cmd": cmd_args},
+                    "name": tool_name,
+                    "args": tool_args,
                     "id": f"call_{analysis_result.step_id}",
                 }
             )
