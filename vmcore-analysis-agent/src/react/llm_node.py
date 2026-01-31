@@ -78,9 +78,10 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
     Returns:
         dict: 包含 messages、error 和 step_count 的状态更新
     """
-    logger.info(
-        f"Starting {llm_analysis_node} node execution (step {state.get('step_count', 0)})..."
-    )
+    # 计算当前步数（之前的累加值 + 本次的 1）
+    current_step = state.get("step_count", 0)
+
+    logger.info(f"Starting {llm_analysis_node} node execution (step {current_step})...")
     curr_token_usage = 0
 
     # 准备系统消息，包含诊断知识库和输出格式
