@@ -129,8 +129,11 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
             # Fix for: "action":{"command_name":"ps",["-m|grep","UN"]} -> "action":{"command_name":"ps","arguments":["-m|grep","UN"]}
             try:
                 content = raw_message.content
+                content_str = (
+                    content if isinstance(content, str) else json.dumps(content)
+                )
                 pattern = r'("command_name"\s*:\s*"[^"]*"\s*,)\s*(\[)'
-                fixed_content = re.sub(pattern, r'\1 "arguments": \2', content)
+                fixed_content = re.sub(pattern, r'\1 "arguments": \2', content_str)
                 analysis_result = VMCoreAnalysisStep.model_validate_json(fixed_content)
                 logger.warning(
                     "Successfully repaired malformed JSON from LLM. "

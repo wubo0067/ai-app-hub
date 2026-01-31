@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Annotated, Optional, TypedDict, Union, cast, Sequence
+from pydantic import Field
 from langgraph.graph import MessagesState
 from langgraph.managed import IsLastStep
 from operator import add
@@ -55,9 +56,9 @@ class AgentState(MessagesState):
     debug_symbol_paths: Sequence[str]
 
     # step_count: 记录分析步数，使用 operator.add 进行聚合
-    step_count: Annotated[int, add]
+    step_count: Annotated[int, add, Field(default=0)]
     # token 的消耗量
-    token_usage: Annotated[int, add] = field(default=0)
+    token_usage: Annotated[int, add, Field(default=0)]
     # is_last_step: LangGraph 管理的值，当达到 recursion_limit 时为 True
     is_last_step: IsLastStep
     # 分析结果

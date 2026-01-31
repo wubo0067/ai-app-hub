@@ -30,7 +30,7 @@ class GraphLoggingCallback(BaseCallbackHandler):
         # logger.info("=" * 80)
         pass
 
-    def on_chain_error(self, error: Exception, **kwargs: Any) -> None:
+    def on_chain_error(self, error: BaseException, **kwargs: Any) -> None:
         """当图执行出错时调用"""
         logger.error("=" * 80)
         logger.error(f"❌ Graph execution failed with error: {error}")
@@ -53,7 +53,7 @@ class GraphLoggingCallback(BaseCallbackHandler):
         # logger.debug(f"    Output: {output[:200]}...")  # 只显示前 200 字符
         pass
 
-    def on_tool_error(self, error: Exception, **kwargs: Any) -> None:
+    def on_tool_error(self, error: BaseException, **kwargs: Any) -> None:
         """当工具执行出错时调用"""
         logger.error(f"  ✗ Tool failed: {error}")
 
@@ -69,7 +69,7 @@ class GraphLoggingCallback(BaseCallbackHandler):
         """当 LLM 调用结束时"""
         logger.info(f"  ✓ LLM invocation completed")
 
-    def on_llm_error(self, error: Exception, **kwargs: Any) -> None:
+    def on_llm_error(self, error: BaseException, **kwargs: Any) -> None:
         """当 LLM 调用出错时"""
         logger.error(f"  ✗ LLM invocation failed: {error}")
 
@@ -81,7 +81,7 @@ class GraphLoggingCallback(BaseCallbackHandler):
         """当 Agent 完成时"""
         logger.info(f"  🏁 Agent finished: {finish}")
 
-    def _format_inputs(self, inputs: Dict[str, Any]) -> str:
+    def _format_inputs(self, inputs: Dict[str, Any]) -> Dict[str, Any] | str:
         """格式化输入以便于日志记录"""
         if not isinstance(inputs, dict):
             return str(inputs)
@@ -96,7 +96,7 @@ class GraphLoggingCallback(BaseCallbackHandler):
                 formatted[k] = str(v)[:100] + "..." if len(str(v)) > 100 else v
         return formatted
 
-    def _format_outputs(self, outputs: Dict[str, Any]) -> str:
+    def _format_outputs(self, outputs: Dict[str, Any]) -> Dict[str, Any] | str:
         """格式化输出以便于日志记录"""
         if not isinstance(outputs, dict):
             return str(outputs)

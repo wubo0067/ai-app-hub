@@ -12,7 +12,7 @@ import asyncio
 import re
 from typing import List, Tuple, Any
 
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_mcp_adapters.tools import load_mcp_tools
 from src.utils.logging import logger
 from .graph_state import AgentState
@@ -349,7 +349,7 @@ async def call_crash_tool(state: AgentState) -> dict:
     commands_to_run = []  # List[str]
 
     try:
-        if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        if isinstance(last_message, AIMessage) and last_message.tool_calls:
             for tool_call in last_message.tool_calls:
                 tool_call_id = tool_call["id"]
                 name = tool_call["name"]

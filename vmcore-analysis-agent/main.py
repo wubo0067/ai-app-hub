@@ -2,10 +2,13 @@
 import asyncio
 import yaml
 import json
+from typing import cast
+from langchain_core.runnables import RunnableConfig
 from src.utils.logging import logger
 from src.utils.config import config_manager
 from src.llm.model import create_llm
 from src.react.graph import create_agent_graph
+from src.react.graph_state import AgentState
 from src.react.logging_callback import graph_logging_callback
 from src.mcp_tools.crash.client import initialize_crash_tools
 from src.mcp_tools.source_patch.client import initialize_patch_tools
@@ -39,37 +42,47 @@ async def main():
 
     # 使用回调配置
     thread = {"configurable": {"thread_id": "2"}}
-    config = {
-        "recursion_limit": 40,
-        "callbacks": [graph_logging_callback],
-        **thread,
-    }
+    config = cast(
+        RunnableConfig,
+        {
+            "recursion_limit": 40,
+            "callbacks": [graph_logging_callback],
+            **thread,
+        },
+    )
 
     try:
+        initial_state: AgentState = {
+            "vmcore_path": "/var/crash/127.0.0.1-2026-01-30-22:51:43/vmcore",
+            "vmlinux_path": "/usr/lib/debug/lib/modules/5.14.0-362.8.1.el9_3.x86_64/vmlinux",
+            "vmcore_dmesg_path": "/var/crash/127.0.0.1-2026-01-30-22:51:43/vmcore-dmesg.txt",
+            "debug_symbol_paths": [
+                "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/soft_lockup/soft_lockup_module.ko",
+                "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko",
+            ],
+            "messages": [],
+            "step_count": 0,
+            "token_usage": 0,
+            "is_last_step": False,
+            "agent_answer": "",
+            "error": None,
+        }
         async for event in agent_graph.astream(
-            {
-                "vmcore_path": "/var/crash/127.0.0.1-2026-01-29-15:16:02/vmcore",
-                "vmlinux_path": "/usr/lib/debug/lib/modules/5.14.0-611.9.1.el9_7.x86_64/vmlinux",
-                "vmcore_dmesg_path": "/var/crash/127.0.0.1-2026-01-29-15:16:02/vmcore-dmesg.txt",
-                "debug_symbol_paths": [
-                    "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/soft_lockup/soft_lockup_module.ko",
-                    "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko",
-                ],
-            },
+            initial_state,
             config=config,
         ):
             for k, v in event.items():
                 if k != "__end__":
                     logger.info(f"📍 Node: {k} execute complete.")
                     # 打印 token 使用情况
-                    token_usage = agent_graph.get_state(thread).values.get(
-                        "token_usage", 0
-                    )
+                    token_usage = agent_graph.get_state(
+                        cast(RunnableConfig, thread)
+                    ).values.get("token_usage", 0)
                     logger.info(f"   Token usage so far: {token_usage}")
     except Exception as e:
         logger.error(f"Agent execution failed: {e}", exc_info=True)
 
-    snapshot = agent_graph.get_state(thread)
+    snapshot = agent_graph.get_state(cast(RunnableConfig, thread))
     # 使用 pretty 打印最终状态
 
     logger.info(f"Final Agent State: \n{json.dumps(snapshot, indent=2, default=str)}")
