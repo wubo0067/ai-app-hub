@@ -104,7 +104,11 @@ def generate_markdown_report(state: AgentState) -> str:
 
             try:
                 # 解析 VMCoreAnalysisStep
-                content = msg.content if isinstance(msg.content, str) else json.dumps(msg.content)
+                content = (
+                    msg.content
+                    if isinstance(msg.content, str)
+                    else json.dumps(msg.content)
+                )
                 analysis = VMCoreAnalysisStep.model_validate_json(content)
 
                 lines.append(f"**推理过程**:")
@@ -184,7 +188,11 @@ def generate_markdown_report(state: AgentState) -> str:
     for msg in reversed(messages):
         if isinstance(msg, AIMessage):
             try:
-                content = msg.content if isinstance(msg.content, str) else json.dumps(msg.content)
+                content = (
+                    msg.content
+                    if isinstance(msg.content, str)
+                    else json.dumps(msg.content)
+                )
                 analysis = VMCoreAnalysisStep.model_validate_json(content)
                 if analysis.is_conclusive and analysis.final_diagnosis:
                     has_diagnosis = True
@@ -198,6 +206,10 @@ def generate_markdown_report(state: AgentState) -> str:
             "⚠️ **注意**: 分析未得出最终结论，可能需要更多信息或达到了步数限制。"
         )
 
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("*This report was jointly created by CalmWU and his AI agent.*")
     lines.append("")
 
     return "\n".join(lines)
@@ -219,7 +231,11 @@ def extract_final_diagnosis(state: AgentState) -> str:
     for msg in reversed(messages):
         if isinstance(msg, AIMessage):
             try:
-                content = msg.content if isinstance(msg.content, str) else json.dumps(msg.content)
+                content = (
+                    msg.content
+                    if isinstance(msg.content, str)
+                    else json.dumps(msg.content)
+                )
                 analysis = VMCoreAnalysisStep.model_validate_json(content)
                 if analysis.is_conclusive and analysis.final_diagnosis:
                     return analysis.final_diagnosis
