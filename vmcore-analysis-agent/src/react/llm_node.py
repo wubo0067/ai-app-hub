@@ -78,9 +78,10 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
     Returns:
         dict: 包含 messages、error 和 step_count 的状态更新
     """
-    logger.info(
-        f"Starting {llm_analysis_node} node execution (step {state.get('step_count', 0)})..."
-    )
+    # 计算当前步数（之前的累加值 + 本次的 1）
+    current_step = state.get("step_count", 0)
+
+    logger.info(f"Starting {llm_analysis_node} node execution (step {current_step})...")
     curr_token_usage = 0
 
     # 准备系统消息，包含诊断知识库和输出格式
@@ -129,8 +130,11 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
             # Fix for: "action":{"command_name":"ps",["-m|grep","UN"]} -> "action":{"command_name":"ps","arguments":["-m|grep","UN"]}
             try:
                 content = raw_message.content
+                content_str = (
+                    content if isinstance(content, str) else json.dumps(content)
+                )
                 pattern = r'("command_name"\s*:\s*"[^"]*"\s*,)\s*(\[)'
-                fixed_content = re.sub(pattern, r'\1 "arguments": \2', content)
+                fixed_content = re.sub(pattern, r'\1 "arguments": \2', content_str)
                 analysis_result = VMCoreAnalysisStep.model_validate_json(fixed_content)
                 logger.warning(
                     "Successfully repaired malformed JSON from LLM. "
