@@ -7,9 +7,21 @@ PWD := $(shell pwd)
 # Module name
 obj-m := soft_lockup_module.o
 
+# Build options
+DEBUG ?= 1
+EXTRA_CFLAGS :=
+
+ifeq ($(DEBUG),1)
+	EXTRA_CFLAGS += -g -O0 -DDEBUG \
+		-fno-inline -fno-inline-functions \
+		-fno-inline-small-functions -fno-optimize-sibling-calls
+else
+EXTRA_CFLAGS += -O2
+endif
+
 # Default target
 all:
-	make -C $(KERNEL_DIR) M=$(PWD) modules
+	make -C $(KERNEL_DIR) M=$(PWD) EXTRA_CFLAGS="$(EXTRA_CFLAGS)" modules
 
 # Clean build artifacts
 clean:
@@ -17,7 +29,7 @@ clean:
 
 # Install the module to the system
 install:
-	sudo make -C $(KERNEL_DIR) M=$(PWD) modules_install
+	sudo make -C $(KERNEL_DIR) M=$(PWD) EXTRA_CFLAGS="$(EXTRA_CFLAGS)" modules_install
 	sudo depmod -a
 
 # Load the module with default parameters

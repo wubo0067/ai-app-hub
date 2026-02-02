@@ -430,6 +430,9 @@ vmcore-analysis-agent/
 ```bash
 cd vmcore-analysis-agent
 pip install -e .
+
+# 安装 FastAPI 相关依赖
+uv add fastapi uvicorn httpx
 ```
 
 ### 2. 配置环境变量
@@ -449,11 +452,90 @@ python rag-preprcessing/extract_md-dsl/extract_integrate.py
 python rag-preprcessing/dsl-diagnostic_dict/dsl_integration.py
 ```
 
-### 4. 运行分析代理
+### 4. 启动 FastAPI 服务
 
 ```bash
+# 方式1：直接运行
 python main.py
+
+# 方式2：使用 uvicorn（推荐，支持热加载）
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
+
+服务启动后：
+- API 文档：http://localhost:8000/docs
+- 健康检查：http://localhost:8000/health
+
+### 5. 使用客户端调用分析接口
+
+#### 5.1 检查服务健康状态
+
+```bash
+python client.py --health
+```
+
+#### 5.2 同步模式分析（使用默认参数）
+
+```bash
+python client.py
+```
+
+#### 5.3 流式模式分析
+
+```bash
+python client.py --stream
+```
+
+#### 5.4 自定义参数分析
+
+```bash
+python client.py --vmcore-path "/path/to/vmcore" \
+                 --vmlinux-path "/path/to/vmlinux" \
+                 --vmcore-dmesg-path "/path/to/vmcore-dmesg.txt" \
+                 --debug-symbols "/path/to/module1.ko" "/path/to/module2.ko"
+```
+
+#### 5.5 指定服务地址
+
+```bash
+python client.py --url http://192.168.1.100:8000 --stream
+```
+
+#### 5.6 报告保存选项
+
+```bash
+# 流式模式分析并保存报告到当前目录（默认行为）
+python client.py --stream
+
+# 指定报告输出目录
+python client.py --stream --output-dir ./reports
+
+# 不保存文件，仅显示
+python client.py --stream --no-save
+```
+
+#### 5.7 客户端完整参数说明
+
+```bash
+python client.py --help
+
+参数说明：
+  --url URL                   API 服务地址 (默认: http://localhost:8000)
+  --stream                    使用流式模式
+  --health                    仅检查服务健康状态
+  --vmcore-path PATH          vmcore 文件路径
+  --vmlinux-path PATH         vmlinux 调试符号路径
+  --vmcore-dmesg-path PATH    vmcore-dmesg.txt 文件路径
+  --debug-symbols [PATH ...]  额外的调试符号路径列表
+  --timeout SECONDS           请求超时时间（秒）(默认: 600)
+  --output-dir DIR            报告输出目录 (默认: 当前目录)
+  --no-save                   不保存 markdown 报告文件
+```
+
+**说明**：
+- 分析完成后，默认会自动保存 markdown 报告到指定目录
+- 报告文件名格式：`127.0.0.1-2026-01-30-22-51-43.md`（从 vmcore 路径提取）
+- 报告包含完整的分析过程、推理步骤和最终诊断结果
 
 ## 技术栈
 

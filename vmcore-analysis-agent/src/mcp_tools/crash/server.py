@@ -22,7 +22,11 @@ def run_script(
     script: Annotated[
         str,
         Field(
-            description="The full crash script content to execute. Commands separated by newlines."
+            description=(
+                "The full crash script content to execute. Commands separated by newlines.\n"
+                "Syntax: command1\\ncommand2\\n...\n"
+                "Example: mod -s rcu_stall_mod /path/to/module.ko\\ndis -s rcu_stall_thread\\nbt"
+            )
         ),
     ],
     vmcore_path: Annotated[
