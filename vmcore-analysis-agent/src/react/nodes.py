@@ -344,7 +344,7 @@ async def call_crash_tool(state: AgentState) -> dict:
 
     # 提取所有工具调用的命令，准备批量执行
     # 为了后续能将结果匹配回 tool_call_id，我们需要维护一个映射或顺序
-    tool_calls_data = []  # List[(tool_call_id, command_string)]
+    tool_calls_data = []  # List[(tool_call_id, tool_name, command_string)]
     commands_to_run = []  # List[str]
 
     try:
@@ -362,7 +362,7 @@ async def call_crash_tool(state: AgentState) -> dict:
                 )
                 full_cmd = f"{name} {args_str}".strip()
 
-                tool_calls_data.append((tool_call_id, full_cmd))
+                tool_calls_data.append((tool_call_id, name, full_cmd))
                 commands_to_run.append(full_cmd)
 
                 logger.debug(
@@ -375,7 +375,7 @@ async def call_crash_tool(state: AgentState) -> dict:
                 # matched_results 是 List[(cmd, output)]，只包含成功匹配并执行的结果
 
                 # 将结果映射回 ToolMessage
-                for tool_call_id, original_cmd in tool_calls_data:
+                for tool_call_id, tool_name, original_cmd in tool_calls_data:
                     found_result = False
 
                     # 在执行结果中查找匹配的命令
@@ -387,7 +387,11 @@ async def call_crash_tool(state: AgentState) -> dict:
                             if isinstance(r_output, Exception):
                                 content = f"[error] Execution failed: {r_output}"
                             tool_messages.append(
-                                ToolMessage(content=content, tool_call_id=tool_call_id)
+                                ToolMessage(
+                                    content=content,
+                                    tool_call_id=tool_call_id,
+                                    name=tool_name,
+                                )
                             )
                             found_result = True
                             # 找到一个就可以停止内层循环，进入下一个 tool_call
@@ -398,7 +402,9 @@ async def call_crash_tool(state: AgentState) -> dict:
                         # 没在结果里找到，说明 tool 没匹配上（因为 dispatch_crash_commands 会忽略未匹配的命令）
                         msg = f"[error] No matching crash tool found for command: {original_cmd}"
                         tool_messages.append(
-                            ToolMessage(content=msg, tool_call_id=tool_call_id)
+                            ToolMessage(
+                                content=msg, tool_call_id=tool_call_id, name=tool_name
+                            )
                         )
 
     except Exception as exc:
