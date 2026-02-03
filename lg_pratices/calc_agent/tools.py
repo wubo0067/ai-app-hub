@@ -1,3 +1,4 @@
+import os
 from langchain.tools import tool
 from langchain_openai import ChatOpenAI
 
@@ -41,7 +42,7 @@ tools_by_name = {tool.name: tool for tool in tools}
 
 
 llm = ChatOpenAI(
-    api_key="sk-b5480f840a794c69a0af1732459f3ae4",
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com",
     model="deepseek-chat",
 )

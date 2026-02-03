@@ -27,7 +27,7 @@ prompt = ChatPromptTemplate.from_messages(
 )
 
 llm = ChatOpenAI(
-    api_key="sk-b5480f840a794c69a0af1732459f3ae4",  # type: ignore
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com",
     model="deepseek-chat",
     temperature=0,  # temperature 的作用是控制生成文本的随机性，值越低，生成的文本越确定和一致
@@ -168,9 +168,9 @@ async def main():
 
 
 if __name__ == "__main__":
-    # 先设置环境变量
-    os.environ["TAVILY_API_KEY"] = "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"
+    # API keys should be set in environment variables before running
+    # Example: export TAVILY_API_KEY=your_key
+    # Example: export LANGSMITH_API_KEY=your_key
     os.environ["LANGSMITH_TRACING"] = "false"
-    os.environ["LANGSMITH_API_KEY"] = "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" # fmt: skip
 
     asyncio.run(main())
