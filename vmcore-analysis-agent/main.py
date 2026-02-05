@@ -170,7 +170,7 @@ async def analyze_vmcore(request: VmcoreAnalysisRequest):
     config = cast(
         RunnableConfig,
         {
-            "recursion_limit": 40,
+            "recursion_limit": 50,
             "callbacks": [graph_logging_callback],
             **thread,
         },
@@ -282,18 +282,24 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
 
             yield f"data: {json.dumps({'event': 'start', 'task_id': task_id})}\n\n"
 
+            # 使用 astream 获取节点级别的更新（自动去重）
+            # stream_mode="updates" 会在每个节点完成后返回该节点的输出
             async for event in app_state["agent_graph"].astream(
                 initial_state,
                 config=config,
+                stream_mode="updates",  # 返回节点更新，key 是节点名
             ):
-                for k, v in event.items():
-                    if k != "__end__":
-                        token_usage = (
-                            app_state["agent_graph"]
-                            .get_state(cast(RunnableConfig, thread))
-                            .values.get("token_usage", 0)
+                # event 格式：{节点名：节点输出}
+                for node_name, node_output in event.items():
+                    if node_name != "__end__":  # 忽略结束标记
+                        # 获取当前总 token 使用量
+                        snapshot = app_state["agent_graph"].get_state(
+                            cast(RunnableConfig, thread)
                         )
-                        yield f"data: {json.dumps({'event': 'node_complete', 'node': k, 'token_usage': token_usage})}\n\n"
+                        token_usage = snapshot.values.get("token_usage", 0)
+                        step_count = snapshot.values.get("step_count", 0)
+
+                        yield f"data: {json.dumps({'event': 'node_complete', 'node': node_name, 'token_usage': token_usage, 'step': step_count})}\n\n"
 
             snapshot = app_state["agent_graph"].get_state(cast(RunnableConfig, thread))
             final_values = snapshot.values
@@ -313,4 +319,11 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # 配置 uvicorn 以支持长时间运行的请求
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        timeout_keep_alive=3600,  # 保持连接 1 小时（针对长时间分析任务）
+        timeout_graceful_shutdown=30,  # 优雅关闭超时 30 秒
+    )

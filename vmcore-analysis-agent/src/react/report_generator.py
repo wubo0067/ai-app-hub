@@ -209,7 +209,9 @@ def generate_markdown_report(state: AgentState) -> str:
     lines.append("")
     lines.append("---")
     lines.append("")
-    lines.append("*This report was jointly created by CalmWU and his AI agent.*")
+    lines.append(
+        '*This report was jointly created by <span style="color: red;">**CalmWU and his AI agent.**</span>*'
+    )
     lines.append("")
 
     return "\n".join(lines)

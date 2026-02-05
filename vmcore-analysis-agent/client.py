@@ -108,10 +108,16 @@ def analyze_vmcore_stream(
 
                         if event == "start":
                             print(f"✅ 任务开始：task_id={data.get('task_id')}")
+                        elif event == "node_start":
+                            print(f"🚦 节点启动：{data.get('node')}")
                         elif event == "node_complete":
                             print(
                                 f"📍 节点完成：{data.get('node')} | Token: {data.get('token_usage', 0)}"
                             )
+                        elif event == "tool_start":
+                            print(f"🔧 工具执行中：{data.get('tool')} ...")
+                        elif event == "tool_end":
+                            print(f"✓ 工具完成：{data.get('tool')}")
                         elif event == "complete":
                             print("-" * 60)
                             print("🎉 分析完成！")
