@@ -127,18 +127,37 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         # 检查解析结果是否为空
         if analysis_result is None:
             # 尝试修复常见的 JSON 格式错误
-            # Fix for: "action":{"command_name":"ps",["-m|grep","UN"]} -> "action":{"command_name":"ps","arguments":["-m|grep","UN"]}
             try:
                 content = raw_message.content
                 content_str = (
                     content if isinstance(content, str) else json.dumps(content)
                 )
+
+                # Fix 1: 修复无效的 JSON 转义序列（LLM 经常混淆 bash 和 JSON 转义）
+                # \| → | (管道符在 JSON 中不需要转义)
+                # \/ → / (斜杠在 JSON 中不需要转义)
+                # \> → > (重定向符在 JSON 中不需要转义)
+                # \< → < (重定向符在 JSON 中不需要转义)
+                # \& → & (与符号在 JSON 中不需要转义)
+                invalid_escapes = [
+                    (r"\|", "|"),
+                    (r"\/", "/"),
+                    (r"\>", ">"),
+                    (r"\<", "<"),
+                    (r"\&", "&"),
+                ]
+                for pattern, replacement in invalid_escapes:
+                    content_str = content_str.replace(pattern, replacement)
+
+                # Fix 2: 修复缺失的 arguments 字段
+                # "action":{"command_name":"ps",["-m"]} -> "action":{"command_name":"ps","arguments":["-m"]}
                 pattern = r'("command_name"\s*:\s*"[^"]*"\s*,)\s*(\[)'
-                fixed_content = re.sub(pattern, r'\1 "arguments": \2', content_str)
-                analysis_result = VMCoreAnalysisStep.model_validate_json(fixed_content)
+                content_str = re.sub(pattern, r'\1 "arguments": \2', content_str)
+
+                analysis_result = VMCoreAnalysisStep.model_validate_json(content_str)
                 logger.warning(
                     "Successfully repaired malformed JSON from LLM. "
-                    f"Original: {content[:100]}... Fixed: {fixed_content[:100]}..."
+                    f"Original: {content[:200]}... Fixed: {content_str[:200]}..."
                 )
             except Exception as repair_err:
                 logger.warning(f"JSON repair failed: {repair_err}")

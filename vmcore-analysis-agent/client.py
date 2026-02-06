@@ -224,10 +224,10 @@ def main():
     parser.add_argument(
         "--debug-symbols",
         nargs="*",
-        default=[
-            "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/soft_lockup/soft_lockup_module.ko",
-            "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko",
-        ],
+        # default=[
+        #     "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/soft_lockup/soft_lockup_module.ko",
+        #     "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko",
+        # ],
         help="额外的调试符号路径列表",
     )
     parser.add_argument(

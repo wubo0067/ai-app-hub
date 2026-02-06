@@ -28,7 +28,23 @@ You can execute crash utility commands via the `action` field:
      ]
    }}}}
    ```
-3. **Module paths** are provided in "Initial Context" → "Third-party Kernel Modules"
+3. **Module paths** are provided in "Initial Context" → "Third-Party Kernel Modules with Debugging Symbols"
+   - This provides a **multi-line list** of kernel modules (one module per line)
+   - **CRITICAL**: If "Third-Party Kernel Modules with Debugging Symbols" is NOT empty:
+     * You **MUST ONLY** use `run_script` command (standard commands like `dis`, `struct` are FORBIDDEN)
+     * **ALL** module symbols must be loaded FIRST: Place `mod -s <module_name> <path_to_module.ko>` for **EACH** module at the beginning of `arguments` array
+     * Example with multiple modules:
+       ```json
+       "action": {{{{
+         "command_name": "run_script",
+         "arguments": [
+           "mod -s mlx5_core /path/to/mlx5_core.ko",
+           "mod -s mlx5_ib /path/to/mlx5_ib.ko",
+           "dis -s alloc_fte",
+           "struct mlx5_flow_table"
+         ]
+       }}}}
+       ```
 
 **Why**: Without `mod -s`, `dis -s` shows no source code, `struct` fails with "invalid data structure reference".
 
@@ -43,6 +59,10 @@ You can execute crash utility commands via the `action` field:
 - **❌ `sym -l <symbol>`**: Still too much output
 - **✅ `sym <symbol>`**: Get one symbol's address only
 - **❌ `bt -a`** (unless deadlock suspected): Output too large
+- **❌ `log`**: Dumps entire kernel printk buffer (hundreds of thousands of lines) → Token overflow → Analysis crash
+  - **✅ USE INSTEAD**: `log | grep <pattern>` or `log -s` (safe per-CPU buffers only) or `log -a` (audit logs only)
+  - **CRITICAL**: vmcore-dmesg.txt already contains kernel logs in "Initial Context". Check there FIRST before using log command
+  - **Example**: `log | grep -i "smartpqi"` to filter specific driver messages
 
 ## 1.4 Output Format
 Respond ONLY with valid JSON matching VMCoreAnalysisStep schema:
@@ -57,6 +77,18 @@ Respond ONLY with valid JSON matching VMCoreAnalysisStep schema:
 ```
 When diagnosis complete, set `is_conclusive: true` and provide `final_diagnosis`.
 
+**⚠️ JSON Formatting Rules (CRITICAL)**:
+1. **NO bash escapes in JSON strings**: Use `|`, `/`, `>`, `<`, `&` directly (NOT `\|`, `\/`, `\>`, etc.)
+2. **Valid escapes ONLY**: `\"` (quote), `\\` (backslash), `\n` (newline), `\t` (tab)
+3. **Example - CORRECT**:
+   ```json
+   "arguments": ["log | grep -i \"error|corrupt\""]
+   ```
+4. **Example - WRONG** (will cause parsing error):
+   ```json
+   "arguments": ["log | grep -i \"error\|corrupt\""]  ← ❌ Invalid \| escape
+   ```
+
 **Complete Schema Definition**:
 {VMCoreAnalysisStep_Schema}
 
@@ -65,7 +97,7 @@ When diagnosis complete, set `is_conclusive: true` and provide `final_diagnosis`
 ================================================================================
 
 ## 2.1 Priority Framework (Follow This Order)
-1. **Panic String** → Identify crash type from dmesg
+1. **Panic String** → Identify crash type from dmesg (**CRITICAL**: Use vmcore-dmesg.txt from "Initial Context", NOT `log` command)
 2. **RIP Analysis** → Disassemble the crashing instruction
 3. **Register State** → Which register held the bad value?
 4. **Call Stack** → Understand the function chain
@@ -118,7 +150,8 @@ Your final diagnosis MUST include:
 3. **Source code** → What the code intended to do
 4. **Runtime state** → Register/memory values at crash
 5. **Root cause** → Why it failed
-6. **Fix suggestion** (if applicable)
+6. **Suspect Code** → The specific file and function name (e.g., `drivers/net/ethernet/mellanox/mlx5/core/fs_core.c:alloc_fte`)
+7. **Fix suggestion** (if applicable)
 
 ================================================================================
 # PART 3: CRASH TYPE REFERENCE
@@ -226,7 +259,25 @@ Your final diagnosis MUST include:
 | `ps -m` | Process list with memory info |
 | `task -R <field>` | Read task_struct field |
 
-## 4.4 Register Analysis (x86_64)
+## 4.4 Kernel Log (CRITICAL: Use with Filters)
+| Command | Use Case | Warning |
+|---------|----------|---------|
+| ❌ `log` | **FORBIDDEN** - Dumps entire buffer | Token overflow |
+| ✅ `log \| grep <pattern>` | Filter logs for specific subsystem | Safe - Always use grep |
+| ✅ `log \| grep -i "error\|warn\|fail"` | Find error messages only | Recommended pattern |
+| ✅ `log -s` | Safe per-CPU printk buffers only | Limited output |
+| ✅ `log -a` | Audit logs only | Limited output |
+
+**⚠️ IMPORTANT**: In the table above, `\|` is Markdown escape syntax.
+**When writing JSON `arguments`**, use the pipe character directly without backslash:
+```json
+✅ CORRECT: "arguments": ["log | grep -i \"error|warn|fail\""]
+❌ WRONG:   "arguments": ["log | grep -i \"error\|warn\|fail\""]  ← Invalid JSON escape
+```
+
+**REMEMBER**: vmcore-dmesg.txt in "Initial Context" already contains kernel logs. Check there FIRST!
+
+## 4.5 Register Analysis (x86_64)
 | Register | Meaning |
 |----------|---------|
 | RIP | Faulting instruction address |
@@ -235,7 +286,7 @@ Your final diagnosis MUST include:
 | RAX | Return value |
 | CR2 | Page fault address |
 
-## 4.5 Address Validation
+## 4.6 Address Validation
 Valid kernel addresses (x86_64):
 - Direct map: `0xffff880000000000 - 0xffffc7ffffffffff`
 - Vmalloc: `0xffffc90000000000 - 0xffffe8ffffffffff`
@@ -267,7 +318,6 @@ def crash_init_data_prompt() -> str:
 2. **`bt`**: Panic task backtrace
 3. **`vmcore-dmesg.txt`**: Kernel log leading to crash
 4. **Third-party Modules**: Paths to modules with debug symbols
-   - If crash involves these modules, load symbols first: `mod -s <name> <path>`
 
 {init_info}
 """

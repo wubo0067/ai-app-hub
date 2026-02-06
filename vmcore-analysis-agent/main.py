@@ -185,7 +185,7 @@ async def analyze_vmcore(request: VmcoreAnalysisRequest):
             "messages": [],
             "step_count": 0,
             "token_usage": 0,
-            "is_last_step": False,
+            # ✅ 不要手动设置 is_last_step，让 LangGraph 根据 recursion_limit 自动管理
             "agent_answer": "",
             "error": None,
         }
@@ -275,7 +275,7 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
                 "messages": [],
                 "step_count": 0,
                 "token_usage": 0,
-                "is_last_step": False,
+                # ✅ 不要手动设置 is_last_step，让 LangGraph 根据 recursion_limit 自动管理
                 "agent_answer": "",
                 "error": None,
             }
