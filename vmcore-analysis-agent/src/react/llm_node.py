@@ -44,6 +44,39 @@ class ToolCall(BaseModel):
         return data
 
 
+class SuspectCode(BaseModel):
+    """可疑代码位置"""
+
+    file: str = Field(..., description="Source file path")
+    function: str = Field(..., description="Function name")
+    line: str = Field(..., description="Line number or 'unknown'")
+
+
+class FinalDiagnosis(BaseModel):
+    """最终诊断结果的完整结构"""
+
+    crash_type: str = Field(
+        ...,
+        description="Crash type (e.g., NULL pointer dereference, use-after-free, soft lockup)",
+    )
+    panic_string: str = Field(..., description="Exact panic string from dmesg")
+    faulting_instruction: str = Field(
+        ..., description="RIP address and disassembly of faulting instruction"
+    )
+    root_cause: str = Field(
+        ..., description="1-2 sentence root cause explanation with evidence"
+    )
+    detailed_analysis: str = Field(
+        ...,
+        description="Multi-paragraph analysis with full evidence chain and kernel subsystem context",
+    )
+    suspect_code: SuspectCode = Field(..., description="Suspected source code location")
+    evidence: List[str] = Field(
+        ...,
+        description="List of key evidence points (register values, memory contents, etc.)",
+    )
+
+
 class VMCoreAnalysisStep(BaseModel):
     step_id: int = Field(..., description="Current step sequence number.")
 
@@ -58,8 +91,19 @@ class VMCoreAnalysisStep(BaseModel):
     )
 
     is_conclusive: bool = Field(False)
-    final_diagnosis: Optional[str] = Field(
+    final_diagnosis: Optional[FinalDiagnosis] = Field(
         None, description="Detailed final root cause and evidence."
+    )
+    fix_suggestion: Optional[str] = Field(
+        None,
+        description="Recommended fix or workaround (e.g., 'Update kernel', 'Hardware replacement needed')",
+    )
+    confidence: Optional[Literal["high", "medium", "low"]] = Field(
+        None, description="Confidence level of the diagnosis"
+    )
+    additional_notes: Optional[str] = Field(
+        None,
+        description="Any caveats, alternative hypotheses, or recommended follow-up actions",
     )
 
 
@@ -132,6 +176,29 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
                 content_str = (
                     content if isinstance(content, str) else json.dumps(content)
                 )
+
+                # Fix 0: 提取 JSON 部分并移除 trailing characters
+                # 尝试找到最外层的 JSON 对象
+                # 查找第一个 '{' 和最后一个匹配的 '}'
+                first_brace = content_str.find("{")
+                if first_brace != -1:
+                    # 查找匹配的结束大括号
+                    brace_count = 0
+                    last_brace = -1
+                    for i in range(first_brace, len(content_str)):
+                        if content_str[i] == "{":
+                            brace_count += 1
+                        elif content_str[i] == "}":
+                            brace_count -= 1
+                            if brace_count == 0:
+                                last_brace = i
+                                break
+
+                    if last_brace != -1:
+                        content_str = content_str[first_brace : last_brace + 1]
+                        logger.info(
+                            f"Extracted JSON from position {first_brace} to {last_brace+1}"
+                        )
 
                 # Fix 1: 修复无效的 JSON 转义序列（LLM 经常混淆 bash 和 JSON 转义）
                 # \| → | (管道符在 JSON 中不需要转义)

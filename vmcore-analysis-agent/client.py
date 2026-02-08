@@ -151,7 +151,7 @@ def health_check(base_url: str) -> dict:
 
 
 def save_markdown_report(
-    agent_answer: str, vmcore_path: str, output_dir: str = "."
+    agent_answer: str, vmcore_path: str, output_dir: str = "./reports"
 ) -> str:
     """
     保存 markdown 分析报告到文件。
@@ -238,8 +238,8 @@ def main():
     )
     parser.add_argument(
         "--output-dir",
-        default=".",
-        help="报告输出目录 (默认：当前目录)",
+        default="./reports",
+        help="报告输出目录 (默认：./reports)",
     )
     parser.add_argument(
         "--no-save",
