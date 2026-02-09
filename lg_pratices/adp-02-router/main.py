@@ -93,7 +93,7 @@ delegation_branch = RunnableBranch(
 # 在 Python 中，LangChain 重载了按位或运算符 |。当你写 A | B 时，它实际上并没有立即执行，
 # 而是创建了一个新的 RunnableSequence（可运行序列）对象。
 coordinator_agent = (
-    # 代码的第一部分是一个字典，这在 LCEL 中被称为 RunnableParallel。它会同时把相同的输入传给字典里的每一个 value。
+    # 代码的第一部分是一个字典，这在 LCEL（LangChain Expression Language）中被称为 RunnableParallel。它会同时把相同的输入传给字典里的每一个 value。
     # 会调用 RunnablePassthrough.invoke({"request": request_a})
     # "request": {"request": "帮我预订飞往伦敦的机票。"}
     {"decision": coordinator_router_chain, "request": RunnablePassthrough()}
