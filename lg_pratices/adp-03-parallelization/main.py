@@ -1,6 +1,6 @@
 import os
 import asyncio
-from langchain_openai import ChatOpenAI
+from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import (
@@ -13,13 +13,17 @@ from langchain_core.runnables import (
 
 
 try:
-    llm = ChatOpenAI(
-        api_key=os.getenv("DEEPSEEK_API_KEY"),
-        base_url="https://api.deepseek.com",
-        model="deepseek-chat",
-        temperature=0,  # temperature 的作用是控制生成文本的随机性，值越低，生成的文本越确定和一致
+    llm = ChatNVIDIA(
+        model="moonshotai/kimi-k2.5",  # "z-ai/glm4.7"
+        api_key=os.getenv("NVIDIA_API_KEY"),
+        temperature=1,
+        top_p=1,
+        max_tokens=16384,
+        extra_body={
+            "chat_template_kwargs": {"enable_thinking": False, "clear_thinking": True}
+        },
     )
-    print(f"语言模型初始化成功：{llm.model_name}")
+    print(f"语言模型初始化成功：{llm.model}")
 except Exception as e:
     print(f"语言模型初始化失败：{e}")
     llm = None
