@@ -38,7 +38,7 @@ def create_llm():
                 temperature
             ),  # https://api-docs.deepseek.com/zh-cn/quick_start/parameter_settings
         )
-        logger.info(f"Successfully created LLM instance, model name: {model_name}")
+        logger.info(f"Successfully created LLM instance, model name: {llm.model_name}")
         return llm
     except Exception as e:
         logger.error(f"Failed to create LLM instance: {e}")

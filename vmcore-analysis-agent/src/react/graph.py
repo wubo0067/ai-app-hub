@@ -151,15 +151,15 @@ def create_agent_graph(llm, tools_list: List):
     logger.info("✅ Agent graph compiled successfully.")
 
     # 可选：在调试模式下保存图结构到文件（需要 graphviz 支持）
-    try:
-        graph_png = graph.get_graph().draw_mermaid_png()
-        output_path = os.path.join(
-            os.path.dirname(__file__), "../../graph_visualization.png"
-        )
-        with open(output_path, "wb") as f:
-            f.write(graph_png)
-        logger.info(f"Graph visualization saved to: {output_path}")
-    except Exception as e:
-        logger.error(f"Could not display graph visualization: {e}")
+    # try:
+    #     graph_png = graph.get_graph().draw_mermaid_png()
+    #     output_path = os.path.join(
+    #         os.path.dirname(__file__), "../../graph_visualization.png"
+    #     )
+    #     with open(output_path, "wb") as f:
+    #         f.write(graph_png)
+    #     logger.info(f"Graph visualization saved to: {output_path}")
+    # except Exception as e:
+    #     logger.error(f"Could not display graph visualization: {e}")
 
     return graph

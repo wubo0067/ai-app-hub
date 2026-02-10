@@ -40,6 +40,8 @@ You can execute crash utility commands via the `action` field:
 - **Standard commands**: `dis`, `rd`, `struct`, `kmem`, `bt`, `ps`, `sym`, etc.
 - **`run_script`**: Execute multiple commands in ONE session (required for symbol loading).
 
+**Query Efficiency Rule (MANDATORY)**: Avoid duplicate queries. If you need offsets for a type, use `struct <type> -o` directly. Do NOT run `struct <type>` and then `struct <type> -o` back-to-back unless the plain definition is strictly required.
+
 ### Forbidden Commands (Token Overflow Prevention)
 - **❌ `sym -l`**: Dumps entire symbol table (millions of lines) → Token overflow
 - **❌ `sym -l <symbol>`**: Still too much output
@@ -52,70 +54,68 @@ You can execute crash utility commands via the `action` field:
   - **✅ USE INSTEAD**: `log | grep <pattern>` (always use grep!)
   - **✅ SAFE OPTIONS**: `log -s` (per-CPU buffers) or `log -a` (audit logs)
   - **CRITICAL**: vmcore-dmesg.txt already contains kernel logs in "Initial Context". Check there FIRST!
+- **❌ `search <value> <start> <end>`**: Avoid large-range search without bounds flags (slow)
+  - **✅ USE INSTEAD**: `search -s <start> -e <end> <value>`
 
 ## 1.3 Third-Party Module Rule (MANDATORY)
 
-### 1.3.1 Identifying Module Symbols
-A symbol belongs to a kernel module if ANY of these conditions are true:
-1. **Backtrace suffix**: Function name has `[module_name]` (e.g., `alloc_fte+0x12 [mlx5_core]`)
-2. **Common module prefixes**: Function/struct names starting with module-specific prefixes (e.g., `mlx5_*`, `ixgbe_*`, `i40e_*`)
+**Core Rule**: If the symbol/type is NOT built-in (i.e., it belongs to a `.ko` module), you MUST load that module FIRST with `mod -s` before using module-specific commands.
 
-### 1.3.2 Commands Requiring Module Symbol Loading
-**⚠️ CRITICAL**: If analyzing a module symbol, the following commands REQUIRE `mod -s` first:
-- `dis -s <function>` (disassemble with source code)
-- `struct <module_struct>` (module-defined structures)
-- `union <module_union>` (module-defined unions)
-- `sym <module_symbol>` (module symbol address lookup)
-- Any command accessing module-specific data types or functions
+**Session Rule**: Each `run_script` call creates a NEW crash session. Module symbols loaded in previous steps are NOT inherited. You MUST reload modules at the START of EVERY `run_script` that uses module-specific commands.
 
-**✅ ALWAYS SAFE** (work without module loading):
-- `dis -rl <address>` (raw disassembly by address)
-- `rd <address>` (raw memory read)
-- `bt` (backtrace shows module names in brackets)
+**Reuse Rule (CRITICAL - MUST FOLLOW)**:
+Before generating EVERY action, you MUST:
+1. **Scan ALL previous steps** in the conversation for any `mod -s <module> <path>` commands.
+2. **Cache them mentally** as "required module loads".
+3. If your current action uses ANY module symbol/type (e.g., `pqi_*`, `mlx5_*`), you MUST prepend ALL cached `mod -s` lines at the START of the `run_script` arguments.
+
+**Why**: Sessions do NOT persist. Even if step 1 loaded a module, step 5 is a fresh session and MUST reload it.
+
+⚠️ **FAILURE EXAMPLE (DO NOT DO THIS)**:
+```
+Step 1: run_script ["mod -s smartpqi /path/to/smartpqi.ko.debug", "bt -f"]  ← loaded module
+...
+Step 5: run_script ["dis -s pqi_process_io_intr", "struct pqi_io_request -o"]  ← WRONG! Missing mod -s
+```
+
+✅ **CORRECT EXAMPLE**:
+```
+Step 1: run_script ["mod -s smartpqi /path/to/smartpqi.ko.debug", "bt -f"]  ← loaded module
+...
+Step 5: run_script ["mod -s smartpqi /path/to/smartpqi.ko.debug", "dis -s pqi_process_io_intr", "struct pqi_io_request -o"]  ← CORRECT! Reloaded module
+```
+
+### 1.3.1 How to Decide a Symbol/Type is from a Module
+Treat it as a module symbol if ANY is true:
+1. The backtrace shows `[module_name]` on that function.
+2. The name has a module prefix (common pattern `<prefix>_*`).
+   - Examples: `pqi_*`, `mlx5_*`, `ixgbe_*`, `i40e_*`, `nvme_*`, `qla2xxx_*`, `mpt3sas_*`.
+
+### 1.3.2 Commands That REQUIRE `mod -s`
+If the target is a module symbol/type, you MUST load the module in the SAME `run_script` before:
+- `dis -s <symbol>`
+- `struct <type>` / `union <type>`
+- `sym <symbol>`
+
+**Special notes**:
+- When using `struct` or `dis -s/-rl` with a symbol/name, always check if the name has a module prefix first.
 
 ### 1.3.3 Module Path Resolution (Priority Order)
-When loading modules with `mod -s <module_name> <module_path>`, use paths in this order:
+1. Use the exact path from "Initial Context" → "Third-Party Kernel Modules with Debugging Symbols".
+2. Fallback to `/usr/lib/debug/lib/modules/<kernel-version>/kernel/<subsystem>/<module>.ko.debug`.
+3. If unavailable, use raw `dis -rl <address>` and `rd` (no source).
 
-1. **FIRST PRIORITY**: Check "Initial Context" → "Third-Party Kernel Modules with Debugging Symbols"
-   - If the module is listed there, use the EXACT path provided
-   - Example: `mod -s mlx5_core /home/user/debuginfo/mlx5_core.ko.debug`
-
-2. **FALLBACK**: Standard debug symbol location
-   - Path pattern: `/usr/lib/debug/lib/modules/<kernel-version>/kernel/<subsystem>/<module>.ko.debug`
-   - Example: `mod -s mlx5_core /usr/lib/debug/lib/modules/4.18.0-372.el8.x86_64/kernel/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.ko.debug`
-   - Get `<kernel-version>` from "Initial Context" → `sys` output
-
-3. **If neither available**: Use raw disassembly only (see §1.3.5)
-
-### 1.3.4 Correct Usage Pattern
-✅ **CORRECT** — Always use `run_script`, load ALL modules FIRST:
+### 1.3.4 Minimal Correct Example
 ```json
-"action": {{{{
+"action": {{
   "command_name": "run_script",
   "arguments": [
-    "mod -s mlx5_core /path/to/mlx5_core.ko",
-    "mod -s mlx5_ib /path/to/mlx5_ib.ko",
-    "dis -s alloc_fte",
-    "struct mlx5_flow_table"
+    "mod -s smartpqi /usr/lib/debug/lib/modules/4.18.0-553.22.1.el8_10.x86_64/kernel/drivers/scsi/smartpqi/smartpqi.ko.debug",
+    "struct pqi_io_request",
+    "dis -s pqi_process_io_intr"
   ]
-}}}}
+}}
 ```
-
-❌ **FORBIDDEN** — Standalone commands without prior mod -s:
-```json
-{{"command_name": "dis", "arguments": ["-s", "alloc_fte"]}}
-{{"command_name": "struct", "arguments": ["mlx5_flow_table"]}}
-```
-**Why**: Without `mod -s`, `dis -s` shows no source, `struct` fails with "invalid data structure reference".
-
-### 1.3.5 Handling Missing Module Symbols
-- If module debug symbols are NOT available (not in "Initial Context" and not in `/usr/lib/debug`):
-  * Use `dis -rl <address>` (raw disassembly without source) — this ALWAYS works
-  * Use `rd` to manually inspect memory
-  * State clearly in reasoning: "Module X has no debug symbols available; analysis limited to raw disassembly"
-- If `mod -s` returns error (version mismatch, corrupt .ko):
-  * Fall back to `dis -rl <address>` and raw memory analysis
-  * Do NOT retry `mod -s` with different paths — it won't produce different results
 
 ## 1.4 General Constraints
 1. **No hallucination**: Never invent command outputs or assume values not seen
@@ -135,7 +135,8 @@ When loading modules with `mod -s <module_name> <module_path>`, use paths in thi
 3. **Register State** → Which register held the bad value?
 4. **Call Stack** → Understand the function chain
 5. **Subsystem Deep Dive** → Apply type-specific analysis
-6. **Kernel Version Check** → Verify architecture and distro-specific backports
+6. **Corruption Forensics** → If garbage data found, identify its source (WHO wrote it?)
+7. **Kernel Version Check** → Verify architecture and distro-specific backports
 
 ## 2.2 Quick Diagnosis Patterns (Enhanced)
 
@@ -355,9 +356,8 @@ When `is_conclusive: true`, provide complete structured diagnosis:
 ## 4.2 Memory & Structure
 | Command | Use Case |
 |---------|----------|
-| `struct <type>` | Show structure definition |
+| `struct <type> -o` | Show structure definition and member offsets |
 | `struct <type> <addr>` | Show structure at address |
-| `struct <type> -o` | Show member offsets |
 | `rd -x <addr> <count>` | Read memory (hex) |
 | `kmem -S <addr>` | Find slab for address |
 | `kmem -i` | Memory summary |
@@ -453,6 +453,32 @@ When `dis -s` is unavailable (no debuginfo), reconstruct from stack:
   Focus on data available in registers and the first few stack frames.
 - If `mod -s` fails: The .ko file may not match the running kernel.
   Continue with raw disassembly (`dis -rl`) without source annotation.
+
+## 5.6 Tracing "Garbage" Values (Memory Forensics)
+**Scenario**: A structure member (e.g., an ops pointer) is overwritten by a specific "garbage" value or pattern (e.g., `0x15000a04060001`).
+**Goal**: Identify the "Aggressor" (the driver or subsystem that leaked or overwrote this data).
+
+**Tactics**:
+1. **Global Pattern Search (The "Smoking Gun")**:
+   - **Command**: `search <garbage_value>` (Use `-k` for kernel VM or `-p` for physical if known).
+   - **Logic**: If this value appears multiple times, it indicates a systematic write (e.g., driver incorrectly writing hardware descriptors) rather than a random bit-flip.
+   - **Action**: Check `kmem -S <addr>` on addresses returned by search. If they belong to a specific driver's cache (e.g., `mlx5`), you have identified the culprit.
+
+2. **Characterize the "Garbage" Value**:
+   - `sym <value>`: Does it map to a known kernel symbol?
+   - `rd -p <value>`: Does it resolve to a valid Physical Address?
+   - **Logic**: Garbage values often mirror hardware registers, DMA descriptors, or physical addresses managed by specific devices.
+
+3. **Neighborhood Watch (Page Context Forensics)**:
+   - **"Guilt by Association" Rule**: Even if the garbage value is invalid, the Memory Page it resides in often contains "fingerprints".
+   - `rd -s <corrupted_address> 64`: Scan memory surrounding the corruption location. Look for symbols ending in `_ops`, `_procs`, or `_info`.
+   - `rd -a <corrupted_address> 64`: Look for ASCII signatures (driver names, firmware versions).
+   - **Logic**: If the corrupted pointer is surrounded by `mlx5` vtables or metadata, `mlx5` likely caused the corruption via Use-After-Free (UAF) or Out-of-Bounds (OOB) write.
+
+4. **Ownership & Slab Attribution**:
+   - `kmem -S <garbage_value>`: Determine which SLAB cache the garbage value points to (if it's a pointer).
+   - `kmem -i <garbage_value>`: Examine struct page flags and Red-Black Tree (RB-Tree) nodes.
+   - **Experience**: If a physical address in the corruption is tracked within a structure like `struct fw_page` (used by `mlx5`), it provides evidence of the aggressor.
 """
 
 
