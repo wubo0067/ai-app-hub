@@ -285,8 +285,14 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
             logger.info("LLM did not call any tools, returning result directly.")
 
         # 将结构化后的对象序列化存入 content，并携带调用的工具信息
+        # 必须保留 additional_kwargs 中的 reasoning_content，否则下一轮对话 DeepSeek-Reasoner 会报错 (Error 400)
+        # DeepSeek-Reasoner 模式下，之前的 assistant 消息必须包含 reasoning_content
+        additional_kwargs = raw_message.additional_kwargs.copy()
+
         response = AIMessage(
-            content=analysis_result.model_dump_json(), tool_calls=tool_calls
+            content=analysis_result.model_dump_json(),
+            tool_calls=tool_calls,
+            additional_kwargs=additional_kwargs,
         )
 
     except Exception as e:

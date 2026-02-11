@@ -40,7 +40,15 @@ You can execute crash utility commands via the `action` field:
 - **Standard commands**: `dis`, `rd`, `struct`, `kmem`, `bt`, `ps`, `sym`, etc.
 - **`run_script`**: Execute multiple commands in ONE session (required for symbol loading).
 
-**Query Efficiency Rule (MANDATORY)**: Avoid duplicate queries. If you need offsets for a type, use `struct <type> -o` directly. Do NOT run `struct <type>` and then `struct <type> -o` back-to-back unless the plain definition is strictly required.
+### Strict Anti-Repetition Policy (ZERO TOLERANCE)
+You MUST NOT generate a command that has already been executed in previous steps, ESPECIALLY resource-intensive commands like `search`.
+Before generating ANY action:
+1. **Review History**: Scan ALL previous "action" fields in the conversation history.
+2. **Check for Duplicates**: If a command (e.g., `search -p 0x...`, `struct <type> -o`) matches a previous one, DO NOT run it again.
+3. **Reuse Output**: Use the output from the previous execution.
+4. **Exception**: `run_script` with `mod -s` is the ONLY exception (module loading must be repeated per session, see §1.3).
+
+**Query Efficiency Rule**: If you need offsets, use `struct <type> -o` immediately. Never run `struct <type>` then `struct <type> -o`.
 
 ### Forbidden Commands (Token Overflow Prevention)
 - **❌ `sym -l`**: Dumps entire symbol table (millions of lines) → Token overflow
@@ -54,8 +62,8 @@ You can execute crash utility commands via the `action` field:
   - **✅ USE INSTEAD**: `log | grep <pattern>` (always use grep!)
   - **✅ SAFE OPTIONS**: `log -s` (per-CPU buffers) or `log -a` (audit logs)
   - **CRITICAL**: vmcore-dmesg.txt already contains kernel logs in "Initial Context". Check there FIRST!
-- **❌ `search <value> <start> <end>`**: Avoid large-range search without bounds flags (slow)
-  - **✅ USE INSTEAD**: `search -s <start> -e <end> <value>`
+ - **❌ `search -k <value>`**: **STRICTLY FORBIDDEN**. Full kernel virtual memory search causes timeouts.
+   - **✅ USE INSTEAD**: `search -p <value>` (physical) or `search -s <start> -e <end> <value>` (constrained range).
 
 ## 1.3 Third-Party Module Rule (MANDATORY)
 
@@ -124,6 +132,8 @@ If the target is a module symbol/type, you MUST load the module in the SAME `run
 4. **Source over speculation**: Conclusions must cite actual disassembly/memory values
 5. **Max steps**: Target conclusion within 15 steps; summarize if exceeded
 6. **All arguments must follow JSON-SAFE rules** (see §1.1)
+7. **Refuse Duplicates**: If you feel the need to run a command again, STOP. Explain why you think you need it, or use the previous output. Repeated `search` commands are strictly forbidden.
+8. **Command Syntax**: `dis -s` and `dis -r` are **MUTUALLY EXCLUSIVE**.
 
 ================================================================================
 # PART 2: DIAGNOSTIC WORKFLOW
@@ -460,25 +470,31 @@ When `dis -s` is unavailable (no debuginfo), reconstruct from stack:
 
 **Tactics**:
 1. **Global Pattern Search (The "Smoking Gun")**:
-   - **Command**: `search <garbage_value>` (Use `-k` for kernel VM or `-p` for physical if known).
-   - **Logic**: If this value appears multiple times, it indicates a systematic write (e.g., driver incorrectly writing hardware descriptors) rather than a random bit-flip.
+   - **Command**: `search -p <garbage_value>` (Physical) or `search -s <start> -e <end> <garbage_value>` (Constrained VM).
+   - **Format**: For 64-bit values, ALWAYS use `0x` prefix and pad to 16 hex digits (e.g., `0x0015000a04060001`). Do not drop leading zeros.
+   - **Warning**: **Avoid `search -k`** (full kernel VM search) as it causes timeouts.
+   - **Logic**: If this value appears multiple times (especially aligned, e.g., every 128 bytes), it indicates a systematic write (e.g., driver incorrectly writing hardware descriptors) rather than a random bit-flip.
    - **Action**: Check `kmem -S <addr>` on addresses returned by search. If they belong to a specific driver's cache (e.g., `mlx5`), you have identified the culprit.
 
-2. **Characterize the "Garbage" Value**:
-   - `sym <value>`: Does it map to a known kernel symbol?
-   - `rd -p <value>`: Does it resolve to a valid Physical Address?
-   - **Logic**: Garbage values often mirror hardware registers, DMA descriptors, or physical addresses managed by specific devices.
+2. **Physical Address Reverse Mapping (The "RHEL Technique")**:
+   - **Concept**: Drivers track their DMA buffers (Physical Addresses) in internal structures. Finding who *tracks* the corrupted memory reveals the owner.
+   - **Step 1**: Pick a Virtual Address (VA) from Tactic 1 results.
+   - **Step 2**: Convert to Physical Address (PA): `vtop <VA>`.
+   - **Step 3**: Search for who holds this PA: `search -p <PA_value>`.
+   - **Step 4**: Identify the holder: `kmem -S <address_holding_PA>`.
+   - **Step 5**: **Contextualize the Holder**: `rd -s <page_start_of_holder> 512`.
+   - **Example**: PA is found in a `kmalloc-96` object. The page containing that object also contains `mlx5_devlink_ops`. **Conclusion**: `mlx5` driver owns the corrupted memory.
 
 3. **Neighborhood Watch (Page Context Forensics)**:
    - **"Guilt by Association" Rule**: Even if the garbage value is invalid, the Memory Page it resides in often contains "fingerprints".
-   - `rd -s <corrupted_address> 64`: Scan memory surrounding the corruption location. Look for symbols ending in `_ops`, `_procs`, or `_info`.
-   - `rd -a <corrupted_address> 64`: Look for ASCII signatures (driver names, firmware versions).
+   - `rd -s <corrupted_address> 512`: Scan memory surrounding the corruption location. Look for symbols ending in `_ops`, `_procs`, or `_info`.
+   - `rd -a <corrupted_address> 512`: Look for ASCII signatures (driver names, firmware versions).
    - **Logic**: If the corrupted pointer is surrounded by `mlx5` vtables or metadata, `mlx5` likely caused the corruption via Use-After-Free (UAF) or Out-of-Bounds (OOB) write.
 
-4. **Ownership & Slab Attribution**:
-   - `kmem -S <garbage_value>`: Determine which SLAB cache the garbage value points to (if it's a pointer).
-   - `kmem -i <garbage_value>`: Examine struct page flags and Red-Black Tree (RB-Tree) nodes.
-   - **Experience**: If a physical address in the corruption is tracked within a structure like `struct fw_page` (used by `mlx5`), it provides evidence of the aggressor.
+4. **Characterize the "Garbage" Value**:
+   - `sym <value>`: Does it map to a known kernel symbol?
+   - `rd -p <value>`: Does it resolve to a valid Physical Address?
+   - **Logic**: Garbage values often mirror hardware registers, DMA descriptors, or physical addresses managed by specific devices.
 """
 
 

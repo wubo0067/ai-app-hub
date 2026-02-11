@@ -14,7 +14,8 @@ from langchain_core.runnables import (
 
 try:
     llm = ChatNVIDIA(
-        model="moonshotai/kimi-k2.5",  # "z-ai/glm4.7"
+        # model="moonshotai/kimi-k2.5",
+        model="z-ai/glm4.7",
         api_key=os.getenv("NVIDIA_API_KEY"),
         temperature=1,
         top_p=1,
