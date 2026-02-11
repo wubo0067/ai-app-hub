@@ -164,6 +164,7 @@ If the target is a module symbol/type, you MUST load the module in the SAME `run
 | "scheduling while atomic: ..., preempt_count=XX" | Sleep in atomic context | preempt_count | `bt` → find sleeping call in atomic path |
 | "list_add corruption" / "list_del corruption" | Linked list corruption | N/A | Memory corruption, check surrounding allocations |
 | "Machine Check Exception" | Hardware failure | Check MCE banks | Check dmesg for EDAC/MCE |
+| Corrupted pointer with Ethernet/NVMe data pattern | DMA stray write (Passthrough IOMMU) | Non-symbol garbage value | `log | grep -Ei iommu`, check §3.12 |
 
 ## 2.3 Analysis Flowchart
 
@@ -352,6 +353,207 @@ When `is_conclusive: true`, provide complete structured diagnosis:
 2. Shadow memory decode: Address in report → actual corruption location
 3. For UBSAN: Usually non-fatal but indicates logic bug; check the arithmetic operation
 
+## 3.12 DMA Memory Corruption (Stray DMA Write)
+**Pattern**: Memory corruption where the corrupted data resembles network packets, NVMe
+completions, or hardware descriptors rather than typical software data patterns.
+Typically occurs when IOMMU is in **Passthrough** mode, allowing devices to DMA
+directly to any physical address without hardware address translation or isolation.
+
+**Indicators** (suspect DMA corruption when ANY of the following is true):
+- Corrupted memory contains patterns matching Ethernet headers, NVMe CQE/SQE, or HW descriptors
+- `log | grep -Ei iommu` shows "Default domain type: Passthrough"
+- Multiple unrelated structures are corrupted in physically contiguous pages
+- Corruption recurs across reboots at different virtual addresses but similar physical ranges
+- The corrupted value does NOT match any kernel symbol (`sym <value>` returns nothing)
+
+### 3.12.1 Step 1: Confirm IOMMU Mode
+**Goal**: Determine if IOMMU provides protection or if devices have unrestricted DMA access.
+
+```
+# Check IOMMU mode (ALWAYS check vmcore-dmesg.txt FIRST)
+log | grep -Ei "iommu|dmar|passthrough|translation"
+```
+
+| IOMMU Mode | Risk Level | Meaning |
+|------------|------------|---------|
+| Passthrough | **HIGH** | Devices DMA directly to physical memory, NO HW isolation |
+| Lazy / Strict | Medium | IOMMU active but stale mappings possible (lazy) |
+| Disabled | **CRITICAL** | No IOMMU at all, any device can write anywhere |
+
+**Passthrough mode implications**:
+- Any buggy device/driver can DMA to arbitrary physical addresses
+- No hardware-level protection against stray DMA writes
+- The kernel's software DMA API still tracks mappings, but hardware does NOT enforce them
+
+### 3.12.2 Step 2: Check Device DMA Configuration
+**Goal**: Inspect the suspect device's DMA operations and verify if software checks are bypassed.
+
+```
+# Find the pci_dev structure for a suspect device (e.g., mlx5 or nvme)
+# Method 1: From module's known global pointer
+run_script ["mod -s mlx5_core <path>", "struct mlx5_core_dev <addr>"]
+
+# Method 2: Via PCI BDF (bus/device/function)
+# First find the device in the PCI device list:
+dev -p | grep -i "mlx5|nvme"
+```
+
+**Inspect DMA ops on device**:
+```
+# Once you have the device struct address:
+struct device.dma_ops <device_addr>
+
+# Check if device uses swiotlb (bounce buffering):
+log | grep -i "swiotlb|bounce"
+```
+
+| `dma_ops` value | Meaning |
+|-----------------|---------|
+| `NULL` or `nommu_dma_ops` | Direct physical mapping, NO software translation |
+| `intel_dma_ops` / `amd_iommu_dma_ops` | IOMMU-backed DMA (safer) |
+| `swiotlb_dma_ops` | Software bounce buffer (safe but slow) |
+
+### 3.12.3 Step 3: Check Corrupted Page's DMA Mapping State
+**Goal**: Determine if the corrupted memory page was (or should have been) a DMA target.
+
+```
+# Convert corrupted VA to physical address
+vtop <corrupted_VA>
+
+# Get the page structure for that physical address
+kmem -p <physical_address>
+
+# Inspect page flags
+struct page <page_struct_addr>
+```
+
+**Key `struct page` fields to check**:
+| Field | DMA-related value | Meaning |
+|-------|-------------------|---------|
+| `flags` | Bit 10 (`PG_reserved`) | Page reserved for I/O or DMA |
+| `_mapcount` | `-1` (PAGE_BUDDY_MAPCOUNT_VALUE) | Page in buddy system, should NOT be DMA target |
+| `_refcount` | `> 0` | Page is actively referenced |
+| `mapping` | Non-NULL | Page belongs to a file/anon mapping (should NOT receive DMA) |
+
+**Red flags for stray DMA**:
+- Page has `mapping != NULL` (belongs to file cache or user process) but contains hardware data
+- Page `_refcount > 1` but content is garbage → something wrote to an in-use page
+- Page is in a slab cache (`kmem -S <addr>` returns slab info) but contains non-slab data
+
+### 3.12.4 Step 4: Driver DMA Buffer Forensics
+**Goal**: Trace DMA buffer allocations of suspect drivers (mlx5_core, nvme, etc.).
+
+#### For mlx5_core (Network):
+```
+# Load module symbols first, then inspect DMA-related structures
+run_script [
+  "mod -s mlx5_core <path>",
+  "struct mlx5_core_dev -o",
+  "struct mlx5_priv -o"
+]
+
+# Check mlx5 Work Queue (WQ) and Completion Queue (CQ) buffer addresses
+# These are DMA coherent buffers that the NIC reads/writes directly
+run_script [
+  "mod -s mlx5_core <path>",
+  "struct mlx5_cq.buf <cq_addr>"
+]
+```
+
+#### For NVMe:
+```
+# Inspect NVMe queue DMA buffers
+run_script [
+  "mod -s nvme <path>",
+  "struct nvme_queue -o"
+]
+
+# Key fields: sq_dma_addr, cq_dma_addr (physical addrs of submission/completion queues)
+# These are where the NVMe controller writes completions via DMA
+```
+
+#### Generic DMA pool check:
+```
+# Check if any DMA pool exists for the driver
+log | grep -i "dma_pool|dma_alloc|dma_map"
+```
+
+### 3.12.5 Step 5: Hex Dump Signature Matching (Identify the "Culprit")
+**Goal**: Examine the corrupted memory content to identify which device wrote the data.
+
+```
+# Dump corrupted region in hex and ASCII (use count >= 64 for better coverage)
+rd -x <corrupted_addr> 64
+rd -a <corrupted_addr> 64
+```
+
+#### Network (mlx5/Ethernet) DMA Signatures:
+| Offset | Pattern | Meaning |
+|--------|---------|---------|
+| +0 | `ff:ff:ff:ff:ff:ff` | Broadcast MAC destination |
+| +0 | `01:00:5e:xx:xx:xx` | Multicast MAC destination |
+| +12 | `0x0800` | EtherType: IPv4 |
+| +12 | `0x0806` | EtherType: ARP |
+| +12 | `0x86dd` | EtherType: IPv6 |
+| +14 | `0x45` | IPv4 header (version=4, IHL=5) |
+| +23 | `0x06` / `0x11` | Protocol: TCP / UDP |
+| Any | `0x0015000a04060001` | mlx5 CQE (Completion Queue Entry) opcode pattern |
+| Any | Repeating 64-byte aligned blocks | CQE/WQE ring buffer content |
+
+**Detection rule**: If corrupted memory shows valid Ethernet frames or CQE patterns,
+the network adapter (mlx5) is the likely culprit — it DMA'd received packets or
+completion entries to a wrong physical address.
+
+#### NVMe DMA Signatures:
+| Offset | Pattern | Meaning |
+|--------|---------|---------|
+| +0 | `0x00` - `0x0F` (command opcode) | NVMe Submission Queue Entry (SQE) |
+| +4 | Valid NSID (usually `0x01`) | NVMe namespace ID in SQE |
+| Any | 16-byte aligned structures | NVMe Completion Queue Entry (CQE) |
+| +0 of CQE | Command-specific DW0 | CQE result field |
+| +8 of CQE | SQ Head Pointer + SQ ID | CQE routing info |
+| +12 of CQE | Status Field + Command ID | CQE status |
+| Any | File system magic numbers | Filesystem metadata DMA'd to wrong location |
+|  | `0xEF53` | ext4 superblock magic |
+|  | `0x58465342` (`XFSB`) | XFS superblock magic |
+
+**Detection rule**: If corrupted memory contains filesystem metadata or NVMe CQE
+patterns, the NVMe controller wrote data to a stale/wrong DMA mapping.
+
+#### SCSI/HBA DMA Signatures:
+| Pattern | Meaning |
+|---------|---------|
+| SCSI sense data (`0x70` or `0x72` at byte 0) | SCSI response frame |
+| SAS address format (8-byte WWN) | SAS controller descriptor |
+| Repeating 128/256-byte blocks | HBA I/O completion ring |
+
+### 3.12.6 Analysis Flowchart for DMA Corruption
+
+```
+Suspect DMA Corruption?
+│
+├─ 1. Check IOMMU mode (§3.12.1)
+│     └─ Passthrough? → HIGH RISK, continue
+│
+├─ 2. Identify suspect devices (§3.12.2)
+│     └─ Check dma_ops for each suspect device
+│
+├─ 3. Examine corrupted page (§3.12.3)
+│     └─ Was this page supposed to be a DMA target?
+│        ├─ YES (page in driver's DMA buffer) → Driver bug (wrong offset/size)
+│        └─ NO (page in slab/pagecache) → Stray DMA (wrong physical address)
+│
+├─ 4. Hex dump analysis (§3.12.5)
+│     ├─ Ethernet headers/CQE patterns? → Network adapter (mlx5)
+│     ├─ NVMe CQE/filesystem data? → NVMe controller
+│     └─ SCSI sense/SAS frames? → SCSI HBA
+│
+└─ 5. Conclude with evidence chain:
+      "Device X in Passthrough mode DMA'd [packet/completion] data to
+       physical address Y, which overlaps with kernel [slab/pagecache]
+       page Z, corrupting [structure/pointer] at offset W."
+```
+
 ================================================================================
 # PART 4: COMMAND REFERENCE
 ================================================================================
@@ -495,6 +697,91 @@ When `dis -s` is unavailable (no debuginfo), reconstruct from stack:
    - `sym <value>`: Does it map to a known kernel symbol?
    - `rd -p <value>`: Does it resolve to a valid Physical Address?
    - **Logic**: Garbage values often mirror hardware registers, DMA descriptors, or physical addresses managed by specific devices.
+
+## 5.7 DMA Corruption Forensics (IOMMU Passthrough Deep Dive)
+**When to use**: After §3.12 identifies DMA corruption as likely. This section provides
+the full investigative workflow to pinpoint the offending device and build an evidence chain.
+
+### 5.7.1 IOMMU Passthrough Verification Checklist
+Run these commands once and cache results for the entire session:
+```
+# 1. IOMMU mode and DMAR table
+log | grep -Ei "iommu|dmar|passthrough|translation|swiotlb"
+
+# 2. All IOMMU groups and device assignments
+log | grep -i "Adding to iommu group"
+```
+
+**Key findings to record**:
+- Is IOMMU Passthrough? → All devices can DMA freely
+- Which devices share an IOMMU group? → Devices in the same group can access each other's mappings
+- Is swiotlb active? → If yes, bounce buffers may mask the real DMA target
+
+### 5.7.2 Device-to-Physical-Page Mapping
+**Goal**: Prove that a specific device's DMA ring buffer overlaps with the corrupted page.
+
+**Method**:
+```
+# Step 1: Get physical address of corrupted memory
+vtop <corrupted_VA>
+
+# Step 2: Find nearby DMA buffer registrations
+# Check dmesg for DMA mapping near the physical address
+log | grep -i "dma"
+
+# Step 3: For mlx5 - check EQ/CQ/WQ buffer physical addresses
+# (requires module symbols)
+run_script [
+  "mod -s mlx5_core <path>",
+  "struct mlx5_eq.buf <eq_addr>",
+  "struct mlx5_frag_buf <buf_addr>"
+]
+
+# Step 4: For NVMe - check queue DMA addresses
+run_script [
+  "mod -s nvme <path>",
+  "struct nvme_queue <queue_addr>"
+]
+# Look for sq_dma_addr/cq_dma_addr near the corrupted physical address
+```
+
+**Smoking gun**: If `vtop` of corrupted VA yields a physical address that falls within
+the range `[device_dma_base, device_dma_base + ring_size]`, the device DMA'd to the
+correct physical address but the kernel reused that page prematurely (use-after-free of
+DMA buffer). If the PA is OUTSIDE all known DMA ranges, the device computed a wrong
+DMA address (firmware/hardware bug).
+
+### 5.7.3 Cross-Referencing with DMA Coherent Allocations
+```
+# Check all DMA coherent allocations visible in the kernel
+# (useful for identifying which driver owns a specific physical range)
+kmem -p <physical_address>
+
+# Check if this physical page was part of a CMA (Contiguous Memory Allocator) region
+log | grep -i "cma|reserved memory"
+```
+
+### 5.7.4 Multi-Device Disambiguation
+When BOTH mlx5 and nvme are suspects, use these distinguishing patterns:
+
+| Evidence | Points to mlx5 (Network) | Points to NVMe (Storage) |
+|----------|--------------------------|--------------------------|
+| Corrupted data pattern | Ethernet frames, CQE with opcodes 0x00-0x0D | NVMe CQE (16-byte), filesystem magic |
+| Data alignment | 64-byte (CQ entry size) | 16-byte (NVMe CQE) or 64-byte (NVMe SQE) |
+| Surrounding context | `rd -s` shows `mlx5_*` symbols nearby | `rd -s` shows `nvme_*` symbols nearby |
+| Repeat pattern | Every 64 bytes (CQ stride) | Every 16 bytes (CQE stride) |
+| Physical addr range | Near `mlx5_cq.buf` DMA addr | Near `nvme_queue.cq_dma_addr` |
+| ASCII content | MAC addresses, IP headers | Filesystem data, file content |
+
+### 5.7.5 Building the Final Evidence Chain for DMA Corruption
+When concluding DMA corruption, your `final_diagnosis.evidence` array MUST include:
+1. **IOMMU mode**: "IOMMU Passthrough confirmed via `log | grep -Ei iommu`"
+2. **Corrupted page state**: "Page at PA 0x... has `mapping=<addr>` (pagecache), refcount=N"
+3. **Data signature match**: "Corrupted bytes at offset +12 = 0x0800 (IPv4 EtherType) → Ethernet frame"
+4. **Device ownership**: "Physical address falls within mlx5 CQ DMA range [base, base+size]"
+   OR "kmem -S shows corrupted page belongs to <slab>, not any driver's DMA pool"
+5. **Conclusion**: "mlx5_core NIC DMA'd received packet to stale physical address 0x...,
+   overwriting kernel slab object at VA 0x..."
 """
 
 
