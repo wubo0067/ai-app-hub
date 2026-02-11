@@ -368,7 +368,7 @@ When `is_conclusive: true`, provide complete structured diagnosis:
 |---------|----------|
 | `struct <type> -o` | Show structure definition and member offsets |
 | `struct <type> <addr>` | Show structure at address |
-| `rd -x <addr> <count>` | Read memory (hex) |
+| `rd -x <addr> <count>` | Read memory (hex) - Recommend count >= 32 |
 | `kmem -S <addr>` | Find slab for address |
 | `kmem -i` | Memory summary |
 
