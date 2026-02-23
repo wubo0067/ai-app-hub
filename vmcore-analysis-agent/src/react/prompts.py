@@ -354,6 +354,20 @@ When `is_conclusive: true`, provide complete structured diagnosis:
 3. For UBSAN: Usually non-fatal but indicates logic bug; check the arithmetic operation
 
 ## 3.12 DMA Memory Corruption (Stray DMA Write)
+PRECONDITION FOR DMA ANALYSIS:
+Before suspecting DMA corruption, you MUST:
+1. Exclude use-after-free:
+   - Check slab state via `kmem -S`
+   - Check poison patterns (0xdead..., 0x5a5a...)
+2. Exclude race condition or double free:
+   - Check refcount
+   - Check list integrity
+3. Confirm that the corrupted memory is DMA-reachable:
+   - Was it allocated via dma_alloc_* ?
+   - Was it part of page_pool or skb data?
+   - Was it part of a driver ring buffer?
+
+If these are not confirmed, DO NOT enter DMA analysis.
 **Pattern**: Memory corruption where the corrupted data resembles network packets, NVMe
 completions, or hardware descriptors rather than typical software data patterns.
 Typically occurs when IOMMU is in **Passthrough** mode, allowing devices to DMA
@@ -782,6 +796,12 @@ When concluding DMA corruption, your `final_diagnosis.evidence` array MUST inclu
    OR "kmem -S shows corrupted page belongs to <slab>, not any driver's DMA pool"
 5. **Conclusion**: "mlx5_core NIC DMA'd received packet to stale physical address 0x...,
    overwriting kernel slab object at VA 0x..."
+6. DMA Reachability Proof:
+   - Show that the corrupted physical address was either:
+     a) inside a known DMA buffer range
+     OR
+     b) mapped via dma_map_* at runtime
+   - If not proven, downgrade confidence.
 """
 
 
