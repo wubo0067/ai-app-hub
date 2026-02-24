@@ -245,7 +245,14 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
 
         # 手动构造 AIMessage 以便 edges.py 识别路由。
         # 如果 LLM 决定调用工具 (action 不为空)，我们需要手动填充 tool_calls
+        # 安全屏障：当 is_last_step=True 时，强制清除 action，阻止生成 tool_calls
         tool_calls = []
+        if is_last_step and analysis_result.action:
+            logger.warning(
+                "is_last_step=True but LLM still returned action. "
+                "Stripping tool_calls to force conclusion."
+            )
+            analysis_result.action = None
         if analysis_result.action:
             logger.info(
                 f"LLM decided to call tool: {analysis_result.action.command_name}"
