@@ -209,8 +209,11 @@ def generate_markdown_report(state: AgentState) -> str:
     lines.append("## 总结")
     lines.append("")
     lines.append(
-        f"本次分析共执行 {step_number} 个步骤，使用了 {state.get('token_usage', 0)} 个 Token。"
+        f"本次分析共执行 {step_number} 个步骤，使用了 {state.get('token_usage', 0)} 个 Token"
     )
+    if state.get("model_name"):
+        lines.append(f"，使用的模型：{state.get('model_name')}")
+    lines.append("。")
 
     # 检查是否有最终诊断
     has_diagnosis = False

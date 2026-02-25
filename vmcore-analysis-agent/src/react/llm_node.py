@@ -177,7 +177,19 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
                     content if isinstance(content, str) else json.dumps(content)
                 )
 
-                # Fix 0: 提取 JSON 部分并移除 trailing characters
+                # Fix 0: DeepSeek-Reasoner 有时将 JSON 输出放在 reasoning_content 而非 content 中，
+                # 导致 content 为空白。此时从 reasoning_content 中提取 JSON。
+                if not content_str or not content_str.strip():
+                    reasoning = raw_message.additional_kwargs.get(
+                        "reasoning_content", ""
+                    )
+                    if reasoning and "{" in reasoning:
+                        logger.warning(
+                            "Content is empty/whitespace, attempting to extract JSON from reasoning_content"
+                        )
+                        content_str = reasoning
+
+                # Fix 1: 提取 JSON 部分并移除 trailing characters
                 # 尝试找到最外层的 JSON 对象
                 # 查找第一个 '{' 和最后一个匹配的 '}'
                 first_brace = content_str.find("{")
@@ -200,7 +212,7 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
                             f"Extracted JSON from position {first_brace} to {last_brace+1}"
                         )
 
-                # Fix 1: 修复无效的 JSON 转义序列（LLM 经常混淆 bash 和 JSON 转义）
+                # Fix 2: 修复无效的 JSON 转义序列（LLM 经常混淆 bash 和 JSON 转义）
                 # \| → | (管道符在 JSON 中不需要转义)
                 # \/ → / (斜杠在 JSON 中不需要转义)
                 # \> → > (重定向符在 JSON 中不需要转义)
@@ -216,7 +228,7 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
                 for pattern, replacement in invalid_escapes:
                     content_str = content_str.replace(pattern, replacement)
 
-                # Fix 2: 修复缺失的 arguments 字段
+                # Fix 3: 修复缺失的 arguments 字段
                 # "action":{"command_name":"ps",["-m"]} -> "action":{"command_name":"ps","arguments":["-m"]}
                 pattern = r'("command_name"\s*:\s*"[^"]*"\s*,)\s*(\[)'
                 content_str = re.sub(pattern, r'\1 "arguments": \2', content_str)
@@ -294,12 +306,20 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         # 将结构化后的对象序列化存入 content，并携带调用的工具信息
         # 必须保留 additional_kwargs 中的 reasoning_content，否则下一轮对话 DeepSeek-Reasoner 会报错 (Error 400)
         # DeepSeek-Reasoner 模式下，之前的 assistant 消息必须包含 reasoning_content
-        additional_kwargs = raw_message.additional_kwargs.copy()
+        # 如果 reasoning_content 存在，日志记录 reasoning_content 的前 100 字符以供调试
+
+        reasoning_content = raw_message.additional_kwargs.get("reasoning_content")
+        if reasoning_content:
+            logger.debug(f"reasoning_content: {reasoning_content[:100]}...")
+        else:
+            logger.warning(
+                f"No reasoning_content found in additional_kwargs. additional_kwargs keys: {raw_message.additional_kwargs.keys()}"
+            )
 
         response = AIMessage(
             content=analysis_result.model_dump_json(),
             tool_calls=tool_calls,
-            additional_kwargs=additional_kwargs,
+            additional_kwargs=raw_message.additional_kwargs.copy(),
         )
 
     except Exception as e:
