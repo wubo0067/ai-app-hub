@@ -64,3 +64,20 @@ def should_continue(state: AgentState) -> str:
         f"Unexpected message type/state: {type(last_message)}, routing to __end__"
     )
     return "__end__"
+
+
+def after_crash_tool(state: AgentState) -> str:
+    """
+    crash_tool_node 执行完毕后的路由判断。
+
+    当 crash_tool_node 处于最后一步时，直接结束而非返回 llm_analysis_node，
+    避免超出 recursion_limit。
+    """
+    is_last_step = state.get("is_last_step", False)
+    if is_last_step:
+        logger.warning(
+            "crash_tool_node is on the last step. "
+            "Routing to __end__ to avoid exceeding recursion_limit."
+        )
+        return "__end__"
+    return llm_analysis_node

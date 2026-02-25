@@ -32,13 +32,23 @@ def create_llm():
             api_key=str(api_key),
             base_url=str(base_url),
             model=str(model_name),
-            max_tokens=8000,
+            max_tokens=(
+                48000
+                if "think" in str(model_name) or "reasoner" in str(model_name)
+                else 8000
+            ),  # DeepSeek-Reasoner 模式需要更大的 max_tokens 来支持长对话历史和复杂推理
             top_p=0.9,
             temperature=float(
                 temperature
             ),  # https://api-docs.deepseek.com/zh-cn/quick_start/parameter_settings
+            # 如果 modle_name 中包含 think，那么 extra_bady={"thinking": {"type": "enabled"}}
+            extra_body=(
+                {"thinking": {"type": "enabled"}}
+                if "think" in str(model_name) or "reasoner" in str(model_name)
+                else None
+            ),
         )
-        logger.info(f"Successfully created LLM instance, model name: {model_name}")
+        logger.info(f"Successfully created LLM instance, model name: {llm.model_name}")
         return llm
     except Exception as e:
         logger.error(f"Failed to create LLM instance: {e}")

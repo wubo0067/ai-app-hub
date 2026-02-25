@@ -26,7 +26,7 @@ from .nodes import (
     llm_analysis_node,
 )
 from .llm_node import call_llm_analysis
-from .edges import should_continue
+from .edges import should_continue, after_crash_tool
 
 
 def create_agent_graph(llm, tools_list: List):
@@ -137,8 +137,19 @@ def create_agent_graph(llm, tools_list: List):
         f"Added conditional edge: {llm_analysis_node} -> [crash_tool_node, __end__]"
     )
 
-    builder.add_edge(crash_tool_node, llm_analysis_node)
-    logger.debug(f"Added edge: {crash_tool_node} -> {llm_analysis_node}")
+    # 条件边 3：crash_tool_node 执行完毕后，检查是否是最后一步
+    # 如果是最后一步（is_last_step=True），直接结束，避免超出 recursion_limit
+    # 这是因为从 llm_analysis_node 经 should_continue 路由到 crash_tool_node 时，
+    # is_last_step 可能为 False（remaining=2），但 crash_tool_node 执行后 remaining=1，
+    # 此时再用固定边进入 llm_analysis_node 会导致 remaining=0 → 递归超限
+    builder.add_conditional_edges(
+        crash_tool_node,
+        after_crash_tool,
+        [llm_analysis_node, "__end__"],
+    )
+    logger.debug(
+        f"Added conditional edge: {crash_tool_node} -> [{llm_analysis_node}, __end__]"
+    )
 
     # =========================================================================
     # 5. 编译图
@@ -151,15 +162,15 @@ def create_agent_graph(llm, tools_list: List):
     logger.info("✅ Agent graph compiled successfully.")
 
     # 可选：在调试模式下保存图结构到文件（需要 graphviz 支持）
-    try:
-        graph_png = graph.get_graph().draw_mermaid_png()
-        output_path = os.path.join(
-            os.path.dirname(__file__), "../../graph_visualization.png"
-        )
-        with open(output_path, "wb") as f:
-            f.write(graph_png)
-        logger.info(f"Graph visualization saved to: {output_path}")
-    except Exception as e:
-        logger.error(f"Could not display graph visualization: {e}")
+    # try:
+    #     graph_png = graph.get_graph().draw_mermaid_png()
+    #     output_path = os.path.join(
+    #         os.path.dirname(__file__), "../../graph_visualization.png"
+    #     )
+    #     with open(output_path, "wb") as f:
+    #         f.write(graph_png)
+    #     logger.info(f"Graph visualization saved to: {output_path}")
+    # except Exception as e:
+    #     logger.error(f"Could not display graph visualization: {e}")
 
     return graph

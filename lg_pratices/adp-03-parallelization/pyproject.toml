@@ -1,0 +1,10 @@
+[project]
+name = "adp-03-parallelization"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain-nvidia-ai-endpoints>=1.0.3",
+    "langchain-openai>=1.1.7",
+]

@@ -44,6 +44,39 @@ class ToolCall(BaseModel):
         return data
 
 
+class SuspectCode(BaseModel):
+    """可疑代码位置"""
+
+    file: str = Field(..., description="Source file path")
+    function: str = Field(..., description="Function name")
+    line: str = Field(..., description="Line number or 'unknown'")
+
+
+class FinalDiagnosis(BaseModel):
+    """最终诊断结果的完整结构"""
+
+    crash_type: str = Field(
+        ...,
+        description="Crash type (e.g., NULL pointer dereference, use-after-free, soft lockup)",
+    )
+    panic_string: str = Field(..., description="Exact panic string from dmesg")
+    faulting_instruction: str = Field(
+        ..., description="RIP address and disassembly of faulting instruction"
+    )
+    root_cause: str = Field(
+        ..., description="1-2 sentence root cause explanation with evidence"
+    )
+    detailed_analysis: str = Field(
+        ...,
+        description="Multi-paragraph analysis with full evidence chain and kernel subsystem context",
+    )
+    suspect_code: SuspectCode = Field(..., description="Suspected source code location")
+    evidence: List[str] = Field(
+        ...,
+        description="List of key evidence points (register values, memory contents, etc.)",
+    )
+
+
 class VMCoreAnalysisStep(BaseModel):
     step_id: int = Field(..., description="Current step sequence number.")
 
@@ -58,8 +91,19 @@ class VMCoreAnalysisStep(BaseModel):
     )
 
     is_conclusive: bool = Field(False)
-    final_diagnosis: Optional[str] = Field(
+    final_diagnosis: Optional[FinalDiagnosis] = Field(
         None, description="Detailed final root cause and evidence."
+    )
+    fix_suggestion: Optional[str] = Field(
+        None,
+        description="Recommended fix or workaround (e.g., 'Update kernel', 'Hardware replacement needed')",
+    )
+    confidence: Optional[Literal["high", "medium", "low"]] = Field(
+        None, description="Confidence level of the diagnosis"
+    )
+    additional_notes: Optional[str] = Field(
+        None,
+        description="Any caveats, alternative hypotheses, or recommended follow-up actions",
     )
 
 
@@ -127,18 +171,60 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         # 检查解析结果是否为空
         if analysis_result is None:
             # 尝试修复常见的 JSON 格式错误
-            # Fix for: "action":{"command_name":"ps",["-m|grep","UN"]} -> "action":{"command_name":"ps","arguments":["-m|grep","UN"]}
             try:
                 content = raw_message.content
                 content_str = (
                     content if isinstance(content, str) else json.dumps(content)
                 )
+
+                # Fix 0: 提取 JSON 部分并移除 trailing characters
+                # 尝试找到最外层的 JSON 对象
+                # 查找第一个 '{' 和最后一个匹配的 '}'
+                first_brace = content_str.find("{")
+                if first_brace != -1:
+                    # 查找匹配的结束大括号
+                    brace_count = 0
+                    last_brace = -1
+                    for i in range(first_brace, len(content_str)):
+                        if content_str[i] == "{":
+                            brace_count += 1
+                        elif content_str[i] == "}":
+                            brace_count -= 1
+                            if brace_count == 0:
+                                last_brace = i
+                                break
+
+                    if last_brace != -1:
+                        content_str = content_str[first_brace : last_brace + 1]
+                        logger.info(
+                            f"Extracted JSON from position {first_brace} to {last_brace+1}"
+                        )
+
+                # Fix 1: 修复无效的 JSON 转义序列（LLM 经常混淆 bash 和 JSON 转义）
+                # \| → | (管道符在 JSON 中不需要转义)
+                # \/ → / (斜杠在 JSON 中不需要转义)
+                # \> → > (重定向符在 JSON 中不需要转义)
+                # \< → < (重定向符在 JSON 中不需要转义)
+                # \& → & (与符号在 JSON 中不需要转义)
+                invalid_escapes = [
+                    (r"\|", "|"),
+                    (r"\/", "/"),
+                    (r"\>", ">"),
+                    (r"\<", "<"),
+                    (r"\&", "&"),
+                ]
+                for pattern, replacement in invalid_escapes:
+                    content_str = content_str.replace(pattern, replacement)
+
+                # Fix 2: 修复缺失的 arguments 字段
+                # "action":{"command_name":"ps",["-m"]} -> "action":{"command_name":"ps","arguments":["-m"]}
                 pattern = r'("command_name"\s*:\s*"[^"]*"\s*,)\s*(\[)'
-                fixed_content = re.sub(pattern, r'\1 "arguments": \2', content_str)
-                analysis_result = VMCoreAnalysisStep.model_validate_json(fixed_content)
+                content_str = re.sub(pattern, r'\1 "arguments": \2', content_str)
+
+                analysis_result = VMCoreAnalysisStep.model_validate_json(content_str)
                 logger.warning(
                     "Successfully repaired malformed JSON from LLM. "
-                    f"Original: {content[:100]}... Fixed: {fixed_content[:100]}..."
+                    f"Original: {content[:200]}... Fixed: {content_str[:200]}..."
                 )
             except Exception as repair_err:
                 logger.warning(f"JSON repair failed: {repair_err}")
@@ -159,7 +245,14 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
 
         # 手动构造 AIMessage 以便 edges.py 识别路由。
         # 如果 LLM 决定调用工具 (action 不为空)，我们需要手动填充 tool_calls
+        # 安全屏障：当 is_last_step=True 时，强制清除 action，阻止生成 tool_calls
         tool_calls = []
+        if is_last_step and analysis_result.action:
+            logger.warning(
+                "is_last_step=True but LLM still returned action. "
+                "Stripping tool_calls to force conclusion."
+            )
+            analysis_result.action = None
         if analysis_result.action:
             logger.info(
                 f"LLM decided to call tool: {analysis_result.action.command_name}"
@@ -199,8 +292,14 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
             logger.info("LLM did not call any tools, returning result directly.")
 
         # 将结构化后的对象序列化存入 content，并携带调用的工具信息
+        # 必须保留 additional_kwargs 中的 reasoning_content，否则下一轮对话 DeepSeek-Reasoner 会报错 (Error 400)
+        # DeepSeek-Reasoner 模式下，之前的 assistant 消息必须包含 reasoning_content
+        additional_kwargs = raw_message.additional_kwargs.copy()
+
         response = AIMessage(
-            content=analysis_result.model_dump_json(), tool_calls=tool_calls
+            content=analysis_result.model_dump_json(),
+            tool_calls=tool_calls,
+            additional_kwargs=additional_kwargs,
         )
 
     except Exception as e:

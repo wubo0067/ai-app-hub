@@ -2,6 +2,7 @@
 import uuid
 import yaml
 import json
+import asyncio
 from pathlib import Path
 from typing import cast, Optional, Any
 from contextlib import asynccontextmanager
@@ -222,6 +223,11 @@ async def analyze_vmcore(request: VmcoreAnalysisRequest):
             error=final_values.get("error"),
         )
 
+    except asyncio.CancelledError:
+        logger.warning(f"Task {task_id} was cancelled by system/user.")
+        # 重新抛出以便 server 处理关闭
+        raise
+
     except Exception as e:
         logger.error(f"Agent execution failed: {e}", exc_info=True)
         return VmcoreAnalysisResponse(
@@ -310,6 +316,11 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
 
             yield f"data: {json.dumps({'event': 'complete', 'agent_answer': markdown_report, 'token_usage': final_values.get('token_usage', 0), 'error': final_values.get('error')})}\n\n"
 
+        except asyncio.CancelledError:
+            logger.warning(f"Stream task {task_id} was cancelled.")
+            yield f"data: {json.dumps({'event': 'error', 'error': 'Task cancelled'})}\n\n"
+            raise
+
         except Exception as e:
             yield f"data: {json.dumps({'event': 'error', 'error': str(e)})}\n\n"
 
@@ -325,5 +336,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         timeout_keep_alive=3600,  # 保持连接 1 小时（针对长时间分析任务）
-        timeout_graceful_shutdown=30,  # 优雅关闭超时 30 秒
+        timeout_graceful_shutdown=60,  # 优雅关闭超时 60 秒
     )

@@ -60,6 +60,7 @@ if llm:
 # --- 定义委托逻辑（等同于 ADK 的 Auto-Flow） ---
 branches = {
     "booker": RunnablePassthrough.assign(
+        # 在 x 上添加一个字段 output
         output=lambda x: booking_handler(x["request"]["request"])
     ),
     "info": RunnablePassthrough.assign(
@@ -71,12 +72,30 @@ branches = {
 }
 
 delegation_branch = RunnableBranch(
-    (lambda x: x["decision"].strip() == "booker", branches["booker"]),
+    (
+        lambda x: x["decision"].strip() == "booker",
+        branches["booker"],
+    ),  # 它选择执行 branches["booker"]。
     (lambda x: x["decision"].strip() == "info", branches["info"]),
     branches["unclear"],  # 默认分支
 )
+# 这一步的最终输出是
+# {
+#     "decision": "booker",
+#     "request": {"request": "帮我..."},
+#     "output": "预订处理器已处理请求..."  # <-- 这是 assign 新增的字段
+# }
 
+# 这段代码使用了 LangChain 的声明式语法（LCEL）来构建一个链（Chain），这个链就是所谓的“agent”对象。
+# 简单地说，在 LangChain 中，任何实现了 Runnable 协议的对象（包括 Prompt、LLM、OutputParser
+# 以及通过 | 连接的组合）都具备 invoke 方法。
+
+# 在 Python 中，LangChain 重载了按位或运算符 |。当你写 A | B 时，它实际上并没有立即执行，
+# 而是创建了一个新的 RunnableSequence（可运行序列）对象。
 coordinator_agent = (
+    # 代码的第一部分是一个字典，这在 LCEL（LangChain Expression Language）中被称为 RunnableParallel。它会同时把相同的输入传给字典里的每一个 value。
+    # 会调用 RunnablePassthrough.invoke({"request": request_a})
+    # "request": {"request": "帮我预订飞往伦敦的机票。"}
     {"decision": coordinator_router_chain, "request": RunnablePassthrough()}
     | delegation_branch
     | (lambda x: x["output"])

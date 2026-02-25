@@ -129,8 +129,37 @@ def generate_markdown_report(state: AgentState) -> str:
                     lines.append("")
                     lines.append("## 🎯 最终诊断结果")
                     lines.append("")
-                    lines.append(analysis.final_diagnosis)
+                    diag = analysis.final_diagnosis
+                    lines.append(f"**崩溃类型**: {diag.crash_type}")
                     lines.append("")
+                    lines.append(f"**Panic 信息**: {diag.panic_string}")
+                    lines.append("")
+                    lines.append(f"**故障指令**: {diag.faulting_instruction}")
+                    lines.append("")
+                    lines.append(f"**根本原因**: {diag.root_cause}")
+                    lines.append("")
+                    lines.append("**详细分析**:")
+                    lines.append("")
+                    lines.append(diag.detailed_analysis)
+                    lines.append("")
+                    lines.append("**可疑代码位置**:")
+                    lines.append(f"- 文件：{diag.suspect_code.file}")
+                    lines.append(f"- 函数：{diag.suspect_code.function}")
+                    lines.append(f"- 行号：{diag.suspect_code.line}")
+                    lines.append("")
+                    lines.append("**关键证据**:")
+                    for ev in diag.evidence:
+                        lines.append(f"- {ev}")
+                    lines.append("")
+                    if analysis.fix_suggestion:
+                        lines.append(f"**修复建议**: {analysis.fix_suggestion}")
+                        lines.append("")
+                    if analysis.confidence:
+                        lines.append(f"**可信度**: {analysis.confidence}")
+                        lines.append("")
+                    if analysis.additional_notes:
+                        lines.append(f"**附加说明**: {analysis.additional_notes}")
+                        lines.append("")
 
             except Exception as e:
                 logger.warning(f"Failed to parse AIMessage as VMCoreAnalysisStep: {e}")
@@ -213,6 +242,8 @@ def generate_markdown_report(state: AgentState) -> str:
         '*This report was jointly created by <span style="color: red;">**CalmWU and his AI agent.**</span>*'
     )
     lines.append("")
+    lines.append("*🐶 xeon*")
+    lines.append("")
 
     return "\n".join(lines)
 
@@ -225,7 +256,7 @@ def extract_final_diagnosis(state: AgentState) -> str:
         state: AgentState
 
     Returns:
-        str: 最终诊断结果，如果没有则返回空字符串
+        str: 最终诊断结果的格式化字符串，如果没有则返回空字符串
     """
     messages = state.get("messages", [])
 
@@ -240,7 +271,26 @@ def extract_final_diagnosis(state: AgentState) -> str:
                 )
                 analysis = VMCoreAnalysisStep.model_validate_json(content)
                 if analysis.is_conclusive and analysis.final_diagnosis:
-                    return analysis.final_diagnosis
+                    diag = analysis.final_diagnosis
+                    result = []
+                    result.append(f"崩溃类型：{diag.crash_type}")
+                    result.append(f"Panic 信息：{diag.panic_string}")
+                    result.append(f"故障指令：{diag.faulting_instruction}")
+                    result.append(f"根本原因：{diag.root_cause}")
+                    result.append(f"\n详细分析:\n{diag.detailed_analysis}")
+                    result.append(
+                        f"\n可疑代码：{diag.suspect_code.file} -> {diag.suspect_code.function}:{diag.suspect_code.line}"
+                    )
+                    result.append("\n关键证据：")
+                    for ev in diag.evidence:
+                        result.append(f"  - {ev}")
+                    if analysis.fix_suggestion:
+                        result.append(f"\n修复建议：{analysis.fix_suggestion}")
+                    if analysis.confidence:
+                        result.append(f"可信度：{analysis.confidence}")
+                    if analysis.additional_notes:
+                        result.append(f"\n附加说明：{analysis.additional_notes}")
+                    return "\n".join(result)
             except Exception as e:
                 logger.debug(f"Message parsing failed: {e}")
                 continue

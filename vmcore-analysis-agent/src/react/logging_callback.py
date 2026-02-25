@@ -1,5 +1,6 @@
 from langchain_core.callbacks import BaseCallbackHandler
 from typing import Any, Dict, List, Optional
+import asyncio
 from src.utils.logging import logger
 
 
@@ -32,6 +33,10 @@ class GraphLoggingCallback(BaseCallbackHandler):
 
     def on_chain_error(self, error: BaseException, **kwargs: Any) -> None:
         """当图执行出错时调用"""
+        if isinstance(error, asyncio.CancelledError):
+            logger.info("⚠️ Graph execution was cancelled.")
+            return
+
         logger.error("=" * 80)
         logger.error(f"❌ Graph execution failed with error: {error}")
         logger.error("=" * 80)

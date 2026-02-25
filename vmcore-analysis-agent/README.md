@@ -560,6 +560,53 @@ python client.py --help
 3. **实时分析**：支持在线系统的实时诊断
 4. **分布式部署**：支持大规模并发分析
 
+## 附录：第三方驱动调试符号编译指南 (以 mlx5_core 为例)
+
+在分析涉及第三方驱动（如 Mellanox 网卡驱动）的 vmcore 时，如果默认驱动缺少调试符号，需要手动安装源码并重新编译。以下是标准操作流程：
+
+### 1. 环境准备
+
+安装驱动源码包和对应的内核开发包：
+
+```bash
+# 安装 Mellanox 驱动源码
+rpm -ivh mlnx-ofa_kernel-source-5.8-OFED.5.8.3.0.7.1.rhel8u4.x86_64.rpm
+
+# 安装对应版本的内核开发包（需与 vmcore 的内核版本一致）
+rpm -ivh --oldpackage kernel-devel-4.18.0-305.130.1.el8.x86_64.rpm
+```
+
+### 2. 编译带调试信息的模块
+
+进入源码目录并配置编译选项：
+
+```bash
+cd /usr/src/ofa_kernel-5.8/source
+
+# 配置编译选项：开启 debug info，指定内核源码路径
+./configure --with-debug-info --with-mlx5-mod \
+                 --kernel-sources /usr/src/kernels/4.18.0-305.130.1.el8_4.x86_64 \
+                 --cache-file=my_config.cache
+
+# 执行编译
+make -j$(nproc)
+```
+
+### 3. 验证调试符号
+
+编译完成后，通过以下方式验证模块是否包含调试信息：
+
+```bash
+# 1. 检查 debug section 是否存在
+readelf -S drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.ko | grep debug
+
+# 2. 尝试反汇编导出源码（验证源码关联）
+objdump -S -d drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.ko > mlx5_debug.asm
+
+# 3. 使用工具脚本验证符号解析
+./tools/show_first_global_func.sh /usr/src/ofa_kernel-5.8/source/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.ko
+```
+
 ## 贡献指南
 
 欢迎提交 Issue 和 Pull Request 来改进项目。

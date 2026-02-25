@@ -268,8 +268,8 @@ async def collect_crash_init_data(state: AgentState) -> dict:
 
                 for i, line in enumerate(dmesg_lines):
                     if pattern.search(line):
-                        start = max(0, i - 5)
-                        end = min(len(dmesg_lines), i + 30)
+                        start = max(0, i - 20)
+                        end = min(len(dmesg_lines), i + 100)
                         return (
                             f"$ vmcore-dmesg.txt (extracted around CPU:{t_cpu} PID:{t_pid} Comm:{t_comm})\n"
                             + "".join(dmesg_lines[start:end])

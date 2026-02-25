@@ -151,7 +151,7 @@ def health_check(base_url: str) -> dict:
 
 
 def save_markdown_report(
-    agent_answer: str, vmcore_path: str, output_dir: str = "."
+    agent_answer: str, vmcore_path: str, output_dir: str = "./reports"
 ) -> str:
     """
     保存 markdown 分析报告到文件。
@@ -224,10 +224,10 @@ def main():
     parser.add_argument(
         "--debug-symbols",
         nargs="*",
-        default=[
-            "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/soft_lockup/soft_lockup_module.ko",
-            "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko",
-        ],
+        # default=[
+        #     "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/soft_lockup/soft_lockup_module.ko",
+        #     "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko",
+        # ],
         help="额外的调试符号路径列表",
     )
     parser.add_argument(
@@ -238,8 +238,8 @@ def main():
     )
     parser.add_argument(
         "--output-dir",
-        default=".",
-        help="报告输出目录 (默认：当前目录)",
+        default="./reports",
+        help="报告输出目录 (默认：./reports)",
     )
     parser.add_argument(
         "--no-save",
