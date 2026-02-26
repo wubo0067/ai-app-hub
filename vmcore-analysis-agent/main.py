@@ -8,6 +8,7 @@ from typing import cast, Optional, Any
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
+from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 from langchain_core.runnables import RunnableConfig
 from src.utils.logging import logger
@@ -19,6 +20,9 @@ from src.react.logging_callback import graph_logging_callback
 from src.react.report_generator import generate_markdown_report
 from src.mcp_tools.crash.client import initialize_crash_tools
 from src.mcp_tools.source_patch.client import initialize_patch_tools
+
+# Agent 图最大递归轮次（LLM ↔ Tool 交互次数上限）
+AGENT_RECURSION_LIMIT = 50
 
 
 # 请求模型
@@ -131,6 +135,10 @@ app = FastAPI(
 )
 
 
+# Initialize Prometheus instrumentation
+Instrumentator().instrument(app).expose(app)
+
+
 @app.get("/health")
 async def health_check():
     """健康检查接口"""
@@ -171,7 +179,7 @@ async def analyze_vmcore(request: VmcoreAnalysisRequest):
     config = cast(
         RunnableConfig,
         {
-            "recursion_limit": 50,
+            "recursion_limit": AGENT_RECURSION_LIMIT,
             "callbacks": [graph_logging_callback],
             **thread,
         },
@@ -266,7 +274,7 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
         config = cast(
             RunnableConfig,
             {
-                "recursion_limit": 40,
+                "recursion_limit": AGENT_RECURSION_LIMIT,
                 "callbacks": [graph_logging_callback],
                 **thread,
             },

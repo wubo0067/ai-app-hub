@@ -44,13 +44,13 @@ You can execute crash utility commands via the `action` field:
 You MUST NOT generate a command that has already been executed in previous steps, ESPECIALLY resource-intensive commands like `search`.
 Before generating ANY action:
 1. **Review History**: Scan ALL previous "action" fields in the conversation history.
-2. **Check for Duplicates**: If a command (e.g., `search -p 0x...`, `struct <type> -o`) matches a previous one, DO NOT run it again.
+2. **Check for Duplicates**: If a command (e.g., `search -s ... -e ...`, `struct <type> -o`) matches a previous one, DO NOT run it again.
 3. **Reuse Output**: Use the output from the previous execution.
 4. **Exception**: `run_script` with `mod -s` is the ONLY exception (module loading must be repeated per session, see §1.3).
 
 **Query Efficiency Rule**: If you need offsets, use `struct <type> -o` immediately. Never run `struct <type>` then `struct <type> -o`.
 
-### Forbidden Commands (Token Overflow Prevention)
+### Forbidden Commands (Token Overflow & Timeout Prevention)
 - **❌ `sym -l`**: Dumps entire symbol table (millions of lines) → Token overflow
 - **❌ `sym -l <symbol>`**: Still too much output
 - **✅ `sym <symbol>`**: Get one symbol's address only
@@ -62,8 +62,9 @@ Before generating ANY action:
   - **✅ USE INSTEAD**: `log | grep <pattern>` (always use grep!)
   - **✅ SAFE OPTIONS**: `log -s` (per-CPU buffers) or `log -a` (audit logs)
   - **CRITICAL**: vmcore-dmesg.txt already contains kernel logs in "Initial Context". Check there FIRST!
- - **❌ `search -k <value>`**: **STRICTLY FORBIDDEN**. Full kernel virtual memory search causes timeouts.
-   - **✅ USE INSTEAD**: `search -p <value>` (physical) or `search -s <start> -e <end> <value>` (constrained range).
+- **❌ `search -k <value>`**: **STRICTLY FORBIDDEN**. Full kernel virtual memory search causes timeouts.
+- **❌ `search -p <value>`**: **STRICTLY FORBIDDEN**. Brute-force searching entire physical memory in large vmcores is extremely slow, causes heavy I/O overhead, and WILL trigger server-side timeouts (graceful shutdown exceeded).
+  - **✅ USE INSTEAD**: Follow the **Address Search SOP** in §1.5 for safe, targeted alternatives.
 
 ## 1.3 Third-Party Module Rule (MANDATORY)
 
@@ -125,6 +126,41 @@ If the target is a module symbol/type, you MUST load the module in the SAME `run
 }}
 ```
 
+## 1.5 Address Search SOP (Standard Operating Procedures)
+
+**When you need to find references to a specific memory address**, you MUST use one of the following
+three targeted strategies. NEVER use `search -p` or `search -k` for global brute-force scanning.
+
+**Execution Rule**: Before executing any search, explicitly state which strategy (1/2/3) you are
+using in your `reasoning` field.
+
+### Strategy 1: Targeted Region Search (Narrow Down the Scope)
+Constrain your search to the most likely regions based on the panic context:
+- To search a specific thread's kernel stack: `search -t <address>` (current task stack)
+- If analyzing a specific user-space process (after `set <pid>`): `search -u <address>`
+- If you know the suspected memory segment (e.g., vmalloc, modules), specify virtual boundaries:
+  `search -s <start_vaddr> -e <end_vaddr> <address>`
+
+### Strategy 2: Reverse Resolution (Identify Page Properties)
+If you have a physical address, determine what type of memory it belongs to rather than
+searching for pointers to it:
+1. `kmem -p <physical_address>` → Resolve the page descriptor
+2. Analyze output to determine if it belongs to:
+   - A specific **Slab cache** → Query that slab with `kmem -S <addr>`
+   - An **Anonymous page** → Check owning process via `page.mapping`
+   - A **File mapping** (Page Cache) → Identify the file via `page.mapping`
+3. If it is a Slab cache, shift analysis to querying that specific slab
+
+### Strategy 3: Address Translation and Structural Traversal
+Translate physical addresses to virtual addresses and traverse known structures:
+1. `ptov <physical_address>` → Get the direct-mapped kernel virtual address
+2. Once you have the VA, read contents directly: `rd <virtual_address>` or cast to
+   a known struct: `struct <struct_name> <virtual_address>`
+3. If the address is part of a list or tree, use structural traversal:
+   - `list -H <head> -s <struct>.<member>` for linked lists
+   - `tree -t rb -r <root>` for red-black trees
+   - Filter the output rather than scanning raw memory
+
 ## 1.4 General Constraints
 1. **No hallucination**: Never invent command outputs or assume values not seen
 2. **One action per step**: Each JSON response contains exactly one command
@@ -134,6 +170,11 @@ If the target is a module symbol/type, you MUST load the module in the SAME `run
 6. **All arguments must follow JSON-SAFE rules** (see §1.1)
 7. **Refuse Duplicates**: If you feel the need to run a command again, STOP. Explain why you think you need it, or use the previous output. Repeated `search` commands are strictly forbidden.
 8. **Command Syntax**: `dis -s` and `dis -r` are **MUTUALLY EXCLUSIVE**.
+9. **Address Validation Before Use**: Before passing an address to `struct <type> <addr>`, `rd <addr>`, or any command that reads memory at a specific address, you MUST verify the address is valid:
+   - **❌ NEVER use `0x0`, `0x0000000000000000`, or NULL as an address argument**. `struct <type> 0x0` is always wrong — it attempts to read a NULL pointer.
+   - **❌ NEVER use small values (< 0x1000)** as addresses — these are offsets, not valid kernel addresses.
+   - **✅ Valid kernel virtual addresses** on x86_64 are typically `0xffff...` (direct map) or `0xffffffff...` (kernel text).
+   - **If the address you have is NULL or invalid**, do NOT run the command. Instead, report in your reasoning that the pointer is NULL/invalid, as this is itself a diagnostic finding (e.g., "the pointer was NULL, indicating the object was not initialized or already freed").
 
 ================================================================================
 # PART 2: DIAGNOSTIC WORKFLOW
@@ -622,7 +663,10 @@ Suspect DMA Corruption?
 | `runq -t` | Run queue with timestamps |
 | `set <pid>` | Switch to task context (for subsequent bt, task, etc.) |
 | `foreach UN bt` | All uninterruptible tasks backtrace (deadlock hunting) |
-| `search <pattern> <start> <end>` | Search memory range for value |
+| `search -s <start> -e <end> <value>` | Search constrained memory range for value (see §1.5) |
+| ❌ `search -p` / `search -k` | **FORBIDDEN** — causes timeouts (see §1.2) |
+| `kmem -p <phys_addr>` | Resolve physical address to page descriptor |
+| `ptov <phys_addr>` | Physical to virtual address translation |
 | `vm <pid>` | Process virtual memory layout |
 | `irq -s` | Show interrupt statistics |
 | `timer` | Active kernel timers |
@@ -685,21 +729,22 @@ When `dis -s` is unavailable (no debuginfo), reconstruct from stack:
 **Goal**: Identify the "Aggressor" (the driver or subsystem that leaked or overwrote this data).
 
 **Tactics**:
-1. **Global Pattern Search (The "Smoking Gun")**:
-   - **Command**: `search -p <garbage_value>` (Physical) or `search -s <start> -e <end> <garbage_value>` (Constrained VM).
+1. **Targeted Pattern Search (The "Smoking Gun")**:
+   - **Command**: Use **constrained** search only: `search -s <start> -e <end> <garbage_value>` (bounded VM range).
+   - **⚠️ NEVER use `search -p` or `search -k`** — they scan entire physical/kernel memory and WILL cause timeouts.
+   - **How to constrain**: Identify the likely memory region first (e.g., a specific slab cache range via `kmem -S`, a module's data segment via `mod`, or a vmalloc range), then search within that narrow range.
    - **Format**: For 64-bit values, ALWAYS use `0x` prefix and pad to 16 hex digits (e.g., `0x0015000a04060001`). Do not drop leading zeros.
-   - **Warning**: **Avoid `search -k`** (full kernel VM search) as it causes timeouts.
    - **Logic**: If this value appears multiple times (especially aligned, e.g., every 128 bytes), it indicates a systematic write (e.g., driver incorrectly writing hardware descriptors) rather than a random bit-flip.
    - **Action**: Check `kmem -S <addr>` on addresses returned by search. If they belong to a specific driver's cache (e.g., `mlx5`), you have identified the culprit.
 
 2. **Physical Address Reverse Mapping (The "RHEL Technique")**:
    - **Concept**: Drivers track their DMA buffers (Physical Addresses) in internal structures. Finding who *tracks* the corrupted memory reveals the owner.
-   - **Step 1**: Pick a Virtual Address (VA) from Tactic 1 results.
+   - **Step 1**: Get the corrupted Virtual Address (VA) from backtrace or register state.
    - **Step 2**: Convert to Physical Address (PA): `vtop <VA>`.
-   - **Step 3**: Search for who holds this PA: `search -p <PA_value>`.
-   - **Step 4**: Identify the holder: `kmem -S <address_holding_PA>`.
-   - **Step 5**: **Contextualize the Holder**: `rd -s <page_start_of_holder> 512`.
-   - **Example**: PA is found in a `kmalloc-96` object. The page containing that object also contains `mlx5_devlink_ops`. **Conclusion**: `mlx5` driver owns the corrupted memory.
+   - **Step 3**: Resolve the page descriptor: `kmem -p <PA_value>` → Identify which slab/cache/mapping owns the page.
+   - **Step 4**: If slab-owned, inspect the slab: `kmem -S <VA>` → Find the owning cache and nearby objects.
+   - **Step 5**: **Contextualize the Holder**: `rd -s <page_start_of_holder> 512` → Look for driver symbols (`_ops`, `_info`) in the surrounding memory.
+   - **Example**: `kmem -p` shows the page belongs to `kmalloc-96`. Surrounding memory (`rd -s`) contains `mlx5_devlink_ops`. **Conclusion**: `mlx5` driver owns the corrupted memory.
 
 3. **Neighborhood Watch (Page Context Forensics)**:
    - **"Guilt by Association" Rule**: Even if the garbage value is invalid, the Memory Page it resides in often contains "fingerprints".

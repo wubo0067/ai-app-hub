@@ -3,6 +3,7 @@ import re
 from typing import Optional, List, Literal, cast, Any, Dict
 from pydantic import BaseModel, Field, model_validator
 from langchain_core.messages import AIMessage, SystemMessage
+from json_repair import repair_json
 from .graph_state import AgentState
 from .nodes import llm_analysis_node
 from .prompts import analysis_crash_prompt
@@ -171,80 +172,112 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         # 检查解析结果是否为空
         if analysis_result is None:
             # 尝试修复常见的 JSON 格式错误
+            logger.warning(
+                "LLM output is empty or could not be parsed. Attempting to repair JSON..."
+            )
             try:
                 content = raw_message.content
                 content_str = (
                     content if isinstance(content, str) else json.dumps(content)
                 )
+                logger.debug(f"Raw content: '{content_str[:100]}'")
 
-                # Fix 0: DeepSeek-Reasoner 有时将 JSON 输出放在 reasoning_content 而非 content 中，
-                # 导致 content 为空白。此时从 reasoning_content 中提取 JSON。
+                # Fix 0: DeepSeek-Reasoner 有时将 JSON 输出放在 reasoning_content 而非 content 中
                 if not content_str or not content_str.strip():
+                    logger.warning(
+                        "LLM output content is empty. Checking reasoning_content for JSON..."
+                    )
                     reasoning = raw_message.additional_kwargs.get(
                         "reasoning_content", ""
                     )
+                    logger.debug(f"Reasoning content: '{reasoning}'")
                     if reasoning and "{" in reasoning:
                         logger.warning(
                             "Content is empty/whitespace, attempting to extract JSON from reasoning_content"
                         )
                         content_str = reasoning
 
-                # Fix 1: 提取 JSON 部分并移除 trailing characters
-                # 尝试找到最外层的 JSON 对象
-                # 查找第一个 '{' 和最后一个匹配的 '}'
-                first_brace = content_str.find("{")
-                if first_brace != -1:
-                    # 查找匹配的结束大括号
-                    brace_count = 0
-                    last_brace = -1
-                    for i in range(first_brace, len(content_str)):
-                        if content_str[i] == "{":
-                            brace_count += 1
-                        elif content_str[i] == "}":
-                            brace_count -= 1
-                            if brace_count == 0:
-                                last_brace = i
+                # 优先尝试使用 json_repair 修复 JSON
+                try:
+                    repaired_obj = repair_json(content_str, return_objects=True)
+                    if isinstance(repaired_obj, list):
+                        # 如果返回列表（即使只有一个元素），取出第一个字典
+                        for item in repaired_obj:
+                            if isinstance(item, dict):
+                                repaired_obj = item
                                 break
 
-                    if last_brace != -1:
-                        content_str = content_str[first_brace : last_brace + 1]
-                        logger.info(
-                            f"Extracted JSON from position {first_brace} to {last_brace+1}"
+                    if isinstance(repaired_obj, dict):
+                        # 尝试直接验证修复后的对象
+                        analysis_result = VMCoreAnalysisStep.model_validate(
+                            repaired_obj
                         )
+                        logger.warning(
+                            "Successfully repaired malformed JSON from LLM using json_repair."
+                        )
+                except Exception as e:
+                    logger.debug(f"json_repair failed: {e}, falling back to manual fix")
+                    pass
 
-                # Fix 2: 修复无效的 JSON 转义序列（LLM 经常混淆 bash 和 JSON 转义）
-                # \| → | (管道符在 JSON 中不需要转义)
-                # \/ → / (斜杠在 JSON 中不需要转义)
-                # \> → > (重定向符在 JSON 中不需要转义)
-                # \< → < (重定向符在 JSON 中不需要转义)
-                # \& → & (与符号在 JSON 中不需要转义)
-                invalid_escapes = [
-                    (r"\|", "|"),
-                    (r"\/", "/"),
-                    (r"\>", ">"),
-                    (r"\<", "<"),
-                    (r"\&", "&"),
-                ]
-                for pattern, replacement in invalid_escapes:
-                    content_str = content_str.replace(pattern, replacement)
+                if analysis_result is None:
+                    # 如果 json_repair 失败，尝试手动修复逻辑
 
-                # Fix 3: 修复缺失的 arguments 字段
-                # "action":{"command_name":"ps",["-m"]} -> "action":{"command_name":"ps","arguments":["-m"]}
-                pattern = r'("command_name"\s*:\s*"[^"]*"\s*,)\s*(\[)'
-                content_str = re.sub(pattern, r'\1 "arguments": \2', content_str)
+                    # Fix 1: 提取 JSON 部分并移除 trailing characters
+                    # 尝试找到最外层的 JSON 对象
+                    # 查找第一个 '{' 和最后一个匹配的 '}'
+                    first_brace = content_str.find("{")
+                    if first_brace != -1:
+                        # 查找匹配的结束大括号
+                        brace_count = 0
+                        last_brace = -1
+                        for i in range(first_brace, len(content_str)):
+                            if content_str[i] == "{":
+                                brace_count += 1
+                            elif content_str[i] == "}":
+                                brace_count -= 1
+                                if brace_count == 0:
+                                    last_brace = i
+                                    break
 
-                analysis_result = VMCoreAnalysisStep.model_validate_json(content_str)
-                logger.warning(
-                    "Successfully repaired malformed JSON from LLM. "
-                    f"Original: {content[:200]}... Fixed: {content_str[:200]}..."
-                )
+                        if last_brace != -1:
+                            content_str = content_str[first_brace : last_brace + 1]
+                            logger.info(
+                                f"Extracted JSON from position {first_brace} to {last_brace+1}"
+                            )
+
+                    # Fix 2: 修复无效的 JSON 转义序列（LLM 经常混淆 bash 和 JSON 转义）
+                    # \| → | (管道符在 JSON 中不需要转义)
+                    # \/ → / (斜杠在 JSON 中不需要转义)
+                    # \> → > (重定向符在 JSON 中不需要转义)
+                    # \< → < (重定向符在 JSON 中不需要转义)
+                    # \& → & (与符号在 JSON 中不需要转义)
+                    invalid_escapes = [
+                        (r"\|", "|"),
+                        (r"\/", "/"),
+                        (r"\>", ">"),
+                        (r"\<", "<"),
+                        (r"\&", "&"),
+                    ]
+                    for pattern, replacement in invalid_escapes:
+                        content_str = content_str.replace(pattern, replacement)
+
+                    # Fix 3: 修复缺失的 arguments 字段
+                    # "action":{"command_name":"ps",["-m"]} -> "action":{"command_name":"ps","arguments":["-m"]}
+                    pattern = r'("command_name"\s*:\s*"[^"]*"\s*,)\s*(\[)'
+                    content_str = re.sub(pattern, r'\1 "arguments": \2', content_str)
+
+                    analysis_result = VMCoreAnalysisStep.model_validate_json(
+                        content_str
+                    )
+                    logger.warning(
+                        "Successfully repaired malformed JSON from LLM (manual fix). "
+                        f"Original: {content[:200]}... Fixed: {content_str[:200]}..."
+                    )
             except Exception as repair_err:
                 logger.warning(f"JSON repair failed: {repair_err}")
 
                 parsing_error = output_data.get("parsing_error")
-                error_msg = (
-                    f"Failed to parse LLM output. Raw content: {raw_message.content}"
-                )
+                error_msg = f"Failed to parse LLM output. Raw content: {repr(raw_message.content)}"
                 if parsing_error:
                     error_msg += f". Parsing error: {parsing_error}"
                 logger.error(error_msg)
