@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from langchain_core.runnables import RunnableConfig
 from src.utils.logging import logger
 from src.utils.config import config_manager
-from src.llm.model import create_llm
+from src.llm.model import create_llm, create_chat_llm
 from src.react.graph import create_agent_graph
 from src.react.graph_state import AgentState
 from src.react.logging_callback import graph_logging_callback
@@ -86,6 +86,7 @@ def validate_file_paths(request: VmcoreAnalysisRequest) -> Optional[str]:
 # 全局变量存储初始化的组件
 app_state: dict[str, Any] = {
     "llm": None,
+    "chat_llm": None,
     "crash_tools": None,
     "source_patch_tools": None,
     "agent_graph": None,
@@ -104,6 +105,10 @@ async def lifespan(app: FastAPI):
     app_state["llm"] = create_llm()
     logger.info(f"LLM Model: {app_state['llm'].model_name}")
 
+    # 初始化 Chat LLM（用于结构化 Reasoner 的纯文本推理内容）
+    app_state["chat_llm"] = create_chat_llm()
+    logger.info(f"Chat LLM Model: {app_state['chat_llm'].model_name}")
+
     # 初始化工具
     logger.info("Initializing crash and patch tools...")
     app_state["crash_tools"] = await initialize_crash_tools()
@@ -118,7 +123,9 @@ async def lifespan(app: FastAPI):
     all_tools = (app_state["crash_tools"] or []) + (
         app_state["source_patch_tools"] or []
     )
-    app_state["agent_graph"] = create_agent_graph(app_state["llm"], all_tools)
+    app_state["agent_graph"] = create_agent_graph(
+        app_state["llm"], all_tools, chat_llm=app_state["chat_llm"]
+    )
     logger.info("Agent graph created successfully.")
 
     yield

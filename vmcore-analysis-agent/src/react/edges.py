@@ -8,7 +8,11 @@ from typing import Literal
 from langchain_core.messages import AIMessage, HumanMessage
 from .graph_state import AgentState
 from src.utils.logging import logger
-from .nodes import crash_tool_node, llm_analysis_node
+from .nodes import (
+    crash_tool_node,
+    llm_analysis_node,
+    structure_reasoning_node,
+)
 
 
 def should_continue(state: AgentState) -> str:
@@ -34,6 +38,13 @@ def should_continue(state: AgentState) -> str:
         msg = error_state.get("message", "")
         logger.error(f"Routing to __end__ from node '{node}' due to error: {msg}")
         return "__end__"
+
+    # 1.5 检查是否需要结构化 reasoning_content
+    if state.get("reasoning_to_structure"):
+        logger.info(
+            f"reasoning_to_structure is set, routing to {structure_reasoning_node}"
+        )
+        return structure_reasoning_node
 
     # 2. 根据消息类型判断路由
     if isinstance(last_message, AIMessage):

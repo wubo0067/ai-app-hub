@@ -24,18 +24,20 @@ from .nodes import (
     call_crash_tool,
     crash_tool_node,
     llm_analysis_node,
+    structure_reasoning_node,
 )
-from .llm_node import call_llm_analysis
+from .llm_node import call_llm_analysis, structure_reasoning_content
 from .edges import should_continue, after_crash_tool
 
 
-def create_agent_graph(llm, tools_list: List):
+def create_agent_graph(llm, tools_list: List, chat_llm=None):
     """
     构建并编译 VMCore 分析 Agent 的状态图。
 
     Args:
         llm: 语言模型实例（通常是 ChatOpenAI 或类似的模型）
         tools_list: 可用的工具列表（MCP crash 工具）
+        chat_llm: 可选的 deepseek-chat 模型实例，用于结构化 Reasoner 的纯文本推理内容
 
     Returns:
         CompiledGraph: 编译后的 LangGraph 图实例，可执行 invoke/astream 等方法
@@ -97,6 +99,21 @@ def create_agent_graph(llm, tools_list: List):
     builder.add_node(crash_tool_node, call_crash_tool)
     logger.debug(f"Added node: {crash_tool_node}")
 
+    # 添加节点 3：推理内容结构化节点
+    # 当 DeepSeek-Reasoner 返回空 content 但有纯文本 reasoning_content 时，
+    # 使用 deepseek-chat 将推理内容结构化为 VMCoreAnalysisStep
+    if chat_llm:
+        builder.add_node(
+            structure_reasoning_node,
+            partial(structure_reasoning_content, chat_llm=chat_llm),
+        )
+        logger.debug(f"Added node: {structure_reasoning_node}")
+    else:
+        logger.warning(
+            "No chat_llm provided. structure_reasoning_node will not be available. "
+            "DeepSeek-Reasoner empty content fallback will be disabled."
+        )
+
     # 添加节点 3：收集 vmcore 详细信息节点
     # 初始节点，执行默认的 crash 命令集合收集基础信息
     builder.add_node(collect_crash_init_data_node, collect_crash_init_data)
@@ -126,16 +143,32 @@ def create_agent_graph(llm, tools_list: List):
     # 条件边 2：LLM 分析后根据决策结果路由
     # LLM 可能返回：
     #   - 工具调用请求 -> crash_tool_node
+    #   - 需要结构化 reasoning_content -> structure_reasoning_node
     #   - 最终答案 -> END
     #   - 错误状态 -> END
+    llm_analysis_targets = [crash_tool_node, "__end__"]
+    if chat_llm:
+        llm_analysis_targets.append(structure_reasoning_node)
     builder.add_conditional_edges(
         llm_analysis_node,
         should_continue,
-        [crash_tool_node, "__end__"],
+        llm_analysis_targets,
     )
     logger.debug(
-        f"Added conditional edge: {llm_analysis_node} -> [crash_tool_node, __end__]"
+        f"Added conditional edge: {llm_analysis_node} -> {llm_analysis_targets}"
     )
+
+    # 条件边 3：structure_reasoning_node 结构化完成后路由
+    # 结构化节点产生的 AIMessage 可能包含 tool_calls 或直接结束
+    if chat_llm:
+        builder.add_conditional_edges(
+            structure_reasoning_node,
+            should_continue,
+            [crash_tool_node, "__end__"],
+        )
+        logger.debug(
+            f"Added conditional edge: {structure_reasoning_node} -> [crash_tool_node, __end__]"
+        )
 
     # 条件边 3：crash_tool_node 执行完毕后，检查是否是最后一步
     # 如果是最后一步（is_last_step=True），直接结束，避免超出 recursion_limit

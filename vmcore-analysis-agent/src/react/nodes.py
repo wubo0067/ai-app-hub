@@ -26,6 +26,7 @@ from src.mcp_tools.crash.client import crash_client
 crash_tool_node = "crash_tool_node"
 collect_crash_init_data_node = "collect_crash_init_data_node"
 llm_analysis_node = "llm_analysis_node"
+structure_reasoning_node = "structure_reasoning_node"
 
 # =========================================================================
 # 默认 crash 命令集合

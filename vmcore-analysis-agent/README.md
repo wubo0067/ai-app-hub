@@ -539,12 +539,6 @@ python client.py --help
 
 ## 技术栈
 
-- **LangGraph**: 代理状态图管理
-- **LangChain**: LLM 应用框架
-- **MCP (Model Context Protocol)**: 工具调用协议
-- **DeepSeek API**: LLM 服务
-- **Pydantic**: 数据验证和序列化
-- **异步编程**: asyncio 并发执行
 
 ## 应用场景
 

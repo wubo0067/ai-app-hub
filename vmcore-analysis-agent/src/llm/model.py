@@ -92,3 +92,35 @@ def create_llm():
     except Exception as e:
         logger.error(f"Failed to create LLM instance: {e}")
         raise
+
+
+def create_chat_llm():
+    """Create a ChatDeepSeek instance with deepseek-chat model.
+
+    用于将 DeepSeek-Reasoner 的纯文本 reasoning_content 结构化为 JSON。
+    当 Reasoner 模型返回空 content 但有 reasoning_content 时，
+    使用此 Chat 模型将推理内容转换为 VMCoreAnalysisStep 结构化输出。
+    """
+    api_key = config_manager.get("DEEPSEEK_API_KEY")
+    base_url = config_manager.get("BASE_URL")
+
+    if not api_key or not base_url:
+        logger.error("Missing DEEPSEEK_API_KEY or BASE_URL for chat LLM")
+        raise ValueError("Missing DEEPSEEK_API_KEY or BASE_URL for chat LLM")
+
+    try:
+        llm = ChatDeepSeek(
+            api_key=str(api_key),
+            base_url=str(base_url),
+            model="deepseek-chat",
+            max_tokens=8000,
+            top_p=0.1,
+            temperature=0.0,
+            timeout=120,
+            max_retries=3,
+        )
+        logger.info(f"Successfully created chat LLM instance: {llm}")
+        return llm
+    except Exception as e:
+        logger.error(f"Failed to create chat LLM instance: {e}")
+        raise

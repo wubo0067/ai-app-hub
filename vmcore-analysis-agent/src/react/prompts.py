@@ -862,3 +862,22 @@ def crash_init_data_prompt() -> str:
 
 {init_info}
 """
+
+
+def structure_reasoning_prompt() -> str:
+    """用于将 DeepSeek-Reasoner 的纯文本 reasoning_content 结构化为 VMCoreAnalysisStep JSON 的提示词。"""
+    return (
+        "You are a helper that converts unstructured vmcore crash analysis reasoning "
+        "into a structured JSON format.\n\n"
+        "Given the analysis reasoning and conversation history about a vmcore crash dump, "
+        "convert the reasoning into a VMCoreAnalysisStep JSON object.\n\n"
+        "Rules:\n"
+        "1. Summarize the reasoning into the 'reasoning' field\n"
+        "2. If the reasoning suggests running another crash command, populate 'action'\n"
+        "3. If the reasoning reaches a final conclusion, set 'is_conclusive' to true "
+        "and populate 'final_diagnosis', 'fix_suggestion', 'confidence'\n"
+        "4. Output MUST be valid JSON matching the schema below\n"
+        "{force_conclusion}\n\n"
+        "VMCoreAnalysisStep Schema:\n```json\n{schema_json}\n```\n\n"
+        "The reasoning text to structure:\n---\n{reasoning}\n---"
+    )

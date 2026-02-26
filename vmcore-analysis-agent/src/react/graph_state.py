@@ -65,6 +65,10 @@ class AgentState(MessagesState):
 
     # is_last_step: LangGraph 管理的值，当达到 recursion_limit 时为 True
     is_last_step: IsLastStep
+    # DeepSeek-Reasoner 纯文本推理内容，需要通过 chat 模型结构化
+    reasoning_to_structure: Optional[str]
+    # 原始 additional_kwargs（含 reasoning_content），用于保留到结构化后的 AIMessage 中
+    reasoning_additional_kwargs: Optional[dict]
     # 分析结果
     agent_answer: str
     # 错误状态

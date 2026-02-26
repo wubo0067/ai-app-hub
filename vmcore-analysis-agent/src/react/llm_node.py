@@ -5,8 +5,8 @@ from pydantic import BaseModel, Field, model_validator
 from langchain_core.messages import AIMessage, SystemMessage
 from json_repair import repair_json
 from .graph_state import AgentState
-from .nodes import llm_analysis_node
-from .prompts import analysis_crash_prompt
+from .nodes import llm_analysis_node, structure_reasoning_node
+from .prompts import analysis_crash_prompt, structure_reasoning_prompt
 from src.utils.logging import logger
 
 
@@ -190,12 +190,27 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
                     reasoning = raw_message.additional_kwargs.get(
                         "reasoning_content", ""
                     )
-                    logger.debug(f"Reasoning content: '{reasoning}'")
+                    logger.debug(
+                        f"Reasoning content: '{reasoning[:100] if reasoning else ''}'"
+                    )
                     if reasoning and "{" in reasoning:
                         logger.warning(
                             "Content is empty/whitespace, attempting to extract JSON from reasoning_content"
                         )
                         content_str = reasoning
+                    elif reasoning and len(reasoning) > 50:
+                        # reasoning_content 是纯文本推理（非 JSON），路由到 structure_reasoning_node
+                        logger.warning(
+                            "Content is empty and reasoning_content is plain text (no JSON). "
+                            "Routing to structure_reasoning_node for structuring."
+                        )
+                        return {
+                            "step_count": 1,
+                            "token_usage": curr_token_usage,
+                            "reasoning_to_structure": reasoning,
+                            "reasoning_additional_kwargs": raw_message.additional_kwargs.copy(),
+                            "error": None,
+                        }
 
                 # 优先尝试使用 json_repair 修复 JSON
                 try:
@@ -275,6 +290,22 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
                     )
             except Exception as repair_err:
                 logger.warning(f"JSON repair failed: {repair_err}")
+
+                # Fallback: 如果存在 reasoning_content，路由到 structure_reasoning_node
+                # 让 deepseek-chat 将纯文本推理内容结构化为 VMCoreAnalysisStep
+                reasoning = raw_message.additional_kwargs.get("reasoning_content", "")
+                if reasoning and len(reasoning) > 50:
+                    logger.warning(
+                        "JSON repair failed but reasoning_content available. "
+                        "Routing to structure_reasoning_node for structuring."
+                    )
+                    return {
+                        "step_count": 1,
+                        "token_usage": curr_token_usage,
+                        "reasoning_to_structure": reasoning,
+                        "reasoning_additional_kwargs": raw_message.additional_kwargs.copy(),
+                        "error": None,
+                    }
 
                 parsing_error = output_data.get("parsing_error")
                 error_msg = f"Failed to parse LLM output. Raw content: {repr(raw_message.content)}"
@@ -371,5 +402,154 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         "step_count": 1,
         "token_usage": curr_token_usage,
         "messages": [response],
+        "error": None,
+    }
+
+
+async def structure_reasoning_content(state: AgentState, chat_llm) -> dict:
+    """
+    使用 deepseek-chat 模型将 DeepSeek-Reasoner 的纯文本 reasoning_content 结构化为 VMCoreAnalysisStep。
+
+    当 Reasoner 模型返回空 content 但有纯文本 reasoning_content 时，
+    此节点接收该文本并通过 Chat 模型将其转换为结构化的分析步骤。
+
+    Args:
+        state: AgentState，包含 reasoning_to_structure 和 reasoning_additional_kwargs
+        chat_llm: deepseek-chat LLM 实例
+
+    Returns:
+        dict: 包含 messages、reasoning_to_structure(清空) 等状态更新
+    """
+    reasoning = state.get("reasoning_to_structure", "")
+    original_kwargs = state.get("reasoning_additional_kwargs", {}) or {}
+    current_step = state.get("step_count", 0)
+    is_last_step = state.get("is_last_step", False)
+
+    logger.info(
+        f"Starting {structure_reasoning_node} node execution (step {current_step})..."
+    )
+    logger.debug(f"Reasoning to structure (first 200 chars): {reasoning[:200]}...")
+
+    curr_token_usage = 0
+
+    # 构建结构化提示
+    schema_json = json.dumps(VMCoreAnalysisStep.model_json_schema(), indent=2)
+
+    force_conclusion = ""
+    if is_last_step:
+        force_conclusion = (
+            "\n\nIMPORTANT: This is the LAST STEP. You MUST set 'is_conclusive' to true, "
+            "'action' to null, and provide a 'final_diagnosis' based on the reasoning."
+        )
+
+    system_prompt = structure_reasoning_prompt().format(
+        force_conclusion=force_conclusion,
+        schema_json=schema_json,
+        reasoning=reasoning,
+    )
+
+    # 包含对话历史以提供上下文
+    messages_to_send = [
+        SystemMessage(content=system_prompt),
+        *state["messages"],
+    ]
+
+    chat_with_structured = chat_llm.with_structured_output(
+        VMCoreAnalysisStep, method="json_mode", include_raw=True
+    )
+
+    try:
+        output_data = await chat_with_structured.ainvoke(messages_to_send)
+        analysis_result = cast(VMCoreAnalysisStep, output_data["parsed"])
+        raw_chat_message = cast(AIMessage, output_data["raw"])
+
+        usage_metadata = getattr(raw_chat_message, "usage_metadata", {}) or {}
+        curr_token_usage = usage_metadata.get("total_tokens", 0)
+
+        if analysis_result is None:
+            # 尝试 json_repair
+            content = raw_chat_message.content
+            content_str = content if isinstance(content, str) else json.dumps(content)
+            try:
+                repaired_obj = repair_json(content_str, return_objects=True)
+                if isinstance(repaired_obj, list):
+                    for item in repaired_obj:
+                        if isinstance(item, dict):
+                            repaired_obj = item
+                            break
+                if isinstance(repaired_obj, dict):
+                    analysis_result = VMCoreAnalysisStep.model_validate(repaired_obj)
+                    logger.warning(
+                        "structure_reasoning_node: repaired JSON via json_repair."
+                    )
+            except Exception as e:
+                logger.debug(f"structure_reasoning_node: json_repair failed: {e}")
+
+        if analysis_result is None:
+            raise ValueError(
+                f"Chat model failed to structure reasoning. "
+                f"Raw: {repr(raw_chat_message.content[:200])}"
+            )
+
+        logger.info(
+            f"structure_reasoning_node: Successfully structured reasoning content. "
+            f"is_conclusive={analysis_result.is_conclusive}, "
+            f"action={'yes' if analysis_result.action else 'no'}"
+        )
+
+        # 构建 tool_calls（与 call_llm_analysis 相同逻辑）
+        tool_calls = []
+        if is_last_step and analysis_result.action:
+            logger.warning(
+                "is_last_step=True in structure_reasoning_node, stripping tool_calls."
+            )
+            analysis_result.action = None
+
+        if analysis_result.action:
+            tool_name = analysis_result.action.command_name
+            tool_args = {}
+            if tool_name == "run_script":
+                script_content = "\n".join(analysis_result.action.arguments)
+                tool_args = {"script": script_content}
+            else:
+                cmd_args = " ".join(analysis_result.action.arguments)
+                tool_args = {"command": cmd_args}
+
+            tool_calls.append(
+                {
+                    "name": tool_name,
+                    "args": tool_args,
+                    "id": f"call_{analysis_result.step_id}",
+                }
+            )
+
+        # 使用原始的 additional_kwargs（含 reasoning_content）以确保
+        # 下一轮 DeepSeek-Reasoner 调用时 assistant 消息包含 reasoning_content
+        response = AIMessage(
+            content=analysis_result.model_dump_json(),
+            tool_calls=tool_calls,
+            additional_kwargs=original_kwargs,
+        )
+
+    except Exception as e:
+        logger.error(f"Error in structure_reasoning_node: {e}", exc_info=True)
+        return {
+            "step_count": 0,
+            "token_usage": curr_token_usage,
+            "reasoning_to_structure": None,
+            "reasoning_additional_kwargs": None,
+            "error": {
+                "message": str(e),
+                "node": structure_reasoning_node,
+                "is_error": True,
+            },
+        }
+
+    return {
+        "step_count": 0,  # 步数已在 llm_analysis_node 中计入
+        "token_usage": curr_token_usage,
+        "messages": [response],
+        "reasoning_to_structure": None,
+        "reasoning_additional_kwargs": None,
         "error": None,
     }
