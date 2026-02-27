@@ -58,10 +58,10 @@ Before generating ANY action:
 - **❌ `ps -m`**: Dumps detailed memory info for ALL processes → Token overflow (can exceed 131072 tokens)
   - **✅ USE INSTEAD**: `ps` (basic process list) or `ps | grep <pattern>` to filter specific processes
   - **✅ SAFE OPTIONS**: `ps <pid>` (single process) or `ps -G <task>` (specific task memory)
-- **❌ `log`**: Dumps entire kernel printk buffer (hundreds of thousands of lines) → Token overflow
-  - **✅ USE INSTEAD**: `log | grep <pattern>` (always use grep!)
-  - **✅ SAFE OPTIONS**: `log -s` (per-CPU buffers) or `log -a` (audit logs)
-  - **CRITICAL**: vmcore-dmesg.txt already contains kernel logs in "Initial Context". Check there FIRST!
+- **❌ `log`**: Dumps entire kernel printk buffer (hundreds of thousands of lines) → Token overflow + server timeout
+- **❌ `log | grep <pattern>`**: **STRICTLY FORBIDDEN**. Even with grep, crash must first buffer the ENTIRE printk output before piping — on large vmcores this can exceed 120s and will be **forcibly killed** by the server.
+  - **✅ MANDATORY ALTERNATIVE**: vmcore-dmesg.txt in "Initial Context" already contains the full kernel log. Search it mentally or reference its content directly.
+  - **✅ SAFE OPTIONS**: `log -t` (timestamps only), `log -m` (monotonic), `log -a` (audit) — only when targeting a specific log subsection
 - **❌ `search -k <value>`**: **STRICTLY FORBIDDEN**. Full kernel virtual memory search causes timeouts.
 - **❌ `search -p <value>`**: **STRICTLY FORBIDDEN**. Brute-force searching entire physical memory in large vmcores is extremely slow, causes heavy I/O overhead, and WILL trigger server-side timeouts (graceful shutdown exceeded).
   - **✅ USE INSTEAD**: Follow the **Address Search SOP** in §1.5 for safe, targeted alternatives.
@@ -124,6 +124,15 @@ If the target is a module symbol/type, you MUST load the module in the SAME `run
     "dis -s pqi_process_io_intr"
   ]
 }}
+```
+
+## 1.4 `set` Context Rule
+`set` changes the task context **within a session**. Each `run_script` is a fresh session, so `set` must be bundled with the follow-up commands in the **same `run_script`**. Never call `set` as a standalone tool.
+
+```json
+{ "command_name": "run_script", "arguments": ["set -p <pid>", "bt"] }
+{ "command_name": "run_script", "arguments": ["set -c <cpu>", "bt"] }
+{ "command_name": "run_script", "arguments": ["mod -s <mod> <path>", "set -p <pid>", "bt -f"] }
 ```
 
 ## 1.5 Address Search SOP (Standard Operating Procedures)
@@ -643,18 +652,16 @@ Suspect DMA Corruption?
 | ✅ `ps -G <task>` | Specific task memory |
 | `task -R <field>` | Read task_struct field |
 
-## 4.4 Kernel Log (CRITICAL: Use with Filters)
+## 4.4 Kernel Log (CRITICAL: vmcore-dmesg.txt FIRST)
 | Command | Use Case | Warning |
 |---------|----------|---------|
-| ❌ `log` | **FORBIDDEN** - Dumps entire buffer | Token overflow |
-| ✅ `log | grep <pattern>` | Filter logs for specific subsystem | Safe - Always use grep |
-| ✅ `log | grep -i "error|warn|fail"` | Find error messages only | Recommended pattern |
-| ✅ `log -s` | Safe per-CPU printk buffers only | Limited output |
+| ❌ `log` | **FORBIDDEN** - Dumps entire buffer | Token overflow + timeout kill |
+| ❌ `log \| grep <pattern>` | **FORBIDDEN** - crash buffers ALL output before piping | Server timeout (>120s) |
+| ✅ `log -t` | Timestamps only | Limited output |
+| ✅ `log -m` | Monotonic timestamps | Limited output |
 | ✅ `log -a` | Audit logs only | Limited output |
 
-**⚠️ All arguments must follow JSON-SAFE rules (see §1.1)**
-
-**REMEMBER**: vmcore-dmesg.txt in "Initial Context" already contains kernel logs. Check there FIRST!
+**⚠️ MANDATORY**: vmcore-dmesg.txt in "Initial Context" already contains the full kernel log. **ALWAYS check there first** instead of running any `log` variant.
 
 ## 4.5 Execution Context & Scheduling
 | Command | Use Case |

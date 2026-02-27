@@ -37,9 +37,9 @@ class GraphLoggingCallback(BaseCallbackHandler):
             logger.info("⚠️ Graph execution was cancelled.")
             return
 
-        logger.error("=" * 80)
+        # logger.error("=" * 80)
         logger.error(f"❌ Graph execution failed with error: {error}")
-        logger.error("=" * 80)
+        # logger.error("=" * 80)
 
     def on_tool_start(
         self,

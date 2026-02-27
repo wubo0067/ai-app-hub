@@ -4,6 +4,13 @@ from src.utils.os import get_linux_distro_version
 
 distro, version = get_linux_distro_version()
 
+# crash 命令单次执行的最长等待时间（秒）。
+# log | grep 等大输出命令可能导致无限期阻塞，超时后强制终止进程并返回截断结果。
+COMMAND_TIMEOUT = 120
+
+# 单次命令返回的最大字符数。超出部分将被截断以防止 LLM token 溢出。
+MAX_OUTPUT_CHARS = 100_000
+
 CRASH_IGNORE_MARKERS = [
     "crash ",
     "Copyright",
@@ -47,14 +54,22 @@ def run_crash_command_rhel9(command, vmcore_path, vmlinux_path, verbose=False):
         text=True,
         bufsize=1024 * 1024,
     )
-    stdout, stderr = process.communicate(input=command + "\nquit\n")
-
-    # if verbose:
-    #     logger.info(
-    #         "Raw output for '{command}' on RHEL 9:\n{output}".format(
-    #             command=command, output=stdout
-    #         )
-    #     )
+    try:
+        stdout, stderr = process.communicate(
+            input=command + "\nquit\n", timeout=COMMAND_TIMEOUT
+        )
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, _ = process.communicate()
+        logger.warning(
+            f"Crash command '{command}' timed out after {COMMAND_TIMEOUT}s. "
+            "Partial output will be returned."
+        )
+        return (
+            f"[TIMEOUT] Command '{command}' exceeded {COMMAND_TIMEOUT}s limit "
+            "and was terminated. The command generates too much output or takes too long. "
+            "Use a more targeted command or filter the output with grep."
+        )
 
     if process.returncode != 0:
         err = "Crash command '{command}' failed with error:\n{error}".format(
@@ -84,6 +99,16 @@ def run_crash_command_rhel9(command, vmcore_path, vmlinux_path, verbose=False):
             filtered_lines.append(line)
 
     output = "\n".join(filtered_lines).strip()
+
+    if len(output) > MAX_OUTPUT_CHARS:
+        logger.warning(
+            f"Command '{command}' output truncated: {len(output)} -> {MAX_OUTPUT_CHARS} chars"
+        )
+        output = (
+            output[:MAX_OUTPUT_CHARS]
+            + f"\n\n[OUTPUT TRUNCATED: {len(output)} chars total, showing first {MAX_OUTPUT_CHARS}. "
+            "Use a more specific command or grep filter to reduce output.]"
+        )
 
     if verbose:
         logger.info(f"Filtered output for '{command}' (RHEL 9):\n{output}")
@@ -123,7 +148,19 @@ def run_crash_script_rhel9(script_content, vmcore_path, vmlinux_path, verbose=Fa
         input_str += "\n"
     input_str += "quit\n"
 
-    stdout, stderr = process.communicate(input=input_str)
+    try:
+        stdout, stderr = process.communicate(input=input_str, timeout=COMMAND_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        logger.warning(
+            f"Crash script timed out after {COMMAND_TIMEOUT}s. Script content: {script_content[:200]!r}"
+        )
+        return (
+            f"[TIMEOUT] Script execution exceeded {COMMAND_TIMEOUT}s limit and was terminated. "
+            "One or more commands in the script generates too much output or takes too long. "
+            "Split the script into smaller steps and avoid large-output commands like 'log' without filters."
+        )
 
     if process.returncode != 0:
         err = f"Crash script failed with error:\n{stderr}"
@@ -169,6 +206,16 @@ def run_crash_script_rhel9(script_content, vmcore_path, vmlinux_path, verbose=Fa
         filtered_lines.append(line)
 
     output = "\n".join(filtered_lines).strip()
+
+    if len(output) > MAX_OUTPUT_CHARS:
+        logger.warning(
+            f"Script output truncated: {len(output)} -> {MAX_OUTPUT_CHARS} chars"
+        )
+        output = (
+            output[:MAX_OUTPUT_CHARS]
+            + f"\n\n[OUTPUT TRUNCATED: {len(output)} chars total, showing first {MAX_OUTPUT_CHARS}. "
+            "Use a more specific command or grep filter to reduce output.]"
+        )
 
     if verbose:
         logger.info(f"Filtered output for script:\n{output}")

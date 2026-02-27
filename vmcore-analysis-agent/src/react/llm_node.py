@@ -180,19 +180,19 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
                 content_str = (
                     content if isinstance(content, str) else json.dumps(content)
                 )
-                logger.debug(f"Raw content: '{content_str[:100]}'")
+                # logger.debug(f"Raw content: '{content_str[:100]}'")
 
                 # Fix 0: DeepSeek-Reasoner 有时将 JSON 输出放在 reasoning_content 而非 content 中
                 if not content_str or not content_str.strip():
-                    logger.warning(
-                        "LLM output content is empty. Checking reasoning_content for JSON..."
-                    )
+                    # logger.warning(
+                    #     "LLM output content is empty. Checking reasoning_content for JSON..."
+                    # )
                     reasoning = raw_message.additional_kwargs.get(
                         "reasoning_content", ""
                     )
-                    logger.debug(
-                        f"Reasoning content: '{reasoning[:100] if reasoning else ''}'"
-                    )
+                    # logger.debug(
+                    #     f"Reasoning content: '{reasoning[:100] if reasoning else ''}'"
+                    # )
                     if reasoning and "{" in reasoning:
                         logger.warning(
                             "Content is empty/whitespace, attempting to extract JSON from reasoning_content"
@@ -493,8 +493,7 @@ async def structure_reasoning_content(state: AgentState, chat_llm) -> dict:
 
         logger.info(
             f"structure_reasoning_node: Successfully structured reasoning content. "
-            f"is_conclusive={analysis_result.is_conclusive}, "
-            f"action={'yes' if analysis_result.action else 'no'}"
+            f"LLM Analysis Result: {analysis_result.model_dump_json(indent=2)}"
         )
 
         # 构建 tool_calls（与 call_llm_analysis 相同逻辑）

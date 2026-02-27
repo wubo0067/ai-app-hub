@@ -233,6 +233,18 @@ commands = [
         "rd -a linux_banner",
         "This command displays the contents of memory, with the output formatted in several different manners",
     ),
+    (
+        "vtop",
+        "vtop [-c [pid | taskp]] [-u|-k] address ...",
+        "vtop c806e000",
+        "This command translates a user or kernel virtual address to its physical address.",
+    ),
+    (
+        "set",
+        "set [[-a] [pid | taskp] | [-c cpu] | -p] | [crash_variable [setting]] | -v",
+        "set -p; set c2fe8000",
+        "This command either sets a new context, or gets the current context for display.",
+    ),
 ]
 
 # 批量注册

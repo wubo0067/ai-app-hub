@@ -303,24 +303,55 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
 
             yield f"data: {json.dumps({'event': 'start', 'task_id': task_id})}\n\n"
 
-            # 使用 astream 获取节点级别的更新（自动去重）
-            # stream_mode="updates" 会在每个节点完成后返回该节点的输出
-            async for event in app_state["agent_graph"].astream(
-                initial_state,
-                config=config,
-                stream_mode="updates",  # 返回节点更新，key 是节点名
-            ):
-                # event 格式：{节点名：节点输出}
-                for node_name, node_output in event.items():
-                    if node_name != "__end__":  # 忽略结束标记
-                        # 获取当前总 token 使用量
-                        snapshot = app_state["agent_graph"].get_state(
-                            cast(RunnableConfig, thread)
-                        )
-                        token_usage = snapshot.values.get("token_usage", 0)
-                        step_count = snapshot.values.get("step_count", 0)
+            # 使用队列 + 心跳机制：将 astream 放入独立 Task，
+            # 每 15s 发送一个 SSE 注释心跳，防止客户端因"无数据"断连。
+            # （crash 工具执行 log / search 等大命令时可能超过 2 分钟，
+            #   executor 的 COMMAND_TIMEOUT=120s 会终止进程，但在此期间
+            #   SSE 连接需保持活跃。）
+            event_queue: asyncio.Queue = asyncio.Queue()
 
-                        yield f"data: {json.dumps({'event': 'node_complete', 'node': node_name, 'token_usage': token_usage, 'step': step_count})}\n\n"
+            async def _run_graph():
+                try:
+                    async for ev in app_state["agent_graph"].astream(
+                        initial_state,
+                        config=config,
+                        stream_mode="updates",
+                    ):
+                        await event_queue.put(("event", ev))
+                except Exception as exc:
+                    await event_queue.put(("error", exc))
+                finally:
+                    await event_queue.put(("done", None))
+
+            graph_task = asyncio.create_task(_run_graph())
+
+            HEARTBEAT_INTERVAL = 15  # 秒
+            while True:
+                try:
+                    kind, payload = await asyncio.wait_for(
+                        event_queue.get(), timeout=HEARTBEAT_INTERVAL
+                    )
+                except asyncio.TimeoutError:
+                    # 心跳：SSE 注释行，客户端忽略，但可刷新 TCP keep-alive
+                    yield ": heartbeat\n\n"
+                    continue
+
+                if kind == "done":
+                    break
+                elif kind == "error":
+                    raise payload
+                else:
+                    # kind == "event"
+                    for node_name, node_output in payload.items():
+                        if node_name != "__end__":
+                            snapshot = app_state["agent_graph"].get_state(
+                                cast(RunnableConfig, thread)
+                            )
+                            token_usage = snapshot.values.get("token_usage", 0)
+                            step_count = snapshot.values.get("step_count", 0)
+                            yield f"data: {json.dumps({'event': 'node_complete', 'node': node_name, 'token_usage': token_usage, 'step': step_count})}\n\n"
+
+            await graph_task  # 确保异常被传播
 
             snapshot = app_state["agent_graph"].get_state(cast(RunnableConfig, thread))
             final_values = snapshot.values
