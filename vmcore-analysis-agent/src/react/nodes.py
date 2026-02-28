@@ -259,23 +259,30 @@ async def collect_crash_init_data(state: AgentState) -> dict:
         def _read_dmesg_context(path: str, t_cpu: int, t_pid: int, t_comm: str) -> str:
             """Synchronous helper to read dmesg, to be run in a thread."""
             try:
+                # 读取 vmcore-dmesg.txt 全部内容
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
                     dmesg_lines = f.readlines()
 
+                # 对进程名进行正则转义，防止特殊字符干扰匹配
                 esc_comm = re.escape(t_comm)
+                # 构建正则：匹配包含指定 CPU、PID 和进程名的 dmesg 行，
+                # 用于定位崩溃现场在 dmesg 日志中的位置
                 pattern = re.compile(
                     rf"CPU:\s*{t_cpu}.*PID:\s*{t_pid}.*Comm:\s*{esc_comm}"
                 )
 
+                # 逐行扫描，找到匹配行后提取上下文窗口
                 for i, line in enumerate(dmesg_lines):
                     if pattern.search(line):
-                        start = max(0, i - 20)
-                        end = min(len(dmesg_lines), i + 100)
+                        # 向前取 50 行（崩溃前的上下文），向后取 50 行（崩溃后的调用栈/日志）
+                        start = max(0, i - 50)
+                        end = min(len(dmesg_lines), i + 50)
                         return (
                             f"$ vmcore-dmesg.txt (extracted around CPU:{t_cpu} PID:{t_pid} Comm:{t_comm})\n"
                             + "".join(dmesg_lines[start:end])
                             + "\n\n"
                         )
+                # 未找到匹配行，返回空字符串
                 return ""
             except Exception as e:
                 logger.error(f"Failed to read dmesg: {e}")

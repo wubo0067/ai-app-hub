@@ -22,7 +22,7 @@ from src.mcp_tools.crash.client import initialize_crash_tools
 from src.mcp_tools.source_patch.client import initialize_patch_tools
 
 # Agent 图最大递归轮次（LLM ↔ Tool 交互次数上限）
-AGENT_RECURSION_LIMIT = 50
+AGENT_RECURSION_LIMIT = 60
 
 
 # 请求模型

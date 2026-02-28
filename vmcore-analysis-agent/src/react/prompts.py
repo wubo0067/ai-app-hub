@@ -56,15 +56,15 @@ Before generating ANY action:
 - **✅ `sym <symbol>`**: Get one symbol's address only
 - **❌ `bt -a`** (unless deadlock suspected): Output too large
 - **❌ `ps -m`**: Dumps detailed memory info for ALL processes → Token overflow (can exceed 131072 tokens)
-  - **✅ USE INSTEAD**: `ps` (basic process list) or `ps | grep <pattern>` to filter specific processes
-  - **✅ SAFE OPTIONS**: `ps <pid>` (single process) or `ps -G <task>` (specific task memory)
+- **✅ USE INSTEAD**: `ps` (basic process list) or `ps | grep <pattern>` to filter specific processes
+- **✅ SAFE OPTIONS**: `ps <pid>` (single process) or `ps -G <task>` (specific task memory)
 - **❌ `log`**: Dumps entire kernel printk buffer (hundreds of thousands of lines) → Token overflow + server timeout
 - **❌ `log | grep <pattern>`**: **STRICTLY FORBIDDEN**. Even with grep, crash must first buffer the ENTIRE printk output before piping — on large vmcores this can exceed 120s and will be **forcibly killed** by the server.
-  - **✅ MANDATORY ALTERNATIVE**: vmcore-dmesg.txt in "Initial Context" already contains the full kernel log. Search it mentally or reference its content directly.
-  - **✅ SAFE OPTIONS**: `log -t` (timestamps only), `log -m` (monotonic), `log -a` (audit) — only when targeting a specific log subsection
+- **✅ MANDATORY ALTERNATIVE**: vmcore-dmesg.txt in "Initial Context" already contains the full kernel log. Search it mentally or reference its content directly.
+- **✅ SAFE OPTIONS**: `log -t` (timestamps only), `log -m` (monotonic), `log -a` (audit) — only when targeting a specific log subsection
 - **❌ `search -k <value>`**: **STRICTLY FORBIDDEN**. Full kernel virtual memory search causes timeouts.
 - **❌ `search -p <value>`**: **STRICTLY FORBIDDEN**. Brute-force searching entire physical memory in large vmcores is extremely slow, causes heavy I/O overhead, and WILL trigger server-side timeouts (graceful shutdown exceeded).
-  - **✅ USE INSTEAD**: Follow the **Address Search SOP** in §1.5 for safe, targeted alternatives.
+- **✅ USE INSTEAD**: Follow the **Address Search SOP** in §1.5 for safe, targeted alternatives.
 
 ## 1.3 Third-Party Module Rule (MANDATORY)
 
@@ -130,9 +130,9 @@ If the target is a module symbol/type, you MUST load the module in the SAME `run
 `set` changes the task context **within a session**. Each `run_script` is a fresh session, so `set` must be bundled with the follow-up commands in the **same `run_script`**. Never call `set` as a standalone tool.
 
 ```json
-{ "command_name": "run_script", "arguments": ["set -p <pid>", "bt"] }
-{ "command_name": "run_script", "arguments": ["set -c <cpu>", "bt"] }
-{ "command_name": "run_script", "arguments": ["mod -s <mod> <path>", "set -p <pid>", "bt -f"] }
+{{ "command_name": "run_script", "arguments": ["set -p <pid>", "bt"] }}
+{{ "command_name": "run_script", "arguments": ["set -c <cpu>", "bt"] }}
+{{ "command_name": "run_script", "arguments": ["mod -s <mod> <path>", "set -p <pid>", "bt -f"] }}
 ```
 
 ## 1.5 Address Search SOP (Standard Operating Procedures)
@@ -179,7 +179,8 @@ Translate physical addresses to virtual addresses and traverse known structures:
 6. **Address Validation Before Use**: Before passing an address to `struct <type> <addr>`, `rd <addr>`, or any command that reads memory at a specific address, you MUST verify the address is valid:
    - **❌ NEVER use `0x0`, `0x0000000000000000`, or NULL as an address argument**. `struct <type> 0x0` is always wrong — it attempts to read a NULL pointer.
    - **❌ NEVER use small values (< 0x1000)** as addresses — these are offsets, not valid kernel addresses.
-   - **✅ Valid kernel virtual addresses** on x86_64 are typically `0xffff...` (direct map) or `0xffffffff...` (kernel text).
+   - **✅ Length & Format Constraint**: On 64-bit systems, a hexadecimal memory address structure **MUST NOT** exceed 16 characters (excluding `0x` prefix). E.g. `ff73d8e1c09baacf8` (17 chars) is a hallucinated/invalid string. Extract exactly 16 characters, padding with leading `0`s if necessary (e.g., `0x0000ffff12345678`).
+   - **✅ Valid kernel virtual addresses** on x86_64 are typically 16 chars starting with `0xffff...` (direct map) or `0xffffffff...` (kernel text).
    - **If the address you have is NULL or invalid**, do NOT run the command. Instead, report in your reasoning that the pointer is NULL/invalid, as this is itself a diagnostic finding (e.g., "the pointer was NULL, indicating the object was not initialized or already freed").
 
 ================================================================================
@@ -836,14 +837,21 @@ Fully consolidated into §3.12.7–§3.12.9. Refer to §3.12 for the complete DM
 def crash_init_data_prompt() -> str:
     return """
 # Initial Context
-**CRITICAL**: The following data is already provided. DO NOT request these commands in your first step.
+**CRITICAL**: The following information and command outputs are already provided below. **DO NOT** attempt to request this data or run these base commands (`sys`, `bt`) again at ANY step of the analysis.
 
-1. **`sys`**: System info (kernel version, panic string, CPU count)
-2. **`bt`**: Panic task backtrace
-3. **`vmcore-dmesg.txt`**: Kernel log leading to crash
-4. **Third-party Modules**: Paths to modules with debug symbols
+**[Provided Data Inventory]**
+1. **`sys`**: System info (kernel version, panic string, CPU count).
+2. **`bt`**: Panic task backtrace.
+3. **`vmcore-dmesg.txt`**: Kernel log messages captured just before the crash.
+4. **Third-party Modules**: Paths to installed modules with debug symbols.
 
+**[Instructions for Initial Analysis]**
+- **Log Evaluation**: Pay special attention to `BUG:`,`Oops`,`panic`,`MCE` entries within the `vmcore-dmesg.txt`. These are critical kernel error logs.
+- **Integration**: You MUST integrate your reasoning over the kernel log messages alongside the `bt` (backtrace) evaluation. Do not analyze them in isolation.
+
+<initial_data>
 {init_info}
+</initial_data>
 """
 
 
