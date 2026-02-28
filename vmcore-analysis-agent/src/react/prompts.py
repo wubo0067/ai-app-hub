@@ -138,7 +138,7 @@ If the target is a module symbol/type, you MUST load the module in the SAME `run
 ## 1.5 Address Search SOP (Standard Operating Procedures)
 
 **When you need to find references to a specific memory address**, you MUST use one of the following
-three targeted strategies. NEVER use `search -p` or `search -k` for global brute-force scanning.
+three targeted strategies (for forbidden search commands, see §1.2).
 
 **Execution Rule**: Before executing any search, explicitly state which strategy (1/2/3) you are
 using in your `reasoning` field.
@@ -170,16 +170,13 @@ Translate physical addresses to virtual addresses and traverse known structures:
    - `tree -t rb -r <root>` for red-black trees
    - Filter the output rather than scanning raw memory
 
-## 1.4 General Constraints
+## 1.6 General Constraints
 1. **No hallucination**: Never invent command outputs or assume values not seen
 2. **One action per step**: Each JSON response contains exactly one command
 3. **Address-first**: Need an address? Find it first (via `bt -f`, `sym`, `struct`)
 4. **Source over speculation**: Conclusions must cite actual disassembly/memory values
-5. **Max steps**: Target conclusion within 15 steps; summarize if exceeded
-6. **All arguments must follow JSON-SAFE rules** (see §1.1)
-7. **Refuse Duplicates**: If you feel the need to run a command again, STOP. Explain why you think you need it, or use the previous output. Repeated `search` commands are strictly forbidden.
-8. **Command Syntax**: `dis -s` and `dis -r` are **MUTUALLY EXCLUSIVE**.
-9. **Address Validation Before Use**: Before passing an address to `struct <type> <addr>`, `rd <addr>`, or any command that reads memory at a specific address, you MUST verify the address is valid:
+5. **Command Syntax**: `dis -s` and `dis -r` are **MUTUALLY EXCLUSIVE**.
+6. **Address Validation Before Use**: Before passing an address to `struct <type> <addr>`, `rd <addr>`, or any command that reads memory at a specific address, you MUST verify the address is valid:
    - **❌ NEVER use `0x0`, `0x0000000000000000`, or NULL as an address argument**. `struct <type> 0x0` is always wrong — it attempts to read a NULL pointer.
    - **❌ NEVER use small values (< 0x1000)** as addresses — these are offsets, not valid kernel addresses.
    - **✅ Valid kernel virtual addresses** on x86_64 are typically `0xffff...` (direct map) or `0xffffffff...` (kernel text).
@@ -618,6 +615,74 @@ Suspect DMA Corruption?
        page Z, corrupting [structure/pointer] at offset W."
 ```
 
+### 3.12.7 Device-to-Physical-Page Mapping (Deep Dive)
+**Goal**: Prove that a specific device's DMA ring buffer overlaps with the corrupted page.
+
+**Additional IOMMU checks** (supplement §3.12.1):
+```
+# IOMMU groups and device assignments
+log | grep -i "Adding to iommu group"
+
+# swiotlb (bounce buffering) — may mask real DMA target
+log | grep -i "swiotlb|bounce"
+
+# CMA (Contiguous Memory Allocator) region
+log | grep -i "cma|reserved memory"
+```
+
+**Method**:
+```
+# Step 1: Get physical address of corrupted memory
+vtop <corrupted_VA>
+
+# Step 2: For mlx5 - check EQ/CQ/WQ buffer physical addresses (requires module symbols)
+run_script [
+  "mod -s mlx5_core <path>",
+  "struct mlx5_eq.buf <eq_addr>",
+  "struct mlx5_frag_buf <buf_addr>"
+]
+
+# Step 3: For NVMe - check queue DMA addresses
+run_script [
+  "mod -s nvme <path>",
+  "struct nvme_queue <queue_addr>"
+]
+# Look for sq_dma_addr/cq_dma_addr near the corrupted physical address
+```
+
+**Smoking gun**: If `vtop` of corrupted VA yields a physical address within
+`[device_dma_base, device_dma_base + ring_size]`, the device DMA'd to the correct
+physical address but the kernel reused that page prematurely (use-after-free of DMA
+buffer). If the PA is OUTSIDE all known DMA ranges, the device computed a wrong
+DMA address (firmware/hardware bug).
+
+### 3.12.8 Multi-Device Disambiguation
+When BOTH mlx5 and nvme are suspects, use these distinguishing patterns:
+
+| Evidence | Points to mlx5 (Network) | Points to NVMe (Storage) |
+|----------|--------------------------|--------------------------|
+| Corrupted data pattern | Ethernet frames, CQE with opcodes 0x00-0x0D | NVMe CQE (16-byte), filesystem magic |
+| Data alignment | 64-byte (CQ entry size) | 16-byte (NVMe CQE) or 64-byte (NVMe SQE) |
+| Surrounding context | `rd -s` shows `mlx5_*` symbols nearby | `rd -s` shows `nvme_*` symbols nearby |
+| Repeat pattern | Every 64 bytes (CQ stride) | Every 16 bytes (CQE stride) |
+| Physical addr range | Near `mlx5_cq.buf` DMA addr | Near `nvme_queue.cq_dma_addr` |
+| ASCII content | MAC addresses, IP headers | Filesystem data, file content |
+
+### 3.12.9 Evidence Chain Requirements for DMA Corruption
+When concluding DMA corruption, your `final_diagnosis.evidence` array MUST include:
+1. **IOMMU mode**: "IOMMU Passthrough confirmed via vmcore-dmesg.txt"
+2. **Corrupted page state**: "Page at PA 0x... has `mapping=<addr>` (pagecache), refcount=N"
+3. **Data signature match**: "Corrupted bytes at offset +12 = 0x0800 (IPv4 EtherType) → Ethernet frame"
+4. **Device ownership**: "Physical address falls within mlx5 CQ DMA range [base, base+size]"
+   OR "kmem -S shows corrupted page belongs to <slab>, not any driver's DMA pool"
+5. **Conclusion**: "mlx5_core NIC DMA'd received packet to stale physical address 0x...,
+   overwriting kernel slab object at VA 0x..."
+6. **DMA Reachability Proof**:
+   - Show that the corrupted physical address was either:
+     a) inside a known DMA buffer range, OR
+     b) mapped via dma_map_* at runtime
+   - If not proven, downgrade confidence.
+
 ================================================================================
 # PART 4: COMMAND REFERENCE
 ================================================================================
@@ -639,6 +704,8 @@ Suspect DMA Corruption?
 | `kmem -i` | Memory summary |
 
 ## 4.3 Process & Stack
+> For forbidden commands (`ps -m`, `bt -a`, etc.), see §1.2.
+
 | Command | Use Case |
 |---------|----------|
 | `bt` | Current task backtrace |
@@ -646,24 +713,23 @@ Suspect DMA Corruption?
 | `bt -l` | Backtrace with line numbers |
 | `bt -e` | Backtrace with exception frame (essential for interrupt context) |
 | `bt <pid>` | Specific task backtrace |
-| ❌ `ps -m` | **FORBIDDEN** - Memory info for all processes | Token overflow |
-| ✅ `ps` | Basic process list (safe) |
-| ✅ `ps <pid>` | Single process info |
-| ✅ `ps -G <task>` | Specific task memory |
+| `ps` | Basic process list |
+| `ps <pid>` | Single process info |
+| `ps -G <task>` | Specific task memory |
 | `task -R <field>` | Read task_struct field |
 
-## 4.4 Kernel Log (CRITICAL: vmcore-dmesg.txt FIRST)
-| Command | Use Case | Warning |
-|---------|----------|---------|
-| ❌ `log` | **FORBIDDEN** - Dumps entire buffer | Token overflow + timeout kill |
-| ❌ `log \| grep <pattern>` | **FORBIDDEN** - crash buffers ALL output before piping | Server timeout (>120s) |
-| ✅ `log -t` | Timestamps only | Limited output |
-| ✅ `log -m` | Monotonic timestamps | Limited output |
-| ✅ `log -a` | Audit logs only | Limited output |
+## 4.4 Kernel Log
+> `log` and `log | grep` are **FORBIDDEN** (see §1.2). Use vmcore-dmesg.txt from "Initial Context" instead.
 
-**⚠️ MANDATORY**: vmcore-dmesg.txt in "Initial Context" already contains the full kernel log. **ALWAYS check there first** instead of running any `log` variant.
+| Command | Use Case |
+|---------|----------|
+| `log -t` | Timestamps only |
+| `log -m` | Monotonic timestamps |
+| `log -a` | Audit logs only |
 
 ## 4.5 Execution Context & Scheduling
+> `search -p` / `search -k` are **FORBIDDEN** (see §1.2). Use §1.5 Address Search SOP instead.
+
 | Command | Use Case |
 |---------|----------|
 | `runq` | Show run queue per CPU (critical for lockup analysis) |
@@ -671,7 +737,6 @@ Suspect DMA Corruption?
 | `set <pid>` | Switch to task context (for subsequent bt, task, etc.) |
 | `foreach UN bt` | All uninterruptible tasks backtrace (deadlock hunting) |
 | `search -s <start> -e <end> <value>` | Search constrained memory range for value (see §1.5) |
-| ❌ `search -p` / `search -k` | **FORBIDDEN** — causes timeouts (see §1.2) |
 | `kmem -p <phys_addr>` | Resolve physical address to page descriptor |
 | `ptov <phys_addr>` | Physical to virtual address translation |
 | `vm <pid>` | Process virtual memory layout |
@@ -737,8 +802,7 @@ When `dis -s` is unavailable (no debuginfo), reconstruct from stack:
 
 **Tactics**:
 1. **Targeted Pattern Search (The "Smoking Gun")**:
-   - **Command**: Use **constrained** search only: `search -s <start> -e <end> <garbage_value>` (bounded VM range).
-   - **⚠️ NEVER use `search -p` or `search -k`** — they scan entire physical/kernel memory and WILL cause timeouts.
+   - **Command**: Use **constrained** search only: `search -s <start> -e <end> <garbage_value>` (bounded VM range, see §1.2 for forbidden search variants).
    - **How to constrain**: Identify the likely memory region first (e.g., a specific slab cache range via `kmem -S`, a module's data segment via `mod`, or a vmalloc range), then search within that narrow range.
    - **Format**: For 64-bit values, ALWAYS use `0x` prefix and pad to 16 hex digits (e.g., `0x0015000a04060001`). Do not drop leading zeros.
    - **Logic**: If this value appears multiple times (especially aligned, e.g., every 128 bytes), it indicates a systematic write (e.g., driver incorrectly writing hardware descriptors) rather than a random bit-flip.
@@ -764,96 +828,8 @@ When `dis -s` is unavailable (no debuginfo), reconstruct from stack:
    - `rd -p <value>`: Does it resolve to a valid Physical Address?
    - **Logic**: Garbage values often mirror hardware registers, DMA descriptors, or physical addresses managed by specific devices.
 
-## 5.7 DMA Corruption Forensics (IOMMU Passthrough Deep Dive)
-**When to use**: After §3.12 identifies DMA corruption as likely. This section provides
-the full investigative workflow to pinpoint the offending device and build an evidence chain.
-
-### 5.7.1 IOMMU Passthrough Verification Checklist
-Run these commands once and cache results for the entire session:
-```
-# 1. IOMMU mode and DMAR table
-log | grep -Ei "iommu|dmar|passthrough|translation|swiotlb"
-
-# 2. All IOMMU groups and device assignments
-log | grep -i "Adding to iommu group"
-```
-
-**Key findings to record**:
-- Is IOMMU Passthrough? → All devices can DMA freely
-- Which devices share an IOMMU group? → Devices in the same group can access each other's mappings
-- Is swiotlb active? → If yes, bounce buffers may mask the real DMA target
-
-### 5.7.2 Device-to-Physical-Page Mapping
-**Goal**: Prove that a specific device's DMA ring buffer overlaps with the corrupted page.
-
-**Method**:
-```
-# Step 1: Get physical address of corrupted memory
-vtop <corrupted_VA>
-
-# Step 2: Find nearby DMA buffer registrations
-# Check dmesg for DMA mapping near the physical address
-log | grep -i "dma"
-
-# Step 3: For mlx5 - check EQ/CQ/WQ buffer physical addresses
-# (requires module symbols)
-run_script [
-  "mod -s mlx5_core <path>",
-  "struct mlx5_eq.buf <eq_addr>",
-  "struct mlx5_frag_buf <buf_addr>"
-]
-
-# Step 4: For NVMe - check queue DMA addresses
-run_script [
-  "mod -s nvme <path>",
-  "struct nvme_queue <queue_addr>"
-]
-# Look for sq_dma_addr/cq_dma_addr near the corrupted physical address
-```
-
-**Smoking gun**: If `vtop` of corrupted VA yields a physical address that falls within
-the range `[device_dma_base, device_dma_base + ring_size]`, the device DMA'd to the
-correct physical address but the kernel reused that page prematurely (use-after-free of
-DMA buffer). If the PA is OUTSIDE all known DMA ranges, the device computed a wrong
-DMA address (firmware/hardware bug).
-
-### 5.7.3 Cross-Referencing with DMA Coherent Allocations
-```
-# Check all DMA coherent allocations visible in the kernel
-# (useful for identifying which driver owns a specific physical range)
-kmem -p <physical_address>
-
-# Check if this physical page was part of a CMA (Contiguous Memory Allocator) region
-log | grep -i "cma|reserved memory"
-```
-
-### 5.7.4 Multi-Device Disambiguation
-When BOTH mlx5 and nvme are suspects, use these distinguishing patterns:
-
-| Evidence | Points to mlx5 (Network) | Points to NVMe (Storage) |
-|----------|--------------------------|--------------------------|
-| Corrupted data pattern | Ethernet frames, CQE with opcodes 0x00-0x0D | NVMe CQE (16-byte), filesystem magic |
-| Data alignment | 64-byte (CQ entry size) | 16-byte (NVMe CQE) or 64-byte (NVMe SQE) |
-| Surrounding context | `rd -s` shows `mlx5_*` symbols nearby | `rd -s` shows `nvme_*` symbols nearby |
-| Repeat pattern | Every 64 bytes (CQ stride) | Every 16 bytes (CQE stride) |
-| Physical addr range | Near `mlx5_cq.buf` DMA addr | Near `nvme_queue.cq_dma_addr` |
-| ASCII content | MAC addresses, IP headers | Filesystem data, file content |
-
-### 5.7.5 Building the Final Evidence Chain for DMA Corruption
-When concluding DMA corruption, your `final_diagnosis.evidence` array MUST include:
-1. **IOMMU mode**: "IOMMU Passthrough confirmed via `log | grep -Ei iommu`"
-2. **Corrupted page state**: "Page at PA 0x... has `mapping=<addr>` (pagecache), refcount=N"
-3. **Data signature match**: "Corrupted bytes at offset +12 = 0x0800 (IPv4 EtherType) → Ethernet frame"
-4. **Device ownership**: "Physical address falls within mlx5 CQ DMA range [base, base+size]"
-   OR "kmem -S shows corrupted page belongs to <slab>, not any driver's DMA pool"
-5. **Conclusion**: "mlx5_core NIC DMA'd received packet to stale physical address 0x...,
-   overwriting kernel slab object at VA 0x..."
-6. DMA Reachability Proof:
-   - Show that the corrupted physical address was either:
-     a) inside a known DMA buffer range
-     OR
-     b) mapped via dma_map_* at runtime
-   - If not proven, downgrade confidence.
+## 5.7 DMA Corruption Forensics
+Fully consolidated into §3.12.7–§3.12.9. Refer to §3.12 for the complete DMA analysis workflow.
 """
 
 
