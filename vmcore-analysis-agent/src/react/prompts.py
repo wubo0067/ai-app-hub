@@ -238,18 +238,61 @@ Translate physical addresses to virtual addresses and traverse known structures:
 | "double free or corruption" / BUG in `kfree` | Double-free: same pointer passed to kfree() twice, corrupting slab freelist | N/A | Enable `slub_debug=FZ`; KASAN will pinpoint second free location |
 | "general protection fault: ... segment ... error" | Concurrent race corruption: two CPUs modify shared struct without lock, pointer value torn | Non-symbol mid-corruption value | Enable lockdep; `bt` all CPUs; look for missing lock around pointer write |
 
-## 2.3 Analysis Flowchart
+## 2.3 Analysis Flowchart (Forensic-Driven)
 
-1. Read Panic String → Identify Crash Type
-2. Branch by type:
-   - NULL PTR     → Check registers for 0x0, find struct offset
-   - SOFT LOCKUP  → `dis -l <func> 100`, find backward jump (loop)
-   - RCU STALL    → `bt` stalled task, find rcu_read_lock holder
-   - GPF/OOPS     → Decode error code, check address validity
-   - HARDWARE     → MCE/EDAC analysis from dmesg
-3. Check backtrace → Third-party module? → YES: `mod -s` first
-4. `dis -s` crash location → Map source to runtime state
-5. Validate with `rd` / `struct` → Construct evidence chain → CONCLUDE
+**Step 1 — Read Panic String → Record Crash Context (Do NOT conclude yet)**
+- Capture: RIP, CR2, error_code, CPU, PID, taint flags, kernel version
+- Treat panic string as a classification *hint* only; ground truth comes from CR2 + error_code
+
+**Step 2 — Classify Fault Address via CR2 (Primary Branch)**
+| CR2 Value | Diagnosis Direction |
+|-----------|---------------------|
+| `0x0` | NULL dereference → register provenance analysis |
+| Small offset (`0x10`/`0x18`/`0x20`...) | Struct member via NULL ptr → `struct <type> -o` |
+| Canonical slab addr (`0xffff8880...`) | UAF / OOB / double-free → `kmem -S <addr>` |
+| Poison pattern (`0x5a5a...` / `0x6b6b...` / `0xdead...`) | Freed-memory access → UAF path |
+| Non-canonical address | Corrupted pointer / race / write-tear → concurrency analysis |
+| `< TASK_SIZE` (user address) | `copy_from_user` / `access_ok` misuse |
+
+**Step 3 — Decode Page Fault Error Code (x86 mandatory)**
+- `P=0` → not-present page (likely UAF or use-before-init)
+- `P=1` → protection violation (permissions)
+- `W/R=1` → write fault
+- `U/S=1` → user-mode origin
+- `I/D=1` → instruction fetch (text corruption / function pointer corruption)
+- **Combine with CR2 classification before branching**
+
+**Step 4 — Branch by Crash Category**
+- **NULL PTR** → `dis -rl <RIP>`, identify NULL register, trace assignment origin
+- **SOFT LOCKUP** → `dis -l <func> 100`, find backward jump / tight loop, check `cond_resched()`
+- **RCU STALL** → `bt` stalled CPU task, find long-held `rcu_read_lock()`, check blocking in read-side
+- **GPF / OOPS (non-NULL)** → verify canonical address, trace corrupted pointer source, suspect race or OOB overwrite
+- **HARDWARE (MCE/ECC)** → `log -m | grep -i mce`, confirm bank status, rule out DIMM fault
+
+**Step 5 — Disassemble Crash Location → Trace Register Provenance**
+- `dis -rl <RIP>` → identify faulting instruction
+- Trace backward: loaded from memory? function return value? parameter corruption?
+- Determine true origin of bad register value
+
+**Step 6 — Check Backtrace Context**
+- `bt` → identify execution context: `Process` / `<IRQ>` / `<SOFTIRQ>` / `<NMI>`
+- If atomic context → check for sleep/mutex/schedule misuse (§3.6)
+- Third-party module in trace? → **YES**: apply §1.3 `mod -s` rule before any module commands
+
+**Step 7 — Memory Forensics (if slab/heap involved)**
+- `kmem -S <addr>` → verify allocated vs free, slab cache name, alloc/free trace
+- Inspect neighbor objects for OOB detection
+
+**Step 8 — Concurrency / Corruption Check (if pointer invalid or partially garbage)**
+- `foreach UN bt` → check all D-state tasks for lock contention (use `bt -a` ONLY for hard lockup)
+- Look for missing locks, inconsistent refcount transitions, list_head integrity
+- Suspect race if pointer is partially valid (write-tear pattern)
+
+**Step 9 — Map Source to Runtime State → Construct Evidence Chain → Conclude**
+- `dis -s <func>` (if debug symbols available) → correlate source with live data
+- Validate structure fields: `rd` / `struct <type> <addr>`
+- Evidence chain MUST include: faulting instruction, bad register origin, object lifetime state, concurrency/logic path
+- If evidence incomplete → continue analysis; if consistent → set `is_conclusive: true`
 
 ## 2.4 Convergence Criteria (When to Stop)
 
@@ -264,9 +307,6 @@ Continue investigation if:
 - ❌ Multiple equally plausible root causes remain
 - ❌ The backtrace suggests the crash is a SYMPTOM of an earlier corruption
   (trace back to the actual corruption point)
-
-**Maximum steps guideline**: If after 15 steps no conclusion is reached,
-summarize findings so far with confidence="low" and list remaining unknowns.
 
 ## 2.5 Evidence Chain Template & Final Diagnosis Structure
 
