@@ -190,9 +190,9 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
                     reasoning = raw_message.additional_kwargs.get(
                         "reasoning_content", ""
                     )
-                    # logger.debug(
-                    #     f"Reasoning content: '{reasoning[:100] if reasoning else ''}'"
-                    # )
+                    logger.debug(
+                        f"use reasoning content: '{reasoning[:50] if reasoning else ''}' to attempt JSON repair"
+                    )
                     if reasoning and "{" in reasoning:
                         logger.warning(
                             "Content is empty/whitespace, attempting to extract JSON from reasoning_content"

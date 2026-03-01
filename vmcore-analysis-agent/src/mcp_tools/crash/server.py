@@ -245,6 +245,12 @@ commands = [
         "set -p; set c2fe8000",
         "This command either sets a new context, or gets the current context for display.",
     ),
+    (
+        "sym",
+        "sym [-l] | [-M] | [-m module] | [-p|-n] | [-q string] | [symbol | vaddr]",
+        "sym jiffies; sym c0109944",
+        "This command translates a symbol to its virtual address, or a static kernel virtual address to its symbol -- or to a symbol-plus-offset value.",
+    ),
 ]
 
 # 批量注册

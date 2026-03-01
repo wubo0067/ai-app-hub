@@ -60,11 +60,30 @@ Before generating ANY action:
 - **✅ SAFE OPTIONS**: `ps <pid>` (single process) or `ps -G <task>` (specific task memory)
 - **❌ `log`**: Dumps entire kernel printk buffer (hundreds of thousands of lines) → Token overflow + server timeout
 - **❌ `log | grep <pattern>`**: **STRICTLY FORBIDDEN**. Even with grep, crash must first buffer the ENTIRE printk output before piping — on large vmcores this can exceed 120s and will be **forcibly killed** by the server.
-- **✅ MANDATORY ALTERNATIVE**: vmcore-dmesg.txt in "Initial Context" already contains the full kernel log. Search it mentally or reference its content directly.
-- **✅ SAFE OPTIONS**: `log -t` (timestamps only), `log -m` (monotonic), `log -a` (audit) — only when targeting a specific log subsection
+- **❌ `log -t`**: **STRICTLY FORBIDDEN** without grep pipe. Standalone use dumps entire log with timestamps → Token overflow.
+- **❌ `log -m`**: **STRICTLY FORBIDDEN** without grep pipe. Standalone use dumps entire log with monotonic timestamps → Token overflow.
+- **❌ `log -a`**: **STRICTLY FORBIDDEN** without grep pipe. Standalone use dumps entire audit log → Token overflow.
+- **✅ ONLY SAFE LOG USAGE**: `log -m | grep -i <pattern>`, `log -t | grep -i <pattern>`, `log -a | grep -i <pattern>` — pipe with grep is **REQUIRED**. Use ONLY when the initial context does not contain sufficient log detail for a specific targeted search.
 - **❌ `search -k <value>`**: **STRICTLY FORBIDDEN**. Full kernel virtual memory search causes timeouts.
 - **❌ `search -p <value>`**: **STRICTLY FORBIDDEN**. Brute-force searching entire physical memory in large vmcores is extremely slow, causes heavy I/O overhead, and WILL trigger server-side timeouts (graceful shutdown exceeded).
 - **✅ USE INSTEAD**: Follow the **Address Search SOP** in §1.5 for safe, targeted alternatives.
+
+### Command Arguments Rule (MANDATORY)
+All crash utility commands MUST have appropriate arguments. NEVER generate actions with empty argument arrays.
+
+**Examples of FORBIDDEN empty-argument commands**:
+- **❌ `{{"command_name": "kmem", "arguments": []}}`**: Invalid. `kmem` without arguments dumps huge amounts of data.
+- **❌ `{{"command_name": "struct", "arguments": []}}`**: Invalid. Must specify struct type.
+- **❌ `{{"command_name": "dis", "arguments": []}}`**: Invalid. Must specify function or address.
+
+**✅ CORRECT usage with required arguments**:
+- `{{"command_name": "kmem", "arguments": ["-i"]}}`  Memory summary
+- `{{"command_name": "kmem", "arguments": ["-S", "<addr>"]}}`  Find slab for address
+- `{{"command_name": "kmem", "arguments": ["-p", "<phys_addr>"]}}`  Resolve physical address
+- `{{"command_name": "struct", "arguments": ["<type>", "-o"]}}`  Show struct with offsets
+- `{{"command_name": "dis", "arguments": ["-rl", "<RIP>"]}}`  Disassemble from address
+
+**Validation Rule**: Before generating ANY action, verify that the `arguments` array contains at least one element that provides context or target for the command.
 
 ## 1.3 Third-Party Module Rule (MANDATORY)
 
@@ -188,7 +207,7 @@ Translate physical addresses to virtual addresses and traverse known structures:
 ================================================================================
 
 ## 2.1 Priority Framework (Follow This Order)
-1. **Panic String** → Identify crash type from dmesg (**CRITICAL**: Use vmcore-dmesg.txt from "Initial Context", NOT `log` command)
+1. **Panic String** → Identify crash type from dmesg (**CRITICAL**: Use vmcore-dmesg from "Initial Context", NOT `log` command)
 2. **RIP Analysis** → Disassemble the crashing instruction
 3. **Register State** → Which register held the bad value?
 4. **Call Stack** → Understand the function chain
@@ -202,17 +221,22 @@ Translate physical addresses to virtual addresses and traverse known structures:
 |---------------------|--------------|-------------------|--------------|
 | "NULL pointer dereference at 0x0000000000000000" | Deref of NULL itself | CR2=0x0 | Check which reg is NULL in `bt` |
 | "NULL pointer dereference at 0x0...00XX" (small offset) | Struct member access via NULL ptr | CR2=offset | `struct -o` to find member at CR2 offset |
-| "paging request at 0xdead000000000100" | SLUB use-after-free | Look for 0xdead... | `kmem <object_addr>`, check free trace |
-| "paging request at 0x5a5a5a5a5a5a5a5a" | SLUB poison (freed) | All 0x5a | `kmem -S <addr>` |
-| "unable to handle kernel paging request at <high_addr>" | Wild/corrupted pointer | Non-canonical addr | Check pointer source in caller |
-| "kernel BUG at <file>:<line>" | Explicit BUG_ON() hit | N/A | Read condition in source |
-| "soft lockup - CPU#X stuck for XXs" | Preemption disabled too long | N/A | `dis -l`, look for loop without cond_resched |
-| "watchdog: BUG: soft lockup" | Same as above (newer kernels) | N/A | Same |
-| "RCU detected stall on CPU" | RCU grace period blocked | N/A | `bt` of stalled CPU task |
-| "scheduling while atomic: ..., preempt_count=XX" | Sleep in atomic context | preempt_count | `bt` → find sleeping call in atomic path |
-| "list_add corruption" / "list_del corruption" | Linked list corruption | N/A | Memory corruption, check surrounding allocations |
-| "Machine Check Exception" | Hardware failure | Check MCE banks | Check dmesg for EDAC/MCE |
-| Corrupted pointer with Ethernet/NVMe data pattern | DMA stray write (Passthrough IOMMU) | Non-symbol garbage value | `log | grep -Ei iommu`, check §3.12 |
+| "paging request at 0xdead000000000100" | SLUB use-after-free (UAF) | Look for 0xdead... | `kmem -S <object_addr>`, check free trace |
+| "paging request at 0x5a5a5a5a5a5a5a5a" | SLUB poison (freed memory read) | All 0x5a | `kmem -S <addr>`, enable slub_debug=P |
+| "paging request at 0x6b6b6b6b6b6b6b6b" | SLUB poison (freed memory deref as ptr) | All 0x6b | UAF: obj freed then pointer dereferenced; `kmem -S <addr>`, check alloc/free trace with KASAN |
+| "paging request at <non-canonical high addr>" | Wild/corrupted pointer or OOB heap write | Non-canonical addr (e.g. 0xffff...garbage) | Check pointer source in caller; `kmem -S` on surrounding slab to find OOB victim |
+| "unable to handle kernel paging request at <high_addr>" | Uninitialized pointer used, or stack OOB | Garbage/uninitialized value | Check var init in caller; inspect stack frame with `bt -f` |
+| "paging request at <addr with Ethernet/NVMe data pattern>" | DMA stray write (missing/bypass IOMMU) | Non-symbol garbage matching device data | `log -m \| grep -Ei iommu`, check §3.12 |
+| "kernel BUG at <file>:<line>" | Explicit BUG_ON() hit (often refcount underflow, double-free detected by slab) | N/A | Read BUG_ON condition in source; check refcount logic around caller |
+| "list_add corruption" / "list_del corruption" | Linked list pointer corrupted — heap OOB write or UAF on list node | Corrupted next/prev pointer | `kmem -S` on list node; check adjacent slab object for OOB; look for missing lock |
+| "soft lockup - CPU#X stuck for XXs" | Preemption disabled too long / spinlock held in loop | N/A | `dis -l`, look for loop without `cond_resched` |
+| "watchdog: BUG: soft lockup" | Same as above (newer kernels) | N/A | Same as above |
+| "RCU detected stall on CPU" | RCU grace period blocked — reader holds rcu_read_lock too long, or callback blocked | N/A | `bt` of stalled CPU task; check for RCU used outside read-side critical section |
+| "scheduling while atomic: ..., preempt_count=XX" | Sleep in atomic context — mutex/sleep call inside spinlock or interrupt | preempt_count>0 | `bt` → find sleeping call in atomic path; check for missing `spin_unlock` before sleep |
+| "Machine Check Exception: ... status" | Hardware failure: DRAM bit flip (ECC error), memory controller fault | MCE bank registers | `log -m \| grep -i mce`; check EDAC/BIOS logs; run memtest86+ to rule out bad DIMM |
+| "refcount_t: underflow; use-after-free" | refcount dropped to 0 prematurely, object freed while another path still holds pointer | N/A | Trace all `put_*` / `*_put` call sites; check with KASAN |
+| "double free or corruption" / BUG in `kfree` | Double-free: same pointer passed to kfree() twice, corrupting slab freelist | N/A | Enable `slub_debug=FZ`; KASAN will pinpoint second free location |
+| "general protection fault: ... segment ... error" | Concurrent race corruption: two CPUs modify shared struct without lock, pointer value torn | Non-symbol mid-corruption value | Enable lockdep; `bt` all CPUs; look for missing lock around pointer write |
 
 ## 2.3 Analysis Flowchart
 
@@ -388,7 +412,7 @@ When `is_conclusive: true`, provide complete structured diagnosis:
 ## 3.10 OOM Killer
 **Pattern**: "Out of memory: Kill process", "oom-kill"
 **Analysis**:
-1. Check vmcore-dmesg.txt for OOM dump (mem info, process scores)
+1. Check vmcore-dmesg for OOM dump (mem info, process scores)
 2. `kmem -i` → Overall memory state
 3. `ps -G <task>` → Check victim process memory usage
 4. Look for memory leak: `kmem -s` → Sort by num_slabs, find abnormal growth
@@ -397,7 +421,7 @@ When `is_conclusive: true`, provide complete structured diagnosis:
 **Pattern**: "BUG: KASAN: slab-out-of-bounds", "BUG: KASAN: use-after-free",
             "UBSAN: shift-out-of-bounds", "UBSAN: signed-integer-overflow"
 **Analysis**:
-1. KASAN provides exact allocation/free stacks in dmesg — check vmcore-dmesg.txt FIRST
+1. KASAN provides exact allocation/free stacks in dmesg — check vmcore-dmesg FIRST
 2. Shadow memory decode: Address in report → actual corruption location
 3. For UBSAN: Usually non-fatal but indicates logic bug; check the arithmetic operation
 
@@ -432,7 +456,7 @@ directly to any physical address without hardware address translation or isolati
 **Goal**: Determine if IOMMU provides protection or if devices have unrestricted DMA access.
 
 ```
-# Check IOMMU mode (ALWAYS check vmcore-dmesg.txt FIRST)
+# Check IOMMU mode (ALWAYS check vmcore-dmesg FIRST)
 log | grep -Ei "iommu|dmar|passthrough|translation"
 ```
 
@@ -671,7 +695,7 @@ When BOTH mlx5 and nvme are suspects, use these distinguishing patterns:
 
 ### 3.12.9 Evidence Chain Requirements for DMA Corruption
 When concluding DMA corruption, your `final_diagnosis.evidence` array MUST include:
-1. **IOMMU mode**: "IOMMU Passthrough confirmed via vmcore-dmesg.txt"
+1. **IOMMU mode**: "IOMMU Passthrough confirmed via vmcore-dmesg"
 2. **Corrupted page state**: "Page at PA 0x... has `mapping=<addr>` (pagecache), refcount=N"
 3. **Data signature match**: "Corrupted bytes at offset +12 = 0x0800 (IPv4 EtherType) → Ethernet frame"
 4. **Device ownership**: "Physical address falls within mlx5 CQ DMA range [base, base+size]"
@@ -703,6 +727,9 @@ When concluding DMA corruption, your `final_diagnosis.evidence` array MUST inclu
 | `rd -x <addr> <count>` | Read memory (hex) - Recommend count >= 32 |
 | `kmem -S <addr>` | Find slab for address |
 | `kmem -i` | Memory summary |
+| `kmem -p <phys_addr>` | Resolve physical address to page descriptor |
+
+**CRITICAL**: `kmem` MUST always be called with an option flag (-i, -S, -p, etc.). Never use `kmem` with empty arguments.
 
 ## 4.3 Process & Stack
 > For forbidden commands (`ps -m`, `bt -a`, etc.), see §1.2.
@@ -720,13 +747,14 @@ When concluding DMA corruption, your `final_diagnosis.evidence` array MUST inclu
 | `task -R <field>` | Read task_struct field |
 
 ## 4.4 Kernel Log
-> `log` and `log | grep` are **FORBIDDEN** (see §1.2). Use vmcore-dmesg.txt from "Initial Context" instead.
+> `log`, `log | grep`, and all **standalone** `log -t` / `log -m` / `log -a` are **FORBIDDEN** (see §1.2).
+> Always use vmcore-dmesg from "Initial Context" first. If a targeted search is truly needed, MUST pipe with grep.
 
 | Command | Use Case |
 |---------|----------|
-| `log -t` | Timestamps only |
-| `log -m` | Monotonic timestamps |
-| `log -a` | Audit logs only |
+| `log -m \| grep -i <pattern>` | Search log with monotonic timestamps (pipe with grep is MANDATORY) |
+| `log -t \| grep -i <pattern>` | Search log with human timestamps (pipe with grep is MANDATORY) |
+| `log -a \| grep -i <pattern>` | Search audit log entries (pipe with grep is MANDATORY) |
 
 ## 4.5 Execution Context & Scheduling
 > `search -p` / `search -k` are **FORBIDDEN** (see §1.2). Use §1.5 Address Search SOP instead.
@@ -842,12 +870,13 @@ def crash_init_data_prompt() -> str:
 **[Provided Data Inventory]**
 1. **`sys`**: System info (kernel version, panic string, CPU count).
 2. **`bt`**: Panic task backtrace.
-3. **`vmcore-dmesg.txt`**: Kernel log messages captured just before the crash.
+3. **`vmcore-dmesg`**: **IMPORTANT** - This is a text content block embedded in the Initial Context below, NOT a file in the crash utility environment. You CANNOT run shell commands like `grep -i pattern vmcore-dmesg` on it. Instead, analyze the text directly from the Initial Context provided.
 4. **Third-party Modules**: Paths to installed modules with debug symbols.
 
 **[Instructions for Initial Analysis]**
-- **Log Evaluation**: Pay special attention to `BUG:`,`Oops`,`panic`,`MCE` entries within the `vmcore-dmesg.txt`. These are critical kernel error logs.
-- **Integration**: You MUST integrate your reasoning over the kernel log messages alongside the `bt` (backtrace) evaluation. Do not analyze them in isolation.
+- **Evaluation**: Pay special attention to `BUG:`,`Oops`,`panic`,`MCE` entries within the `vmcore-dmesg` content block. These are critical kernel error.
+- **Integration**: You MUST integrate your reasoning over the critical kernel error alongside the `bt` (backtrace) evaluation. Do not analyze them in isolation.
+- **Log Searching**: If you need to search for specific patterns in the kernel log AFTER initial analysis, you MUST pipe the log command with grep, e.g. `log -m | grep -i <pattern>`. **NEVER use `log -m`, `log -t`, or `log -a` standalone** — they dump the entire log and cause token overflow. Do NOT attempt to use `grep` on vmcore-dmesg.
 
 <initial_data>
 {init_info}

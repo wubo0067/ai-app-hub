@@ -278,7 +278,7 @@ async def collect_crash_init_data(state: AgentState) -> dict:
                         start = max(0, i - 50)
                         end = min(len(dmesg_lines), i + 50)
                         return (
-                            f"$ vmcore-dmesg.txt (extracted around CPU:{t_cpu} PID:{t_pid} Comm:{t_comm})\n"
+                            f"$ vmcore-dmesg (extracted around CPU:{t_cpu} PID:{t_pid} Comm:{t_comm})\n"
                             + "".join(dmesg_lines[start:end])
                             + "\n\n"
                         )
@@ -297,17 +297,17 @@ async def collect_crash_init_data(state: AgentState) -> dict:
             if dmesg_output:
                 crash_output_parts.append(dmesg_output)
                 logger.info(
-                    f"Extracted vmcore-dmesg.txt content around CPU:{cpu} PID:{pid} Comm:{command}. dmesg_output: {dmesg_output}"
+                    f"Extracted vmcore-dmesg content around CPU:{cpu} PID:{pid} Comm:{command}. dmesg_output: {dmesg_output}"
                 )
             else:
                 logger.warning(
-                    f"No matching line found in vmcore-dmesg.txt for CPU:{cpu} PID:{pid} Comm:{command}."
+                    f"No matching line found in vmcore-dmesg for CPU:{cpu} PID:{pid} Comm:{command}."
                 )
         except Exception as exc:
             logger.error(f"Error during dmesg extraction: {exc}", exc_info=True)
     else:
         logger.warning(
-            "Skipping vmcore-dmesg.txt extraction: match info (PID/CPU/COMMAND) not found in 'bt' output."
+            "Skipping vmcore-dmesg extraction: match info (PID/CPU/COMMAND) not found in 'bt' output."
         )
 
     if state.get("debug_symbol_paths"):
