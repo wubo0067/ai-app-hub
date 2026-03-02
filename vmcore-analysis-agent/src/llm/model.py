@@ -82,7 +82,7 @@ def create_llm():
                 if "think" in str(model_name) or "reasoner" in str(model_name)
                 else 8000
             ),  # DeepSeek-Reasoner 模式需要更大的 max_tokens 来支持长对话历史和复杂推理
-            top_p=0.1,  # 配合低 Temperature，进一步收窄选择范围，只保留最可靠的词汇。
+            top_p=0.85,  #
             presence_penalty=0,  # 不需要模型通过增加多样性来“换个说法”，我们需要的是精确的原始符号。
             temperature=temperature,  # https://api-docs.deepseek.com/zh-cn/quick_start/parameter_settings            timeout=300,  # 5 分钟超时，后期步骤对话历史很长，LLM 推理耗时较久
             max_retries=3,  # 遇到连接超时等瞬态错误时自动重试

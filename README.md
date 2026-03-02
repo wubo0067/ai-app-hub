@@ -6,7 +6,7 @@
 
 ### Linux Kernel Crash 定位分析
 
-Linux kernel crash 分析是最具挑战性的技术难题之一。
+Linux 内核崩溃分析是系统工程领域皇冠上的明珠，也是最具挑战性的技术难题之一。
 
 **挑战与难点**：
 - **知识体系庞杂**：要求精通 C 语言、操作系统原理、常用数据结构与算法、内核子系统架构（内存管理、调度、文件系统等）。
@@ -14,7 +14,7 @@ Linux kernel crash 分析是最具挑战性的技术难题之一。
 - **推理能力门槛**：在海量堆栈和内存数据中抽丝剥茧，需要极其强大的逻辑推理和归纳分析能力。
 
 **项目核心优势**：
-本项目创新性地引入了 **ReAct (Reasoning + Acting)** 模式的 AI Agent 架构，结合 **MCP Tools**，实现了自动化的 vmcore 深度分析：
+本项目创新性地引入了 **ReAct (Reasoning + Acting)** 模式的 AI Agent 架构，结合 **MCP (Model Context Protocol)** 工具体系，实现了自动化的 vmcore 深度分析：
 - **专家经验数字化**：复刻 RHEL 资深工程师的分析思维，通过精心设计的专业 Prompts，让 LLM 习得顶级专家的推理路径。
 - **工具使用智能化**：AI 能够自主规划和执行 crash 调试命令，像人类专家一样动态探索内存现场，而非简单的静态匹配。
 - **分析过程透明化**：提供完整的思考链（Chain of Thought）和操作记录，不仅给出结论，更展示完整的分析逻辑。
@@ -276,47 +276,50 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 #### 4.1 检查服务健康状态
 
 ```bash
-python client/client.py --health
+uv run client/main.py --health
 ```
 
-#### 4.2 同步模式分析（使用默认参数）
+#### 4.2 标准流式分析（推荐）
 
 ```bash
-python client/client.py
+uv run client/main.py --url http://192.168.14.132:8000 --stream \
+                       --vmcore-path "/crash_case/Case_04387188/vmcore" \
+                       --vmlinux-path "/usr/lib/debug/lib/modules/4.18.0-305.40.2.el8_4.x86_64/vmlinux" \
+                       --vmcore-dmesg-path "/crash_case/Case_04387188/vmcore-dmesg.txt"
 ```
 
-#### 4.3 流式模式分析
+#### 4.3 同步模式分析（可选）
 
 ```bash
-python client/client.py --stream
+uv run client/main.py
 ```
 
 #### 4.4 自定义参数分析
 
 ```bash
-python client/client.py --vmcore-path "/path/to/vmcore" \
-                         --vmlinux-path "/path/to/vmlinux" \
-                         --vmcore-dmesg-path "/path/to/vmcore-dmesg.txt" \
-                         --debug-symbols "/path/to/module1.ko" "/path/to/module2.ko"
+uv run client/main.py --vmcore-path "/path/to/vmcore" \
+                      --vmlinux-path "/path/to/vmlinux" \
+                      --vmcore-dmesg-path "/path/to/vmcore-dmesg.txt" \
+                      --debug-symbols "/path/to/module1.ko" "/path/to/module2.ko"
 ```
 
 #### 4.5 指定服务地址
 
 ```bash
-python client/client.py --url http://192.168.1.100:8000 --stream
+uv run client/main.py --url http://192.168.1.100:8000 --stream
 ```
 
 #### 4.6 报告保存选项
 
 ```bash
 # 流式模式分析并保存报告到当前目录（默认行为）
-python client/client.py --stream
+uv run client/main.py --stream
 
 # 指定报告输出目录
-python client/client.py --stream --output-dir ./reports
+uv run client/main.py --stream --output-dir ./reports
 
 # 不保存文件，仅显示
-python client/client.py --stream --no-save
+uv run client/main.py --stream --no-save
 ```
 
 #### 4.7 客户端完整参数说明

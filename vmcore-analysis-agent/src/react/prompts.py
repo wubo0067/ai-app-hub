@@ -364,31 +364,53 @@ When `is_conclusive: true`, provide complete structured diagnosis:
 ## 3.1 NULL Pointer Dereference
 **Pattern**: "unable to handle kernel NULL pointer dereference at 0x0000..."
 **Analysis**:
-1. Check registers in `bt` output → Which register was 0?
-2. `dis -rl <RIP>` → See the faulting instruction
-3. If offset non-zero (e.g., 0x08), use `struct <type>` to find member at that offset
-4. Trace back: Where did the NULL pointer come from?
+1. **Check CR2 register** → Distinguish crash subtype:
+   - Strictly `0x0`: Direct NULL pointer dereference
+   - Small non-zero offset (e.g., `0x08`, `0x18`): Struct member access via NULL pointer
+2. Check registers in `bt` output → Which register was 0?
+3. `sym <RIP>` → Quickly locate symbol name; then `dis -rl <RIP>` → See the faulting instruction
+4. If offset non-zero (e.g., 0x08), use `struct <type> -o` to find member at that offset
+5. Trace back: Where did the NULL pointer come from?
+   - **Single-level**: Which function returned NULL without a NULL check?
+   - **Multi-level**: NULL pointer passed as a struct member — trace the assignment path layer by layer
+6. Use `task -R <field>` to check current process context and judge whether the crash is in a driver path or kernel core path
 
 ## 3.2 Soft Lockup / Hard Lockup
 **Pattern**: "soft lockup - CPU#X stuck for Xs" or "NMI watchdog: hard LOCKUP"
 **Analysis**:
-1. `dis -l <stuck_function> 100` → Look for loops (backward jumps)
+1. `dis -l <stuck_function> 100` → Look for loops (backward jumps); also watch for `pause` instruction, which is a spinloop signature
 2. Check for missing `cond_resched()` in loops
-3. For hard lockup: `bt -a` to check all CPUs for spinlock contention
+3. Check vmcore-dmesg for `irqsoff` traces → IRQ disabled for an extended period
+4. For hard lockup:
+   - `bt -a` to check all CPUs for spinlock contention
+   - Verify NMI itself is not masked (extremely rare, but can cause false hard lockup diagnosis)
+5. `runq` → Inspect per-CPU run queues for severe load imbalance or task pile-up
 
 ## 3.3 RCU Stall
 **Pattern**: "rcu_sched self-detected stall on CPU"
 **Analysis**:
-1. `bt` of stalled task → Find `rcu_read_lock()` without matching unlock
-2. Look for long loops holding RCU read lock
-3. `struct rcu_data` for RCU state details
+1. **Identify stall type**: `rcu_sched` / `rcu_bh` / `rcu_tasks` — each has a different handling path
+2. `bt` of stalled task → Find `rcu_read_lock()` without matching unlock
+3. Look for long loops holding RCU read lock
+4. `struct rcu_data` for RCU state details
+5. Check RCU stall annotation flags in dmesg: `is idle` / `is nesting` / `!!` — these help characterize the stall nature
+6. Check if CPU offline/online operations caused abnormal grace period delays
+7. If `CONFIG_RCU_NOCB_CPU` is enabled, also check for offloaded callback backlog accumulation
 
 ## 3.4 Use-After-Free / Memory Corruption
 **Pattern**: "paging request at <non-NULL address>" or KASAN report
 **Analysis**:
-1. `kmem -S <address>` → Check slab state
-2. Look for poison values: 0xdead..., 0x5a5a..., 0x6b6b...
-3. If KASAN: Check "Allocated by" and "Freed by" stacks in dmesg
+1. `kmem -S <address>` → Check slab state; if this fails, fallback to `kmem -p <phys_addr>` for page-level reverse lookup
+2. Look for poison values (meanings differ):
+   - `0x6b6b...`: Freed SLUB object (SLUB poison)
+   - `0x5a5a...`: Uninitialized memory
+   - `0xdead...`: SLUB free pointer poison (debug marker)
+3. **Distinguish corruption subtype**:
+   - **UAF**: Object reused after free, accessed via stale pointer
+   - **Heap OOB / Write Overflow**: Redzone overwritten — check with `kmem -s <slab>` for "Redzone" warnings
+   - **Double-free**: Poison value itself is corrupted; combine with `kmem -s` statistics to detect anomalies
+4. If KASAN: Check "Allocated by" and "Freed by" stacks in dmesg
+5. If KFENCE (lightweight detection): Look for `BUG: KFENCE: ...` prefix — report format differs from KASAN
 
 **Advanced Debugging**:
 - **Slab Analysis**: `kmem -s <slab>` for slab statistics; look for "Poison overwritten", "Object already free", "Redzone"
@@ -397,15 +419,26 @@ When `is_conclusive: true`, provide complete structured diagnosis:
   - `fb`: Heap right redzone
   - `fd`: Heap freed
   - `fe`: Slab freed
+  - `f1`: Stack left redzone
+  - `f2`: Stack mid redzone
+  - `f3`: Stack right redzone
+  - `f8`: Global redzone
 - **Bad Page State**: `kmem -p <page_addr>` or `struct page <addr>` → Check flags, _refcount, _mapcount, mapping
 
 ## 3.5 Deadlock / Hung Task
 **Pattern**: "task blocked for more than 120 seconds"
 **Analysis**:
-1. `foreach UN bt` → Check all uninterruptible (D-state) tasks directly
+1. **Classify hung type first**:
+   - **True deadlock**: Circular wait (A holds Lock1 and waits Lock2; B holds Lock2 and waits Lock1)
+   - **Lock starvation**: Priority inversion — low-priority task holds lock, high-priority task starves
+   - **I/O hung**: Waiting for storage device response — not a lock problem
+2. `foreach UN bt` → Check all uninterruptible (D-state) tasks directly
    - Alternative: `ps | grep UN` → Find D-state tasks (safer than `ps -m`)
-2. `bt <PID>` → See what lock they're waiting on
-3. Look for circular wait pattern (A holds Lock1, waits Lock2; B holds Lock2, waits Lock1)
+3. `bt <PID>` → See what lock they're waiting on
+4. **Mutex fast path**: `struct mutex <addr>` → check `owner` field to get the lock holder's PID, then `bt <holder_PID>` to trace the full wait chain
+5. **I/O hung path**: Check `struct request_queue` state; look for blktrace residuals; inspect storage layer timeout logs in dmesg
+6. If lockdep enabled: Prioritize parsing the "possible circular locking dependency detected" report in dmesg
+7. Look for circular wait pattern (A holds Lock1, waits Lock2; B holds Lock2, waits Lock1)
 
 **Advanced Lock Debugging**:
 - **Mutex**: `struct mutex <addr>` → Check owner, wait_list
@@ -416,31 +449,53 @@ When `is_conclusive: true`, provide complete structured diagnosis:
 **Pattern**: "BUG: scheduling while atomic"
 **Analysis**:
 1. `task -R preempt_count` → Should be > 0 (in atomic context)
+   - **`preempt_count` bit field breakdown**:
+     - `[7:0]`   Preempt nesting level (spinlock etc.)
+     - `[15:8]`  Softirq level
+     - `[19:16]` Hardirq level
+     - `[20]`    NMI flag
 2. `bt` → Find the sleeping function called in atomic context
-3. Common culprits: mutex_lock, kmalloc(GFP_KERNEL), msleep inside spinlock
+3. **Severity classification**:
+   - Sleeping in **hardirq context**: Most severe
+   - Sleeping while **holding spinlock**: Most common case
+4. Common culprits: `mutex_lock`, `kmalloc(GFP_KERNEL)`, `msleep` inside spinlock
+5. Other common trigger paths: crypto API (may call `might_sleep()` internally), `wait_event()`, `schedule_timeout()`
 
 ## 3.7 Hardware Errors (MCE/EDAC)
 **Pattern**: "Machine Check Exception", "Hardware Error", "EDAC", "PCIe Bus Error"
 **Analysis**:
 1. Check dmesg for "[Hardware Error]: CPU X: Machine Check Exception"
-2. **MCE Bank Identification**:
-   - Bank 0-3: CPU internal (cache, TLB)
-   - Bank 4: Memory controller
-   - Bank 5+: Vendor-specific
-3. **EDAC Messages**:
-   - "CE": Correctable Error (warning, may indicate degrading hardware)
-   - "UE": Uncorrectable Error (fatal)
-4. **PCIe/IOMMU Errors**: Look for "AER:", "PCIe Bus Error:", "DMAR:", "IOMMU fault"
-5. **Action**: Hardware errors often require replacement; focus on identifying faulty component
+2. **MCE Bank Identification** (Intel x86; AMD/ARM layouts differ — consult vendor docs):
+   - Bank 0: Instruction Cache / TLB
+   - Bank 1: Data Cache
+   - Bank 2: L2 / MLC Cache
+   - Bank 3: L3 / LLC Cache
+   - Bank 4: Memory Controller (primary suspect for memory errors)
+   - Bank 5+: Vendor-specific (PCIe, QPI/UPI interconnects, etc.)
+3. **MCE Error Code Parsing**: For `MCACOD` / `MSCOD` fields in dmesg, use `mcelog --ascii` or `rasdaemon` to decode — avoid manual table lookup errors
+4. **EDAC Messages**:
+   - "CE": Correctable Error (single-bit flip; correctable, but **frequent CE events indicate hardware degradation — replace proactively, do not wait for UE**)
+   - "UE": Uncorrectable Error (multi-bit flip; fatal, causes system crash immediately)
+5. **PCIe/IOMMU Errors**: Look for "AER:", "PCIe Bus Error:", "DMAR:", "IOMMU fault"
+   - **AER Correctable**: Link noise/jitter — monitor frequency
+   - **AER Uncorrectable Fatal**: Triggers device reset or system panic
+6. **Firmware / ACPI disguise check**: `log -m | grep -Ei "ACPI Error|firmware bug|BIOS bug"` → Exclude firmware bugs masquerading as hardware errors
+7. **Action**: Hardware errors often require replacement; focus on identifying faulty component
 
 ## 3.8 Stack Overflow / Stack Corruption
 **Pattern**: "kernel stack overflow", "corrupted stack end detected",
             or crash in seemingly random code with RSP near stack boundary
 **Analysis**:
-1. `bt` → Check if RSP is near STACK_END_MAGIC (0x57AC6E9D)
-2. `task -R stack` → Get stack base address
-3. `rd -x <stack_base> 4` → Check if STACK_END_MAGIC (0x57AC6E9D) is overwritten
-4. Deep call chains (especially recursive) or large local variables on stack
+1. **Classify overflow type** (each stack is independent on x86_64):
+   - **Process stack overflow**: RSP near process stack bottom, STACK_END_MAGIC overwritten
+   - **IRQ stack overflow**: RSP within IRQ stack range but exceeds boundary (IRQ stack is separate from process stack; each is 16 KB)
+   - **Exception stack overflow**: RSP within exception stack range (each 4 KB; extremely rare)
+2. `bt` → Check if RSP is near STACK_END_MAGIC (0x57AC6E9D)
+   - ⚠️ After STACK_END_MAGIC is overwritten, `bt` may produce an incorrect call stack — validate with `rd` by manually scanning stack contents
+3. `task -R stack` → Get stack base address
+4. `rd -x <stack_base> 4` → Check if STACK_END_MAGIC (0x57AC6E9D) is overwritten
+5. **Recursive calls** are the most common cause: look for repeated function names in `bt` output
+6. Manual stack scan: `rd -x <stack_base> <stack_size_in_qwords>` → search for recognizable return address patterns to help reconstruct the call chain
 
 ## 3.9 Divide-by-Zero / Invalid Opcode
 **Pattern**: "divide error: 0000", "invalid opcode: 0000"
@@ -450,12 +505,19 @@ When `is_conclusive: true`, provide complete structured diagnosis:
 3. For `ud2`: Usually compiler-generated from BUG()/WARN() macro — check source
 
 ## 3.10 OOM Killer
-**Pattern**: "Out of memory: Kill process", "oom-kill"
+**Pattern**: "Out of memory: Kill process", "oom-kill:constraint=..."
 **Analysis**:
-1. Check vmcore-dmesg for OOM dump (mem info, process scores)
-2. `kmem -i` → Overall memory state
-3. `ps -G <task>` → Check victim process memory usage
-4. Look for memory leak: `kmem -s` → Sort by num_slabs, find abnormal growth
+1. Check vmcore-dmesg for OOM dump; distinguish trigger type:
+   - Global OOM: system-wide memory exhaustion
+   - cgroup OOM: `oom-kill:constraint=CONSTRAINT_MEMCG` — triggered by cgroup memory limit
+2. Examine the OOM memory statistics snapshot auto-printed in dmesg:
+   - `MemFree` / `MemAvailable` → Confirm available memory at crash time
+   - `Slab` / `PageTables` → Rule out kernel memory leak
+3. `kmem -i` → Overall memory state at crash time
+4. `ps -G <task>` → Check victim process memory usage
+5. Look for memory leak: `kmem -s` → Sort by num_slabs, find abnormal growth
+6. Check the victim process's `oom_score_adj` to judge whether the OOM killer's choice was reasonable
+7. **cgroup scenario**: Check `memory.limit_in_bytes` configuration (may be set too low) and whether `memory.failcnt` has been continuously incrementing
 
 ## 3.11 KASAN / UBSAN Reports
 **Pattern**: "BUG: KASAN: slab-out-of-bounds", "BUG: KASAN: use-after-free",
@@ -474,10 +536,17 @@ Before suspecting DMA corruption, you MUST:
 2. Exclude race condition or double free:
    - Check refcount
    - Check list integrity
+   - Specifically rule out software-only ring/queue index bugs (producer/consumer index drift),
+     which can mimic stray DMA symptoms
 3. Confirm that the corrupted memory is DMA-reachable:
    - Was it allocated via dma_alloc_* ?
    - Was it part of page_pool or skb data?
    - Was it part of a driver ring buffer?
+4. Confirm reproducibility and workload correlation:
+   - Does corruption correlate with high I/O load (network/storage/GPU)?
+   - If corruption is independent of I/O pressure, prioritize software logic bugs
+5. Check whether DMA API debugging evidence exists:
+   - If `CONFIG_DMA_API_DEBUG` was enabled, prioritize dma_map/unmap violation messages in vmcore-dmesg
 
 If these are not confirmed, DO NOT enter DMA analysis.
 **Pattern**: Memory corruption where the corrupted data resembles network packets, NVMe
@@ -487,7 +556,7 @@ directly to any physical address without hardware address translation or isolati
 
 **Indicators** (suspect DMA corruption when ANY of the following is true):
 - Corrupted memory contains patterns matching Ethernet headers, NVMe CQE/SQE, or HW descriptors
-- `log | grep -Ei iommu` shows "Default domain type: Passthrough"
+- `log -m | grep -Ei "iommu|dmar|passthrough|translation"` indicates Passthrough or IOMMU faults
 - Multiple unrelated structures are corrupted in physically contiguous pages
 - Corruption recurs across reboots at different virtual addresses but similar physical ranges
 - The corrupted value does NOT match any kernel symbol (`sym <value>` returns nothing)
@@ -497,16 +566,29 @@ directly to any physical address without hardware address translation or isolati
 
 ```
 # Check IOMMU mode (ALWAYS check vmcore-dmesg FIRST)
-log | grep -Ei "iommu|dmar|passthrough|translation"
+log -m | grep -Ei "iommu|dmar|passthrough|translation|smmu|arm-smmu"
+
+# Confirm effective Lazy/Strict mode from kernel command line
+log -m | grep -i "Command line" | grep -iE "iommu|strict"
 ```
 
 | IOMMU Mode | Risk Level | Meaning |
 |------------|------------|---------|
 | Passthrough | **HIGH** | Devices DMA directly to physical memory, NO HW isolation |
-| Lazy / Strict | Medium | IOMMU active but stale mappings possible (lazy) |
+| Lazy | Medium-High | IOMMU active, but unmap invalidation can be deferred; stale IOVA window may allow stray DMA |
+| Strict | Low-Medium | IOMMU active with immediate invalidation on unmap; smaller stale-mapping window |
 | Disabled | **CRITICAL** | No IOMMU at all, any device can write anywhere |
 
+⚠️ **Critical Verification (Primary Rule)**: Do not rely on kernel version alone to infer IOMMU state. Architecture defaults vary (e.g., ARM SMMU vs. Intel DMAR), and distro/backport behavior can differ. Always verify the effective mode from vmcore logs (for example, `log -m | grep -Ei "iommu|dmar|smmu|passthrough|strict|lazy"`).
+
+**Version context (background only)**: Linux 5.x+ generally moved the default IOMMU DMA mode from **Lazy** to **Strict**. Treat this as a hint, not evidence. If vmcore-dmesg or kernel command line shows `iommu=lazy` / `iommu.strict=0`, the stale-mapping risk window is active regardless of kernel version.
+
+**Architecture note (ARM64 SMMU)**:
+- On ARM64, analyze SMMU logs (`arm-smmu`, context faults, stream IDs) in addition to DMAR-like x86 indicators
+- Naming differs, but the same principle applies: device-visible IOVA must be translated and invalidated correctly
+
 **Passthrough mode implications**:
+- **Note on Causality**: Passthrough mode means "no seatbelt." It doesn't cause the crash, but it allows a buggy device/firmware to overwrite any physical page without an IOMMU fault being triggered.
 - Any buggy device/driver can DMA to arbitrary physical addresses
 - No hardware-level protection against stray DMA writes
 - The kernel's software DMA API still tracks mappings, but hardware does NOT enforce them
@@ -528,16 +610,23 @@ dev -p | grep -i "mlx5|nvme"
 ```
 # Once you have the device struct address:
 struct device.dma_ops <device_addr>
+struct device.coherent_dma_mask <device_addr>
+struct device.dma_mask <device_addr>
 
 # Check if device uses swiotlb (bounce buffering):
-log | grep -i "swiotlb|bounce"
+log -m | grep -i "swiotlb|bounce"
 ```
 
 | `dma_ops` value | Meaning |
 |-----------------|---------|
 | `NULL` or `nommu_dma_ops` | Direct physical mapping, NO software translation |
 | `intel_dma_ops` / `amd_iommu_dma_ops` | IOMMU-backed DMA (safer) |
-| `swiotlb_dma_ops` | Software bounce buffer (safe but slow) |
+| `swiotlb_dma_ops` | Software bounce buffer (safer but not immunity; corruption may still occur during bounce copy/sync paths) |
+
+**Additional checks**:
+- **DMA mask sanity**: If effective DMA mask is 32-bit on hosts with >4 GB RAM, validate addressing paths carefully (risk of truncation/wrap bugs)
+- **SR-IOV**: Verify PF vs VF behavior separately; VF DMA isolation and ops may differ, and VF + Passthrough is higher risk
+  - **VFIO passthrough to VM**: When a VF is assigned directly to a guest via VFIO, the guest driver's DMA operations are completely opaque to the host kernel. The host cannot track guest-side map/unmap lifecycle. Treat this scenario as **HIGH** risk — equivalent to Passthrough — regardless of host-side `dma_ops`.
 
 ### 3.12.3 Step 3: Check Corrupted Page's DMA Mapping State
 **Goal**: Determine if the corrupted memory page was (or should have been) a DMA target.
@@ -557,7 +646,13 @@ struct page <page_struct_addr>
 | Field | DMA-related value | Meaning |
 |-------|-------------------|---------|
 | `flags` | Bit 10 (`PG_reserved`) | Page reserved for I/O or DMA |
-| `_mapcount` | `-1` (PAGE_BUDDY_MAPCOUNT_VALUE) | Page in buddy system, should NOT be DMA target |
+| `flags` | `PG_slab` | Page belongs to slab allocator |
+| `flags` | `PG_lru` | Page participates in LRU (often page cache) |
+| `flags` | `PG_compound` | Hugepage/compound page component |
+| `flags` | `PG_active` | Page on active LRU list — indicates recently accessed user-space cache (auxiliary: not DMA-specific, but helps confirm page was live user/file data at time of corruption) |
+| `flags` | `PG_referenced` | Page was recently referenced — similar auxiliary signal; if set alongside hardware-like payload, strengthens stray DMA conclusion |
+| `_mapcount` | `-1` | Anonymous page with no active user-space mapping (not in buddy system) |
+| `_mapcount` | `-128` (`PAGE_BUDDY_MAPCOUNT_VALUE`) | Page held by buddy allocator, free and should NOT be a DMA target |
 | `_refcount` | `> 0` | Page is actively referenced |
 | `mapping` | Non-NULL | Page belongs to a file/anon mapping (should NOT receive DMA) |
 
@@ -565,6 +660,12 @@ struct page <page_struct_addr>
 - Page has `mapping != NULL` (belongs to file cache or user process) but contains hardware data
 - Page `_refcount > 1` but content is garbage → something wrote to an in-use page
 - Page is in a slab cache (`kmem -S <addr>` returns slab info) but contains non-slab data
+- Corruption lands on non-CMA page while pattern indicates device DMA payload
+
+**Zone/CMA heuristics**:
+- Use `kmem -p <PA>` output `node`/`zone` to judge DMA32/CMA locality
+- If page is clearly outside expected DMA/CMA regions yet carries device-like payload, stray DMA probability increases
+- ⚠️ **`_mapcount` value caveat**: `PAGE_BUDDY_MAPCOUNT_VALUE` is `-128` on most kernels, but `-1` conventionally means "anonymous page with no user mapping". These are distinct states. Confirm the actual macro value for the target kernel version before drawing conclusions from this field.
 
 ### 3.12.4 Step 4: Driver DMA Buffer Forensics
 **Goal**: Trace DMA buffer allocations of suspect drivers (mlx5_core, nvme, etc.).
@@ -578,13 +679,23 @@ run_script [
   "struct mlx5_priv -o"
 ]
 
-# Check mlx5 Work Queue (WQ) and Completion Queue (CQ) buffer addresses
+# Check mlx5 Event Queue (EQ), Completion Queue (CQ), and Receive Queue (RQ) buffer addresses
 # These are DMA coherent buffers that the NIC reads/writes directly
 run_script [
   "mod -s mlx5_core <path>",
-  "struct mlx5_cq.buf <cq_addr>"
+  "struct mlx5_eq.buf <eq_addr>",
+  "struct mlx5_cq.buf <cq_addr>",
+  "struct mlx5_rq.wqe.frag_buf <rq_addr>"
 ]
+
+# Key field to verify in mlx5 buffers:
+# buf.direct.map (DMA physical/I/O address backing EQ/CQ/WQ/RQ)
 ```
+
+⚠️ **mlx5 CQ vs RQ distinction (critical for packet corruption cases)**:
+- **CQ** (`mlx5_cq.buf`): DMA target for **completion metadata** only (small entries, 64 bytes each)
+- **RQ** (`mlx5_rq.wqe.frag_buf`): DMA target for **actual packet payload** data
+- If corruption content resembles raw packet bytes (not just CQE opcodes), the RQ buffer range is the primary suspect, not CQ
 
 #### For NVMe:
 ```
@@ -596,12 +707,31 @@ run_script [
 
 # Key fields: sq_dma_addr, cq_dma_addr (physical addrs of submission/completion queues)
 # These are where the NVMe controller writes completions via DMA
+# Coverage range formula:
+# [dma_addr, dma_addr + queue_depth * entry_size]
+
+# Also inspect Admin Queue (admin_sq/admin_cq):
+# Admin Queue is a high-value reference target because:
+#   - Fixed depth: SQ depth = 32, CQ depth = 32 (per NVMe spec)
+#   - Allocated once at driver init time → address is stable across queue lifecycle
+#   - If Admin CQ DMA range overlaps corrupted PA, it is strong evidence (fixed, verifiable)
+```
+
+#### Additional common DMA-capable devices:
+```
+# virtio (VM scenarios)
+run_script ["struct virtqueue <vq_addr>"]
+# Check descriptor/available/used ring DMA addresses
+
+# RDMA/RoCE
+# Validate whether large MR (Memory Region) registrations made broad memory DMA-reachable
+log -m | grep -Ei "ib|rdma|mr|memory region"
 ```
 
 #### Generic DMA pool check:
 ```
 # Check if any DMA pool exists for the driver
-log | grep -i "dma_pool|dma_alloc|dma_map"
+log -m | grep -i "dma_pool|dma_alloc|dma_map|dma_unmap|dma-api"
 ```
 
 ### 3.12.5 Step 5: Hex Dump Signature Matching (Identify the "Culprit")
@@ -618,13 +748,23 @@ rd -a <corrupted_addr> 64
 |--------|---------|---------|
 | +0 | `ff:ff:ff:ff:ff:ff` | Broadcast MAC destination |
 | +0 | `01:00:5e:xx:xx:xx` | Multicast MAC destination |
+| +12 | `0x8100` | VLAN tag present; actual EtherType shifts by +4 bytes |
 | +12 | `0x0800` | EtherType: IPv4 |
 | +12 | `0x0806` | EtherType: ARP |
 | +12 | `0x86dd` | EtherType: IPv6 |
 | +14 | `0x45` | IPv4 header (version=4, IHL=5) |
 | +23 | `0x06` / `0x11` | Protocol: TCP / UDP |
+| Any | `0x8000` opcode range hints | RDMA/RoCE BTH-like control patterns |
 | Any | `0x0015000a04060001` | mlx5 CQE (Completion Queue Entry) opcode pattern |
 | Any | Repeating 64-byte aligned blocks | CQE/WQE ring buffer content |
+
+**mlx5 CQE opcode hints (example)**:
+| CQE opcode | Meaning |
+|------------|---------|
+| `0x00` | Requester error |
+| `0x01` | Receive completion |
+| `0x02` | No inline data |
+| `0x0F` | Responder send |
 
 **Detection rule**: If corrupted memory shows valid Ethernet frames or CQE patterns,
 the network adapter (mlx5) is the likely culprit — it DMA'd received packets or
@@ -638,10 +778,11 @@ completion entries to a wrong physical address.
 | Any | 16-byte aligned structures | NVMe Completion Queue Entry (CQE) |
 | +0 of CQE | Command-specific DW0 | CQE result field |
 | +8 of CQE | SQ Head Pointer + SQ ID | CQE routing info |
-| +12 of CQE | Status Field + Command ID | CQE status |
+| +12 of CQE | Status Field + Command ID | CQE status (0x0000 often success) |
 | Any | File system magic numbers | Filesystem metadata DMA'd to wrong location |
 |  | `0xEF53` | ext4 superblock magic |
 |  | `0x58465342` (`XFSB`) | XFS superblock magic |
+|  | `0x5F42487246534D5F` (`_BHrFSM_`) | btrfs magic marker |
 
 **Detection rule**: If corrupted memory contains filesystem metadata or NVMe CQE
 patterns, the NVMe controller wrote data to a stale/wrong DMA mapping.
@@ -653,10 +794,19 @@ patterns, the NVMe controller wrote data to a stale/wrong DMA mapping.
 | SAS address format (8-byte WWN) | SAS controller descriptor |
 | Repeating 128/256-byte blocks | HBA I/O completion ring |
 
+#### GPU DMA Signatures (if GPU present):
+| Pattern | Meaning |
+|---------|---------|
+| `0xDEADBEEF` (padding style in command buffers) | Possible GPU command/ring artifact (context-dependent) |
+| Corruption in DMA-BUF shared pages | GPU/device shared-memory overwrite candidate |
+
 ### 3.12.6 Analysis Flowchart for DMA Corruption
 
 ```
 Suspect DMA Corruption?
+│
+├─ 0. Check DMA API DEBUG evidence
+│     └─ `CONFIG_DMA_API_DEBUG` violations present? → Prioritize as direct mapping-lifecycle evidence
 │
 ├─ 1. Check IOMMU mode (§3.12.1)
 │     └─ Passthrough? → HIGH RISK, continue
@@ -666,8 +816,12 @@ Suspect DMA Corruption?
 │
 ├─ 3. Examine corrupted page (§3.12.3)
 │     └─ Was this page supposed to be a DMA target?
-│        ├─ YES (page in driver's DMA buffer) → Driver bug (wrong offset/size)
-│        └─ NO (page in slab/pagecache) → Stray DMA (wrong physical address)
+│        ├─ YES, and PA falls within known DMA buffer range
+│        │    → Driver bug (offset/size calculation error; device wrote to wrong location within its own mapping)
+│        ├─ YES, but DMA mapping was already unmapped (dma_unmap_* completed)
+│        │    → DMA-after-free (device continued writing after buffer was released; fence/sync ordering bug)
+│        └─ NO (page is slab/pagecache — never a DMA target)
+│             → Stray DMA (device computed a wrong physical address entirely)
 │
 ├─ 4. Hex dump analysis (§3.12.5)
 │     ├─ Ethernet headers/CQE patterns? → Network adapter (mlx5)
@@ -678,6 +832,10 @@ Suspect DMA Corruption?
       "Device X in Passthrough mode DMA'd [packet/completion] data to
        physical address Y, which overlaps with kernel [slab/pagecache]
        page Z, corrupting [structure/pointer] at offset W."
+
+Negative exit:
+- If DMA signatures, mapping overlap, and workload correlation are all weak/inconsistent,
+  DE-PRIORITIZE DMA corruption and return to software-bug analysis (UAF/race/OOB/index bug).
 ```
 
 ### 3.12.7 Device-to-Physical-Page Mapping (Deep Dive)
@@ -686,14 +844,22 @@ Suspect DMA Corruption?
 **Additional IOMMU checks** (supplement §3.12.1):
 ```
 # IOMMU groups and device assignments
-log | grep -i "Adding to iommu group"
+log -m | grep -i "Adding to iommu group"
 
 # swiotlb (bounce buffering) — may mask real DMA target
-log | grep -i "swiotlb|bounce"
+log -m | grep -i "swiotlb|bounce"
 
 # CMA (Contiguous Memory Allocator) region
-log | grep -i "cma|reserved memory"
+log -m | grep -i "cma|reserved memory"
 ```
+
+**IOVA vs PA note**:
+- In non-Passthrough mode, devices usually issue DMA to IOVA, not raw PA
+- Therefore, if only IOVA-side evidence exists, correlate through IOMMU mapping context before asserting PA overlap
+
+**DMA-after-free nuance**:
+- Differentiate "stray DMA to unrelated page" from "DMA-after-free" (buffer returned/reused before device truly stopped)
+- Fence/sync ordering bugs (missing or late sync/unmap) can produce writes into pages already recycled by kernel allocators
 
 **Method**:
 ```
@@ -721,6 +887,20 @@ physical address but the kernel reused that page prematurely (use-after-free of 
 buffer). If the PA is OUTSIDE all known DMA ranges, the device computed a wrong
 DMA address (firmware/hardware bug).
 
+**Third smoking-gun case**:
+- Address overlap is not exact, but corruption timing aligns with device interrupt bursts
+  and payload signatures match one device class consistently. Treat as medium-confidence
+  DMA attribution and continue narrowing using the following methods:
+  1. **Cross-crash PA distribution**: If multiple vmcores are available, collect the corrupted
+     PA from each. If different VAs map to different PAs yet all cluster within a contiguous
+     physical range, that range is likely owned by one DMA source.
+  2. **Physical range ownership**: Check system boot logs or `/proc/iomem` snapshots (if
+     preserved in dmesg or oops output) to identify which driver or firmware region owns
+     that physical segment.
+  3. **Per-queue/ring drill-down**: Use `vtop` on each corrupted VA → compare resulting PAs
+     against known DMA buffer ranges of each suspect queue (EQ/CQ/RQ for mlx5, SQ/CQ/Admin
+     for NVMe) to find the closest range match.
+
 ### 3.12.8 Multi-Device Disambiguation
 When BOTH mlx5 and nvme are suspects, use these distinguishing patterns:
 
@@ -732,6 +912,12 @@ When BOTH mlx5 and nvme are suspects, use these distinguishing patterns:
 | Repeat pattern | Every 64 bytes (CQ stride) | Every 16 bytes (CQE stride) |
 | Physical addr range | Near `mlx5_cq.buf` DMA addr | Near `nvme_queue.cq_dma_addr` |
 | ASCII content | MAC addresses, IP headers | Filesystem data, file content |
+| Time correlation | Grows with NIC IRQ / packet rate | Grows with block I/O depth and disk load |
+| Load trigger | Reproduces under high network throughput | Reproduces under large file read/write |
+
+**Mixed-corruption caveat**:
+- Rarely, two devices may corrupt different chunks simultaneously.
+- In that case, segment corrupted memory by region/pattern and attribute per segment.
 
 ### 3.12.9 Evidence Chain Requirements for DMA Corruption
 When concluding DMA corruption, your `final_diagnosis.evidence` array MUST include:
@@ -744,9 +930,53 @@ When concluding DMA corruption, your `final_diagnosis.evidence` array MUST inclu
    overwriting kernel slab object at VA 0x..."
 6. **DMA Reachability Proof**:
    - Show that the corrupted physical address was either:
-     a) inside a known DMA buffer range, OR
-     b) mapped via dma_map_* at runtime
-   - If not proven, downgrade confidence.
+     a) inside a known DMA buffer range (coherent allocation — permanently mapped), OR
+     b) mapped via `dma_map_*` at runtime (streaming mapping — valid only between map and unmap)
+   - ⚠️ **Stray DMA vs DMA-after-free distinction**: For case (b), verify whether `dma_unmap_*`
+     had already been called before the corruption occurred:
+     - **Unmap NOT yet called** → device still held a valid IOVA → **Stray DMA** (device wrote
+       to wrong address while mapping was still live)
+     - **Unmap already completed** → device should have stopped accessing the buffer, but wrote
+       anyway → **DMA-after-free** (fence/sync ordering bug or device firmware defect). Use this
+       term in the conclusion, not "stray DMA", as the root cause differs.
+   - If reachability is not proven for either case, downgrade confidence.
+7. **Driver/Firmware version evidence**:
+    - Include driver version and firmware version, and compare against known bug advisories when available
+
+**Confidence grading for DMA conclusion**:
+- **High**: Evidence items 1-7 satisfied, including concrete address overlap/mapping proof
+- **Medium**: IOMMU + payload signature + page state are solid, but exact overlap proof is partial
+- **Low**: Only payload-pattern similarity exists, with weak mapping/address evidence
+
+**Recommended validation experiment**:
+- Propose one controlled config/workload A/B check in `additional_notes`
+   (example: switch to `iommu=strict`; if issue disappears under same load, DMA hypothesis is strengthened)
+
+### 3.12.10 DMA Corruption vs Similar Failures (Differential Table)
+
+| Feature | DMA Corruption | Use-After-Free (UAF) | HW Bit Flip / ECC Fault |
+|---------|----------------|----------------------|--------------------------|
+| Data content | Structured device-like payload (packet/CQE/descriptor) | Poison/allocator patterns common | Random bit errors, weak structure |
+| KASAN report | Often absent | Common | Usually absent |
+| MCE/EDAC logs | Usually absent | Absent | Often present (CE/UE) |
+| Reproduction trigger | Correlates with I/O pressure | Correlates with specific code path/lifetime bug | Often random/intermittent |
+| IOMMU Passthrough impact | Strong risk amplifier | Usually unrelated | Unrelated |
+| Multi-location corruption | Common in ring/buffer overwrite patterns | Less common and object-local | Random distribution |
+
+## 3.13 Bad IRQ / IRQ Storm
+**Pattern**: "nobody cared (try booting with the 'irqpoll' option)",
+            "irq X: nobody cared", or system extremely slow with a single IRQ counter exploding
+**Analysis**:
+1. Check vmcore-dmesg for `nobody cared` → Identify the problematic IRQ number and its associated device
+2. `log -m | grep -Ei "nobody cared|spurious irq"` → Confirm IRQ problem and gather surrounding context
+3. `bt` → Inspect the IRQ handler call stack; verify whether the driver correctly clears the hardware interrupt status bit
+4. **Common root causes**:
+   - Driver fails to clear hardware interrupt status → interrupt re-fires immediately (**IRQ Storm**)
+   - After hot-unplug of a device on a shared IRQ line, the driver did not unregister its handler (**nobody cared**)
+5. **Resolution direction**:
+   - `disable_irq()` to isolate the problematic IRQ
+   - Check the corresponding driver's `irq_handler` return value — must return `IRQ_HANDLED` (not `IRQ_NONE`) when the interrupt is handled
+   - If shared IRQ line: use `irq -s` to enumerate all registered handlers on that line and identify the non-clearing one
 
 ================================================================================
 # PART 4: COMMAND REFERENCE
@@ -898,7 +1128,7 @@ When `dis -s` is unavailable (no debuginfo), reconstruct from stack:
    - **Logic**: Garbage values often mirror hardware registers, DMA descriptors, or physical addresses managed by specific devices.
 
 ## 5.7 DMA Corruption Forensics
-Fully consolidated into §3.12.7–§3.12.9. Refer to §3.12 for the complete DMA analysis workflow.
+Fully consolidated into §3.12.7–§3.12.10. Refer to §3.12 for the complete DMA analysis workflow.
 """
 
 
