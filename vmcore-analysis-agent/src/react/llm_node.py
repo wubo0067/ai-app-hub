@@ -448,10 +448,10 @@ async def structure_reasoning_content(state: AgentState, chat_llm) -> dict:
         reasoning=reasoning,
     )
 
-    # 包含对话历史以提供上下文
+    # 只需传入 system_prompt（已包含完整 reasoning 内容和目标 schema）
+    # 无需携带历史对话，避免浪费 token
     messages_to_send = [
         SystemMessage(content=system_prompt),
-        *state["messages"],
     ]
 
     chat_with_structured = chat_llm.with_structured_output(

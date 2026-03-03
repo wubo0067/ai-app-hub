@@ -202,6 +202,58 @@ Translate physical addresses to virtual addresses and traverse known structures:
    - **✅ Valid kernel virtual addresses** on x86_64 are typically 16 chars starting with `0xffff...` (direct map) or `0xffffffff...` (kernel text).
    - **If the address you have is NULL or invalid**, do NOT run the command. Instead, report in your reasoning that the pointer is NULL/invalid, as this is itself a diagnostic finding (e.g., "the pointer was NULL, indicating the object was not initialized or already freed").
 
+## 1.7 Per-CPU Variable Access Rule (MANDATORY)
+
+On x86_64 Linux, `%gs` points to the **per-CPU area base** of the currently executing CPU.
+An instruction like `mov %gs:0xXXXX(%rip), %reg  # 0xOFFSET` reads a **per-CPU variable** —
+it is **NOT** an absolute virtual address.
+
+### ⚠️ Critical: Identify the Correct Per-CPU Offset from Disassembly
+
+The assembler encodes a **RIP-relative displacement** (`0xXXXX`) that, when added to `%rip`,
+computes the GS-base address at runtime. The **assembler comment** (`# 0xOFFSET`) shows the
+**actual per-CPU offset** resolved at link time — this is the value you must use.
+
+```
+mov %gs:0x79aa8211(%rip), %ebp   # 0x14168
+                 ^^^^^^^^^^           ^^^^^^^
+          RIP-relative displacement   ✅ TRUE per-CPU offset  ← USE THIS
+          (runtime artifact, ignore)
+```
+
+**❌ NEVER** use the RIP-relative displacement (`0x79aa8211`) as the offset.
+**❌ NEVER** call `rd 0x14168` directly — it is an offset, not a kernel virtual address.
+
+**✅ MANDATORY resolution procedure** when disassembly contains `%gs:...(% rip)  # 0xOFFSET`:
+
+```
+1. Extract OFFSET from the assembler comment (the value after '#')
+   ⚠️  If the comment is MISSING, compute it manually:
+       OFFSET = (address of next instruction) + disp32
+       where disp32 is the signed 32-bit displacement in %gs:disp32(%rip)
+       Example: instruction at 0xffffffff8656bf50, length 7 bytes → RIP_next = 0xffffffff8656bf57
+                disp32 = 0x79aa8211 (interpreted as signed: -0x7655 7def)
+                OFFSET = (0xffffffff8656bf57 + 0xffffffff79aa8211) & 0xffffffffffffffff = 0x14168  ✅
+2. Read the per-CPU base for the specific CPU directly via the global array:
+   Try: p/x __per_cpu_offset[<panic_cpu>]
+   (If that fails, dump the array: rd __per_cpu_offset <nr_cpus> and manually pick index [panic_cpu])
+3. real_addr = __per_cpu_offset[panic_cpu] + OFFSET   # compute absolute VA
+4. rd <real_addr>                               # read the actual per-CPU variable value
+```
+
+**Example** — panic on CPU 7, disassembly shows:
+```
+mov %gs:0x79aa8211(%rip), %ebp   # 0x14168
+```
+`OFFSET = 0x14168`  (from the comment, NOT `0x79aa8211`)
+
+```
+run_script:
+  p/x __per_cpu_offset[7]         # preferred way to get CPU7 base, assume returns ffff8cd9befc0000
+  rd ffff8cd9befd4168             # ffff8cd9befc0000 + 0x14168 = ffff8cd9befd4168
+```
+
+
 ================================================================================
 # PART 2: DIAGNOSTIC WORKFLOW
 ================================================================================

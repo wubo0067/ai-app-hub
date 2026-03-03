@@ -51,7 +51,7 @@ class ChatDeepSeekReasoner(ChatDeepSeek):
 
 def create_llm():
     """Create and return ChatOpenAI instance"""
-    api_key = config_manager.get("DEEPSEEK_API_KEY")
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
     base_url = config_manager.get("BASE_URL")
     model_name = config_manager.get("LLM_MODEL")
     temperature = float(config_manager.get("TEMPERATURE"))
@@ -63,7 +63,6 @@ def create_llm():
     # 配置 LangSmith 追踪
     if config_manager.get("LANGSMITH_TRACING"):
         os.environ["LANGSMITH_TRACING"] = "true"
-        os.environ["LANGSMITH_API_KEY"] = str(config_manager.get("LANGSMITH_API_KEY"))
 
     # top_p 值	采样集合大小	随机性	确定性	适合场景
     # top_p=0.1	很小	很低	很高	代码生成、事实回答
@@ -82,7 +81,7 @@ def create_llm():
                 if "think" in str(model_name) or "reasoner" in str(model_name)
                 else 8000
             ),  # DeepSeek-Reasoner 模式需要更大的 max_tokens 来支持长对话历史和复杂推理
-            top_p=0.85,  #
+            top_p=0.1,  #
             presence_penalty=0,  # 不需要模型通过增加多样性来“换个说法”，我们需要的是精确的原始符号。
             temperature=temperature,  # https://api-docs.deepseek.com/zh-cn/quick_start/parameter_settings            timeout=300,  # 5 分钟超时，后期步骤对话历史很长，LLM 推理耗时较久
             max_retries=3,  # 遇到连接超时等瞬态错误时自动重试
@@ -101,12 +100,12 @@ def create_chat_llm():
     当 Reasoner 模型返回空 content 但有 reasoning_content 时，
     使用此 Chat 模型将推理内容转换为 VMCoreAnalysisStep 结构化输出。
     """
-    api_key = config_manager.get("DEEPSEEK_API_KEY")
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
     base_url = config_manager.get("BASE_URL")
 
     if not api_key or not base_url:
-        logger.error("Missing DEEPSEEK_API_KEY or BASE_URL for chat LLM")
-        raise ValueError("Missing DEEPSEEK_API_KEY or BASE_URL for chat LLM")
+        logger.error("Missing DEEPSEEK_API_KEY env var or BASE_URL for chat LLM")
+        raise ValueError("Missing DEEPSEEK_API_KEY env var or BASE_URL for chat LLM")
 
     try:
         llm = ChatDeepSeek(
