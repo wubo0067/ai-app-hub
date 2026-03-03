@@ -904,7 +904,7 @@ def main():
     parser.add_argument(
         "--api-key",
         type=str,
-        default="sk-b5480f840a794c69a0af1732459f3ae4",
+        default=os.environ.get("DEEPSEEK_API_KEY"),
         help="DeepSeek API 密钥。如果未提供，将尝试从环境变量 DEEPSEEK_API_KEY 读取",
     )
 

@@ -79,7 +79,7 @@ def test_single_file():
 
         # 初始化LLM
         llm = ChatOpenAI(
-            api_key="sk-b5480f840a794c69a0af1732459f3ae4",
+            api_key=os.environ.get("DEEPSEEK_API_KEY"),
             base_url="https://api.deepseek.com",
             model="deepseek-chat",
             temperature=0,

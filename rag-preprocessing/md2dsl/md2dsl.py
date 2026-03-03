@@ -194,7 +194,7 @@ def main():
     os.makedirs("dsl", exist_ok=True)
 
     llm = ChatOpenAI(
-        api_key="sk-b5480f840a794c69a0af1732459f3ae4",  # type: ignore
+        api_key=os.environ.get("DEEPSEEK_API_KEY"),  # type: ignore
         base_url="https://api.deepseek.com",
         model="deepseek-chat",
         temperature=0,  # 数据抽取/分析	1.0
