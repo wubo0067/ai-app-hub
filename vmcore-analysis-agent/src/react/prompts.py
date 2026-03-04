@@ -1028,76 +1028,24 @@ Negative exit:
 ### 3.12.7 Step 7: Device-to-Physical-Page Mapping (Deep Dive)
 **Goal**: Prove that a specific device's DMA ring buffer overlaps with the corrupted page.
 
-**Additional IOMMU checks** (supplement §3.12.1):
-```
-# IOMMU groups and device assignments
-log -m | grep -i "Adding to iommu group"
-
-# swiotlb (bounce buffering) — may mask real DMA target
-log -m | grep -i "swiotlb|bounce"
-
-# CMA (Contiguous Memory Allocator) region
-log -m | grep -i "cma|reserved memory"
-```
-
-**IOVA vs PA note**:
-- In non-Passthrough mode, devices usually issue DMA to IOVA, not raw PA
-- IOMMU translates IOVA → PA. If IOMMU is active, the device sees IOVA, but corruption occurs at PA.
-- Therefore, if only IOVA-side evidence exists, correlate through IOMMU mapping context before asserting PA overlap.
-- ⚠️ **Swiotlb Caveat**: If swiotlb is active, device DMA PA ≠ Kernel Page PA (`vtop` result). Device writes to swiotlb buffer → CPU copies to target. Direct PA comparison will fail.
-
-**DMA-after-free nuance**:
-- Differentiate "stray DMA to unrelated page" from "DMA-after-free" (buffer returned/reused before device truly stopped)
-- Fence/sync ordering bugs (missing or late sync/unmap) can produce writes into pages already recycled by kernel allocators
+**Additional Context Checks** (supplement §3.12.1):
+- **IOMMU/CMA/Swiotlb**: Search dmesg for `Adding to iommu group`, `swiotlb|bounce`, `cma|reserved memory`.
+- **IOVA vs PA**: Devices see IOVA. IOMMU translates IOVA → PA. If `swiotlb` is active, device DMA PA ≠ Kernel Page PA (`vtop`). Direct PA overlap checks will fail under swiotlb.
+- **DMA-after-free vs Stray DMA**: 'Stray DMA' writes to an unrelated page. 'DMA-after-free' writes to a correct buffer that was already recycled by the kernel due to a missing/late unmap sync.
 
 **Method**:
-```
-# Step 1: Get physical address of corrupted memory
-vtop <corrupted_VA>
-
-# Step 2: For mlx5 - check EQ/CQ/WQ buffer physical addresses (requires module symbols)
-# ⚠️ Fallback: If symbols missing, search dmesg for init logs printing DMA bases, or use pci -s to find resource bars
-run_script [
-  "mod -s mlx5_core <path>",
-  "struct mlx5_eq.buf <eq_addr>",
-  "struct mlx5_frag_buf <buf_addr>"
-]
-
-# Step 3: For NVMe - check queue DMA addresses
-run_script [
-  "mod -s nvme <path>",
-  "struct nvme_queue <queue_addr>"
-]
-# Look for sq_dma_addr/cq_dma_addr near the corrupted physical address
-```
+1. Get corrupted PA via `vtop <corrupted_VA>`.
+2. Compare this PA against the device DMA buffer addresses previously gathered in **§3.12.4** (e.g., `mlx5_eq.buf`, `nvme_queue.sq_dma_addr`). There is NO need to repeat the `struct` dump commands here.
 
 **Smoking gun** (three cases):
-
-- **Direct DMA (IOMMU Passthrough/Disabled)**: If `vtop` of corrupted VA yields PA `0xP`, and `0xP` falls within
-  `[device_dma_base, device_dma_base + ring_size]`, the device DMA'd to the correct physical address but the kernel
-  reused that page prematurely.
-  → Conclusion: **DMA-after-free** (Sync/Unmap ordering bug).
-
-- **Swiotlb Active**: If swiotlb is active, `vtop` PA ≠ device DMA PA.
-  → Check: Does corrupted content match swiotlb buffer patterns?
-  → Conclusion: Likely **CPU sync/copy bug** OR **swiotlb slot collision**.
-
-- **Stray DMA (IOMMU Active but Bypassed/Bug)**: If PA is OUTSIDE all known DMA ranges AND IOMMU did not fault:
+- **Direct DMA (Exact Overlap)**: If `vtop` PA falls entirely within `[device_dma_base, device_dma_base + ring_size]`.
+  → Conclusion: **DMA-after-free** (Sync/Unmap sequence bug).
+- **Swiotlb Active**: `vtop` PA ≠ device DMA PA, but corrupted content matches swiotlb bounce buffer signatures.
+  → Conclusion: **CPU sync/copy bug** OR **swiotlb slot collision**.
+- **Stray DMA (Out of Range)**: PA is completely OUTSIDE known DMA ranges, and IOMMU did not fault.
   → Conclusion: **Device firmware computed wrong address** OR **IOMMU mapping bug**.
 
-**Third smoking-gun case**:
-- Address overlap is not exact, but corruption timing aligns with device interrupt bursts
-  and payload signatures match one device class consistently. Treat as medium-confidence
-  DMA attribution and continue narrowing using the following methods:
-  1. **Cross-crash PA distribution**: If multiple vmcores are available, collect the corrupted
-     PA from each. If different VAs map to different PAs yet all cluster within a contiguous
-     physical range, that range is likely owned by one DMA source.
-  2. **Physical range ownership**: Check system boot logs or `/proc/iomem` snapshots (if
-     preserved in dmesg or oops output) to identify which driver or firmware region owns
-     that physical segment.
-  3. **Per-queue/ring drill-down**: Use `vtop` on each corrupted VA → compare resulting PAs
-     against known DMA buffer ranges of each suspect queue (EQ/CQ/RQ for mlx5, SQ/CQ/Admin
-     for NVMe) to find the closest range match.
+*Cross-crash validation*: If overlap is not exact but payload signatures match a single device class consistently, check `/proc/iomem` logs for physical range ownership across multiple vmcores.
 
 ### 3.12.8 Step 8: Multi-Device Disambiguation
 When BOTH mlx5 and nvme are suspects, use these distinguishing patterns:
@@ -1187,6 +1135,8 @@ When concluding DMA corruption, your `final_diagnosis.evidence` array MUST inclu
 | `dis -l <func> 100` | Forward from function start (100 lines) |
 | `dis -s <func>` | With source code (requires debug symbols) |
 
+Note: If `<func>` is from a third-party module, do NOT emit standalone `dis` action. Use `run_script` with `mod -s` first (see §1.3.2).
+
 ## 4.2 Memory & Structure
 | Command | Use Case |
 |---------|----------|
@@ -1196,6 +1146,8 @@ When concluding DMA corruption, your `final_diagnosis.evidence` array MUST inclu
 | `kmem -S <addr>` | Find slab for address |
 | `kmem -i` | Memory summary |
 | `kmem -p <phys_addr>` | Resolve physical address to page descriptor |
+
+Note: If `<type>` is from a third-party module (e.g., `mlx5_*`, `nvme_*`), do NOT emit standalone `struct` action. Use `run_script` with `mod -s` first (see §1.3.2).
 
 **CRITICAL**: `kmem` MUST always be called with an option flag (-i, -S, -p, etc.). Never use `kmem` with empty arguments.
 
@@ -1298,35 +1250,13 @@ When `dis -s` is unavailable (no debuginfo), reconstruct from stack:
 **Goal**: Identify the "Aggressor" (the driver or subsystem that leaked or overwrote this data).
 
 **Tactics**:
-1. **Targeted Pattern Search (The "Smoking Gun")**:
-   - **Command**: Use **constrained** search only: `search -s <start> -e <end> <garbage_value>` (bounded VM range, see §1.2 for forbidden search variants).
-   - **How to constrain**: Identify the likely memory region first (e.g., a specific slab cache range via `kmem -S`, a module's data segment via `mod`, or a vmalloc range), then search within that narrow range.
-   - **Format**: For 64-bit values, ALWAYS use `0x` prefix and pad to 16 hex digits (e.g., `0x0015000a04060001`). Do not drop leading zeros.
-   - **Logic**: If this value appears multiple times (especially aligned, e.g., every 128 bytes), it indicates a systematic write (e.g., driver incorrectly writing hardware descriptors) rather than a random bit-flip.
-   - **Action**: Check `kmem -S <addr>` on addresses returned by search. If they belong to a specific driver's cache (e.g., `mlx5`), you have identified the culprit.
-
-2. **Physical Address Reverse Mapping (The "RHEL Technique")**:
-   - **Concept**: Drivers track their DMA buffers (Physical Addresses) in internal structures. Finding who *tracks* the corrupted memory reveals the owner.
-   - **Step 1**: Get the corrupted Virtual Address (VA) from backtrace or register state.
-   - **Step 2**: Convert to Physical Address (PA): `vtop <VA>`.
-   - **Step 3**: Resolve the page descriptor: `kmem -p <PA_value>` → Identify which slab/cache/mapping owns the page.
-   - **Step 4**: If slab-owned, inspect the slab: `kmem -S <VA>` → Find the owning cache and nearby objects.
-   - **Step 5**: **Contextualize the Holder**: `rd -s <page_start_of_holder> 512` → Look for driver symbols (`_ops`, `_info`) in the surrounding memory.
-   - **Example**: `kmem -p` shows the page belongs to `kmalloc-96`. Surrounding memory (`rd -s`) contains `mlx5_devlink_ops`. **Conclusion**: `mlx5` driver owns the corrupted memory.
-
-3. **Neighborhood Watch (Page Context Forensics)**:
-   - **"Guilt by Association" Rule**: Even if the garbage value is invalid, the Memory Page it resides in often contains "fingerprints".
-   - `rd -s <corrupted_address> 512`: Scan memory surrounding the corruption location. Look for symbols ending in `_ops`, `_procs`, or `_info`.
-   - `rd -a <corrupted_address> 512`: Look for ASCII signatures (driver names, firmware versions).
-   - **Logic**: If the corrupted pointer is surrounded by `mlx5` vtables or metadata, `mlx5` likely caused the corruption via Use-After-Free (UAF) or Out-of-Bounds (OOB) write.
-
-4. **Characterize the "Garbage" Value**:
-   - `sym <value>`: Does it map to a known kernel symbol?
-   - `rd -p <value>`: Does it resolve to a valid Physical Address?
-   - **Logic**: Garbage values often mirror hardware registers, DMA descriptors, or physical addresses managed by specific devices.
+1. **Targeted Pattern Search (The "Smoking Gun")**: See **§1.5 Strategy 1**. Find the value in a bounded VM range. If the value appears multiple times aligned (e.g., every 128 bytes), it strongly indicates a systematic driver/hardware write rather than a random bit-flip.
+2. **Physical Address Reverse Mapping**: See **§1.5 Strategy 2** for resolving Page/Slab (`vtop` → `kmem -p` → `kmem -S`). Once the page/slab is resolved, use `rd -s <page_start_of_holder> 512` to look for driver vtables (e.g. `_ops` or `_info`) indicating ownership.
+3. **Neighborhood Watch (Page Context Forensics)**: "Guilt by Association". Use `rd -s <corrupted_address> 512` and `rd -a` to find ASCII signatures or driver symbols surrounding the corruption location.
+4. **Characterize the "Garbage" Value**: Use `sym <value>` or `rd -p <value>` to check if it represents a valid symbol or hardware physical address.
 
 ## 5.7 DMA Corruption Forensics
-Fully consolidated into §3.12.7–§3.12.10. Refer to §3.12 for the complete DMA analysis workflow.
+Fully consolidated into §3.12. Refer to §3.12 for the complete DMA analysis workflow.
 """
 
 
