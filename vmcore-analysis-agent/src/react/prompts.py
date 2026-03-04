@@ -88,17 +88,19 @@ Before generating ANY action:
 2. **Check for Duplicates**: If a command (e.g., `search -s ... -e ...`, `struct <type> -o`) matches a previous one, DO NOT run it again.
 3. **Reuse Output**: Use the output from the previous execution.
 4. **Exception**: `run_script` with `mod -s` is the ONLY exception (module loading must be repeated per session, see §1.3).
+5. **Module Preflight (MANDATORY)**: If the planned target name has a module prefix (`mlx5_*`, `nvme_*`, `pqi_*`, etc.) or appears as `[module]` in backtrace, the action MUST be `run_script` and include `mod -s` first (see §1.3.2). Do NOT emit standalone `struct/dis/sym` actions.
 
-**Query Efficiency Rule**: If you need offsets, use `struct <type> -o` immediately. Never run `struct <type>` then `struct <type> -o`.
+**Query Efficiency Rule**: If you need offsets, use `struct <type> -o` immediately. Never run `struct <type>` then `struct <type> -o`. This rule NEVER overrides §1.3.2 module-loading requirements.
 
 ### Forbidden Commands (Token Overflow & Timeout Prevention)
 - **❌ `sym -l`**: Dumps entire symbol table (millions of lines) → Token overflow
 - **❌ `sym -l <symbol>`**: Still too much output
 - **✅ `sym <symbol>`**: Get one symbol's address only
 - **❌ `bt -a`** (unless deadlock suspected): Output too large
-- **❌ `ps -m`**: Dumps detailed memory info for ALL processes → Token overflow (can exceed 131072 tokens)
-- **✅ USE INSTEAD**: `ps` (basic process list) or `ps | grep <pattern>` to filter specific processes
+- **❌ `ps`**: **STRICTLY FORBIDDEN** as a standalone command. Dumps the full process list for all tasks → Token overflow (confirmed to exceed 131072-token context limit). You MUST always pipe with grep.
+- **✅ ONLY SAFE `ps` USAGE**: `ps | grep <pattern>` — grep filter is **REQUIRED**
 - **✅ SAFE OPTIONS**: `ps <pid>` (single process) or `ps -G <task>` (specific task memory)
+- **❌ `ps -m`**: **STRICTLY FORBIDDEN**. Dumps detailed memory info for ALL processes → Token overflow (even worse than bare `ps`)
 - **❌ `log`**: Dumps entire kernel printk buffer (hundreds of thousands of lines) → Token overflow + server timeout
 - **❌ `log | grep <pattern>`**: **STRICTLY FORBIDDEN**. Even with grep, crash must first buffer the ENTIRE printk output before piping — on large vmcores this can exceed 120s and will be **forcibly killed** by the server.
 - **❌ `log -t`**: **STRICTLY FORBIDDEN** without grep pipe. Standalone use dumps entire log with timestamps → Token overflow.
@@ -168,6 +170,18 @@ If the target is a module symbol/type, you MUST load the module in the SAME `run
 
 **Special notes**:
 - When using `struct` or `dis -s/-rl` with a symbol/name, always check if the name has a module prefix first.
+
+**Action-level hard constraint (MUST FOLLOW)**:
+- For module symbols/types, `action.command_name` MUST be `run_script`.
+- The FIRST relevant command in `action.arguments` MUST be `mod -s <module> <path>`.
+- Standalone actions such as `{{"command_name":"struct","arguments":["mlx5_core_dev","-o"]}}` are INVALID for module types.
+- This applies even if module symbols were loaded in a previous step/session.
+
+**Forbidden vs Correct JSON examples**:
+- ❌ `{{"command_name": "struct", "arguments": ["mlx5_core_dev", "-o"]}}`
+- ❌ `{{"command_name": "dis", "arguments": ["-s", "mlx5e_napi_poll"]}}`
+- ✅ `{{"command_name": "run_script", "arguments": ["mod -s mlx5_core <path>", "struct mlx5_core_dev -o"]}}`
+- ✅ `{{"command_name": "run_script", "arguments": ["mod -s mlx5_core <path>", "dis -s mlx5e_napi_poll"]}}`
 
 ### 1.3.3 Module Path Resolution (Priority Order)
 1. Use the exact path from "Initial Context" → "Third-Party Kernel Modules with Debugging Symbols".
@@ -831,12 +845,14 @@ log -m | grep -i "dma_pool|dma_alloc|dma_map|dma_unmap|dma-api"
 **Goal**: Examine the corrupted memory content to identify which device wrote the data.
 
 ```
-# Dump corrupted region in hex and ASCII (use count >= 64 for better coverage)
-rd -x <corrupted_addr> 64
-rd -a <corrupted_addr> 64
+# Dump corrupted region in hex and ASCII (use count >= 512 for better coverage)
+rd -x <corrupted_addr> 512
+rd -a <corrupted_addr> 512
 ```
 
 #### Network (mlx5/Ethernet) DMA Signatures:
+
+**1. Packet Payload Signatures (Ethernet/IP/TCP):**
 | Offset | Pattern | Meaning |
 |--------|---------|---------|
 | +0 | `ff:ff:ff:ff:ff:ff` | Broadcast MAC destination |
@@ -848,37 +864,83 @@ rd -a <corrupted_addr> 64
 | +14 | `0x45` | IPv4 header (version=4, IHL=5) |
 | +23 | `0x06` / `0x11` | Protocol: TCP / UDP |
 | Any | `0x8000` opcode range hints | RDMA/RoCE BTH-like control patterns |
-| Any | `0x0015000a04060001` | mlx5 CQE (Completion Queue Entry) opcode pattern |
-| Any | Repeating 64-byte aligned blocks | CQE/WQE ring buffer content |
 
-**mlx5 CQE opcode hints (example)**:
-| CQE opcode | Meaning |
-|------------|---------|
-| `0x00` | Requester error |
-| `0x01` | Receive completion |
-| `0x02` | No inline data |
-| `0x0F` | Responder send |
+**2. mlx5 CQE (Completion Queue Entry) Structural Signatures:**
 
-**Detection rule**: If corrupted memory shows valid Ethernet frames or CQE patterns,
-the network adapter (mlx5) is the likely culprit — it DMA'd received packets or
-completion entries to a wrong physical address.
+**Rationale**: Hardware completion rings have highly predictable structural patterns, which are
+far more reliable than static magic values. For mlx5 CQE v1 (64 bytes, 64-byte aligned):
+
+| Offset (within 64B) | Characteristic | Meaning |
+|---------------------|----------------|---------|
+| Byte `0x38`–`0x3B` | Monotonically increasing 32-bit integer | `wqe_counter`. Check consecutive 64B blocks; this value should increment by 1. |
+| Byte `0x3C` | High 4 bits = opcode, Low 4 bits = syndrome | Hardware completion status/opcode. |
+| Byte `0x3F` (last byte) | Alternating `0x00` / `0x01` per ring pass | **Ownership bit**. Hardware flips this bit on each new entry. A consistent toggle pattern across 64B-aligned blocks is a near-certain CQE ring fingerprint. |
+
+**Detection rule**:
+- If corrupted memory shows valid Ethernet frames (EtherType + MAC patterns above), the NIC
+  DMA'd received packets to a wrong physical address (RX buffer mapping error).
+- If you find repeating 64-byte aligned blocks with an incrementing `wqe_counter` and ownership
+  bit toggles at offset `0x3F`, the NIC wrote its Completion Queue Entries to stale or wild
+  memory addresses.
 
 #### NVMe DMA Signatures:
+**1. SQE / Filesystem Payload Signatures:**
 | Offset | Pattern | Meaning |
 |--------|---------|---------|
 | +0 | `0x00` - `0x0F` (command opcode) | NVMe Submission Queue Entry (SQE) |
 | +4 | Valid NSID (usually `0x01`) | NVMe namespace ID in SQE |
-| Any | 16-byte aligned structures | NVMe Completion Queue Entry (CQE) |
-| +0 of CQE | Command-specific DW0 | CQE result field |
-| +8 of CQE | SQ Head Pointer + SQ ID | CQE routing info |
-| +12 of CQE | Status Field + Command ID | CQE status (0x0000 often success) |
 | Any | File system magic numbers | Filesystem metadata DMA'd to wrong location |
 |  | `0xEF53` | ext4 superblock magic |
 |  | `0x58465342` (`XFSB`) | XFS superblock magic |
 |  | `0x5F42487246534D5F` (`_BHrFSM_`) | btrfs magic marker |
 
-**Detection rule**: If corrupted memory contains filesystem metadata or NVMe CQE
-patterns, the NVMe controller wrote data to a stale/wrong DMA mapping.
+**2. NVMe CQE (16 bytes) Structural Signatures:**
+
+**Rationale**: The NVMe spec mandates a Phase Tag that toggles on every ring wrap — this is
+one of the strongest structural fingerprints across all DMA device types.
+
+| Offset (within 16B) | Characteristic | Meaning |
+|---------------------|----------------|---------|
+| Bytes `0`–`3` | Command-specific DW0 | CQE result field (command-dependent) |
+| Bytes `8`–`9` | Small integer (`0x0001`–`0x00FF`) | **SQ Head Pointer** — nearly always a small counter value |
+| Bytes `10`–`11` | Small integer (`0x0000`–`0x0007`) | **SQ Identifier** — limited number of queues per controller |
+| Bytes `14`–`15` | bit0 alternates `0` / `1` per ring pass | **Phase Tag** (NVMe spec §4.6). If 16B-aligned blocks show bit0 of the last 2 bytes toggling consistently across entries, it is almost certainly a CQE ring. |
+
+**Detection rule**:
+- If corrupted memory contains filesystem metadata or SQE opcode patterns, the NVMe
+  controller wrote data to a stale/wrong DMA mapping (TX/command path error).
+- If you find 16-byte aligned blocks where bytes `8–9` are small counters, bytes `10–11`
+  are a small queue ID, and the Phase Tag (bit0 of bytes `14–15`) alternates `0/1` across
+  consecutive entries → the NVMe controller wrote its Completion Queue Entries to stale or
+  wild memory addresses.
+
+#### RoCE / RDMA DMA Signatures:
+
+**Rationale**: RoCE v2 encapsulates InfiniBand semantics over UDP/IP. Its BTH header contains
+a Packet Sequence Number (PSN) that the spec requires to increment monotonically — making it
+one of the strongest ring-level fingerprints, analogous to mlx5 `wqe_counter` and NVMe Phase Tag.
+
+**1. RoCE v2 UDP Encapsulation Marker:**
+| Offset (Ethernet frame) | Pattern | Meaning |
+|-------------------------|---------|---------|
+| +12 | `0x0800` (IPv4) or `0x86dd` (IPv6) | Outer EtherType — RoCE v2 rides over IP |
+| UDP dst port | `0x12B7` (4791) | **RoCE v2 canonical port** (IANA assigned). Presence alone is a strong indicator. |
+
+**2. BTH (Base Transport Header, 12 bytes) Structural Signatures:**
+
+| Offset (within BTH) | Characteristic | Meaning |
+|---------------------|----------------|---------|
+| Byte `0` | opcode: `0x04`=RC SEND, `0x0A`=RC RDMA Write, `0x06`=RC SEND with Immediate, etc. | Transport opcode — validates this is a real BTH, not random data |
+| Bytes `2`–`3` | Partition Key (`0xFFFF` for default partition) | P_Key — nearly always `0x7FFF` (limited) or `0xFFFF` (full) in production |
+| Bytes `5`–`7` | 24-bit Destination QP number (small integer) | Valid QPs are allocated sequentially; wild random values rule out BTH |
+| Bytes `8`–`11` | bit31 = Ack-Request; bits `[23:0]` = **PSN** (monotonically increasing) | **Packet Sequence Number** — if consecutive BTH blocks show PSN incrementing by 1, it is almost certainly a captured RoCE ring. |
+
+**Detection rule**:
+- If corrupted memory contains UDP dst-port `4791` followed by a valid BTH opcode and a
+  monotonically increasing PSN across 12-byte-aligned blocks → the RDMA NIC (e.g., mlx5 in
+  RoCE mode) DMA'd incoming RDMA packets or send-queue descriptors to a stale/wrong address.
+- RoCE corruption is distinct from plain Ethernet corruption: look for the BTH PSN ramp as
+  the decisive differentiator when EtherType alone is ambiguous.
 
 #### SCSI/HBA DMA Signatures:
 | Pattern | Meaning |
@@ -892,6 +954,38 @@ patterns, the NVMe controller wrote data to a stale/wrong DMA mapping.
 |---------|---------|
 | `0xDEADBEEF` (padding style in command buffers) | Possible GPU command/ring artifact (context-dependent) |
 | Corruption in DMA-BUF shared pages | GPU/device shared-memory overwrite candidate |
+
+#### Adjacent Physical Page Inspection
+**Rationale**: A DMA write with a miscalculated offset or over-sized transfer can straddle
+a page boundary. The dominant payload signature may be in the page *before* or *after* the
+known corrupted page, not inside it. Always extend the scan if in-page signatures are weak.
+
+```
+# Step 1: Convert the corrupted VA to PA
+vtop <corrupted_VA>
+# → Note the physical address (PAGE_PA). Align to page boundary: PAGE_PA & ~0xfff
+
+# Step 2: Get VA of the preceding physical page (PA - 0x1000), then dump it
+ptov <PAGE_PA - 0x1000>
+# → Note the returned VA as PREV_VA
+rd -x <PREV_VA> 512
+rd -a <PREV_VA> 512
+
+# Step 3: Get VA of the following physical page (PA + 0x1000), then dump it
+ptov <PAGE_PA + 0x1000>
+# → Note the returned VA as NEXT_VA
+rd -x <NEXT_VA> 512
+rd -a <NEXT_VA> 512
+```
+
+**Decision rule**:
+- If adjacent pages contain recognizable device signatures (Ethernet frames, NVMe CQE, SCSI
+  descriptors) but the corrupted page itself does not → the DMA write started/ended in the
+  neighbor; the corrupted page received an overflow tail or lead-in fragment.
+- Correlate the pattern direction (prefix vs. suffix) with the DMA size/offset error in the
+  driver to pinpoint the calculation bug.
+- If all three pages (prev / current / next) contain signatures → wide stray DMA write,
+  suggesting a severely wrong DMA length or a ring-buffer wrap-around error.
 
 ### 3.12.6 Step 6: Analysis Flowchart for DMA Corruption
 
