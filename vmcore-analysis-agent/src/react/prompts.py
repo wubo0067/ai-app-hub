@@ -1212,40 +1212,157 @@ Note: If `<type>` is from a third-party module (e.g., `mlx5_*`, `nvme_*`), do NO
 ================================================================================
 
 ## 5.1 Reconstructing Local Variables
-When `dis -s` is unavailable (no debuginfo), reconstruct from stack:
-1. `bt -f` → Dump full stack frames
-2. `dis -rl <RIP>` → Note which registers hold local vars
-3. Map register allocations to function parameters via calling convention
+
+When `dis -s` is unavailable (no debuginfo), attempt reconstruction
+from registers, stack, and calling convention.
+
+1. `bt -f` → Dump full stack frames (raw frame data if available)
+
+2. `dis -rl <RIP>` → Identify:
+   - Which registers hold arguments
+   - Which registers were recently written
+   - Whether locals were spilled to stack
+
+3. Apply calling convention (x86_64 SysV ABI):
+   - rdi, rsi, rdx, rcx, r8, r9 → First 6 function arguments
+   - Remaining arguments → On stack
+   - rax → Return value
+
+4. Note:
+   - Under -O2/-O3, many locals remain in registers only
+   - Some locals may be optimized out entirely
+   - Not all variables can be reconstructed from stack
+
+5. If unwinding seems unreliable:
+   - Manually inspect stack memory with `rd`
+   - Validate potential return addresses with `sym`
+   - Ensure addresses fall within kernel text section
 
 ## 5.2 Handling Compiler Optimizations
-- **Inlined functions**: RIP may point to caller, not actual buggy function
-  - Use `dis -s` (with symbols) to see inlined source
-  - Or `dis -rl` and look for multiple source files in one function
-- **Tail call optimization**: Caller frame may be missing from backtrace
-  - Check `bt -f` raw stack for additional return addresses
 
-## 5.3 Multi-CPU Correlation (for lockups/deadlocks)
-1. `bt -a` → All CPU backtraces (use ONLY for lockup/deadlock)
-2. For each CPU: Note which lock/resource it's waiting on
-3. Build dependency graph → Detect circular waits
-4. `runq` → Check if specific CPUs are starved
+- **Inlined functions**:
+  - RIP may point to caller, not logical buggy function
+  - `dis -s` requires DWARF debuginfo to show inline boundaries
+  - Without debuginfo: use `dis -rl` and inspect mixed source lines
+  - Multiple source locations inside one function often indicate inlining
+
+- **Tail call optimization**:
+  - Caller frame may be missing from backtrace
+  - No return address is pushed for tail calls
+  - `bt -f` raw stack may NOT reliably recover missing frames
+  - Confirm suspected callers by inspecting control flow in disassembly
+
+- **Aggressive register allocation**:
+  - Locals may never appear on stack
+  - Variable lifetime may not match source-level expectation
+
+- Always treat optimized backtraces as potentially incomplete.
+
+## 5.3 Multi-CPU Correlation (for lockups, deadlocks, races)
+
+**Command selection by scenario (§1.2 compliance)**:
+- **Hard lockup / deadlock ONLY**: `bt -a` is permitted (output is large — use only when necessary)
+- **All other multi-CPU analysis**: Use `bt -c <cpu>` per CPU, or `foreach UN bt` for D-state tasks
+- **❌ Do NOT use `bt -a` for race conditions or general corruption analysis**
+
+**Lockup / Deadlock workflow**:
+1. `bt -a` → All CPU backtraces (hard lockup/deadlock only)
+2. For each CPU:
+   - Identify locks held
+   - Identify locks waited on
+   - Note interrupt context vs process context
+3. Build dependency graph:
+   - Detect circular waits
+   - Detect lock order inversion
+   - Identify same lock acquired in reverse order
+4. `runq` → Inspect scheduler state
+   - Helpful to observe runnable vs blocked tasks
+   - Not definitive proof of starvation
+
+**Race condition / corruption workflow** (no `bt -a`):
+1. `foreach UN bt` → All uninterruptible (D-state) tasks
+2. `bt -c <cpu>` → Per-CPU backtrace for specific CPUs of interest
+3. Compare struct write sites across CPUs
+4. Look for missing spin_lock / atomic usage
+5. Check refcount transitions
 
 ## 5.4 KASLR Considerations
-- Crash utility handles KASLR automatically in most cases
-- If manual address calculation needed: `sym _text` to get kernel text base
-- Module addresses shift independently: Always use `sym` or `mod` to resolve
+
+- Crash utility handles KASLR automatically when:
+  - vmcore matches vmlinux
+  - Proper symbols are loaded
+
+- If manual base verification is required:
+  - `sym _stext` (or `_text` depending on kernel version)
+  - Confirm kernel text base
+
+- Module addresses shift independently:
+  - Always resolve via `mod`
+  - Use `sym` for symbol resolution
+
+- Never manually subtract fixed offsets unless base address confirmed
 
 ## 5.5 Error Recovery & Fallbacks
-- If a command returns "invalid address" or "no data found":
-  The address may be corrupted. Try reading nearby memory with `rd`.
-- If `bt` shows "<garbage>" or truncated frames:
-  The stack may be corrupted. Use `bt -f` and manually walk the stack.
-- If vmcore is incomplete (truncated dump):
-  Focus on data available in registers and the first few stack frames.
-- If `mod -s` fails: The .ko file may not match the running kernel.
-  Continue with raw disassembly (`dis -rl`) without source annotation.
 
-## 5.6 Tracing "Garbage" Values (Memory Forensics)
+- If a command returns "invalid address" or "no data found":
+  Possible causes:
+    - Corrupted pointer
+    - Page not present in dump
+    - makedumpfile filtered page
+    - High memory/user page not saved
+  Action:
+    - Try nearby memory with `rd`
+    - Verify mapping via `vtop`
+
+- If `bt` shows "<garbage>" or truncated frames:
+  Possible stack corruption or unwinder failure.
+  Action:
+    - Use `bt -f`
+    - Manually inspect stack memory
+    - Validate return addresses with `sym`
+    - Confirm addresses lie in kernel text
+
+- If vmcore is incomplete (truncated dump):
+  - Prioritize register state
+  - Analyze first few stack frames
+  - Avoid conclusions relying on missing pages
+
+- If `mod -s` fails:
+  - .ko may not match running kernel
+  - vermagic mismatch possible
+  - Debug package may not correspond to build
+  Action:
+    - Continue with raw disassembly (`dis -rl`)
+    - Avoid source-level assumptions
+
+- If backtrace appears correct but inconsistent with disassembly:
+  - Suspect unwinder metadata issue (ORC/frame pointer mismatch)
+  - Validate call chain manually via return addresses
+
+## 5.6 Backtrace Reliability Assessment (Critical in Modern Kernels)
+
+Modern kernels may use:
+  - ORC unwinder
+  - No frame pointers
+  - Clang/CFI instrumentation
+
+Backtrace may appear valid but be incorrect if:
+  - Stack is corrupted
+  - ORC metadata is inconsistent
+  - Frame pointer disabled
+  - Return address overwritten
+
+Before trusting `bt`:
+
+1. Confirm return addresses are canonical
+2. Confirm addresses map to kernel text (`sym`)
+3. Verify stack pointer progression is reasonable
+4. Cross-check with disassembly control flow
+
+Never base root cause solely on a single backtrace
+without validating unwinder reliability.
+
+## 5.7 Tracing "Garbage" Values (Memory Forensics)
 **Scenario**: A structure member (e.g., an ops pointer) is overwritten by a specific "garbage" value or pattern (e.g., `0x15000a04060001`).
 **Goal**: Identify the "Aggressor" (the driver or subsystem that leaked or overwrote this data).
 
@@ -1255,7 +1372,7 @@ When `dis -s` is unavailable (no debuginfo), reconstruct from stack:
 3. **Neighborhood Watch (Page Context Forensics)**: "Guilt by Association". Use `rd -s <corrupted_address> 512` and `rd -a` to find ASCII signatures or driver symbols surrounding the corruption location.
 4. **Characterize the "Garbage" Value**: Use `sym <value>` or `rd -p <value>` to check if it represents a valid symbol or hardware physical address.
 
-## 5.7 DMA Corruption Forensics
+## 5.8 DMA Corruption Forensics
 Fully consolidated into §3.12. Refer to §3.12 for the complete DMA analysis workflow.
 """
 
