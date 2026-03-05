@@ -64,11 +64,11 @@ def create_llm():
     if config_manager.get("LANGSMITH_TRACING"):
         os.environ["LANGSMITH_TRACING"] = "true"
 
-    # top_p 值	采样集合大小	随机性	确定性	适合场景
-    # top_p=0.1	很小	很低	很高	代码生成、事实回答
-    # top_p=0.5	中等	中等	中等	创意写作、头脑风暴
-    # top_p=0.9	较大	较高	较低	探索性分析、多样化输出
-    # top_p=1.0	全部词汇	最高	最低	开放式创作
+    # top_p 值      采样集合大小    随机性        确定性        适合场景
+    # top_p=0.1     很小           很低          很高          代码生成、事实回答
+    # top_p=0.5     中等           中等          中等          创意写作、头脑风暴
+    # top_p=0.9     较大           较高          较低          探索性分析、多样化输出
+    # top_p=1.0     全部词汇       最高          最低          开放式创作
 
     try:
         # 使用 ChatDeepSeekReasoner 以修复 reasoning_content 在多轮对话中丢失的问题
@@ -81,9 +81,10 @@ def create_llm():
                 if "think" in str(model_name) or "reasoner" in str(model_name)
                 else 8000
             ),  # DeepSeek-Reasoner 模式需要更大的 max_tokens 来支持长对话历史和复杂推理
-            top_p=0.1,  #
-            presence_penalty=0,  # 不需要模型通过增加多样性来“换个说法”，我们需要的是精确的原始符号。
-            temperature=temperature,  # https://api-docs.deepseek.com/zh-cn/quick_start/parameter_settings            timeout=300,  # 5 分钟超时，后期步骤对话历史很长，LLM 推理耗时较久
+            top_p=0.1,  # 使用低随机性设置，适合代码生成和事实回答
+            presence_penalty=0,  # 不需要模型通过增加多样性来“换个说法”，我们需要的是精确的原始符号
+            temperature=temperature,  # https://api-docs.deepseek.com/zh-cn/quick_start/parameter_settings
+            timeout=300,  # 5 分钟超时，后期步骤对话历史很长，LLM 推理耗时较久
             max_retries=3,  # 遇到连接超时等瞬态错误时自动重试
         )
         logger.info(f"Successfully created LLM instance, model: {llm}")

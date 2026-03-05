@@ -224,6 +224,11 @@ Constrain your search to the most likely regions based on the panic context:
 - If you know the suspected memory segment (e.g., vmalloc, modules), specify virtual boundaries:
   `search -s <start_vaddr> -e <end_vaddr> <address>`
 
+⚠️ **Search Value Syntax (MANDATORY)**:
+The `<address>` argument to `search` MUST be a raw hex value WITHOUT the `0x` prefix.
+- ✅ CORRECT: `search -s ffff8cbad8aabf00 -e ffff8cbad8aaeac0 65db75c7`
+- ❌ WRONG: `search -s ffff8cbad8aabf00 -e ffff8cbad8aaeac0 0x65db75c7` → parse error: `"x" is not a digit`
+
 ### Strategy 2: Reverse Resolution (Identify Page Properties)
 If you have a physical address, determine what type of memory it belongs to rather than
 searching for pointers to it:
@@ -237,7 +242,59 @@ searching for pointers to it:
 ### Strategy 3: Address Translation and Structural Traversal
 Translate physical addresses to virtual addresses and traverse known structures:
 1. `ptov <physical_address>` → Get the direct-mapped kernel virtual address
-2. Once you have the VA, read contents directly: `rd <virtual_address>` or cast to
+⚠️ **MANDATORY: Validate the ptov result before calling `rd`**
+
+`ptov` is a **pure arithmetic operation**: it adds the direct-map base offset to the PA
+and returns a VA. It does NOT verify that:
+- The physical page actually exists in RAM
+- The page was saved in the vmcore dump
+- The page is not hardware-reserved (`PG_reserved`)
+
+**If you call `rd <ptov_result>` on an inaccessible page, you will get:**
+```
+rd: seek error: kernel virtual address: ffff8cba25db75c7  type: "64-bit KVADDR"
+```
+This is a hard failure — retrying with the same address will always fail.
+
+**Validation procedure (MANDATORY before every `rd` on a ptov result)**:
+```
+# Step A: Translate PA to VA
+ptov <PA>
+# → records returned VA as <VA>
+
+# Step B: Verify the VA is backed by an accessible page
+vtop <VA>
+# → FAILURE: vtop returns error or different PA → page NOT in vmcore → do NOT call rd
+# → SUCCESS: continue to Step C (do NOT assume rd is safe yet)
+
+# Step C: Check physical page flags from the resolved PA
+kmem -p <PA>
+# → If page flags include PG_reserved: skip rd
+#   (reserved/MMIO/firmware pages are typically excluded by makedumpfile)
+# → If page is normal non-reserved RAM: safe to call rd
+```
+
+**Decision table (MANDATORY)**:
+
+| vtop result | page flags (`kmem -p <PA>`) | Action |
+|-------------|-------------------------------|--------|
+| FAIL (error/mismatch) | N/A | Skip `rd`; use `kmem -p <PA>` as evidence path |
+| SUCCESS | `PG_reserved` set | Skip `rd`; record reserved-page evidence |
+| SUCCESS | non-reserved | Safe to call `rd` |
+
+**If vtop validation fails or page is `PG_reserved`**:
+- Do NOT call `rd` on this VA — it will produce `seek error`
+- Check `kmem -p <PA>` to inspect page flags:
+  - `PG_reserved` set → hardware-reserved region (DMA/firmware), not normal RAM;
+    pages like this are typically not saved in vmcore
+  - This is itself diagnostic evidence: **a valid kernel pointer should not normally resolve
+    to a reserved/inaccessible physical page** → strongly supports pointer corruption
+    or DMA-written garbage value hypothesis
+- Record in reasoning: "PA 0x... is reserved/not in vmcore — rd will fail; page
+  inaccessibility is consistent with a DMA-corrupted garbage pointer value"
+
+2. Once validation passes (`vtop` success + non-reserved page), read contents directly:
+   `rd <virtual_address>` or cast to
    a known struct: `struct <struct_name> <virtual_address>`
 3. If the address is part of a list or tree, use structural traversal:
    - `list -H <head> -s <struct>.<member>` for linked lists
@@ -253,11 +310,40 @@ Translate physical addresses to virtual addresses and traverse known structures:
 6. **Address Validation Before Use**: Before passing an address to `struct <type> <addr>`, `rd <addr>`, or any command that reads memory at a specific address, you MUST verify the address is valid:
    - **❌ NEVER use `0x0`, `0x0000000000000000`, or NULL as an address argument**. `struct <type> 0x0` is always wrong — it attempts to read a NULL pointer.
    - **❌ NEVER use small values (< 0x1000)** as addresses — these are offsets, not valid kernel addresses.
+   - **❌ NEVER use assembler/register syntax** as an address argument — e.g. `%gs:0x1b440`, `(%rax)`, `$rbx`, `%rip+0x20`. These are CPU instruction operand encodings, not numeric addresses. crash only accepts numeric literals. See §1.7 for the mandatory per-CPU address computation procedure.
    - **✅ Length & Format Constraint**: On 64-bit systems, a hexadecimal memory address structure **MUST NOT** exceed 16 characters (excluding `0x` prefix). E.g. `ff73d8e1c09baacf8` (17 chars) is a hallucinated/invalid string. Extract exactly 16 characters, padding with leading `0`s if necessary (e.g., `0x0000ffff12345678`).
    - **✅ Valid kernel virtual addresses** on x86_64 are typically 16 chars starting with `0xffff...` (direct map) or `0xffffffff...` (kernel text).
    - **If the address you have is NULL or invalid**, do NOT run the command. Instead, report in your reasoning that the pointer is NULL/invalid, as this is itself a diagnostic finding (e.g., "the pointer was NULL, indicating the object was not initialized or already freed").
+7. **Backtrace Command Constraints**:
+   - **❌ NEVER use `bt -a` with arguments** (e.g., `bt -a 7`). The `bt -a` command takes NO arguments and is used to trace all active tasks.
+   - **✅ To get the backtrace for a specific CPU, you MUST use `bt -c <cpu_number>`** (e.g., `bt -c 7`).
 
 ## 1.7 Per-CPU Variable Access Rule (MANDATORY)
+
+### ❌ FORBIDDEN: Never use assembler register/segment syntax as crash command arguments
+
+This is a **ZERO TOLERANCE** rule. The following argument forms are **STRICTLY FORBIDDEN**
+in ANY action, under ANY circumstance:
+
+| Forbidden form | Why it fails |
+|----------------|--------------|
+| `rd %gs:0x1b440` | `%gs` is x86 assembler GS-segment syntax; crash does not parse register names |
+| `rd %gs:0x79aa8211(%rip)` | RIP-relative displacement encoding; meaningless outside CPU execution context |
+| `rd (%rax)` | Indirect register reference; crash has no register state to dereference |
+| `rd $rax` | Register value reference; crash cannot read live registers from a vmcore |
+| `rd %rip+0x1b440` | Any register arithmetic; all invalid in crash |
+
+**crash utility ONLY accepts explicit numeric addresses (hex or decimal literals).**
+
+If you see `mov %gs:0x79aa8211(%rip), %reg  # 0x1b440` in disassembly and want to read
+that per-CPU variable, you MUST compute the actual VA first (Steps 1–3 below) and pass
+that numeric result as the argument. **Never copy assembler syntax verbatim into an action.**
+
+**Self-check before generating any `rd` action**: Does the argument contain `%`, `(`, `)`,
+`$`, or any register name (`rax`, `rbx`, `gs`, `rip`, etc.)? If YES → it is FORBIDDEN.
+Compute the numeric address first, then generate the action.
+
+---
 
 On x86_64 Linux, `%gs` points to the **per-CPU area base** of the currently executing CPU.
 An instruction like `mov %gs:0xXXXX(%rip), %reg  # 0xOFFSET` reads a **per-CPU variable**.
@@ -276,6 +362,24 @@ mov %gs:0x79aa8211(%rip), %ebp   # 0x14168
 **❌ NEVER** invent or use symbols like `per_cpu__base` or `cpu_base[]`. They do not exist in the kernel.
 **❌ NEVER** use the RIP-relative displacement (`0x79aa8211`) as the offset.
 
+### ⚠️ Critical: Identify the CORRECT per-CPU access when multiple exist in disassembly
+
+A function may contain **multiple `%gs`-relative accesses** at different offsets. When tracing
+the cause of a crash, you MUST identify which specific access is relevant:
+
+**Rule**: In a RIP-CR2 contradiction scenario (RIP at a non-faulting instruction), the relevant
+per-CPU access is the **last `%gs`-relative load that feeds a pointer used BEFORE the RIP
+instruction**, NOT any arbitrary `%gs` access in the function.
+
+**Procedure**:
+1. Use `dis -l <function> 100` to get the full disassembly.
+2. Starting from RIP, scan **backwards** through the instructions.
+3. Find the first instruction that LOADS from memory into a register (`mov (%reg), %reg` or
+   `mov %gs:...(%rip), %reg`).
+4. That load's target register, when dereferenced, is the likely actual fault source.
+5. Record that specific per-CPU offset (the comment value `# 0xOFFSET`).
+6. Do NOT use a per-CPU offset from a different, earlier instruction that is unrelated to the
+   crash path.
 **✅ MANDATORY resolution procedure using the crash utility:**
 
 **Step 1: Extract the OFFSET**
@@ -306,6 +410,16 @@ To understand what you are reading, map the offset back to the kernel's static p
 crash> sym __per_cpu_start+0x14168
 ffffffff82614168 (D) static_per_cpu_variable_name
 ```
+
+**Step 5: Interpret the Read Value — Do NOT assume corruption without checking**
+After reading a per-CPU variable, you MUST interpret the value in context before labeling it
+as "corrupted":
+- A value matching the **current task pointer** from `bt` output (e.g., `ffff8cbad8aabf00`)
+  is **CORRECT** — it confirms the per-CPU `current` pointer is intact; do NOT treat as corruption.
+- A small integer (e.g., `0x0000000000000007`) is likely a **CPU ID or counter** — this is
+  expected; check what the per-CPU offset resolves to via `sym __per_cpu_start+<OFFSET>`.
+- Only label a value as corrupted if it is inconsistent with what the variable should hold
+  (e.g., `current` pointer holds a non-kernel address when the task is a kernel thread).
 
 **Example Summary (Panic on CPU 7):**
 * **Disassembly:** `mov %gs:0x79aa8211(%rip), %rax  # 0x14168`
@@ -338,6 +452,7 @@ ffffffff82614168 (D) static_per_cpu_variable_name
 | "paging request at 0x6b6b6b6b6b6b6b6b" | SLUB poison (freed memory deref as ptr) | All 0x6b | UAF: obj freed then pointer dereferenced; `kmem -S <addr>`, check alloc/free trace with KASAN |
 | "paging request at <non-canonical high addr>" | Wild/corrupted pointer or OOB heap write | Non-canonical addr (e.g. 0xffff...garbage) | Check pointer source in caller; `kmem -S` on surrounding slab to find OOB victim |
 | "unable to handle kernel paging request at <high_addr>" | Uninitialized pointer used, or stack OOB | Garbage/uninitialized value | Check var init in caller; inspect stack frame with `bt -f` |
+| "unable to handle kernel paging request at <user_space_addr>" in **idle/interrupt/kernel context** | ⚠️ Corrupted kernel pointer — NOT a user-space access. The kernel has no business accessing user addresses in this context. Treat DMA corruption (device wrote a raw value into a kernel pointer) as a **high-priority hypothesis**, but do not conclude DMA until software causes (UAF/race/OOB/index bug) are checked per §3.12 preconditions. | CR2 is a symptom value, NOT the access target | Apply Step 5a (RIP-CR2 contradiction check); attempt `kmem -p <CR2>` and `ptov <CR2>`; check `iommu=pt` in dmesg |
 | "paging request at <addr with Ethernet/NVMe data pattern>" | DMA stray write (missing/bypass IOMMU) | Non-symbol garbage matching device data | `log -m \| grep -Ei iommu`, check §3.12 |
 | "kernel BUG at <file>:<line>" | Explicit BUG_ON() hit (often refcount underflow, double-free detected by slab) | N/A | Read BUG_ON condition in source; check refcount logic around caller |
 | "list_add corruption" / "list_del corruption" | Linked list pointer corrupted — heap OOB write or UAF on list node | Corrupted next/prev pointer | `kmem -S` on list node; check adjacent slab object for OOB; look for missing lock |
@@ -364,7 +479,8 @@ ffffffff82614168 (D) static_per_cpu_variable_name
 | Canonical slab addr (`0xffff8880...`) | UAF / OOB / double-free → `kmem -S <addr>` |
 | Poison pattern (`0x5a5a...` / `0x6b6b...` / `0xdead...`) | Freed-memory access → UAF path |
 | Non-canonical address | Corrupted pointer / race / write-tear → concurrency analysis |
-| `< TASK_SIZE` (user address) | `copy_from_user` / `access_ok` misuse |
+| `< TASK_SIZE` (user address) in **user context** | `copy_from_user` / `access_ok` misuse |
+| `< TASK_SIZE` (user address) in **kernel/idle context** | ⚠️ **Corrupted kernel pointer** — the CR2 value is NOT a legitimate user-space address. A kernel code path (e.g., idle loop, softirq, interrupt handler) should never access user memory. This indicates a kernel pointer was overwritten with a low/garbage value. Treat CR2 as a symptom, NOT the address to dereference. → Apply "RIP-CR2 contradiction check" (see Step 5a below) |
 
 **Step 3 — Decode Page Fault Error Code (x86 mandatory)**
 - `P=0` → not-present page (likely UAF or use-before-init)
@@ -386,11 +502,73 @@ ffffffff82614168 (D) static_per_cpu_variable_name
 - Trace backward: loaded from memory? function return value? parameter corruption?
 - Determine true origin of bad register value
 
+**Step 5a — RIP-CR2 Contradiction Check (MANDATORY when instruction does NOT access memory)**
+
+⚠️ **Critical Rule**: If `dis -rl <RIP>` reveals that the faulting instruction at RIP is one of
+the following — `pause`, `nop`, `sti`, `cli`, `ret`, `push`, `pop` (without memory operand),
+`hlt`, or any instruction that CANNOT cause a page fault by itself — then CR2 does NOT reflect
+the actual faulting access. This is a contradiction and MUST be resolved before continuing.
+
+**Contradiction resolution procedure**:
+1. **Do NOT attempt to dereference CR2 directly** — it is a symptom, not a pointer.
+2. **Check error_code bits carefully**:
+   - `W=1` (write fault) from a non-writing instruction → hardware page table corruption or
+     external memory write to page table. Treat **DMA corruption** / **hardware MCE** as
+     high-priority hypotheses, then validate by collecting exclusion evidence (UAF/race/OOB)
+     before convergence.
+3. **Treat CR2 as a "garbage value leaked into a pointer"**:
+   - Ask: which kernel data structure was recently accessed by instructions BEFORE RIP?
+   - `dis -rl <RIP>` and inspect the 5–10 instructions BEFORE the reported RIP for any memory
+     loads (`mov (%reg), %reg`, `cmp (%reg), ...`). The LAST such load before RIP is the likely
+     faulting access.
+4. **CR2 as a candidate physical address under DMA corruption**:
+   - If CR2 is in user-space range (e.g., `0x0000000065db75c7`) AND execution context is
+     kernel/idle AND no user-space access instruction is near RIP → attempt:
+     ```
+     kmem -p <CR2_value>   # treat CR2 as a physical address, find page owner
+     ptov <CR2_value>      # attempt PA→VA translation
+     ```
+   - If `kmem -p` returns a valid page in a DMA-reachable region (e.g., page_pool, slab used
+     by a driver), this is strong evidence that a device DMA'd to physical address `CR2` and
+     corrupted a kernel pointer which was later dereferenced.
+5. **Proceed to DMA analysis (§3.12)** if:
+   - RIP instruction cannot cause page fault AND
+   - `iommu=pt` or IOMMU disabled is confirmed in dmesg AND
+   - Active network/storage devices (mlx5, nvme, qla2xxx) are present in module list
+
 **Step 6 — Check Backtrace Context**
 - `bt` → identify execution context: `Process` / `<IRQ>` / `<SOFTIRQ>` / `<NMI>`
 - If atomic context → check for sleep/mutex/schedule misuse (§3.6)
 - Third-party module in trace? → **YES**: apply §1.3 `mod -s` rule before any module commands
 
+**Step 6a — Idle / Interrupt Context: Use `bt -e` (MANDATORY)**
+
+If the crashing task is an **idle task** (`swapper/N`, PID=0) or the backtrace shows an
+**interrupt/exception frame** (`<IRQ>`, `<NMI>`, `<SOFTIRQ>`), you MUST run `bt -e` in
+addition to plain `bt`. The `-e` flag dumps the CPU exception frame, which contains the
+**actual register state at the point of the fault** (RIP, RSP, CR2, error_code, RFLAGS, CS).
+
+```
+# Always run for idle/interrupt crash context:
+bt -e
+```
+
+**Why this matters**:
+- Idle tasks (`swapper`) have minimal stack frames. Plain `bt` may show only 1–2 frames
+  and miss the full interrupt/NMI chain that delivered the fault.
+- `bt -e` reveals whether the page fault was taken directly in the idle loop, or whether
+  an **NMI or external interrupt fired during idle** and the fault occurred inside that
+  handler — these are fundamentally different root causes.
+- For `W=1` write faults in idle context (e.g., `pause` at RIP with CR2 in user-space range),
+  `bt -e` may expose a **second, deeper call chain** (e.g., an NMI handler that triggered
+  the actual write), which `bt` alone will not show.
+
+**Decision after `bt -e`**:
+- If `bt -e` shows the fault was taken **directly in the idle loop** (no interrupt frame):
+  → The fault is from the idle task itself; proceed with Step 5a (RIP-CR2 contradiction).
+- If `bt -e` reveals an **interrupt/NMI frame above the idle loop**:
+  → The fault occurred inside an interrupt handler; shift analysis focus to that handler's
+  code path, not the idle loop instruction at RIP.
 **Step 7 — Memory Forensics (if slab/heap involved)**
 - `kmem -S <addr>` → verify allocated vs free, slab cache name, alloc/free trace
 - Inspect neighbor objects for OOB detection
@@ -419,6 +597,31 @@ Continue investigation if:
 - ❌ Multiple equally plausible root causes remain
 - ❌ The backtrace suggests the crash is a SYMPTOM of an earlier corruption
   (trace back to the actual corruption point)
+## 2.4a Step Budget Management (Efficiency Rule)
+
+To prevent step exhaustion on unproductive paths, follow this budget discipline:
+
+**Phase allocation** (total budget = ~30 steps):
+
+| Phase | Steps | Goal | Must-complete items |
+|-------|-------|------|---------------------|
+| **Triage** | 1–5 | Classify crash type, identify CR2/RIP, check error_code, detect RIP-CR2 contradiction | Panic string parsed; CR2 classified; RIP disassembled; `bt -e` if idle/interrupt context |
+| **Core Evidence** | 6–20 | Execute the relevant analysis workflow (DMA §3.12 / UAF §3.4 / Lockup §3.2 etc.) | At least one positive evidence item confirmed (signature match, slab state, IOMMU mode, etc.) |
+| **Validation** | 21–27 | Confirm or rule out top hypothesis; check alternative hypotheses | MCE excluded; key pointer verified; module symbols loaded AND used |
+| **Conclusion** | 28–30 | Assemble evidence chain; output final diagnosis | `is_conclusive: true` with all evidence fields populated |
+
+**Early exit rules**:
+- If by step 10 you have NOT found a single positive evidence item → re-examine your initial
+  classification (Step 2); you may be analyzing the wrong branch.
+- If a tool call returns an error you have seen before → **do NOT retry with the same arguments**.
+  Refer to §5.5 for the correct fallback; a repeated failure is itself diagnostic data.
+- If you have been investigating a hypothesis for 5+ steps with no supporting evidence →
+  downgrade it to "less likely" and pivot to the next alternative.
+
+**Anti-pattern (FORBIDDEN)**:
+- ❌ Spending 3+ steps searching for a value in a structure that has already been verified as intact.
+- ❌ Retrying a failed `search` command with only cosmetic argument changes (same range, same value).
+- ❌ Loading module symbols (`mod -s`) and then concluding without performing any analysis using those symbols.
 
 ## 2.5 Evidence Chain Template & Final Diagnosis Structure
 
@@ -718,6 +921,17 @@ run_script ["mod -s mlx5_core <path>", "struct mlx5_core_dev <addr>"]
 dev -p | grep -i "mlx5|nvme"
 ```
 
+⚠️ **Post-load mandatory rule**: Loading module symbols via `mod -s` is only useful if
+followed immediately by concrete analysis actions in the SAME `run_script`. Never emit a
+`run_script` that ONLY loads the module and does nothing else. Always combine `mod -s` with
+at least one struct/dis/sym command that uses the newly loaded symbols. For example:
+```
+# ✅ CORRECT: load + immediately use
+run_script ["mod -s mlx5_core <path>", "struct mlx5_core_dev -o", "sym mlx5_core_dev"]
+
+# ❌ WRONG: load only, then conclude without using symbols
+run_script ["mod -s mlx5_core <path>"]   ← wasted step, symbols loaded but nothing examined
+```
 **Inspect DMA ops on device**:
 ```
 # Once you have the device struct address:
@@ -753,6 +967,43 @@ kmem -p <physical_address>
 # Inspect page flags
 struct page <page_struct_addr>
 ```
+
+**Special case — CR2 as the physical address (RIP-CR2 contradiction scenario)**:
+When the faulting instruction at RIP cannot access memory (e.g., `pause`, `nop`) but CR2
+contains a user-space-range value, the CR2 value may itself BE the physical address that was
+DMA'd into a kernel pointer. In this case:
+```
+# Step 1: Treat CR2 directly as a physical address candidate
+kmem -p <CR2_value>         # e.g., kmem -p 0x65db75c7
+# → If this returns a valid page descriptor, note zone/slab and page flags
+# → If PG_reserved is set → hardware-reserved page, not normal RAM
+#   This means the corrupted pointer leads to reserved/inaccessible memory
+#   → rd WILL FAIL on the ptov result; record as evidence and skip Step 3
+
+# Step 2: Attempt PA→VA translation
+ptov <CR2_value>            # e.g., ptov 0x65db75c7
+# → ptov always returns a mathematically computed VA; it does NOT confirm the page is readable
+
+# ⚠️ MANDATORY: Validate the ptov result before attempting rd (see §1.5 Strategy 3)
+vtop <returned_VA>          # e.g., vtop ffff8cba25db75c7
+# → If vtop SUCCEEDS (returns same PA): run kmem -p <CR2_value> and check page flags
+#   - If PG_reserved is set: skip rd and record reserved/inaccessible-page evidence
+#   - If non-reserved: proceed to Step 3
+# → If vtop FAILS with seek error or mismatch: page is NOT in vmcore
+#   → Do NOT call rd on this VA — it will produce:
+#     "rd: seek error: kernel virtual address: ... type: 64-bit KVADDR"
+#   → This failure is itself evidence: a valid kernel pointer should not normally point to
+#     a reserved/dump-excluded physical page → supports DMA corruption hypothesis
+
+# Step 3: Only if vtop validation succeeded — dump surrounding memory for DMA signature matching
+rd -x <returned_VA> 512
+rd -a <returned_VA> 512
+
+# Step 4: Check if this PA belongs to a DMA-reachable region (only if page is accessible)
+kmem -S <returned_VA>       # Is it a slab cache page? → Note cache name
+```
+This path is the **primary investigation route** when you have a RIP-CR2 contradiction and
+`iommu=pt` is confirmed. Execute it BEFORE loading driver debug symbols.
 
 **Key `struct page` fields to check**:
 | Field | DMA-related value | Meaning |
@@ -1093,11 +1344,18 @@ When concluding DMA corruption, your `final_diagnosis.evidence` array MUST inclu
    - If reachability is not proven for either case, downgrade confidence.
 7. **Driver/Firmware version evidence**:
     - Include driver version and firmware version, and compare against known bug advisories when available
+8. **CR2/corrupted-value physical address investigation (REQUIRED when RIP-CR2 contradiction exists)**:
+   - You MUST attempt `kmem -p <CR2_value>` and `ptov <CR2_value>` before concluding.
+   - If these fail (invalid PA): state explicitly "CR2 value 0x... is not a valid physical
+     address; it represents a corrupted pointer whose origin could not be mapped to a physical page."
+   - If these succeed: include the page ownership result as direct evidence.
+   - Skipping this step when a RIP-CR2 contradiction was observed MUST lower confidence to **Low**.
 
 **Confidence grading for DMA conclusion**:
 - **High**: Evidence items 1-7 satisfied, including concrete address overlap/mapping proof
 - **Medium**: IOMMU + payload signature + page state are solid, but exact overlap proof is partial
-- **Low**: Only payload-pattern similarity exists, with weak mapping/address evidence
+- **Low**: Only payload-pattern similarity exists, with weak mapping/address evidence; OR
+  a RIP-CR2 contradiction was observed but `kmem -p <CR2>` and `ptov <CR2>` were not attempted
 
 **Recommended validation experiment**:
 - Propose one controlled config/workload A/B check in `additional_notes`
@@ -1162,14 +1420,19 @@ Note: If `<type>` is from a third-party module (e.g., `mlx5_*`, `nvme_*`), do NO
 | Command | Use Case |
 |---------|----------|
 | `bt` | Current task backtrace |
-| `bt -f` | Backtrace with stack frame dump |
+| `bt -f` | Backtrace with stack frame dump — use when stack corruption suspected or frames appear truncated |
 | `bt -l` | Backtrace with line numbers |
-| `bt -e` | Backtrace with exception frame (essential for interrupt context) |
+| `bt -e` | **Backtrace with CPU exception frame** — **MANDATORY** for idle task crashes (`swapper/N`, PID=0) and interrupt/NMI context crashes. Reveals register state (RIP, CR2, error_code, RFLAGS) at the exact fault point and exposes interrupt delivery chains invisible to plain `bt`. |
 | `bt <pid>` | Specific task backtrace |
 | `ps` | Basic process list |
 | `ps <pid>` | Single process info |
 | `ps -G <task>` | Specific task memory |
 | `task -R <field>` | Read task_struct field |
+
+**`bt -e` usage guidance**:
+- Always pair `bt -e` with plain `bt` for idle/interrupt crashes — they provide complementary information.
+- If `bt -e` output shows an **additional frame above the idle loop** (e.g., an NMI or IRQ handler), that upper frame is the actual execution context of the fault, not the idle instruction at plain `bt`'s RIP.
+- In `run_script`, combine them: `run_script ["bt", "bt -e"]`
 
 ## 4.4 Kernel Log
 > `log`, `log | grep`, and all **standalone** `log -t` / `log -m` / `log -a` are **FORBIDDEN** (see §1.2).
@@ -1319,6 +1582,49 @@ from registers, stack, and calling convention.
     - Try nearby memory with `rd`
     - Verify mapping via `vtop`
 
+- If `rd <addr>` returns `"seek error: kernel virtual address: ... type: 64-bit KVADDR"` or
+  `"seek error: kernel virtual address: ... type: ascii"`:
+  The page backing this VA was **not saved in the vmcore dump**, or the VA maps to a
+  hardware region that crash cannot read.
+  **Root causes**:
+    - makedumpfile excluded this page type (most common: `PG_reserved`, MMIO, firmware pages)
+    - PA is outside actual installed RAM range
+    - Page belongs to a hardware-reserved DMA/firmware region
+  **Action**:
+    - Do NOT retry `rd` at this address — it will always fail.
+    - Use `kmem -p <PA>` to check the physical page's flags. If `PG_reserved` is set,
+      this confirms the page is a hardware/firmware reserved region, not normal kernel RAM.
+    - **Key diagnostic insight**: A valid kernel pointer should not normally resolve to a
+      `PG_reserved` or dump-excluded physical page. If it does, the pointer itself is
+      corrupted — record: "pointer 0x... leads to reserved/inaccessible PA 0x... →
+      consistent with DMA-written garbage value, not a valid kernel VA."
+    - This is **positive evidence** for DMA corruption; treat it as such and proceed to
+      §3.12 DMA analysis rather than retrying memory reads.
+
+  **Prevention**: Always run `vtop <VA>` to validate a `ptov` result BEFORE calling `rd`.
+  - If `vtop` fails, skip `rd` entirely.
+  - If `vtop` succeeds, also run `kmem -p <PA>` and check page flags.
+    If `PG_reserved` is set, skip `rd` as well (reserved pages are typically excluded from vmcore).
+  Only call `rd` when `vtop` succeeds and page flags indicate normal (non-reserved) RAM
+  (see §1.5 Strategy 3 for the full validation procedure).
+
+- If `rd <addr>` returns an error containing `type: "mm_struct pgd"` or similar internal
+  page-walk type errors (e.g., `type: "pgd"`, `type: "pud"`, `type: "pmd"`):
+  This means the crash utility attempted a software page-table walk for `<addr>` and
+  **failed at the page-global-directory level** — the address has NO mapping in any page
+  table visible to crash.
+  **Interpretation**:
+    - If `<addr>` is in user-space range (`< 0x0000800000000000`) AND the faulting context
+      is kernel/idle (supervisor mode, `swapper` task, or interrupt handler) → this **confirms
+      pointer corruption**: a kernel pointer was overwritten with a user-space-range value,
+      which has no kernel mapping. Do NOT attempt further `rd` at this address.
+    - If `<addr>` is in kernel range but still gets a pgd error → page was not saved in the
+      dump (makedumpfile exclusion), or the page table itself is corrupted.
+  **Action**:
+    - Do NOT attempt `rd <addr>` again — it will fail the same way.
+    - Instead: `kmem -p <addr>` — treat `<addr>` as a **physical address candidate** and
+      check if it resolves to a valid page descriptor. This is the correct next step when
+      the address may be a DMA-written raw physical address rather than a valid VA.
 - If `bt` shows "<garbage>" or truncated frames:
   Possible stack corruption or unwinder failure.
   Action:
