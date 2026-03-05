@@ -260,53 +260,58 @@ Translate physical addresses to virtual addresses and traverse known structures:
 ## 1.7 Per-CPU Variable Access Rule (MANDATORY)
 
 On x86_64 Linux, `%gs` points to the **per-CPU area base** of the currently executing CPU.
-An instruction like `mov %gs:0xXXXX(%rip), %reg  # 0xOFFSET` reads a **per-CPU variable** —
-it is **NOT** an absolute virtual address.
+An instruction like `mov %gs:0xXXXX(%rip), %reg  # 0xOFFSET` reads a **per-CPU variable**.
 
 ### ⚠️ Critical: Identify the Correct Per-CPU Offset from Disassembly
 
-The assembler encodes a **RIP-relative displacement** (`0xXXXX`) that, when added to `%rip`,
-computes the GS-base address at runtime. The **assembler comment** (`# 0xOFFSET`) shows the
-**actual per-CPU offset** resolved at link time — this is the value you must use.
+The assembler encodes a **RIP-relative displacement** (`0xXXXX`) which is a runtime artifact. The **assembler comment** (`# 0xOFFSET`) shows the actual per-CPU offset resolved at link time.
 
 ```
 mov %gs:0x79aa8211(%rip), %ebp   # 0x14168
                  ^^^^^^^^^^           ^^^^^^^
           RIP-relative displacement   ✅ TRUE per-CPU offset  ← USE THIS
-          (runtime artifact, ignore)
+          (Ignore for calculation)    (Static offset from __per_cpu_start)
 ```
 
+**❌ NEVER** invent or use symbols like `per_cpu__base` or `cpu_base[]`. They do not exist in the kernel.
 **❌ NEVER** use the RIP-relative displacement (`0x79aa8211`) as the offset.
-**❌ NEVER** call `rd 0x14168` directly — it is an offset, not a kernel virtual address.
 
-**✅ MANDATORY resolution procedure** when disassembly contains `%gs:...(% rip)  # 0xOFFSET`:
+**✅ MANDATORY resolution procedure using the crash utility:**
 
-```
-1. Extract OFFSET from the assembler comment (the value after '#')
-   ⚠️  If the comment is MISSING, compute it manually:
-       OFFSET = (address of next instruction) + disp32
-       where disp32 is the signed 32-bit displacement in %gs:disp32(%rip)
-       Example: instruction at 0xffffffff8656bf50, length 7 bytes → RIP_next = 0xffffffff8656bf57
-                disp32 = 0x79aa8211 (interpreted as signed: -0x7655 7def)
-                OFFSET = (0xffffffff8656bf57 + 0xffffffff79aa8211) & 0xffffffffffffffff = 0x14168  ✅
-2. Read the per-CPU base for the specific CPU directly via the global array:
-   Try: p/x __per_cpu_offset[<panic_cpu>]
-   (If that fails, dump the array: rd __per_cpu_offset <nr_cpus> and manually pick index [panic_cpu])
-3. real_addr = __per_cpu_offset[panic_cpu] + OFFSET   # compute absolute VA
-4. rd <real_addr>                               # read the actual per-CPU variable value
+**Step 1: Extract the OFFSET**
+Extract the value after the `#` in the disassembly.
+*Example: `0x14168`.*
+*Note: If the comment is missing, use: `OFFSET = (RIP_of_next_instruction + disp32)`.*
+
+**Step 2: Retrieve the CPU-specific Base Address**
+In crash, the ONLY valid way to get a CPU's base address is via the `__per_cpu_offset` array.
+```bash
+# Replace <N> with the target CPU ID (e.g., panic_cpu)
+crash> p/x __per_cpu_offset[<N>]
+$1 = 0xffff88813f1c0000  # This is the BASE for CPU N
 ```
 
-**Example** — panic on CPU 7, disassembly shows:
+**Step 3: Compute and Read the Actual Virtual Address**
+Add the BASE from Step 2 to the OFFSET from Step 1. You can perform the math directly in the `rd` command.
+```bash
+# Formula: rd <BASE>+<OFFSET>
+crash> rd 0xffff88813f1c0000+0x14168 1
+ffff88813f1d4168:  0000000000000001
 ```
-mov %gs:0x79aa8211(%rip), %ebp   # 0x14168
-```
-`OFFSET = 0x14168`  (from the comment, NOT `0x79aa8211`)
 
+**Step 4: (Optional) Identify the Variable Name**
+To understand what you are reading, map the offset back to the kernel's static per-CPU symbols:
+```bash
+# __per_cpu_start is the base for all static per-cpu symbols
+crash> sym __per_cpu_start+0x14168
+ffffffff82614168 (D) static_per_cpu_variable_name
 ```
-run_script:
-  p/x __per_cpu_offset[7]         # preferred way to get CPU7 base, assume returns ffff8cd9befc0000
-  rd ffff8cd9befd4168             # ffff8cd9befc0000 + 0x14168 = ffff8cd9befd4168
-```
+
+**Example Summary (Panic on CPU 7):**
+* **Disassembly:** `mov %gs:0x79aa8211(%rip), %rax  # 0x14168`
+* **Get Base:** `p/x __per_cpu_offset[7]` → Result: `0xffff88813f1c0000`
+* **Read Memory:** `rd 0xffff88813f1c0000+0x14168`
+* **Confirm Symbol:** `sym __per_cpu_start+0x14168`
 
 
 ================================================================================
