@@ -231,7 +231,9 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
                             "Successfully repaired malformed JSON from LLM using json_repair."
                         )
                 except Exception as e:
-                    logger.debug(f"json_repair failed: {e}, falling back to manual fix")
+                    logger.debug(
+                        f"json_repair failed: '{e}', falling back to manual fix"
+                    )
                     pass
 
                 if analysis_result is None:
@@ -289,7 +291,7 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
                         f"Original: {content[:200]}... Fixed: {content_str[:200]}..."
                     )
             except Exception as repair_err:
-                logger.warning(f"JSON repair failed: {repair_err}")
+                logger.warning(f"JSON repair failed: '{repair_err}'")
 
                 # Fallback: 如果存在 reasoning_content，路由到 structure_reasoning_node
                 # 让 deepseek-chat 将纯文本推理内容结构化为 VMCoreAnalysisStep
@@ -483,7 +485,7 @@ async def structure_reasoning_content(state: AgentState, chat_llm) -> dict:
                         "structure_reasoning_node: repaired JSON via json_repair."
                     )
             except Exception as e:
-                logger.debug(f"structure_reasoning_node: json_repair failed: {e}")
+                logger.debug(f"structure_reasoning_node: json_repair failed: '{e}'")
 
         if analysis_result is None:
             raise ValueError(

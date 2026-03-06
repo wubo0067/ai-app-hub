@@ -21,8 +21,12 @@ from src.react.report_generator import generate_markdown_report
 from src.mcp_tools.crash.client import initialize_crash_tools
 from src.mcp_tools.source_patch.client import initialize_patch_tools
 
-# Agent 图最大递归轮次（LLM ↔ Tool 交互次数上限）
-AGENT_RECURSION_LIMIT = 60
+# Agent 图最大递归轮次（LangGraph superstep 上限）
+# 注意：每轮可见分析消耗 3 个 superstep：
+#   llm_analysis_node (1) + structure_reasoning_node (1) + crash_tool_node (1)
+# 加上初始 collect_crash_init_data_node (1)，公式为：1 + N_rounds × 3
+# 例如：支持 ~30 轮分析 → 1 + 30×3 = 91；支持 ~40 轮 → 1 + 40×3 = 121
+AGENT_RECURSION_LIMIT = 46
 
 
 # 请求模型
