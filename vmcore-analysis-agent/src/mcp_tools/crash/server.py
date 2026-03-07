@@ -251,6 +251,12 @@ commands = [
         "sym jiffies; sym c0109944",
         "This command translates a symbol to its virtual address, or a static kernel virtual address to its symbol -- or to a symbol-plus-offset value.",
     ),
+    (
+        "task",
+        "task [-R member[,member]] [-dx] [pid | taskp] ...; task -R se.on_rq",
+        "task -x; task -R ngroups,groups 2958",
+        "This command dumps a formatted display of the contents of a task's task_struct and thread_info structures.",
+    ),
 ]
 
 # 批量注册

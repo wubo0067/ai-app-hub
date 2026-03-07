@@ -82,16 +82,12 @@ def generate_markdown_report(state: AgentState) -> str:
                         lines.append("```")
                     else:
                         lines.append("```")
-                        lines.append(content[:500])  # 限制长度
-                        if len(content) > 500:
-                            lines.append("...")
+                        lines.append(content)
                         lines.append("```")
                 except:
                     # 不是 JSON，直接显示
                     lines.append("```")
-                    lines.append(content[:500])
-                    if len(content) > 500:
-                        lines.append("...")
+                    lines.append(content)
                     lines.append("```")
 
             lines.append("")
@@ -164,9 +160,9 @@ def generate_markdown_report(state: AgentState) -> str:
             except Exception as e:
                 logger.warning(f"Failed to parse AIMessage as VMCoreAnalysisStep: {e}")
                 lines.append("```json")
-                lines.append(msg.content[:500])
-                if len(msg.content) > 500:
-                    lines.append("...")
+                lines.append(
+                    msg.content if isinstance(msg.content, str) else str(msg.content)
+                )
                 lines.append("```")
                 lines.append("")
 
@@ -183,11 +179,9 @@ def generate_markdown_report(state: AgentState) -> str:
             lines.append("```")
             content = msg.content
             if isinstance(content, str):
-                lines.append(content[:1000])  # 限制长度
-                if len(content) > 1000:
-                    lines.append("...")
+                lines.append(content)
             else:
-                lines.append(str(content)[:1000])
+                lines.append(str(content))
             lines.append("```")
             lines.append("")
             step_number += 1

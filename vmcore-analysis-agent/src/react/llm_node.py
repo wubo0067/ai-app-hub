@@ -2,7 +2,7 @@ import json
 import re
 from typing import Optional, List, Literal, cast, Any, Dict
 from pydantic import BaseModel, Field, model_validator
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from json_repair import repair_json
 from .graph_state import AgentState
 from .nodes import llm_analysis_node, structure_reasoning_node
@@ -108,6 +108,90 @@ class VMCoreAnalysisStep(BaseModel):
     )
 
 
+def _compress_messages_for_llm(
+    messages: list,
+    max_tool_output_chars: int = 4000,
+    old_reasoning_head: int = 200,
+    old_reasoning_tail: int = 500,
+) -> list:
+    """
+    在发送给 LLM 前对消息历史进行无损压缩，降低 token 消耗。
+
+    策略：
+    1. 旧 AIMessage 的 reasoning_content 保留头部 + 尾部，中间截断。
+       - 头部（old_reasoning_head）：保留"当前在分析什么"的上下文
+       - 尾部（old_reasoning_tail）：保留"结论和下一步决策"（推理链结论在尾部）
+       ⚠️ DeepSeek-Reasoner API 要求所有 assistant 消息必须包含 reasoning_content 字段，
+       不可删除、不可设为 None，否则返回 400 错误。
+    2. 将超过 max_tool_output_chars 的 ToolMessage 内容截断（保留头尾各一半）。
+
+    此函数不修改 AgentState，仅返回压缩后的副本用于当次 LLM 调用。
+
+    Args:
+        messages: state["messages"] 原始消息列表
+        max_tool_output_chars: ToolMessage 内容允许的最大字符数
+        old_reasoning_head: 旧 AIMessage reasoning_content 保留的头部字符数
+        old_reasoning_tail: 旧 AIMessage reasoning_content 保留的尾部字符数
+
+    Returns:
+        压缩后的消息列表（浅拷贝，修改的对象为新建实例）
+    """
+    ai_msg_indices = [i for i, m in enumerate(messages) if isinstance(m, AIMessage)]
+    # 最后一条 AIMessage 保留完整 reasoning_content
+    last_ai_idx = ai_msg_indices[-1] if ai_msg_indices else -1
+    keep_threshold = old_reasoning_head + old_reasoning_tail
+
+    compressed = []
+    truncated_reasoning_count = 0
+    truncated_tool_count = 0
+
+    for i, msg in enumerate(messages):
+        if isinstance(msg, AIMessage) and i != last_ai_idx:
+            rc = msg.additional_kwargs.get("reasoning_content", "")
+            if rc and len(rc) > keep_threshold:
+                omitted = len(rc) - keep_threshold
+                new_kwargs = dict(msg.additional_kwargs)
+                new_kwargs["reasoning_content"] = (
+                    rc[:old_reasoning_head]
+                    + f"\n...[{omitted} chars truncated]...\n"
+                    + rc[-old_reasoning_tail:]
+                )
+                msg = AIMessage(
+                    content=msg.content,
+                    tool_calls=msg.tool_calls,
+                    additional_kwargs=new_kwargs,
+                    id=msg.id,
+                )
+                truncated_reasoning_count += 1
+        elif (
+            isinstance(msg, ToolMessage)
+            and isinstance(msg.content, str)
+            and len(msg.content) > max_tool_output_chars
+        ):
+            half = max_tool_output_chars // 2
+            omitted = len(msg.content) - max_tool_output_chars
+            truncated_content = (
+                msg.content[:half]
+                + f"\n...[{omitted} chars truncated]...\n"
+                + msg.content[-half:]
+            )
+            msg = ToolMessage(
+                content=truncated_content,
+                tool_call_id=msg.tool_call_id,  # type: ignore[arg-type]
+                id=msg.id,
+            )
+            truncated_tool_count += 1
+        compressed.append(msg)
+
+    if truncated_reasoning_count or truncated_tool_count:
+        logger.info(
+            f"[compress] truncated reasoning_content in {truncated_reasoning_count} old AIMessages "
+            f"(head={old_reasoning_head}+tail={old_reasoning_tail} chars), "
+            f"truncated {truncated_tool_count} ToolMessages (limit={max_tool_output_chars})"
+        )
+    return compressed
+
+
 async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
     """
     调用 LLM 分析节点，根据收集到的 vmcore 信息进行智能分析。
@@ -150,11 +234,9 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
             "Set 'is_conclusive' to true and do NOT request any further tool calls (action must be null)."
         )
 
-    # 核心原因：LLM 是无状态的
-    # LLM 本身没有记忆。每次调用 invoke() 都是一个独立的 API 请求，LLM 不会"记住"之前的对话。这和我们使用的聊天界面不同：
-
-    # 每次调用都需要传入完整的上下文消息列表，包括系统消息和之前的对话历史。
-    messages_to_send = [SystemMessage(content=system_message), *state["messages"]]
+    # 压缩消息历史后再发送给 LLM，避免 reasoning_content 累积和大工具输出导致 token 暴增
+    compressed_messages = _compress_messages_for_llm(state["messages"])
+    messages_to_send = [SystemMessage(content=system_message), *compressed_messages]
     # 结构化输出，设置 include_raw=True 以获取 token 消耗等元数据
     llm_analysis = llm_with_tools.with_structured_output(
         VMCoreAnalysisStep, method="json_mode", include_raw=True
@@ -430,7 +512,9 @@ async def structure_reasoning_content(state: AgentState, chat_llm) -> dict:
     logger.info(
         f"Starting {structure_reasoning_node} node execution (step {current_step})..."
     )
-    logger.debug(f"Reasoning to structure (first 200 chars): {reasoning[:200]}...")
+    logger.debug(
+        f"Reasoning to structure (first 200 chars): {(reasoning or '')[:200]}..."
+    )
 
     curr_token_usage = 0
 

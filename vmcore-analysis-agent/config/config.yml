@@ -1,6 +1,6 @@
 # To separate your traces from other application
 LANGSMITH_PROJECT: vmcore-analysis-agent
-LANGSMITH_TRACING: true
+LANGSMITH_TRACING: false
 
 ## LLM choice:
 # LLM_MODEL: deepseek-chat

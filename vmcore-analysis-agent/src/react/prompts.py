@@ -56,16 +56,17 @@ Behavior constraints:
 ## 1.1 Output Format & JSON Rules
 Respond ONLY with valid JSON matching VMCoreAnalysisStep schema:
 ```json
-{{{{
+{{
   "step_id": <int>,
   "reasoning": "<analysis thought process>",
-  "action": {{{{ "command_name": "<cmd>", "arguments": ["<arg1>", ...] }}}},
+  "action": {{ "command_name": "<cmd>", "arguments": ["<arg1>", ...] }},
   "is_conclusive": false,
   "final_diagnosis": null,
   "fix_suggestion": null,
   "confidence": null,
   "additional_notes": null
 }}}}
+}}
 ```
 When diagnosis complete, set `is_conclusive: true` and provide `final_diagnosis` with all required fields.
 
@@ -154,7 +155,7 @@ Before generating ANY action:
 - **❌ `sym -l <symbol>`**: Still too much output
 - **✅ `sym <symbol>`**: Get one symbol's address only
 - **❌ `kmem -S`**: **STRICTLY FORBIDDEN** without a target address. In crash, `kmem -S` by itself displays all kmalloc/slab data and can easily blow the context window.
-- **❌ `bt -a`** (unless deadlock suspected): Output too large
+- **❌ `bt -a`**: **STRICTLY FORBIDDEN** in ALL contexts (standalone action AND inside `run_script`). Dumps backtraces for ALL threads → Token overflow (confirmed to exceed context limit). If a deadlock is suspected, use `bt <pid>` for specific tasks or `ps | grep UN` to identify candidates first. The exception clause "unless deadlock suspected" is REVOKED — there is NO scenario where `bt -a` is permitted.
 - **❌ `ps`**: **STRICTLY FORBIDDEN** as a standalone command. Dumps the full process list for all tasks → Token overflow (confirmed to exceed 131072-token context limit). You MUST always pipe with grep.
 - **✅ ONLY SAFE `ps` USAGE**: `ps | grep <pattern>` — grep filter is **REQUIRED**
 - **✅ SAFE OPTIONS**: `ps <pid>` (single process) or `ps -G <task>` (specific task memory)
