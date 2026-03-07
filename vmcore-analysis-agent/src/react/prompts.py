@@ -311,12 +311,15 @@ The `<address>` argument to `search` MUST be a raw hex value WITHOUT the `0x` pr
 ### Strategy 2: Reverse Resolution (Identify Page Properties)
 If you have a physical address, determine what type of memory it belongs to rather than
 searching for pointers to it:
-1. `kmem -p <physical_address>` → Resolve the page descriptor
-2. Analyze output to determine if it belongs to:
+1. **Align the physical address**: `kmem -p` **REQUIRES** the input physical address to be 4KB page-aligned. You MUST clear the lower 12 bits (replace the last 3 hex digits with `000`) before calling it.
+   - ❌ WRONG: `kmem -p 65db75c7`
+   - ✅ CORRECT: `kmem -p 65db7000`
+2. `kmem -p <aligned_physical_address>` → Resolve the page descriptor
+3. Analyze output to determine if it belongs to:
    - A specific **Slab cache** → Query that slab with `kmem -S <addr>`
    - An **Anonymous page** → Check owning process via `page.mapping`
    - A **File mapping** (Page Cache) → Identify the file via `page.mapping`
-3. If it is a Slab cache, shift analysis to querying that specific slab
+4. If it is a Slab cache, shift analysis to querying that specific slab
 
 ### Strategy 3: Address Translation and Structural Traversal
 Translate physical addresses to virtual addresses and traverse known structures:
@@ -370,7 +373,7 @@ ffffd45901976dc0   65db7000            0          0   1  fffffc0000800 reserved
 
 **If vtop validation fails OR FLAGS contains `reserved`**:
 - Do NOT call `rd` on this VA — it will produce `seek error`
-- Check `kmem -p <PA>` to inspect page flags if not already done:
+- Check `kmem -p <aligned_PA>` to inspect page flags if not already done:
   - `PG_reserved` set → hardware-reserved region (DMA/firmware), not normal RAM;
     makedumpfile **never** saves reserved pages in vmcore
   - This is itself diagnostic evidence: **a valid kernel pointer should never resolve
@@ -399,7 +402,7 @@ ffffd45901976dc0   65db7000            0          0   1  fffffc0000800 reserved
   - `ptov <value>` is a **mathematical translation attempt**, not proof that `<value>` is a real physical address.
   - You MUST NOT conclude "the corrupted value is a physical address" merely because `ptov` returned a VA.
   - Treat it as a candidate only, and validate it using the full procedure in **§1.5 Strategy 3**.
-  - **Hard gate**: Do NOT use `ptov` / `kmem -p` on an arbitrary corrupted register value unless you first justify why it is a plausible physical-address candidate rather than ordinary corrupted object data.
+  - **Hard gate**: Do NOT use `ptov` / `kmem -p` on an arbitrary corrupted register value unless you first justify why it is a plausible physical-address candidate rather than ordinary corrupted object data. Remember to align the address for `kmem -p`.
 7. **Address Validation Before Use**: Before passing an address to `struct <type> <addr>`, `rd <addr>`, or any command that reads memory at a specific address, you MUST verify the address is valid:
    - **❌ NEVER use `0x0`, `0x0000000000000000`, or NULL as an address argument**. `struct <type> 0x0` is always wrong — it attempts to read a NULL pointer.
    - **❌ NEVER use small values (< 0x1000)** as addresses — these are offsets, not valid kernel addresses.
@@ -533,14 +536,14 @@ in ANY action, under ANY circumstance:
 | Forbidden form | Why it fails |
 |----------------|--------------|
 | `rd %gs:0x1b440` | `%gs` is x86 assembler GS-segment syntax; crash does not parse register names |
-| `rd %gs:0x79aa8211(%rip)` | RIP-relative displacement encoding; meaningless outside CPU execution context |
+| `rd 0x79aa8211(%rip)` | RIP-relative displacement encoding; meaningless outside CPU execution context |
 | `rd (%rax)` | Indirect register reference; crash has no register state to dereference |
 | `rd $rax` | Register value reference; crash cannot read live registers from a vmcore |
 | `rd %rip+0x1b440` | Any register arithmetic; all invalid in crash |
 
 **crash utility ONLY accepts explicit numeric addresses (hex or decimal literals).**
 
-If you see `mov %gs:0x79aa8211(%rip), %reg  # 0x1b440` in disassembly and want to read
+If you see `mov %gs:0x1b440, %reg` in disassembly and want to read
 that per-CPU variable, you MUST compute the actual VA first (Steps 1–3 below) and pass
 that numeric result as the argument. **Never copy assembler syntax verbatim into an action.**
 
@@ -551,17 +554,17 @@ Compute the numeric address first, then generate the action.
 ---
 
 On x86_64 Linux, `%gs` points to the **per-CPU area base** of the currently executing CPU.
-An instruction like `mov %gs:0xXXXX(%rip), %reg  # 0xOFFSET` reads a **per-CPU variable**.
+An instruction like `mov %gs:0xXXXX, %reg` reads a **per-CPU variable**.
 
 ### ⚠️ Critical: Identify the Correct Per-CPU Offset from Disassembly
 
-The assembler encodes a **RIP-relative displacement** (`0xXXXX`) which is a runtime artifact. The **assembler comment** (`# 0xOFFSET`) shows the actual per-CPU offset resolved at link time.
+The per-CPU variable offset is an **absolute displacement** (`0xXXXX`) from the `%gs` base register, resolved statically at link time.
 
 ```
-mov %gs:0x79aa8211(%rip), %ebp   # 0x14168
-                 ^^^^^^^^^^           ^^^^^^^
-          RIP-relative displacement   ✅ TRUE per-CPU offset  ← USE THIS
-          (Ignore for calculation)    (Static offset from __per_cpu_start)
+mov %gs:0x14168, %rax
+             ^^^^^^^
+        ✅ TRUE per-CPU offset  ← USE THIS (0x14168)
+        (Static offset from __per_cpu_start)
 ```
 
 **❌ NEVER** invent or use symbols like `per_cpu__base` or `cpu_base[]`. They do not exist in the kernel.
@@ -580,17 +583,17 @@ instruction**, NOT any arbitrary `%gs` access in the function.
 1. Use `dis -l <function> 100` to get the full disassembly.
 2. Starting from RIP, scan **backwards** through the instructions.
 3. Find the first instruction that LOADS from memory into a register (`mov (%reg), %reg` or
-   `mov %gs:...(%rip), %reg`).
+   `mov %gs:0xXXXX, %reg`).
 4. That load's target register, when dereferenced, is the likely actual fault source.
-5. Record that specific per-CPU offset (the comment value `# 0xOFFSET`).
+5. Record that specific per-CPU offset.
 6. Do NOT use a per-CPU offset from a different, earlier instruction that is unrelated to the
    crash path.
 **✅ MANDATORY resolution procedure using the crash utility:**
 
 **Step 1: Extract the OFFSET**
-Extract the value after the `#` in the disassembly.
-*Example: `0x14168`.*
-*Note: If the comment is missing, use: `OFFSET = (RIP_of_next_instruction + disp32)`.*
+Extract the value of the offset directly from the instruction displacement.
+*Example: `mov %gs:0x14168, %rax`.*
+*The offset is `0x14168`.*
 
 **Step 2: Retrieve the CPU-specific Base Address**
 In crash, the ONLY valid way to get a CPU's base address is via the `__per_cpu_offset` array.
@@ -627,11 +630,22 @@ as "corrupted":
   (e.g., `current` pointer holds a non-kernel address when the task is a kernel thread).
 
 **Example Summary (Panic on CPU 7):**
-* **Disassembly:** `mov %gs:0x79aa8211(%rip), %rax  # 0x14168`
+* **Disassembly:** `mov %gs:0x14168, %rax`
 * **Get Base:** `p/x __per_cpu_offset[7]` → Result: `0xffff88813f1c0000`
 * **Read Memory:** `rd 0xffff88813f1c0000+0x14168`
 * **Confirm Symbol:** `sym __per_cpu_start+0x14168`
 
+## 1.8 Global Variable Access Rule (RIP-Relative)
+
+If you see an instruction accessing a global variable via RIP-relative addressing, such as:
+`mov 0x79aa8211(%rip), %reg`
+
+The target address lies at an offset relative to the **next instruction's** address (RIP).
+Usually, `dis -l` or normal decoding automatically computes the address and adds a comment like `# 0xffffffff82614168`.
+
+If you must compute the final address manually:
+`ADDRESS = (RIP_of_next_instruction + disp32)`
+*Note: This is strictly for normal variables (`(%rip)`). Do not apply this to per-CPU (`%gs`) offsets.*
 
 ================================================================================
 # PART 2: DIAGNOSTIC WORKFLOW
