@@ -113,17 +113,20 @@ def _compress_messages_for_llm(
     max_tool_output_chars: int = 4000,
     old_reasoning_head: int = 200,
     old_reasoning_tail: int = 500,
+    recent_ai_messages_to_keep: int = 2,
+    recent_tool_messages_to_keep: int = 2,
 ) -> list:
     """
-    在发送给 LLM 前对消息历史进行无损压缩，降低 token 消耗。
+    在发送给 LLM 前对消息历史进行保守压缩，降低 token 消耗。
 
     策略：
-    1. 旧 AIMessage 的 reasoning_content 保留头部 + 尾部，中间截断。
+    1. 保留最近几条 AIMessage 和 ToolMessage 的完整内容，尽量减少对当前推理链的干扰。
+    2. 更早的 AIMessage 的 reasoning_content 保留头部 + 尾部，中间截断。
        - 头部（old_reasoning_head）：保留"当前在分析什么"的上下文
        - 尾部（old_reasoning_tail）：保留"结论和下一步决策"（推理链结论在尾部）
        ⚠️ DeepSeek-Reasoner API 要求所有 assistant 消息必须包含 reasoning_content 字段，
        不可删除、不可设为 None，否则返回 400 错误。
-    2. 将超过 max_tool_output_chars 的 ToolMessage 内容截断（保留头尾各一半）。
+    3. 对更早的 ToolMessage，仅在超过 max_tool_output_chars 时才截断。
 
     此函数不修改 AgentState，仅返回压缩后的副本用于当次 LLM 调用。
 
@@ -132,62 +135,90 @@ def _compress_messages_for_llm(
         max_tool_output_chars: ToolMessage 内容允许的最大字符数
         old_reasoning_head: 旧 AIMessage reasoning_content 保留的头部字符数
         old_reasoning_tail: 旧 AIMessage reasoning_content 保留的尾部字符数
+        recent_ai_messages_to_keep: 保留完整内容的最近 AIMessage 数量
+        recent_tool_messages_to_keep: 保留完整内容的最近 ToolMessage 数量
 
     Returns:
         压缩后的消息列表（浅拷贝，修改的对象为新建实例）
     """
     ai_msg_indices = [i for i, m in enumerate(messages) if isinstance(m, AIMessage)]
-    # 最后一条 AIMessage 保留完整 reasoning_content
-    last_ai_idx = ai_msg_indices[-1] if ai_msg_indices else -1
+    tool_msg_indices = [i for i, m in enumerate(messages) if isinstance(m, ToolMessage)]
+    recent_ai_indices = set(ai_msg_indices[-recent_ai_messages_to_keep:])
+    recent_tool_indices = set(tool_msg_indices[-recent_tool_messages_to_keep:])
     keep_threshold = old_reasoning_head + old_reasoning_tail
+
+    def _truncate_middle(text: str, head_chars: int, tail_chars: int) -> str:
+        keep_chars = head_chars + tail_chars
+        if keep_chars <= 0 or len(text) <= keep_chars:
+            return text
+
+        omitted = len(text) - keep_chars
+        return (
+            text[:head_chars]
+            + f"\n...[{omitted} chars truncated]...\n"
+            + text[-tail_chars:]
+        )
 
     compressed = []
     truncated_reasoning_count = 0
     truncated_tool_count = 0
+    reasoning_chars_before = 0
+    reasoning_chars_after = 0
+    tool_chars_before = 0
+    tool_chars_after = 0
 
     for i, msg in enumerate(messages):
-        if isinstance(msg, AIMessage) and i != last_ai_idx:
+        if isinstance(msg, AIMessage) and i not in recent_ai_indices:
             rc = msg.additional_kwargs.get("reasoning_content", "")
+            if isinstance(rc, str):
+                reasoning_chars_before += len(rc)
             if rc and len(rc) > keep_threshold:
-                omitted = len(rc) - keep_threshold
                 new_kwargs = dict(msg.additional_kwargs)
-                new_kwargs["reasoning_content"] = (
-                    rc[:old_reasoning_head]
-                    + f"\n...[{omitted} chars truncated]...\n"
-                    + rc[-old_reasoning_tail:]
+                new_kwargs["reasoning_content"] = _truncate_middle(
+                    rc,
+                    old_reasoning_head,
+                    old_reasoning_tail,
                 )
-                msg = AIMessage(
-                    content=msg.content,
-                    tool_calls=msg.tool_calls,
-                    additional_kwargs=new_kwargs,
-                    id=msg.id,
-                )
+                msg = msg.model_copy(update={"additional_kwargs": new_kwargs})
                 truncated_reasoning_count += 1
+            if isinstance(msg.additional_kwargs.get("reasoning_content"), str):
+                reasoning_chars_after += len(msg.additional_kwargs["reasoning_content"])
         elif (
             isinstance(msg, ToolMessage)
+            and i not in recent_tool_indices
             and isinstance(msg.content, str)
             and len(msg.content) > max_tool_output_chars
         ):
-            half = max_tool_output_chars // 2
-            omitted = len(msg.content) - max_tool_output_chars
-            truncated_content = (
-                msg.content[:half]
-                + f"\n...[{omitted} chars truncated]...\n"
-                + msg.content[-half:]
+            tool_chars_before += len(msg.content)
+            tool_head_chars = max_tool_output_chars * 3 // 5
+            tool_tail_chars = max_tool_output_chars - tool_head_chars
+            truncated_content = _truncate_middle(
+                msg.content,
+                tool_head_chars,
+                tool_tail_chars,
             )
-            msg = ToolMessage(
-                content=truncated_content,
-                tool_call_id=msg.tool_call_id,  # type: ignore[arg-type]
-                id=msg.id,
-            )
+            msg = msg.model_copy(update={"content": truncated_content})
             truncated_tool_count += 1
+            tool_chars_after += len(msg.content)
+        elif (
+            isinstance(msg, ToolMessage)
+            and i not in recent_tool_indices
+            and isinstance(msg.content, str)
+        ):
+            tool_chars_before += len(msg.content)
+            tool_chars_after += len(msg.content)
         compressed.append(msg)
 
     if truncated_reasoning_count or truncated_tool_count:
+        reasoning_saved = reasoning_chars_before - reasoning_chars_after
+        tool_saved = tool_chars_before - tool_chars_after
         logger.info(
             f"[compress] truncated reasoning_content in {truncated_reasoning_count} old AIMessages "
-            f"(head={old_reasoning_head}+tail={old_reasoning_tail} chars), "
-            f"truncated {truncated_tool_count} ToolMessages (limit={max_tool_output_chars})"
+            f"(head={old_reasoning_head}+tail={old_reasoning_tail} chars, "
+            f"before={reasoning_chars_before}, after={reasoning_chars_after}, saved={reasoning_saved}), "
+            f"truncated {truncated_tool_count} old ToolMessages (limit={max_tool_output_chars}, "
+            f"before={tool_chars_before}, after={tool_chars_after}, saved={tool_saved}, "
+            f"kept recent ai/tool messages full: {recent_ai_messages_to_keep}/{recent_tool_messages_to_keep})"
         )
     return compressed
 
