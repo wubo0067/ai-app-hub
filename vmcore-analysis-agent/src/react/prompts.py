@@ -283,7 +283,7 @@ If the target is a module symbol/type, you MUST load the module in the SAME `run
 **Action-level hard constraint (MUST FOLLOW)**:
 - For module symbols/types, `action.command_name` MUST be `run_script`.
 - The FIRST relevant command in `action.arguments` MUST be `mod -s <module> <path>`.
-- Standalone actions such as `{{"command_name":"struct","arguments":["mlx5_core_dev","-o"]}}` are INVALID for module types.
+- Standalone actions such as a direct `struct -o` against a mlx5 module type are INVALID for module types.
 - This applies even if module symbols were loaded in a previous step/session.
 
 **Module-irrelevant pairing rule (ZERO TOLERANCE)**:
@@ -297,8 +297,7 @@ If the target is a module symbol/type, you MUST load the module in the SAME `run
 | `device` | kernel built-in (`linux/device.h`) | ❌ NO |
 | `task_struct`, `mm_struct` | kernel built-in | ❌ NO |
 | `net_device`, `sk_buff` | kernel built-in | ❌ NO |
-| `mlx5_core_dev`, `mlx5_priv` | mlx5_core module | ✅ YES — `mod -s mlx5_core` |
-| `mlx5_eq`, `mlx5_cq`, `mlx5_rq` | mlx5_core module | ✅ YES — `mod -s mlx5_core` |
+| `mlx5_*` module structs | mlx5_core module | ✅ YES — `mod -s mlx5_core` |
 | `nvme_queue`, `nvme_dev` | nvme_core module | ✅ YES — `mod -s nvme_core` |
 | `scsi_qla_host` | qla2xxx module | ✅ YES — `mod -s qla2xxx` |
 | `pqi_io_request` | smartpqi module | ✅ YES — `mod -s smartpqi` |
@@ -314,16 +313,14 @@ wastes the module-load. The two commands have no logical connection.
 ```json
 # Step N: read pci_dev field (built-in — NO mod -s)
 run_script ["struct pci_dev.dev.driver_data <pci_dev_addr>"]
-
-# Step N+1: inspect the returned mlx5 pointer (module — MUST have mod -s)
-run_script ["mod -s mlx5_core <path>", "struct mlx5_core_dev.pdev <result_from_N>"]
 ```
+Step N+1: start a new `run_script` with `mod -s mlx5_core <path>`, then inspect the already-validated current-kernel mlx5 module type using `struct -o` or a specific field read.
 
 **Forbidden vs Correct JSON examples**:
-- ❌ `{{"command_name": "struct", "arguments": ["mlx5_core_dev", "-o"]}}`
+- ❌ `{{"command_name": "struct", "arguments": ["some mlx5 module type", "-o"]}}`
 - ❌ `{{"command_name": "dis", "arguments": ["-s", "mlx5e_napi_poll"]}}`
 - ❌ `{{"command_name": "run_script", "arguments": ["mod -s mlx5_core <path>", "struct pci_dev -o"]}}` — pci_dev is built-in, mod -s irrelevant
-- ✅ `{{"command_name": "run_script", "arguments": ["mod -s mlx5_core <path>", "struct mlx5_core_dev -o"]}}`
+- ✅ Correct approach: start `run_script` with `mod -s mlx5_core <path>`, then run `struct -o` or a field read against the mlx5 module type you already validated for this kernel.
 - ✅ `{{"command_name": "run_script", "arguments": ["mod -s mlx5_core <path>", "dis -s mlx5e_napi_poll"]}}`
 
 ### 1.3.3 Module Path Resolution (Priority Order)
@@ -1097,7 +1094,7 @@ To prevent step exhaustion on unproductive paths, follow this budget discipline:
 - ❌ Emitting essay-length reasoning that mostly repeats earlier steps instead of adding new information.
 - ❌ Using broad log searches on noisy module names without an error/fault keyword.
 - ❌ Spending multiple steps speculating that a bucket/list head changed after crash before testing embedded-node/container semantics.
-- ❌ **Continuing to use `struct <module_type>` in a new `run_script` without `mod -s`**, even if the previous step successfully loaded the same module. Each `run_script` is a brand new crash session. Symbols are NOT cached between steps. A `struct mlx5_core_dev ...` in step N+1 will fail with "invalid data structure reference" if `mod -s mlx5_core` is not in the same step N+1 `run_script` — this causes a multi-step error-recovery spiral that wastes the entire step budget. **Zero-tolerance: every `run_script` that uses a module type must start with `mod -s`**.
+- ❌ **Continuing to use `struct <module_type>` in a new `run_script` without `mod -s`**, even if the previous step successfully loaded the same module. Each `run_script` is a brand new crash session. Symbols are NOT cached between steps. Any mlx5 module-type access in step N+1 will fail with "invalid data structure reference" if `mod -s mlx5_core` is not in the same step N+1 `run_script` — this causes a multi-step error-recovery spiral that wastes the entire step budget. **Zero-tolerance: every `run_script` that uses a module type must start with `mod -s`**.
 - ❌ **Ignoring e820 / BIOS memory map data that has appeared in tool output.** When `log -m | grep` returns e820/BIOS-e820 entries showing reserved memory ranges, you MUST cross-check the faulting CR2 physical address against those ranges. If CR2_PA falls within a BIOS-reported reserved range (e.g., `[mem 0x00000000705eb000-0x000000007a765fff] reserved`), this is direct evidence that the address is a BIOS/firmware-reserved region — NOT a DMA buffer. Record this explicitly: "CR2_PA 0x65db75c7 confirmed in BIOS-e820 reserved range [mem 0x...–0x...]; firmware-reserved memory, not a driver DMA buffer; H2 (software corruption landing in reserved region) confirmed as primary hypothesis."
 - ❌ **Spending steps on `task_struct` field reads when the per-CPU `current` pointer has already been confirmed intact.** If `rd <per_cpu_base + 0x1b440>` returns a value matching the `bt` TASK address, the current pointer is intact. Reading the first N qwords of task_struct to "check for corruption" adds no diagnostic value when the pointer source is already confirmed valid. Proceed to the next unresolved question instead.
 - ❌ **Using `dev -p | grep <driver_name>` as a device-attribution method for DMA corruption.** `dev -p` enumerates PCI devices by kernel-internal driver names and provides zero evidence about DMA buffer ranges or payload content. An empty result is a false negative (grep pattern mismatch), not proof the device is absent. **ALWAYS use `dev -p | grep <PCI_vendor_id>` instead** (e.g., `dev -p | grep 15b3` for Mellanox, `dev -p | grep 14e4` for Broadcom). Driver name grep (`grep mlx5`, `grep nvme`) is FORBIDDEN; vendor ID grep is the correct approach.
@@ -1466,101 +1463,79 @@ rd -a <VA_next> 512
 
 #### Sub-step B: Extract Suspect Device DMA Address Ranges
 
-Only after Sub-step A (or when adjacent pages are unreadable), inspect the driver's runtime DMA buffer addresses to check for overlap with the faulting PA.
+Only after Sub-step A above (adjacent-page content check), or when those adjacent pages are unreadable in the dump, inspect the driver's runtime DMA buffer addresses to check for overlap with the faulting PA.
 
 ```bash
-# ⚠️ MANDATORY: load module symbols first — each run_script is a fresh session
-run_script [
-  "mod -s mlx5_core <path_to_mlx5_core.ko.debug>",
-  "struct mlx5_core_dev -o"          # get field offsets for DMA-relevant members
-]
+# ⚠️ MANDATORY: each run_script is a fresh session.
+# ⚠️ Any run_script using mlx5 module structs must start with mod -s mlx5_core in that SAME run_script.
+# Example bootstrap for mlx5 symbol work:
+#   Start a run_script with `mod -s mlx5_core <path_to_mlx5_core.ko.debug>`.
+#   In that SAME run_script, run `struct -o` on the mlx5 module type already
+#   validated for the current kernel to obtain offsets for DMA-relevant fields.
 
-# ── LOCATING THE mlx5_core_dev RUNTIME INSTANCE ADDRESS ──────────────────────
-# The module base (e.g., ffffffffc0646000) is the .text/.data address — NOT the
-# runtime struct instance. You must locate the live mlx5_core_dev object.
+# ── LOCATING THE mlx5 RUNTIME DRIVER OBJECT ───────────────────────────────────
+# The module base is NOT the runtime mlx5 driver object.
+# For this section: `pci_dev` / `device` are vmlinux built-ins; `mlx5_*` structs
+# require `mod -s mlx5_core` in the SAME run_script.
+# Mellanox PCI vendor ID is 15b3. Use `dev -p | grep 15b3` to find candidate
+# pci_dev objects. If multiple matches exist, prefer BDF correlation from logs;
+# treat CPU/IRQ locality as supporting evidence only.
 #
-# ⚠️ MODULE-LOADING RULE FOR THIS SECTION:
-#   - struct pci_dev, struct device  →  BUILT-IN kernel structs (from vmlinux).
-#     Do NOT put mod -s mlx5_core before struct pci_dev commands.
-#     These two are completely independent; combining them in one run_script is
-#     semantically meaningless and wastes a token-heavy module-load operation.
-#   - struct mlx5_core_dev, struct mlx5_priv, struct mlx5_eq  →  MODULE structs.
-#     MUST be preceded by mod -s mlx5_core in the SAME run_script.
+# ── PRIMARY METHOD (GOLD STANDARD — use this first on 4.18+ kernels) ─────────
 #
-# ⚠️ Mellanox PCI_ID vendor is 15b3 (not 1d94 which is AMD).
-#    Common device IDs: 15b3:1013 (CX-4), 15b3:1015 (CX-4Lx),
-#                       15b3:1017 (CX-5),  15b3:1019 (CX-6)
-#    Find the pci_dev address in dev -p output by matching PCI_ID 15b3:xxxx.
+# STEP 1: Read driver_data directly from pci_dev (NO mod -s needed)
+#   struct pci_dev.dev.driver_data <pci_dev_addr>
+#   This returns the driver-private pointer for that PCI function.
+#   For mlx5, do NOT assume a fixed top-level struct name across kernels.
+#   Do NOT replace this with manual offset arithmetic, and do NOT pair `struct pci_dev`
+#   with `mod -s mlx5_core`.
 #
-# ── METHOD 2 (RECOMMENDED): pci_dev → driver_data ────────────────────────────
+# STEP 2: Verify the object/field path before DMA-range work (MANDATORY; requires mod -s)
+#   Use the current kernel's exported mlx5 structs/offsets to validate how the
+#   returned driver_data pointer reaches EQ/CQ/buffer objects before dereferencing.
+#   If the assumed path does not validate on this kernel, stop and re-evaluate the
+#   object's real type/layout instead of forcing a stale struct name.
 #
-# STEP 2a: Read driver_data directly from pci_dev (NO mod -s needed — pci_dev is built-in)
+# STEP 3: PF/VF edge case check (NO mod -s needed)
+#   In SR-IOV / multi-function environments, first distinguish PF from VF:
+#      struct pci_dev.is_virtfn <pci_dev_addr>
+#   If is_virtfn = 1, also inspect:
+#      struct pci_dev.physfn <pci_dev_addr>
+#   Use the PF relationship as supporting context; do NOT blindly apply a PF-only
+#   interpretation to every VF driver_data pointer.
 #
-#   crash supports dot-path field access: struct TYPE.FIELD.SUBFIELD <addr>
-#   This reads the exact field in ONE command without computing offsets manually.
+# ── FALLBACK METHOD (LEGACY / SYMBOL LOOKUP ONLY — NOT for default 4.18+ flow) ─
 #
-#   ✅ CORRECT single-command approach:
-#      struct pci_dev.dev.driver_data <pci_dev_addr>
-#      e.g.: struct pci_dev.dev.driver_data ffff8d9a40c4c000
-#      → returns the pointer value, which IS the mlx5_core_dev instance address
+# On 4.18+/5.x kernels, list-based discovery is often unusable because the list
+# head may be static/internal or absent from available symbols. Treat `sym
+# mlx5_dev_list` / `sym mdev_list` as legacy fallback only. If lookup fails,
+# stop that branch immediately and return to the PRIMARY METHOD. Do NOT chase
+# unrelated names such as `mlx5_res_manager` or guessed list symbols.
 #
-#   ❌ WRONG two-step approach (DO NOT DO THIS):
-#      Step N:   struct pci_dev -o          ← queries offsets only, reads nothing
-#      Step N+1: rd -x <pci_dev + offset>   ← unnecessary manual offset arithmetic
-#      The dot-path syntax above replaces both steps with one command.
-#
-#   ❌ WRONG pairing (DO NOT DO THIS):
-#      run_script ["mod -s mlx5_core <path>", "struct pci_dev -o"]
-#      mod -s mlx5_core is irrelevant to pci_dev. pci_dev is from vmlinux, not mlx5.
-#      These two commands have NO logical connection.
-#
-# STEP 2b: Verify the result is a valid mlx5_core_dev (requires mod -s)
-#
-#   run_script [
-#     "mod -s mlx5_core <path>",
-#     "struct mlx5_core_dev.pdev <result_from_2a>"   ← should point back to pci_dev
-#   ]
-#
-# ── METHOD 1: mlx5_dev_list global linked list ────────────────────────────────
-#
-# STEP 1a: Resolve the global list head symbol (requires mod -s — it's in mlx5 .data)
-#
-#   run_script [
-#     "mod -s mlx5_core <path>",
-#     "sym mlx5_dev_list",             ← get VA of the LIST_HEAD global
-#     "struct mlx5_priv -o"            ← get offsetof(mlx5_priv, dev_list) = 744
-#   ]
-#
-# STEP 1b: Walk the list (NO mod -s needed — rd uses raw addresses)
-#
-#   rd -x <mlx5_dev_list_va> 2         ← read next/prev list_head pointers
-#   # list_head.next points to mlx5_priv.dev_list inside some mlx5_core_dev
-#   # mlx5_core_dev base = next_ptr - offsetof(mlx5_core_dev, priv) - 744
-#   # offsetof(mlx5_core_dev, priv) comes from struct mlx5_core_dev -o (Step 1a)
-#
-# ── DMA RANGE EXTRACTION (after locating mlx5_core_dev instance) ─────────────
+# ── DMA RANGE EXTRACTION (after locating a validated mlx5 object/path) ───────
 #
 # All struct mlx5_* commands MUST include mod -s mlx5_core in the same run_script.
 #
 # EQ path (most stable — event queues are long-lived):
-#   run_script [
-#     "mod -s mlx5_core <path>",
-#     "struct mlx5_core_dev.priv.eq_table <dev_addr>",  ← get eq_table pointer
-#     "struct mlx5_eq_table -o"                          ← find eq[] array offset
-#   ]
-#   # Then in a separate run_script (eq_table_ptr known as literal now):
-#   run_script [
-#     "mod -s mlx5_core <path>",
-#     "struct mlx5_eq <eq_instance_addr>",   ← read buf.dma and buf.npages
-#   ]
-#   # DMA range: [buf.dma, buf.dma + buf.npages * 4096]
-#   # Check: faulting_PA ∈ [buf.dma, buf.dma + buf.npages * 4096]?
+#   # First inspect the current kernel's mlx5 struct layout; do NOT hard-code a
+#   # top-level object path that may differ across kernels.
+#   # In one run_script: load mlx5 symbols, then inspect the current kernel's
+#   # relevant mlx5 queue/buffer struct types with `struct -o`.
+#   # In a later run_script: use the validated current-kernel path to reach the
+#   # target EQ/CQ instance and read buf.dma / buf.npages.
+#   # read buf.dma and buf.npages
+#   # DMA range first-pass: [buf.dma, buf.dma + buf.npages * PAGE_SIZE]
+#   # Confirm PAGE_SIZE from crash if needed: `p PAGE_SIZE` or `kmem -i`
+#   # Check: faulting_PA ∈ [buf.dma, buf.dma + buf.npages * PAGE_SIZE]?
+#   # If `npages > 1`, treat this as a heuristic only.
+#   # For fragmented mlx5 buffers, inspect the current layout and compare against per-page DMA fragments, not one contiguous span.
 #
 # For nvme (all structs are in nvme_core module — mod -s nvme_core required):
 #   run_script [
 #     "mod -s nvme_core <path>",
-#     "struct nvme_queue -o"             ← find sq_dma_addr, cq_dma_addr offsets
+#     "struct nvme_queue -o"
 #   ]
+#   # find sq_dma_addr and cq_dma_addr offsets
 #
 # For qla2xxx (mod -s qla2xxx required):
 #   struct scsi_qla_host -o  → fields: init_cb_dma, gid_list_dma, ct_sns_dma
@@ -1571,6 +1546,7 @@ Once you have a DMA base address and size from the driver struct, check:
 ```
 faulting PA ∈ [dma_base, dma_base + (npages * PAGE_SIZE)]?
 ```
+- For mlx5, `[buf.dma, buf.dma + npages * PAGE_SIZE]` is only a first-pass check. If `npages > 1`, an out-of-range result does not exclude fragmented per-page DMA mappings.
 - **Inside range** → "Physical address falls within driver's DMA buffer" → strong DMA evidence
 - **Outside all known ranges** → downgrade DMA confidence; consider alternative hypotheses
 - **Cannot extract range** (missing debug symbols, partial dump) → explicitly state "DMA range unverifiable" and set confidence ≤ `medium`
@@ -1582,7 +1558,7 @@ If debug symbols for the suspect driver are missing and DMA range cannot be extr
 ```bash
 # Inspect the generic device DMA ops to understand protection level
 # First: find the struct device address for the suspect PCI device
-# (derive from mlx5_core_dev.pdev -> pci_dev -> dev, or from known module globals)
+# (derive from the validated mlx5 driver object path -> pci_dev -> dev, or from known module globals)
 struct device.dma_ops <device_addr>
 struct device.coherent_dma_mask <device_addr>
 ```
@@ -1737,7 +1713,7 @@ kmem -p <CR2> → FLAGS: reserved
 │     → Proceed to Step B for DMA range extraction.
 │
 ├─ STEP B: DMA range extraction (§3.12.2 Sub-step B)
-│  Use Method 2 (pci_dev.dev.driver_data) to locate mlx5_core_dev instance.
+│  Use the PRIMARY METHOD (pci_dev.dev.driver_data) to locate the mlx5 driver-private pointer.
 │  Extract eq_table→eq[N]→buf.dma, check if CR2_PA ∈ [dma_base, dma_base+size].
 │  → Overlap confirmed? → H1 strongly supported; can reach 'high' if fingerprint
 │    also confirmed in Step A.
@@ -2195,20 +2171,21 @@ the per-CPU `current` pointer.
 
 ## 6.2 Module Symbol Access — Session Reload Rule
 
-**Situation**: Step N loaded mlx5_core symbols and read `mlx5_core_dev -o`. Step N+1 needs to read a specific field using that struct type.
+**Situation**: Step N loaded mlx5_core symbols and read a mlx5 module struct. Step N+1 needs another mlx5 struct/field read.
 
 ```json
 [
   {{
     "step_id": 14,
-    "reasoning": "I have the mlx5_core_dev address 0xffff8d3a45f000e0 from driver_data. I need to read priv.eq_table. CRITICAL: step 13 loaded mod -s mlx5_core, but each run_script is a fresh session — those symbols are GONE. I must reload mod -s in this step's run_script or struct mlx5_core_dev will fail with 'invalid data structure reference'.",
+    "reasoning": "I have a mlx5 driver-private pointer from driver_data and need another mlx5 struct/field read. CRITICAL: step 13 loaded mod -s mlx5_core, but each run_script is a fresh session — those symbols are GONE. I must reload mod -s in this step's run_script or the next mlx5 struct access will fail with 'invalid data structure reference'.",
     "action": {{"command_name": "run_script", "arguments": [
-      "mod -s mlx5_core /usr/lib/debug/lib/modules/4.19.90-89.20.v2401.ky10.x86_64/kernel/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.ko.debug",
-      "struct mlx5_core_dev.priv.eq_table 0xffff8d3a45f000e0"
+      "mod -s mlx5_core /usr/lib/debug/lib/modules/4.19.90-89.20.v2401.ky10.x86_64/kernel/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.ko.debug"
     ]}}
   }}
 ]
 ```
+
+Follow-up in the same step: after loading symbols, run `struct -o` or the required field read against the mlx5 module type already validated for this kernel.
 
 **Key lessons**: (1) Every run_script that uses a module type MUST start with `mod -s`. (2) `struct pci_dev.*` does NOT need mod -s — pci_dev is a vmlinux built-in. (3) The checklist: "Is this struct from a .ko module? YES → prepend mod -s. NO (pci_dev/task_struct/etc.) → do not add mod -s."
 
