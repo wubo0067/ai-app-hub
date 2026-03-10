@@ -3,7 +3,6 @@ from typing import Any
 
 # from langchain_openai import ChatOpenAI
 from langchain_core.messages import AIMessage
-from src.mcp_tools.crash.client import crash_tools
 from src.utils.config import config_manager
 from src.utils.logging import logger
 from langchain_deepseek.chat_models import ChatDeepSeek
@@ -76,11 +75,7 @@ def create_llm():
             api_key=str(api_key),
             base_url=str(base_url),
             model=str(model_name),
-            max_tokens=(
-                48000
-                if "think" in str(model_name) or "reasoner" in str(model_name)
-                else 8000
-            ),  # DeepSeek-Reasoner 模式需要更大的 max_tokens 来支持长对话历史和复杂推理
+            max_tokens=8192,  # DeepSeek-Reasoner 模式需要更大的 max_tokens 来支持长对话历史和复杂推理
             top_p=0.1,  # 使用低随机性设置，适合代码生成和事实回答
             presence_penalty=0,  # 不需要模型通过增加多样性来“换个说法”，我们需要的是精确的原始符号
             temperature=temperature,  # https://api-docs.deepseek.com/zh-cn/quick_start/parameter_settings

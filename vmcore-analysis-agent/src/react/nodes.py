@@ -33,6 +33,7 @@ structure_reasoning_node = "structure_reasoning_node"
 # =========================================================================
 DEFAULT_CRASH_COMMANDS: list[str] = [
     "sys",  # 系统信息
+    "sys -t",  # 内核的 taint 状态（kernel taint flags
     "bt",  # 所有线程的堆栈回溯
     # "ps -a",  # 进程列表
     # "runq",  # 运行队列

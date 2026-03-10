@@ -257,6 +257,30 @@ commands = [
         "task -x; task -R ngroups,groups 2958",
         "This command dumps a formatted display of the contents of a task's task_struct and thread_info structures.",
     ),
+    (
+        "ptov",
+        "ptov [address | offset:cpuspec]",
+        "ptov 56e000; ptov b0c0:a",
+        "This command translates a hexadecimal physical address into a kernel virtual address.",
+    ),
+    (
+        "ptob",
+        "ptob page_number ...",
+        "ptob 512a",
+        "This command translates a page frame number to its byte value.",
+    ),
+    (
+        "irq",
+        "irq [[[index ...] | -u ] | -d | -b | -a | -s [-c cpu]]",
+        "irq -d; irq 21",
+        "This command collaborates the data in an irq_desc_t, along with its associated hw_interrupt_type and irqaction structure data, into a consolidated per-IRQ display.",
+    ),
+    (
+        "sbitmapq",
+        "sbitmapq [-s struct[.member[,member]] -a address [-p] [-v]] -[x|d] address",
+        "sbitmapq -s iscsi_cmd -a 0xc0000000671c0000 -v c0000000e118c808",
+        "The command dumps the contents of the sbitmap_queue structure and the used bits in the bitmap.",
+    ),
 ]
 
 # 批量注册
