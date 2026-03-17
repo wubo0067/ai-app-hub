@@ -65,7 +65,7 @@ bt"""
         async with crash_client.session("crash") as session:
             logger.info("Session established")
             tools = await load_mcp_tools(session)
-
+            # next 从迭代器 tools 中找到 name 为 "run_script" 的工具，如果没有则返回 None
             run_script_tool = next((t for t in tools if t.name == "run_script"), None)
             if run_script_tool:
                 logger.info("Executing 'run_script' tool")
