@@ -2,7 +2,12 @@
  * @Author: CALM.WU
  * @Date: 2026-03-17 17:47:21
  * @Last Modified by: CALM.WU
- * @Last Modified time: 2026-03-17 18:02:39
+ * @Last Modified time: 2026-03-17 18:21:08
+
+ * Advanced DMA corruption simulator
+ * - separate DMA buffer and victim object
+ * - cross-object overwrite
+ * - optional struct page corruption
  */
 
 #define pr_fmt(fmt) "%s:%s(): " fmt, KBUILD_MODNAME, __func__
@@ -10,170 +15,214 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
-#include <linux/err.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/kthread.h>
+#include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/slab.h>
 #include <linux/types.h>
+#include <linux/io.h>
+
+#include "mem_vaddr_page_dump.h"
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Calm.Wu");
-MODULE_DESCRIPTION("DMA memory corruption simulator for vmcore analysis");
-MODULE_VERSION("1.0");
+MODULE_VERSION("3.0");
 
-// 模块参数：是否启用 DMA 损坏模拟，默认为 false
+/* ================= 参数 ================= */
+
 static bool enable_dma_corruption;
 module_param(enable_dma_corruption, bool, 0644);
-MODULE_PARM_DESC(enable_dma_corruption,
-                 "Enable DMA corruption crash simulation (default: false)");
 
-// 模块参数：触发损坏前的延迟时间（毫秒）
-static unsigned int start_delay_ms = 1500;
-module_param(start_delay_ms, uint, 0644);
-MODULE_PARM_DESC(start_delay_ms,
-                 "Delay in milliseconds before triggering corruption");
+static bool corrupt_page_struct = false; // ⭐ 新增
+module_param(corrupt_page_struct, bool, 0644);
 
-// 模块参数：从 DMA 缓冲区开始写入的字节数，必须大于 64 才能覆盖回调指针
-static unsigned int corruption_len = 96;
-module_param(corruption_len, uint, 0644);
-MODULE_PARM_DESC(corruption_len, "Bytes written from DMA buffer start (must be "
-                                 "> 64 to corrupt callback pointer)");
+/* ================= victim ================= */
 
-/**
- * DMA 损坏载荷结构体
- * 包含 64 字节的缓冲区，后面紧跟着一个函数指针和标记值
- * 通过向缓冲区写入超过 64 字节的数据可以覆盖 callback 指针，从而引发错误
- */
-struct dma_corrupt_payload {
-  uint8_t buf[64];        // 64 字节的缓冲区，用于模拟 DMA 传输
-  void (*callback)(void); // 回调函数指针，会被缓冲区溢出覆盖
-  uint64_t marker;        // 标记值，用于检测损坏程度
+struct victim_obj {
+    char data[32];
+    void (*fn)(void);
+    u64 magic;
 };
 
-// 设备结构体和线程结构体声明
+static void victim_safe_fn(void)
+{
+    pr_info("victim safe fn (should NOT run)\n");
+}
+
+static unsigned int corruption_len =
+        PAGE_SIZE + sizeof(struct victim_obj); // 默认越界写入，覆盖 victim 对象
+module_param(corruption_len, uint, 0644);
+
+/* ================= 全局 ================= */
+
 static struct device *dma_dev;
 static struct task_struct *corrupt_task;
 
-/**
- * 安全回调函数
- * 正常情况下会调用此函数，但在内存损坏后可能被恶意数据覆盖
- */
-static void safe_callback(void) {
-  pr_info("dma_memory_corruption: safe callback should never be called after "
-          "corruption\n");
+/* ================= DMA 写 ================= */
+
+static void simulate_dma_write(dma_addr_t dma_handle, size_t len)
+{
+    // 在没有 IOMMU 的系统中，这个地址通常直接对应物理内存地址。
+    // CPU 在模拟硬件设备执行 DMA 写操作时，通常会使用 dma_handle 这个 DMA 地址来访问内存，但 CPU 不能直接使用物理地址或总线
+    // 地址，所以这里将物理地址转换为内核可以直接访问的虚拟地址
+    void *alias = phys_to_virt(dma_handle);
+
+    pr_info("DMA write: dma_handle=%pad alias=%px len=%zu\n", &dma_handle,
+            alias, len);
+
+    memset(alias, 0x41, len);
 }
 
-/**
- * DMA 损坏模拟线程函数
- * 分配 DMA 内存，填充恶意数据以覆盖回调函数指针，然后调用该指针触发内核崩溃
- */
-static int dma_corruption_thread(void *data) {
-  struct dma_corrupt_payload *payload; // 载荷结构体指针
-  dma_addr_t dma_handle;               // DMA 地址句柄
-  size_t write_len;                    // 实际写入长度
+/* ================= 主逻辑 ================= */
 
-  // 延迟指定时间后再开始损坏操作
-  msleep(start_delay_ms);
+static int dma_corruption_thread(void *data)
+{
+    void *region;
+    // 前半段是 DMA source
+    // 后半段是 victim
+    // DMA 写越界后跨到第二页，破坏 victim
+    // 被 DMA overflow 波及的对象
+    struct victim_obj *victim;
+    // 模拟 DMA 写入源
+    void *dma_area;
+    dma_addr_t dma_handle;
+    struct page *victim_page;
+    size_t total_size = PAGE_SIZE * 2;
 
-  // 分配 DMA 一致性内存，用于模拟 DMA 传输场景
-  payload =
-      dma_alloc_coherent(dma_dev, sizeof(*payload), &dma_handle, GFP_KERNEL);
-  if (!payload) {
-    pr_err("dma_memory_corruption: dma_alloc_coherent failed\n");
-    return -ENOMEM;
-  }
+    msleep(1000);
 
-  // 初始化载荷结构体，设置安全回调函数和标记值
-  memset(payload, 0, sizeof(*payload));
-  payload->callback = safe_callback;
-  payload->marker = 0x1122334455667788ULL;
+    /*
+     * ⭐ 分配连续区域：
+     * [ DMA buffer | victim ]
+     */
+    region = kmalloc(total_size, GFP_KERNEL);
+    if (!region)
+        return -ENOMEM;
 
-  // 记录分配的内存信息
-  pr_info("dma_memory_corruption: payload=%px dma=%pad size=%zu\n", payload,
-          &dma_handle, sizeof(*payload));
+    memset(region, 0, total_size);
 
-  // 计算实际写入长度，不能超过载荷大小
-  write_len = min_t(size_t, corruption_len, sizeof(*payload));
-  // 向缓冲区写入恶意数据 (0x41='A')，如果 write_len > 64 则会覆盖 callback 指针
-  memset(payload->buf, 0x41, write_len);
+    dma_area = region;
+    // victim 在第 2 个 page 中，明确构造“跨 page / 跨区域 overwrite”
+    // “设备往某个 DMA buffer 写数据，结果写穿了边界，破坏了后面的别的对象”
+    victim = (struct victim_obj *)(region + PAGE_SIZE);
 
-  pr_info("dma_memory_corruption: wrote %zu bytes from payload->buf\n",
-          write_len);
-  // 检查 callback 指针是否已被破坏以及标记值是否正确
-  pr_info("dma_memory_corruption: callback pointer after corruption=%px "
-          "marker=0x%llx\n",
-          payload->callback, payload->marker);
+    /* 初始化 victim */
+    victim->fn = victim_safe_fn;
+    victim->magic = 0xdeadbeefcafebabeULL;
 
-  // 调用被破坏的回调函数，这将导致内核崩溃
-  pr_emerg("dma_memory_corruption: invoking corrupted callback to trigger "
-           "kernel crash\n");
-  payload->callback();
+    pr_info("region=%px dma_area=%px victim=%px\n", region, dma_area, victim);
 
-  // 释放分配的 DMA 内存
-  dma_free_coherent(dma_dev, sizeof(*payload), payload, dma_handle);
-  return 0;
-}
+    dump_kvaddr_page_info(victim, sizeof(*victim), "victim");
 
-/**
- * 模块初始化函数
- * 注册设备，创建内核线程来执行 DMA 损坏模拟
- */
-static int __init dma_memory_corruption_init(void) {
-  pr_info("dma_memory_corruption: module loaded\n");
+    /*
+     * ⭐ 为 DMA buffer 建立 mapping
+     * 是 linux 内核中用于流式 DMA 映射的核心 API 之一
+     * 功能：为一块单个、物理连续的内存缓冲区创建 DMA 映射。这个缓冲区通常是之前通过 kmalloc 或类似方式分配的。
+     *      这种映射是临时的，用于一次或短期的 I/O 操作。操作完成后，需要通过 dma_unmap_single 来解除映射
+     * 使用场景：非常适用于所谓的“流式”数据传输，其特点是数据单向或双向流动一次。
+     *          网络设备驱动：发送或接收一个网络数据包。
+     *          块设备驱动：向磁盘写入或从磁盘读取一个数据块。
+     *          USB 设备驱动：传输一个 USB 请求块 (URB)。
+     * 返回值：成功时返回一个 dma_addr_t 类型的 DMA 地址，这个地址可以被设备用来访问缓冲区。失败时返回一个错误码，通常是一个负数。
+     *       dma 地址不一定等于物理地址，因为中间可能有 IOMMU 或总线地址转换
+     *       无 IOMMU，简单直通：DMA address ≈ physical address
+     *       有 IOMMU，地址转换：device DMA address -> IOMMU translation -> physical address
+     */
+    dma_handle =
+            dma_map_single(dma_dev, dma_area, PAGE_SIZE, DMA_BIDIRECTIONAL);
 
-  // 注册根设备，用于 DMA 操作
-  dma_dev = root_device_register("dma_memory_corruption_dev");
-  if (IS_ERR(dma_dev)) {
-    pr_err("dma_memory_corruption: root_device_register failed\n");
-    return PTR_ERR(dma_dev);
-  }
+    if (dma_mapping_error(dma_dev, dma_handle)) {
+        pr_err("dma_map_single failed\n");
+        kfree(region);
+        return -EIO;
+    }
 
-  // 如果没有启用损坏模拟，则退出
-  if (!enable_dma_corruption) {
-    pr_warn("dma_memory_corruption: disabled by default, set "
-            "enable_dma_corruption=1 to trigger\n");
+    /*
+     * ⭐ DMA overflow：从 DMA buffer 写，溢出到 victim
+     */
+    simulate_dma_write(dma_handle, corruption_len);
+
+    pr_info("after corruption: victim->fn=%px magic=0x%llx\n", victim->fn,
+            victim->magic);
+
+    /* ================= 模式 A：函数指针 crash ================= */
+
+    if (!corrupt_page_struct) {
+        pr_emerg("trigger via corrupted function pointer\n");
+        victim->fn(); // crash
+    }
+
+    /* ================= 模式 B：page struct 污染 ================= */
+    // 调用 virt_to_page 宏，将 victim 对象的内核虚拟地址转换为管理这块内存的 struct page 描述地址
+    // victim 是一个内核虚拟地址，该虚拟地址由内存管理子系统分配，并映射到某个物理内存页上。
+    // 内核为每一个物理内存都维护一个名为 struct page 的元数据结构，来追踪这个页的状态
+    victim_page = virt_to_page(victim);
+
+    pr_emerg("corrupting struct page at %px\n", victim_page);
+
+    /*
+     * ⭐ 直接模拟 DMA 覆盖 page struct
+     * 这是极其危险的操作。它直接用 0x41 覆盖了整个 struct page 结构。
+     * 这个结构是内核内存管理的心脏，包含了指向伙伴系统（Buddy System）中其他空闲页的链表指针、页的引用计数、标志位等关键信息。
+     */
+    memset(victim_page, 0x41, sizeof(struct page));
+
+    /*
+     * 触发 page 相关路径
+     * 当调用 __free_pages 尝试释放这个页时，内核会去操作已被破坏的 struct page。
+     * 它会读取到无效的链表指针（比如 0x41414141...），并尝试将它们链接到空闲链表中。
+     * 这会立刻破坏内核的内存管理数据结构，极大概率在尝试访问这些无效指针时触发缺页异常或一般保护性异常（General Protection Fault），
+     * 导致内核崩溃。这种类型的崩溃通常非常难以调试，因为根本原因（struct page 被破坏）和崩溃点（在内存分配/释放路径中）可能相距甚远
+     */
+    pr_emerg("triggering page free to detect corruption\n");
+
+    __free_pages(victim_page, 0); // 高概率 crash
+
+    /*
+     * 即使在触发 crash 之前，也应该有清理代码。
+     * 这展示了完整的 DMA mapping 生命周期。
+     */
+    dma_unmap_single(dma_dev, dma_handle, PAGE_SIZE, DMA_BIDIRECTIONAL);
+    kfree(region);
     return 0;
-  }
-
-  // 检查损坏长度参数，确保其足够大以覆盖回调指针
-  if (corruption_len <= sizeof(((struct dma_corrupt_payload *)0)->buf)) {
-    pr_warn("dma_memory_corruption: corruption_len should be > 64 to corrupt "
-            "callback pointer\n");
-  }
-
-  // 创建内核线程来执行损坏模拟
-  corrupt_task = kthread_run(dma_corruption_thread, NULL, "dma_corrupt_thread");
-  if (IS_ERR(corrupt_task)) {
-    int ret = PTR_ERR(corrupt_task);
-
-    pr_err("dma_memory_corruption: failed to start kthread: %d\n", ret);
-    root_device_unregister(dma_dev);
-    dma_dev = NULL;
-    return ret;
-  }
-
-  return 0;
 }
 
-/**
- * 模块退出函数
- * 清理资源，停止内核线程并注销设备
- */
-static void __exit dma_memory_corruption_exit(void) {
-  // 停止内核线程
-  if (corrupt_task && !IS_ERR(corrupt_task)) {
-    kthread_stop(corrupt_task);
-    corrupt_task = NULL;
-  }
+/* ================= init/exit ================= */
 
-  // 注销设备
-  if (dma_dev) {
-    root_device_unregister(dma_dev);
-    dma_dev = NULL;
-  }
+static int __init dma_memory_corruption_init(void)
+{
+    // 在路径/sys/devices 下创建设备文件 dma_memory_corruption_dev
+    // 用来模拟一个可以咨询 DMA 操作的硬件设备。以便后续进行内存的破坏仿真
+    dma_dev = root_device_register("dma_memory_corruption_dev");
+    if (IS_ERR(dma_dev))
+        return PTR_ERR(dma_dev);
 
-  pr_info("dma_memory_corruption: module unloaded\n");
+    // 为创建的模拟设备设置 DMA 寻址能力，它告诉内核，这个设备能够对 64 位的物理地址进行 DMA 操作
+    // 一个设备的 DMA 掩码定义了该设备能够访问的物理内存地址范围。
+    // 这行代码是在初始化一个用于模拟 DMA 内存破坏的虚拟设备，并将其配置为能够访问系统中的所有 64 位物理地址，
+    // 为后续模拟 DMA 写操作（包括越界写入）提供了必要的前提条件。
+    if (dma_set_mask_and_coherent(dma_dev, DMA_BIT_MASK(64))) {
+        pr_err("dma_set_mask_and_coherent failed\n");
+        root_device_unregister(dma_dev);
+        return -EIO;
+    }
+
+    if (!enable_dma_corruption)
+        return 0;
+
+    corrupt_task = kthread_run(dma_corruption_thread, NULL, "dma_corrupt");
+
+    return PTR_ERR_OR_ZERO(corrupt_task);
+}
+
+static void __exit dma_memory_corruption_exit(void)
+{
+    if (corrupt_task)
+        kthread_stop(corrupt_task);
+
+    if (dma_dev)
+        root_device_unregister(dma_dev);
 }
 
 module_init(dma_memory_corruption_init);
