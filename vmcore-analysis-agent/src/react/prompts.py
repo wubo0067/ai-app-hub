@@ -133,6 +133,18 @@ Before generating ANY action:
 
 **Query Efficiency Rule**: If you need offsets, use `struct <type> -o` immediately. Never run `struct <type>` then `struct <type> -o`. This rule NEVER overrides §1.3.2 module-loading requirements.
 
+**Crash-Path Struct First Rule (MANDATORY)**:
+Once disassembly has identified the **exact struct type** being accessed at the crash RIP
+(e.g., a function argument is `struct adapter_reply_queue *` and the faulting offset is a
+field of that struct), the next `struct` action — before ANY other struct inspection — MUST be:
+1. `struct <crash_path_type> -o` → obtain ALL field offsets of the identified struct.
+2. `struct <crash_path_type> <crash_address>` → read the actual instance to validate every field.
+
+Querying a DIFFERENT struct type before completing steps 1 and 2 is a **Protocol Violation**.
+This includes related but uninvolved types (e.g., running `struct MPT3SAS_TARGET -o` when the
+crash is in a function whose only argument is `struct adapter_reply_queue *`).
+The disassembly is the AUTHORITATIVE source for which struct is on the crash path.
+
 **run_script bundling rule (MANDATORY)**:
 - When several validation commands use inputs that are already known as **literal values**, prefer combining them in one `run_script` to save steps.
 - Good candidates: `kmem -S <addr>` + `struct <type> <addr>`, or `rd -x <addr> 64` + `rd -a <addr> 64`.
@@ -188,31 +200,21 @@ When you need to read memory at a computed address (e.g., per-CPU base + offset)
 - If a symbol lookup fails but the needed quantity can be derived from already-known values, do not stop on the missing symbol; pivot to the derivation path instead.
 
 ### Forbidden Commands (Token Overflow & Timeout Prevention)
-- **❌ `sym -l` / `sym -l <symbol>`**: Dumps entire (or large portions of) symbol table → Token overflow
-- **✅ `sym <symbol>`**: Get one symbol's address only
-- **❌ `kmem -S`**: **STRICTLY FORBIDDEN** without a target address. In crash, `kmem -S` by itself displays all kmalloc/slab data and can easily blow the context window.
-- **❌ `kmem -a <addr>` / `kmem -p -a <addr>`**: **STRICTLY FORBIDDEN and INVALID SYNTAX**. `kmem` has no `-a` option in crash. Do NOT invent `-a` as an address flag. Use `kmem -S <addr>` for a kernel virtual/slab address, `kmem -p <phys_addr>` for a physical address, or `rd -a <addr> <count>` only when you specifically need ASCII memory output.
-- **❌ `bt -a`**: **STRICTLY FORBIDDEN** in ALL contexts (standalone action AND inside `run_script`). Dumps backtraces for ALL threads → Token overflow (confirmed to exceed context limit). If a deadlock is suspected, use `bt <pid>` for specific tasks or `ps | grep UN` to identify candidates first. The exception clause "unless deadlock suspected" is REVOKED — there is NO scenario where `bt -a` is permitted.
-- **❌ `ps`**: **STRICTLY FORBIDDEN** as a standalone command. Dumps the full process list for all tasks → Token overflow (confirmed to exceed 131072-token context limit). You MUST always pipe with grep.
-- **✅ ONLY SAFE `ps` USAGE**: `ps | grep <pattern>` — grep filter is **REQUIRED**
-- **✅ SAFE OPTIONS**: `ps <pid>` (single process) or `ps -G <task>` (specific task memory)
-- **❌ `ps -m`**: **STRICTLY FORBIDDEN**. Dumps detailed memory info for ALL processes → Token overflow (even worse than bare `ps`)
-- **❌ `log`**: Dumps entire kernel printk buffer (hundreds of thousands of lines) → Token overflow + server timeout
-- **❌ `log | grep <pattern>`**: **STRICTLY FORBIDDEN**. Even with grep, crash must first buffer the ENTIRE printk output before piping — on large vmcores this can exceed 120s and will be **forcibly killed** by the server.
-- **❌ `log -t` / `log -m` / `log -a`**: **STRICTLY FORBIDDEN** without grep pipe. Standalone use dumps the entire log buffer (timestamps / monotonic timestamps / audit entries) → Token overflow.
-- **❌ `log -m <KEYWORD>`**: **STRICTLY FORBIDDEN and INVALID SYNTAX**. `log -m` does NOT accept positional keyword arguments for filtering. `log -m MCE`, `log -m EDAC`, `log -m hardware` are all invalid — they do NOT filter output; they either produce an error or dump the full log ignoring the argument. You MUST use a pipe: `log -m | grep -i MCE`.
-- **✅ ONLY SAFE LOG USAGE**: `log -m | grep -i <pattern>`, `log -t | grep -i <pattern>`, `log -a | grep -i <pattern>` — pipe with grep is **REQUIRED**. Use ONLY when the User-Provided Initial Context does not contain sufficient log detail for a specific targeted search.
-- **❌ FORBIDDEN broad module-only log grep**: commands like `log -m | grep -i nouveau`, `log -m | grep -i mlx5`, `log -m | grep -i nvme` are too noisy in production and may return hundreds of lines.
-- **✅ REQUIRED narrow log grep**: when searching for a device/driver, combine the module name with at least one anomaly keyword or another narrowing condition.
-  - Good: `log -m | grep -i nouveau | grep -Ei "fail|error|timeout|fault|mmu|fifo|xid|dma"`
-  - Good: `log -m | grep -Ei "iommu|dmar|passthrough|strict|fault|translation"`
-  - Good: `log -m | grep -i "0000:34:00.0" | grep -Ei "fail|error|timeout|fault"`
-  - Bad: `log -m | grep -i nouveau`
-  - Bad: `log -m | grep -i mlx5`
-- If a log query is likely to match a high-volume subsystem, you MUST add a second grep stage or a more specific regex in the SAME command.
-- **❌ `search -k <value>`**: **STRICTLY FORBIDDEN**. Full kernel virtual memory search causes timeouts.
-- **❌ `search -p <value>`**: **STRICTLY FORBIDDEN**. Brute-force searching entire physical memory in large vmcores is extremely slow, causes heavy I/O overhead, and WILL trigger server-side timeouts (graceful shutdown exceeded).
-- **✅ USE INSTEAD**: Follow the **Address Search SOP** in §1.5 for safe, targeted alternatives.
+
+| ❌ Forbidden form | Why forbidden | ✅ Safe alternative |
+|-------------------|---------------|---------------------|
+| `sym -l` | Token overflow (full symbol table) | `sym <symbol>` |
+| `kmem -S` (no addr) / `kmem -a <addr>` | No-addr dumps all slabs; `-a` is invalid syntax | `kmem -S <addr>` · `kmem -p <phys_addr>` |
+| `bt -a` (any context) | ALL threads → token overflow. Exception clause **REVOKED** — no scenario permits `bt -a` | `bt <pid>` · `bt -c <cpu>` · `foreach UN bt` |
+| `ps` / `ps -m` (standalone) | Full process list → token overflow | `ps \| grep <pat>` · `ps <pid>` · `ps -G <task>` |
+| `log` / `log -m` / `log -t` / `log -a` (standalone) | Entire printk buffer → token overflow + timeout | `log -m \| grep -iE <pattern>` |
+| `log \| grep <pat>` | Crash buffers **entire** log before piping → server-side timeout (~120 s) | Use `log -m \| grep` instead |
+| `log -m <KEYWORD>` | **Invalid syntax** — positional args are silently ignored; full log dumped | `log -m \| grep -i <KEYWORD>` |
+| `log -m \| grep -i <driver>` (no error keyword) | High-volume noise (hundreds of lines) | `log -m \| grep -i <driver> \| grep -Ei "fail\|error\|fault\|timeout"` |
+| `search -k <val>` / `search -p <val>` | Full memory scan → server-side timeout | §1.5 Address Search SOP |
+
+**Safe log pattern** (use only when initial context lacks the needed detail):
+Always pair a module name with an error keyword. `log -m | grep -Ei "iommu|dmar|passthrough"` is fine; `log -m | grep -i mlx5` alone is **forbidden** (too noisy).
 
 ### Command Arguments Rule (MANDATORY)
 All crash utility commands MUST have appropriate arguments. NEVER generate actions with empty argument arrays.
@@ -235,6 +237,16 @@ All crash utility commands MUST have appropriate arguments. NEVER generate actio
 - `kmem -p` MUST be followed by `<phys_addr>`
 - `struct <type>` is not a substitute for `struct <type> -o` when you need offsets
 - `rd` MUST be followed by a concrete address expression that crash can parse directly
+- `ptov` MUST be followed by a physical address literal (e.g., `ptov 0x65db7000`). `ptov` alone with no argument is **STRICTLY FORBIDDEN** — it prints a usage message and performs no translation.
+- `rd -x` (or any `rd` flag combination) MUST be followed by an address AND an optional count. `rd -x` with no address is **STRICTLY FORBIDDEN** — it prints a usage message and reads nothing.
+
+**Self-check before emitting any `run_script` argument**:
+Every element in the `arguments` array that is a crash command MUST be parseable as:
+`<command> [flags] <required_address_or_target> [optional_count]`
+If the element is ONLY a command name with flags and nothing else (e.g., `"ptov"`, `"rd -x"`,
+`"dis -rl"`, `"sym"`), it is INCOMPLETE and MUST be rejected. The address or target argument is
+NOT optional for these commands — if you do not yet have the concrete address, you MUST
+obtain it in a prior step before emitting the command.
 
 **Physical-vs-Virtual Rule (ZERO TOLERANCE)**:
 - `kmem -p` accepts a **physical address only**.
@@ -320,26 +332,7 @@ If the target is a module symbol/type, you MUST load the module in the SAME `run
 | `scsi_qla_host` | qla2xxx module | ✅ YES — `mod -s qla2xxx` |
 | `pqi_io_request` | smartpqi module | ✅ YES — `mod -s smartpqi` |
 
-**❌ FORBIDDEN pairing example**:
-```json
-run_script ["mod -s mlx5_core <path>", "struct pci_dev -o"]
-```
-`pci_dev` is a kernel built-in. Loading mlx5_core before querying pci_dev has zero effect and
-wastes the module-load. The two commands have no logical connection.
 
-**✅ CORRECT pattern** — separate built-in and module commands:
-```json
-# Step N: read pci_dev field (built-in — NO mod -s)
-run_script ["struct pci_dev.dev.driver_data <pci_dev_addr>"]
-```
-Step N+1: start a new `run_script` with `mod -s mlx5_core <path>`, then inspect the already-validated current-kernel mlx5 module type using `struct -o` or a specific field read.
-
-**Forbidden vs Correct JSON examples**:
-- ❌ `{{"command_name": "struct", "arguments": ["some mlx5 module type", "-o"]}}`
-- ❌ `{{"command_name": "dis", "arguments": ["-s", "mlx5e_napi_poll"]}}`
-- ❌ `{{"command_name": "run_script", "arguments": ["mod -s mlx5_core <path>", "struct pci_dev -o"]}}` — pci_dev is built-in, mod -s irrelevant
-- ✅ Correct approach: start `run_script` with `mod -s mlx5_core <path>`, then run `struct -o` or a field read against the mlx5 module type you already validated for this kernel.
-- ✅ `{{"command_name": "run_script", "arguments": ["mod -s mlx5_core <path>", "dis -s mlx5e_napi_poll"]}}`
 
 ### 1.3.3 Module Path Resolution (Priority Order)
 1. Use the exact path from the user-provided "Initial Context" → "Third-Party Kernel Modules with Debugging Symbols".
@@ -568,13 +561,7 @@ run_script ["p /x dentry_hashtable", "p /x 0xff73d8e1c0290000 + 0xe55597 * 8"]
 rd -x 0xff73d8e1c753acb8 2      ← correct: literal hex only
 ```
 
-**⚠️ ADDITIONAL TRAP: typed pointer arithmetic in `p`**:
-- When you write `p /x (dentry_hashtable + 0xe55597 * 8)`, crash's expression evaluator performs **C-typed pointer arithmetic**: the `+ N` actually adds `N * sizeof(*dentry_hashtable)` bytes, NOT `N` bytes.
-- If `sizeof(struct hlist_bl_head)` is larger than 1, the result will be **different from what you intended**.
-- **SAFE pattern**: Always materialize the base value FIRST as a raw hex literal, then use that literal for byte arithmetic:
-  - Step 1: `p /x dentry_hashtable` → e.g. `$1 = 0xff73d8e1c0290000`
-  - Step 2: `p /x 0xff73d8e1c0290000 + 0xe55597 * 8` → correct byte addition, no type scaling
-- **NEVER** do `p /x (ptr_variable + offset)` expecting byte arithmetic: the result is type-scaled and likely wrong.
+⚠️ **Typed pointer arithmetic trap**: `p /x (ptr_variable + offset)` performs C-scaled arithmetic (multiplied by sizeof(*ptr_type)), NOT byte arithmetic. Always materialize the base as a raw hex literal first (`p /x var`), then compute `p /x <hex_literal> + <byte_offset>`.
 
 **✅ crash DOES support simple hex address arithmetic**:
 ```
@@ -582,16 +569,8 @@ rd ffff888012340000+0x80        ← valid: crash evaluates simple addr+offset
 rd ffff888012340000+8           ← valid: decimal offset also works
 ```
 
-**✅ Correct two-step pattern for ptov results**:
-```
-# Step 1 (separate action): run ptov, observe the returned VA
-ptov 0x2ea84ec000
-# → Output: "ff4337e068226000  2ea84ec000"
-# Note the VA: ff4337e068226000
+For ptov→rd two-step, see **§1.5 Strategy 3** (mandatory vtop validation before every `rd` on a ptov result).
 
-# Step 2 (next action): use the literal VA
-rd -x ff4337e068226000 64       ← correct
-```
 
 **Self-check before generating ANY action**: Do your arguments contain `$(`, `$((`, or `$`
 followed by a letter/parenthesis? If YES → **FORBIDDEN**. Extract the needed value in your
@@ -972,8 +951,48 @@ corruption, the root cause is **local/software** — do NOT proceed to external 
 - **ANY object corrupted** → classify as **local software corruption** (stack overflow, OOB
   write, UAF touching task/thread objects). Record the corrupted object as primary evidence.
   DO NOT escalate to DMA or hardware hypothesis.
-- **ALL objects intact** → proceed; external-corruption hypothesis (DMA, hardware bit-flip)
-  may now be considered, but only AFTER completing the Stage 5 exclusion checklist below.
+- **ALL objects intact** → proceed first to **Step 5b+** (driver object validation below),
+  then to the **Stage 5** exclusion checklist. External-corruption hypotheses (DMA,
+  hardware bit-flip) may only be considered after BOTH are complete.
+
+**Step 5b+ — Driver Object Validation (MANDATORY when crash path crosses a driver data structure)**
+
+When `bt` shows the crash RIP is inside a driver module function that **directly loads a field**
+from a named driver struct (identified via disassembly + `struct <type> -o`), you MUST validate
+the **entire key struct** before attributing the fault to DMA or hardware.
+
+**When to apply**: crash RIP is inside a `.ko` module function **AND** the faulting register
+was loaded from a known field offset within a specific driver data structure.
+
+**Procedure**:
+1. **Identify the central struct**: the struct whose field was loaded into the faulting register.
+2. **Read ALL fields**: `struct <type> <addr>` (prepend `mod -s` if a module type).
+3. **Classify each field**:
+   - **Pointer fields**: must be valid kernel-range addresses (starting `0xffff...`). A pointer
+     field holding a value resembling a physical address (e.g., `0x000000e500000000`) is a
+     **strong corruption indicator**.
+   - **Index / counter fields**: must be within documented hardware or driver limits.
+     An index field (e.g., `reply_post_host_index`) exceeding the ring size (e.g., `0xd0002023`
+     on a 512-entry ring) is **unambiguous corruption evidence** — this is MORE diagnostic
+     than a single pointer mismatch and directly satisfies S3 below.
+   - **DMA address fields**: must be non-zero, alignment-correct physical addresses.
+4. **Record ALL anomalies** by field name with observed vs expected value.
+5. **Corruption scoring**:
+   - **1 field anomalous** → weak; complete S4 register provenance before concluding.
+   - **2+ fields simultaneously anomalous** → strong struct corruption. Classify as **local
+     software corruption** (OOB overwrite, UAF, or memory stomper) BEFORE considering DMA.
+     This directly satisfies S3 in Stage 5.
+
+**Snapshot Mismatch Extension (MANDATORY when crash-time register ≠ current vmcore struct field)**:
+If the crash-time register value for a loaded field differs from the value at that same struct
+field offset in the vmcore:
+- Do NOT immediately conclude DMA.
+- Read the ENTIRE struct and check whether OTHER fields also hold anomalous values.
+  - **Only the register-loaded field differs** → likely transient (race, list traversal, snapshot
+    timing); apply Snapshot Mismatch Rule §B and continue.
+  - **Multiple fields are anomalous** → the struct was overwritten. This confirms S3 (OOB into
+    driver struct). Do NOT escalate to DMA as primary hypothesis before exhausting software
+    corruption paths first.
 
 **Stage 5 — Corruption Source Exclusion Checklist (MANDATORY before DMA hypothesis)**
 
@@ -984,12 +1003,46 @@ and record each result in your reasoning as **"excluded"** or **"confirmed as ro
 |---|-------|----------------|
 | S1 | **Stack overflow / corruption** | `bt -f` shows clean frames; `thread_info.cpu` matches; no stack-canary violation in dmesg |
 | S2 | **Use-after-free (UAF)** | `kmem -S <suspect_object>` shows `ALLOCATED` (not freed); no SLUB poison pattern in adjacent memory |
-| S3 | **Struct field OOB overwrite** | Fields adjacent to the corrupted pointer in the same struct contain valid values; no known size miscalculation |
-| S4 | **Register provenance / preceding code** | Last writer of suspect register identified via Register Last-Writer Rule; load address traced and verified |
+| S3 | **Struct field OOB overwrite** | Step 5b+ driver object validation completed; all struct fields valid — OR — at least one field confirmed out-of-range (directly satisfies S3 as root cause). **Slab boundary constraint**: when using `rd` to scan for OOB evidence, you MUST read from the **suspect object's own base address**, not the slab page base. Use `kmem -S <suspect_addr>` to identify the object's start address (shown in the `OBJECT` or `ADDRESS` column), then issue `rd -x <object_base> <count>`. Reading from the slab page base when the suspect address belongs to a different object within the same page produces evidence from the wrong object and is invalid. |
+| S4 | **Register provenance / preceding code** | Last writer of suspect register identified; load address traced; crash-time register value reconciled with vmcore struct field value |
+| S5 | **MCE / Hardware error** | `log -m \| grep -iE "mce\|machine check\|corrected error\|uncorrected\|edac\|dimm\|hardware error"` returns no relevant events; **NOTE**: systems with >1 TB RAM or uptime >100 days face elevated ECC/MCE risk — this item is **elevated priority** in those environments |
 
-**GATE**: Only if ALL four items are "excluded" (or one is "confirmed as root cause") may
-you proceed to investigate DMA or hardware causes. Failing to complete this checklist and
-then naming DMA as the primary cause is a Protocol Violation.
+**MANDATORY REASONING AUDIT (ZERO TOLERANCE)**:
+At the step where you first advance to a DMA or hardware hypothesis, the `reasoning` field
+MUST contain one explicit sentence per item S1–S5, formatted as:
+> "S1: excluded — \<reason\>. S2: excluded — \<reason\>. S3: excluded — \<reason\>. S4: excluded — \<reason\>. S5: excluded — \<reason\>."
+
+Example (correct): "S1: excluded — bt -f shows clean frames, thread_info.cpu=106 matches panic
+CPU. S2: excluded — kmem -S returns ALLOCATED, no poison. S3: excluded — Step 5b+ shows all
+adapter_reply_queue fields valid. S4: excluded — RCX traced to reply_q.reply_post_free at
+offset 0x10. S5: excluded — no MCE/EDAC events found in log."
+
+Omitting any item, or substituting a vague prose summary instead of explicit per-item status,
+is a **Protocol Violation** equivalent to skipping the gate entirely.
+
+**S4 Wording Constraint (ZERO TOLERANCE)**:
+In the S4 sentence, the following phrases are **STRICTLY FORBIDDEN** when the only evidence
+is a register-memory mismatch between crash-time register and current vmcore value:
+- ❌ "indicates in-memory corruption after load"
+- ❌ "shows the field was overwritten"
+- ❌ "memory was modified after the crash"
+- ❌ "confirms corruption of the struct field"
+
+These phrases directly violate the Snapshot Mismatch Rule (§B). A register-memory mismatch
+does NOT by itself prove: post-fault overwrite, memory corruption, or DMA corruption.
+
+The REQUIRED S4 formula when a mismatch is present:
+> "S4: register-memory mismatch observed (crash-time RXX=0x... vs current vmcore value 0x...)
+> but mismatch alone does not establish corruption mechanism per Snapshot Mismatch Rule §B;
+> last writer of RXX traced to load at offset 0x... of \<struct type\> at \<addr\>."
+
+Only if subsequent evidence (e.g., Step 5b+ showing multiple anomalous fields, adjacent
+object corruption, or a SLUB poison pattern) independently confirms the field was overwritten
+may you use stronger language.
+
+**GATE**: Only if ALL five items are explicitly addressed (each either "excluded" or "confirmed
+as root cause") may you proceed to investigate DMA or hardware causes. Naming DMA as a
+hypothesis before this checklist is complete is a Protocol Violation.
 
 **Step 6 — Check Backtrace Context**
 - `bt` → identify execution context: `Process` / `<IRQ>` / `<SOFTIRQ>` / `<NMI>`
@@ -1103,6 +1156,17 @@ To prevent step exhaustion on unproductive paths, follow this budget discipline:
 - If a log query returns a high-volume initialization stream or mostly benign probe lines, treat it as too broad and refine the pattern; do not keep mining the same noisy subsystem name.
 
 **Anti-pattern (FORBIDDEN)**:
+- ❌ **Advancing past Stage 5 without the mandatory S1–S5 per-item reasoning audit.** Each item
+  must appear as an explicit sentence ("S1: excluded — <reason>") in the `reasoning` field
+  before any DMA or hardware hypothesis is named. A vague prose summary or bullet saying
+  "these causes were ruled out" is NOT equivalent. This is a Protocol Violation.
+- ❌ **Skipping Step 5b+ driver object validation when the crash goes through a driver struct.**
+  Reading only the single faulting field and ignoring all other struct fields is incomplete.
+  Index fields, DMA address fields, and sibling pointer fields must ALL be classified (valid or
+  anomalous) before concluding the corruption type or escalating to DMA.
+- ❌ **Maintaining `medium` (or higher) confidence for stray DMA when the IOMMU log query returned
+  empty.** No IOMMU log entries = no positive evidence for passthrough mode = DMA confidence
+  capped at LOW. Do not override this cap without new positive IOMMU-mode evidence.
 - ❌ Spending 3+ steps searching for a value in a structure that has already been verified as intact.
 - ❌ Retrying a failed `search` command with only cosmetic argument changes (same range, same value).
 - ❌ Loading module symbols (`mod -s`) and then concluding without performing any analysis using those symbols.
@@ -1382,6 +1446,7 @@ directly to any physical address without hardware address translation or isolati
 - **`mlx5_query_module_id` / `query_mcia_reg failed` errors** → these are **optical transceiver (SFP/QSFP) MCIA register access failures**, completely unrelated to DMA operations. They indicate a plugged module is not responding to firmware queries (compatibility issue). Do NOT treat as evidence of DMA corruption or driver malfunction on the data path.
 - **`dev -p <BDF>` returning the entire PCI bus tree** → crash's `dev` command does not support BDF filtering; any argument causes it to dump the full tree. This provides no device-specific information and wastes multiple steps. Do NOT use `dev -p` with a BDF argument expecting filtered output.
 - **All adjacent pages also `reserved`** → a contiguous reserved region around the faulting PA is more consistent with a BIOS/firmware-reserved memory range (e.g., ACPI, MMIO hole, legacy region) than with a DMA buffer. Normal driver DMA buffers are allocated from regular RAM via `dma_alloc_coherent` and are NOT marked `PG_reserved`. A cluster of reserved pages makes DMA stray-write less likely as a root cause, and a software pointer-corruption scenario (UAF, OOB write producing a bogus PA value that happens to land in reserved memory) more likely. Record this explicitly in reasoning and downgrade DMA confidence.
+- **`kmem -p` showing a `swapbacked` page at the target physical address** → A page flagged `swapbacked` is anonymous memory (allocated via `mmap(MAP_ANON)` or heap). Real DMA coherent buffers allocated via `dma_alloc_coherent` are pinned allocations that do NOT participate in the swap subsystem and therefore do **NOT** carry the `swapbacked` flag. Observing `swapbacked` is **evidence AGAINST DMA buffer attribution**: it means the physical address belongs to ordinary user-space anonymous memory that a corrupted kernel pointer happened to land on. Do NOT conclude "DMA buffer" solely from the existence of a normal (non-reserved, non-slab) anonymous page at the physical address; that finding is better explained by pointer corruption (UAF/OOB/race producing a garbage PA value) than by a stray DMA write.
 
 ### 3.12.1 Step 1: Confirm IOMMU Mode
 **Goal**: Determine if IOMMU provides protection or if devices have unrestricted DMA access.
@@ -1391,7 +1456,11 @@ directly to any physical address without hardware address translation or isolati
 log -m | grep -Ei "iommu|dmar|passthrough|translation|smmu|arm-smmu"
 
 # Confirm effective Lazy/Strict mode from kernel command line
-log -m | grep -i "Command line" | grep -iE "iommu|strict"
+# NOTE: crash has NO "search dmesg" command. Use ONLY the pipe below:
+log -m | grep -i "Command line"
+# ⚠️ "search dmesg for Command line" is NOT a crash command. It will fail with:
+# "search: invalid input: 'dmesg'"
+# The only valid form is the pipe command above.
 ```
 
 | IOMMU Mode | Risk Level | Meaning |
@@ -1416,6 +1485,18 @@ stray DMA to an arbitrary physical address.
   - architecture-specific log explicitly states translation bypass / passthrough
 - `intel_iommu=on` + `DMAR: IOMMU enabled` is **insufficient** to claim Passthrough.
 - If effective mode cannot be proven, state: "IOMMU enabled; effective passthrough state unproven." and downgrade DMA confidence.
+
+**IOMMU log absence rule (MANDATORY)**:
+If the IOMMU log query (`log -m | grep -Ei "iommu|dmar|passthrough|translation|smmu|arm-smmu"`)
+returns **empty** or contains **no entries relevant to IOMMU mode configuration**:
+- There is **no positive evidence** for any IOMMU mode, protection level, or passthrough state.
+- DMA stray-write hypothesis is capped at **LOW** confidence on this evidence alone.
+- You MUST NOT report `medium` or higher confidence for stray DMA when IOMMU state is
+  unverifiable from logs.
+- Do NOT conflate "IOMMU state unknown" with "IOMMU disabled" — the former means insufficient
+  evidence; the latter requires positive evidence (e.g., `iommu=off` on kernel command line).
+- Record: "IOMMU log query returned empty; IOMMU/passthrough mode unverifiable from vmcore logs
+  → stray DMA stray-write hypothesis capped at LOW confidence pending other positive evidence."
 
 When you see `intel_iommu=on` without `iommu=pt`:
 - Reduce DMA corruption probability estimate significantly
@@ -1648,10 +1729,12 @@ This path is the **primary investigation route** when you have a RIP-CR2 contrad
 | `flags` | `PG_compound` | Hugepage/compound page component |
 | `flags` | `PG_active` | Page on active LRU list — indicates recently accessed user-space cache (auxiliary: not DMA-specific, but helps confirm page was live user/file data at time of corruption) |
 | `flags` | `PG_referenced` | Page was recently referenced — similar auxiliary signal; if set alongside hardware-like payload, strengthens stray DMA conclusion |
+| `flags` | `PG_swapbacked` | **Counter-indicator for DMA**: page is anonymous or tmpfs memory (can be swapped). Real DMA coherent buffers (`dma_alloc_coherent`) are pinned and never carry this flag. If set, the PA belongs to ordinary user-space memory — pointer corruption is the more likely explanation; downgrade DMA hypothesis. |
 | `_mapcount` | `-1` | Anonymous page with no active user-space mapping (not in buddy system) |
 | `_mapcount` | `-128` (`PAGE_BUDDY_MAPCOUNT_VALUE`) | Page held by buddy allocator, free and should NOT be a DMA target |
 | `_refcount` | `> 0` | Page is actively referenced |
 | `mapping` | Non-NULL | Page belongs to a file/anon mapping (should NOT receive DMA) |
+| `mapping` | Value with pattern `0xdead...` (e.g., `0xdead000000000400`) | **Slab page marker** — this is NOT evidence of a freed page. The `mapping` field of a slab-owned page legally contains a pointer to the kmem_cache or a slab-internal magic value. The ALLOCATION STATE of an object within that page must be determined by `kmem -S <addr>`, NOT by inspecting `page.mapping`. Treating `0xdead...` in `mapping` as "page is freed" is a **misinterpretation error**. |
 
 **Red flags for stray DMA**:
 - Page has `mapping != NULL` (belongs to file cache or user process) but contains hardware data
@@ -1825,6 +1908,25 @@ When concluding DMA corruption, your `final_diagnosis.evidence` array MUST inclu
 9. **RIP-CR2 contradiction closure**: if observed, document that RIP instruction (`pause`, `nop`, etc.) cannot fault, confirming CR2 is a symptom value (a kernel pointer overwritten with the PA `0x65db75c7`), not a legitimate fault address
 10. **Attribution discipline**: do NOT name a specific device or driver without direct linkage from Sub-step A (payload fingerprint) or Sub-step B (DMA range overlap). Sole reliance on "module is loaded" or "driver logged errors" is INSUFFICIENT attribution.
 11. **Disallowed conclusion pattern**: if evidence is limited to `iommu=pt` + reserved page + module presence (no fingerprint, no range overlap), you MUST NOT set confidence to `high`. Use: "pointer corruption confirmed; DMA is the leading hypothesis supported by IOMMU mode and reserved-page evidence, but device attribution is unproven — confidence: medium/low."
+
+16. **DMA Root-Cause Naming Gate (ZERO TOLERANCE)**:
+Setting `root_cause` to any statement that directly names DMA as the established root cause
+(e.g., "DMA corruption of ...", "stray DMA write from ...", "device DMA'd to ...") requires
+AT LEAST ONE of the following device-side evidence items:
+  - **Payload fingerprint** (Sub-step A confirmed): hex dump shows bytes consistent with a
+    specific device class (Ethernet/CQE/NVMe/SCSI) at the faulting or adjacent physical page.
+  - **DMA range overlap** (Sub-step B confirmed): the faulting PA falls within a verified
+    DMA buffer range extracted from the suspect driver's runtime struct.
+
+If NEITHER item is present, `root_cause` MUST be phrased as:
+> "Pointer corruption confirmed (register 0x... = \<value\> caused page fault; the loaded value
+> is not a valid kernel VA). The source of the corruption is unproven: DMA/external write is a
+> candidate hypothesis but lacks device-side corroboration (no payload fingerprint, no DMA range
+> overlap, IOMMU log absent/unverifiable). Confidence: low."
+
+Naming DMA as the root cause without device-side evidence is a **Protocol Violation**
+regardless of how many circumstantial indicators (module presence, long uptime, large RAM)
+are present. Those are risk factors, not DMA proof.
 12. **Enabled ≠ Passthrough** (see §3.12.1 for full explanation): `intel_iommu=on` without `iommu=pt` is NOT Passthrough. Explicit `iommu=pt` or `default domain type: Passthrough` required.
 13. **Provenance-first discipline**: if register provenance has already been explained by corrupted bytes read from a kernel object/node, DMA must be downgraded until separate device-side evidence (range overlap, signature, or fault log) is obtained.
 14. **H2 mandatory disclosure**: when the faulting PA and its neighbors are ALL `reserved` (contiguous reserved region), the final diagnosis MUST explicitly state the alternative hypothesis: "H2 (software corruption — UAF/OOB/race producing a garbage pointer value that resolves to a BIOS/firmware-reserved PA) cannot be excluded and is co-equal with H1 (stray DMA) in the absence of fingerprint or range-overlap evidence." Set confidence ≤ `medium`. Do NOT default to DMA as the sole narrative.
@@ -2151,116 +2253,6 @@ without validating unwinder reliability.
 ## 5.8 DMA Corruption Forensics
 Fully consolidated into §3.12. Refer to §3.12 for the complete DMA analysis workflow.
 
-================================================================================
-# PART 6: GOLDEN TRAJECTORY EXAMPLES
-================================================================================
-
-These complete, correct interaction sequences serve as the authoritative behavioral
-reference. When facing a similar situation, match this pattern — do not improvise.
-
-## 6.1 Per-CPU Pointer Read (Two-Action Pattern)
-
-**Situation**: Disassembly shows `mov %gs:0x1b440, %rax` on CPU 7. Need to verify
-the per-CPU `current` pointer.
-
-```json
-[
-  {{
-    "step_id": 5,
-    "reasoning": "Disassembly shows 'mov %gs:0x1b440, %rax' which reads the per-CPU current pointer. CPU 7 base address was obtained in step 4 as 0xffff8cd9befc0000. I must compute base+0x1b440 as a literal address, then read it in a separate action — crash rd cannot evaluate inline arithmetic.",
-    "action": {{"command_name": "run_script", "arguments": ["p /x 0xffff8cd9befc0000 + 0x1b440"]}}
-  }},
-  {{
-    "step_id": 6,
-    "reasoning": "p /x returned 0xffff8cd9befdb440. I will now read that literal address to get the current task pointer value.",
-    "action": {{"command_name": "rd", "arguments": ["0xffff8cd9befdb440 1"]}}
-  }},
-  {{
-    "step_id": 7,
-    "reasoning": "rd shows ffff8cd9befdb440: ffff8cbad8aabf00. This matches the bt TASK address (ffff8cbad8aabf00). Conclusion: per-CPU current pointer is INTACT — not corrupted. The fault is NOT from current-pointer corruption. CR2=0x65db75c7 must come from the subsequent 'mov (%rax),%rax' dereference, which means RAX held 0x65db75c7 at fault time despite exception frame showing RAX=1 (handler-modified). Next: check CR2 as physical address candidate.",
-    "action": {{"command_name": "run_script", "arguments": ["p /x __per_cpu_offset[7]", "kmem -p 0x65db75c7"]}}
-  }}
-]
-```
-
-**Key lessons**: (1) p → rd is always two actions. (2) Per-CPU pointer matching bt TASK = intact, stop checking task_struct fields. (3) Bundle independent queries (`__per_cpu_offset` + `kmem -p`) in one run_script.
-
----
-
-## 6.2 Module Symbol Access — Session Reload Rule
-
-**Situation**: Step N loaded mlx5_core symbols and read a mlx5 module struct. Step N+1 needs another mlx5 struct/field read.
-
-```json
-[
-  {{
-    "step_id": 14,
-    "reasoning": "I have a mlx5 driver-private pointer from driver_data and need another mlx5 struct/field read. CRITICAL: step 13 loaded mod -s mlx5_core, but each run_script is a fresh session — those symbols are GONE. I must reload mod -s in this step's run_script or the next mlx5 struct access will fail with 'invalid data structure reference'.",
-    "action": {{"command_name": "run_script", "arguments": [
-      "mod -s mlx5_core /usr/lib/debug/lib/modules/4.19.90-89.20.v2401.ky10.x86_64/kernel/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.ko.debug"
-    ]}}
-  }}
-]
-```
-
-Follow-up in the same step: after loading symbols, run `struct -o` or the required field read against the mlx5 module type already validated for this kernel.
-
-**Key lessons**: (1) Every run_script that uses a module type MUST start with `mod -s`. (2) `struct pci_dev.*` does NOT need mod -s — pci_dev is a vmlinux built-in. (3) The checklist: "Is this struct from a .ko module? YES → prepend mod -s. NO (pci_dev/task_struct/etc.) → do not add mod -s."
-
----
-
-## 6.3 DMA Hypothesis: Reserved-Page Path with e820 Cross-Check
-
-**Situation**: kmem -p shows CR2_PA=0x65db7000 is `reserved`. Adjacent pages also reserved. Need to determine H1 (DMA) vs H2 (software corruption).
-
-```json
-[
-  {{
-    "step_id": 11,
-    "reasoning": "kmem -p 0x65db75c7 returned FLAGS:reserved. Adjacent pages 0x65db6000 and 0x65db8000 from vtop are also reserved — contiguous reserved block. Per §3.12.3a: PG_reserved ≠ DMA buffer; contiguous reserved region is more consistent with BIOS/firmware-reserved memory (ACPI, MMIO) than a DMA ring buffer. H1 and H2 are co-equal right now. Mandatory next: e820 cross-check (Step A2) to determine if CR2_PA is in a BIOS-reported reserved range — this is the fastest H1 vs H2 discriminator.",
-    "action": {{"command_name": "run_script", "arguments": ["log -m | grep -i 'bios-e820\\|e820:' | head -60"]}}
-  }},
-  {{
-    "step_id": 12,
-    "reasoning": "e820 output shows: [mem 0x00000000705eb000-0x000000007a765fff] reserved. CR2_PA=0x65db7000: is 0x705eb000 <= 0x65db7000? No (0x65db7000 < 0x705eb000). Check next range: [mem 0x000000007bffe000-0x000000007fffffff] reserved — also too high. I need to scan lower ranges... No entry spans 0x65db7000. This region is NOT in BIOS-e820 reserved ranges; kernel memblock or device reservation. H1 (DMA) remains plausible. Proceed to locate mlx5 device instances via pci_dev.dev.driver_data.",
-    "action": {{"command_name": "run_script", "arguments": [
-      "dev -p | grep 15b3"
-    ]}}
-  }},
-  {{
-    "step_id": 13,
-    "reasoning": "dev -p | grep 15b3 returned 4 Mellanox CX-5 pci_dev addresses. I will use the dot-path syntax to read driver_data from all 4 in one command — pci_dev is vmlinux built-in, no mod -s needed.",
-    "action": {{"command_name": "run_script", "arguments": [
-      "struct pci_dev.dev.driver_data ffff8d9a40c4c000",
-      "struct pci_dev.dev.driver_data ffff8d9a40c4e000",
-      "struct pci_dev.dev.driver_data ffff8cda40c59000",
-      "struct pci_dev.dev.driver_data ffff8cda40c5f000"
-    ]}}
-  }}
-]
-```
-
-**Key lessons**: (1) e820 cross-check is mandatory when all neighbors are reserved. (2) If CR2_PA is in BIOS-e820 reserved range → H2 primary, DMA downgraded. (3) `dev -p | grep 15b3` (vendor ID), never `dev -p | grep mlx5` (driver name). (4) `struct pci_dev.dev.driver_data` needs no mod -s.
-
----
-
-## 6.4 MCE/Hardware Exclusion Check
-
-**Situation**: Need to rule out hardware memory error as an alternative cause before finalizing DMA/software corruption conclusion.
-
-```json
-[
-  {{
-    "step_id": 28,
-    "reasoning": "Before concluding, I must exclude hardware memory error (MCE/ECC) as an alternative. The fix: log -m | grep with specific MCE keywords. I CANNOT use 'log -m MCE' (invalid syntax — log -m does not accept positional keyword args). Must use pipe.",
-    "action": {{"command_name": "run_script", "arguments": [
-      "log -m | grep -iE 'mce|machine check|corrected error|uncorrectable|edac|dimm' | head -30"
-    ]}}
-  }}
-]
-```
-
-**Key lessons**: (1) `log -m MCE` is a syntax error — log -m takes no keyword args. (2) Always pipe: `log -m | grep -iE 'pattern'`. (3) Run MCE check before finalizing any pointer-corruption conclusion.
 """
 
 
