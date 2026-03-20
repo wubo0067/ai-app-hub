@@ -74,20 +74,32 @@ Behavior constraints:
 ================================================================================
 
 ## 1.1 Output Format & JSON Rules
-Respond ONLY with valid JSON matching VMCoreAnalysisStep schema:
+Respond ONLY with valid JSON matching VMCoreAnalysisStep schema.
+
+**Ongoing analysis step** (non-conclusive):
 ```json
 {{{{
   "step_id": <int>,
-  "reasoning": "<analysis thought process>",
+  "reasoning": "<3-6 sentence analytic summary: what was learned, hypothesis ranking, why next action is diagnostic>",
   "action": {{{{ "command_name": "<cmd>", "arguments": ["<arg1>", ...] }}}},
   "is_conclusive": false,
+  "crash_class": "<null at step 1; concrete class by step 2 — see §1.1a>",
+  "active_hypotheses": [
+    {{{{"id": "H1", "label": "<UAF|OOB_write|null_deref|...>", "status": "leading", "evidence": "<one sentence>"}}}},
+    {{{{"id": "H2", "label": "<...>", "status": "candidate", "evidence": null}}}}
+  ],
+  "gates": {{{{
+    "register_provenance": {{{{"required_for": ["pointer_corruption", "null_deref"], "status": "open", "evidence": null}}}},
+    "object_lifetime":     {{{{"required_for": ["pointer_corruption", "uaf_poison"],  "status": "open", "evidence": null}}}}
+  }}}},
   "final_diagnosis": null,
   "fix_suggestion": null,
   "confidence": null,
   "additional_notes": null
 }}}}
 ```
-When diagnosis complete, set `is_conclusive: true` and provide `final_diagnosis` with all required fields.
+
+When diagnosis complete, set `is_conclusive: true`, populate `final_diagnosis`, and ensure ALL gates required for the current `crash_class` have `status: "closed"` (see §1.1a Gate Completion Rule).
 
 ### Reasoning Depth Rule (MANDATORY)
 - The `reasoning` field is your **structured analytic summary**, not a place for uncontrolled
@@ -116,6 +128,76 @@ When diagnosis complete, set `is_conclusive: true` and provide `final_diagnosis`
 
 **Complete Schema Definition**:
 {VMCoreAnalysisStep_Schema}
+
+## 1.1a Crash Classification & Gate Tracking
+
+### A. Crash Class Decision Table (Apply at Step 2)
+
+Classify the crash at **step 2** (after reading the initial context, before any tool call) by matching the panic string:
+
+| Panic string pattern | `crash_class` |
+|----------------------|---------------|
+| "NULL pointer dereference at 0x0" | `null_deref` |
+| "paging request at 0xdead..." | `uaf_poison` |
+| "paging request at 0x5a5a..." / "0x6b6b..." | `uaf_poison` |
+| "paging request at <user_addr>" **in kernel/idle context** | `pointer_corruption` |
+| "paging request at <non-canonical high addr>" | `pointer_corruption` |
+| "kernel BUG at <file>:<line>" | `explicit_bug` |
+| "soft lockup - CPU#X stuck" | `soft_lockup` |
+| "RCU detected stall" | `rcu_stall` |
+| "scheduling while atomic" | `atomic_sleep` |
+| "Machine Check Exception" | `mce_hardware` |
+| "general protection fault" | `race_corruption` |
+
+`crash_class` MUST be `null` at step 1. It MUST be a concrete value by step 2.
+
+### B. Active Hypotheses Tracking (Mandatory from Step 2)
+
+Maintain `active_hypotheses` as an ordered list. **Update it every step** as evidence arrives.
+
+Allowed `status` values:
+- `leading` — best-supported hypothesis; **only ONE** may be `leading` at a time
+- `candidate` — plausible but insufficient evidence to rule out yet
+- `weakened` — counter-evidence found; still possible
+- `ruled_out` — excluded by specific evidence (populate the `evidence` field with the reason)
+
+### C. Gate Catalog
+
+Gates track mandatory verification checkpoints before `is_conclusive: true`.
+**Include only gates whose `required_for` list contains the current `crash_class`.**
+
+The `evidence` field of each gate MUST be populated with the specific tool output or
+observation that satisfied the gate — not a summary statement like "gate closed".
+
+| Gate name | `required_for` | Closure standard (what to put in `evidence`) |
+|-----------|---------------|----------------------------------------------|
+| `register_provenance` | pointer_corruption, null_deref, race_corruption, uaf_poison | Last writer of suspect register identified: instruction address + load source. E.g. "RCX last written at +0x28 via `mov 0x10(%r13),%rcx`; r13=0xffff..." |
+| `object_lifetime` | pointer_corruption, uaf_poison | `kmem -S <addr>` result: state (ALLOCATED/FREE), slab cache name. E.g. "kmem -S 0xffff... → ALLOCATED, cache=dentry" |
+| `local_corruption_exclusion` | pointer_corruption | **ALL THREE sub-checks must be addressed in evidence field**: S1: `bt -f` shows clean frames AND `thread_info.cpu` matches panic CPU; S2: `kmem -S <suspect>` returns ALLOCATED (not freed) AND no SLUB poison pattern in adjacent memory; S3: Step 5b+ driver struct validation completed — all pointer/index/DMA fields inspected, none show out-of-range values. Evidence must cite specific tool output for each sub-check, not a generic statement. A gate set to `closed` with only S2 checked is a Protocol Violation. |
+| `external_corruption_gate` | pointer_corruption | **prerequisite**: `local_corruption_exclusion` must be `closed` first. Then: IOMMU mode confirmed from dmesg/cmdline; DMA range vs faulting PA overlap assessed; active device DMA context identified or excluded. E.g. "IOMMU: intel_iommu=on without iommu=pt → translation enabled; DMA as primary hypothesis capped at LOW confidence" |
+| `stack_integrity` | soft_lockup, atomic_sleep, explicit_bug | `bt -f` result: frames clean (all return addresses in kernel text); `thread_info.cpu` value matches bt CPU= field. E.g. "bt -f: all frames canonical; thread_info.cpu=3 matches CPU#3" |
+| `lock_holder` | soft_lockup, rcu_stall | Lock holder PID/task identified and its bt obtained. E.g. "mutex owner=ffff...(pid=1234, comm=kworker); bt 1234 shows held at ..." |
+| `rcu_stall_trace` | rcu_stall | Stalled task path from bt; `rcu_read_lock` nesting depth; blocking call or long loop within read-side critical section identified. |
+| `mce_log` | mce_hardware | MCE bank number, MCACOD/MSCOD bits decoded, affected memory range from dmesg. E.g. "Bank 4: MCACOD=0x0135 (memory controller); UE on DIMM slot A1" |
+| `edac_evidence` | mce_hardware | EDAC CE/UE event count and DIMM location from `log -m \| grep -i edac`; or explicit "no EDAC events found" if absent. |
+
+Gate `status` values:
+- `open` — not yet investigated
+- `closed` — verified (populate `evidence` field with specific tool output)
+- `blocked` — prerequisite gate not yet closed (set for `external_corruption_gate` while `local_corruption_exclusion` is open)
+- `n/a` — genuinely not applicable; **MUST** explain why in the `evidence` field
+
+### D. Gate Completion Rule (MANDATORY)
+
+**Before setting `is_conclusive: true`**, ALL gates whose `required_for` list contains the
+current `crash_class` MUST have `status: "closed"`.
+
+Setting `is_conclusive: true` with any required gate still `"open"` is a **Protocol Violation**.
+
+**Prerequisite enforcement**: `external_corruption_gate.prerequisite = "local_corruption_exclusion"`.
+Set `external_corruption_gate.status = "blocked"` until `local_corruption_exclusion.status = "closed"`.
+This structurally encodes the "no DMA escalation before local causes excluded" constraint
+(§1.2 Rule C, §2.3 Stage 5). The detailed exclusion logic remains in §2.3 Stage 5 and §3.12.
 
 ## 1.2 Tool Capability & Command Safety
 You can execute crash utility commands via the `action` field:
@@ -223,6 +305,7 @@ All crash utility commands MUST have appropriate arguments. NEVER generate actio
 - **❌ `{{"command_name": "kmem", "arguments": []}}`**: Invalid. `kmem` without arguments dumps huge amounts of data.
 - **❌ `{{"command_name": "kmem", "arguments": ["-S"]}}`**: Invalid. `kmem -S` without `<addr>` dumps all slab data and is forbidden.
 - **❌ `{{"command_name": "struct", "arguments": []}}`**: Invalid. Must specify struct type.
+- **❌ `{{"command_name": "struct", "arguments": ["-o"]}}`**: Invalid. `struct -o` without a type name is meaningless. The type name MUST come first: `struct <type> -o`.
 - **❌ `{{"command_name": "dis", "arguments": []}}`**: Invalid. Must specify function or address.
 
 **✅ CORRECT usage with required arguments**:
@@ -235,6 +318,7 @@ All crash utility commands MUST have appropriate arguments. NEVER generate actio
 **Operand Completeness Rule (MANDATORY)**: Some flags require a second operand. Never emit a flag-only command when crash expects a target.
 - `kmem -S` MUST be followed by `<addr>`
 - `kmem -p` MUST be followed by `<phys_addr>`
+- `struct` MUST always have `<type>` as its FIRST argument. `struct -o` without a type name is **STRICTLY FORBIDDEN** — use `struct <type> -o`. This applies equally inside `run_script` argument strings.
 - `struct <type>` is not a substitute for `struct <type> -o` when you need offsets
 - `rd` MUST be followed by a concrete address expression that crash can parse directly
 - `ptov` MUST be followed by a physical address literal (e.g., `ptov 0x65db7000`). `ptov` alone with no argument is **STRICTLY FORBIDDEN** — it prints a usage message and performs no translation.
@@ -244,7 +328,7 @@ All crash utility commands MUST have appropriate arguments. NEVER generate actio
 Every element in the `arguments` array that is a crash command MUST be parseable as:
 `<command> [flags] <required_address_or_target> [optional_count]`
 If the element is ONLY a command name with flags and nothing else (e.g., `"ptov"`, `"rd -x"`,
-`"dis -rl"`, `"sym"`), it is INCOMPLETE and MUST be rejected. The address or target argument is
+`"dis -rl"`, `"struct -o"`, `"sym"`), it is INCOMPLETE and MUST be rejected. The address or target argument is
 NOT optional for these commands — if you do not yet have the concrete address, you MUST
 obtain it in a prior step before emitting the command.
 
@@ -1103,13 +1187,15 @@ Set `is_conclusive: true` when ALL of:
 1. ✅ Root cause identified with supporting diagnostic evidence from at least 2 independent sources
    (e.g., register state + source code, or memory content + backtrace)
 2. ✅ The causal chain is complete: trigger → propagation → crash
-3. ✅ Alternative hypotheses considered and ruled out (or noted as less likely)
+3. ✅ Alternative hypotheses considered and reflected in `active_hypotheses` (`status: "ruled_out"` or `"weakened"`)
+4. ✅ **All gates required for the current `crash_class` have `status: "closed"`** (see §1.1a Gate Catalog)
 
 Continue investigation if:
 - ❌ You have a hypothesis but no supporting diagnostic evidence
 - ❌ Multiple equally plausible root causes remain
 - ❌ The backtrace suggests the crash is a SYMPTOM of an earlier corruption
   (trace back to the actual corruption point)
+- ❌ Any gate required for the current `crash_class` still has `status: "open"` (must be closed before concluding)
 ## 2.4a Step Budget Management (Efficiency Rule)
 
 To prevent step exhaustion on unproductive paths, follow this budget discipline:
@@ -1195,6 +1281,16 @@ When `is_conclusive: true`, provide complete structured diagnosis:
   "reasoning": "<final convergence reasoning>",
   "action": null,
   "is_conclusive": true,
+  "crash_class": "<concrete crash class, e.g. pointer_corruption>",
+  "active_hypotheses": [
+    {{{{"id": "H1", "label": "<root cause label>", "status": "leading", "evidence": "<final evidence chain summary>"}}}}
+  ],
+  "gates": {{{{
+    "register_provenance":        {{{{"required_for": ["pointer_corruption"], "status": "closed", "evidence": "<trace result>"}}}},
+    "object_lifetime":            {{{{"required_for": ["pointer_corruption", "uaf_poison"], "status": "closed", "evidence": "<kmem -S result>"}}}},
+    "local_corruption_exclusion": {{{{"required_for": ["pointer_corruption"], "status": "closed", "evidence": "S1: excluded — ...; S2: excluded — ...; S3: excluded — ..."}}}},
+    "external_corruption_gate":   {{{{"required_for": ["pointer_corruption"], "prerequisite": "local_corruption_exclusion", "status": "closed", "evidence": "<DMA/hw source assessment>"}}}}
+  }}}},
   "final_diagnosis": {{{{
     "crash_type": "NULL pointer dereference | use-after-free | soft lockup | ...",
     "panic_string": "<exact panic string from dmesg>",
@@ -1218,7 +1314,7 @@ When `is_conclusive: true`, provide complete structured diagnosis:
 }}}}
 ```
 
-**CRITICAL**: All fields in `final_diagnosis` are required. `suspect_code.line` can be "unknown" if not available.
+**CRITICAL**: All fields in `final_diagnosis` are required. `suspect_code.line` can be "unknown" if not available. All gates required for the current `crash_class` must have `status: "closed"` before `is_conclusive: true` (see §1.1a Gate Completion Rule).
 
 ## 2.6 Kernel Version & Architecture Awareness
 
@@ -1490,13 +1586,47 @@ stray DMA to an arbitrary physical address.
 If the IOMMU log query (`log -m | grep -Ei "iommu|dmar|passthrough|translation|smmu|arm-smmu"`)
 returns **empty** or contains **no entries relevant to IOMMU mode configuration**:
 - There is **no positive evidence** for any IOMMU mode, protection level, or passthrough state.
-- DMA stray-write hypothesis is capped at **LOW** confidence on this evidence alone.
+- Before capping confidence, you MUST attempt the **kernel variable fallback** (see below).
+- If fallback also fails, DMA stray-write hypothesis is capped at **LOW** confidence.
 - You MUST NOT report `medium` or higher confidence for stray DMA when IOMMU state is
-  unverifiable from logs.
+  unverifiable from both logs and kernel variables.
 - Do NOT conflate "IOMMU state unknown" with "IOMMU disabled" — the former means insufficient
   evidence; the latter requires positive evidence (e.g., `iommu=off` on kernel command line).
 - Record: "IOMMU log query returned empty; IOMMU/passthrough mode unverifiable from vmcore logs
   → stray DMA stray-write hypothesis capped at LOW confidence pending other positive evidence."
+
+**IOMMU Kernel Variable Fallback (MANDATORY when log query returns empty)**:
+When dmesg-based detection yields no result, probe kernel variables directly. These variables
+reflect the **runtime state** captured in vmcore memory and are immune to dmesg truncation.
+
+```
+# Step F-1: Check if Intel IOMMU is enabled (Intel platform ONLY)
+# Symbol may not exist on AMD or older kernels; a "symbol not found" error is informative.
+p intel_iommu_enabled
+# $1 = 0 → IOMMU disabled entirely
+# $1 = 1 → IOMMU driver loaded and active
+
+# Step F-2: Check effective default domain type (kernel ~4.x+; may be absent on older kernels)
+p iommu_def_domain_type
+# Decode:
+#   $1 = 1 → IOMMU_DOMAIN_IDENTITY  = Passthrough mode (iommu=pt)  ← HIGH DMA risk
+#   $1 = 2 → IOMMU_DOMAIN_DMA       = Strict translation mode      ← Low-Medium DMA risk
+#   $1 = 4 → IOMMU_DOMAIN_DMA_FQ    = Deferred-flush mode          ← Medium DMA risk (stale IOVA window)
+# If symbol not found: older kernel or non-Intel IOMMU driver; fallback unavailable.
+```
+
+**Fallback interpretation rules**:
+- `intel_iommu_enabled=1` **AND** `iommu_def_domain_type=1` → treat as equivalent to explicit
+  `iommu=pt` in kernel command line; DMA passthrough risk is confirmed at HIGH.
+- `intel_iommu_enabled=1` **AND** `iommu_def_domain_type=2` → translation is active; deprioritize
+  stray DMA; same decision path as `intel_iommu=on` without `iommu=pt`.
+- `intel_iommu_enabled=1` **AND** `iommu_def_domain_type=4` → deferred-flush mode; stale IOVA
+  window is active; DMA risk elevated to Medium; note this in evidence.
+- `intel_iommu_enabled=0` → IOMMU disabled; DMA protection absent; risk is CRITICAL.
+- Symbol not found (either variable) → platform is non-Intel, or kernel predates the variable;
+  record "kernel variable fallback unavailable" and apply the log-absence confidence cap.
+- ⚠️ These variables are **Intel/x86 specific**. On ARM64 with SMMU, there is no equivalent
+  `intel_iommu_enabled`; rely on SMMU dmesg patterns and `smmu_enabled` (if present) instead.
 
 When you see `intel_iommu=on` without `iommu=pt`:
 - Reduce DMA corruption probability estimate significantly
@@ -2300,14 +2430,32 @@ def structure_reasoning_prompt() -> str:
     return (
         "You are a helper that converts unstructured vmcore crash analysis reasoning "
         "into a structured JSON format.\n\n"
-        "Given the analysis reasoning and conversation history about a vmcore crash dump, "
-        "convert the reasoning into a VMCoreAnalysisStep JSON object.\n\n"
+        "Given the analysis reasoning text about a vmcore crash dump, "
+        "convert it into a VMCoreAnalysisStep JSON object.\n\n"
         "Rules:\n"
         "1. Summarize the reasoning into the 'reasoning' field\n"
         "2. If the reasoning suggests running another crash command, populate 'action'\n"
         "3. If the reasoning reaches a final conclusion, set 'is_conclusive' to true "
         "and populate 'final_diagnosis', 'fix_suggestion', 'confidence'\n"
         "4. Output MUST be valid JSON matching the schema below\n"
+        "5. Classify 'crash_class' from the panic string and crash symptoms described in "
+        "the reasoning text, using the Decision Table in §1.1a of the analysis prompt. "
+        "If the reasoning explicitly states a previously determined crash_class value, "
+        "preserve that value.\n"
+        "6. Update 'active_hypotheses': list all hypotheses mentioned in the reasoning "
+        "with their current status (leading/candidate/weakened/ruled_out) and optional rank "
+        "(1=highest priority). Only one hypothesis may have status='leading'.\n"
+        "7. Reconstruct 'gates': infer each gate's status solely from evidence explicitly "
+        "stated in the reasoning text. Use gate names from the Gate Catalog in §1.1a. "
+        "Only include gates whose required_for list contains the current crash_class. "
+        "For each check confirmed in the reasoning (e.g., 'bt -f shows clean frames', "
+        "'kmem -S returns ALLOCATED', 'IOMMU log shows no fault'), set that gate to "
+        "'closed' with the confirming statement as the evidence field value. "
+        "If the reasoning explicitly marks a gate as blocked or n/a, reflect that status. "
+        "Gates not mentioned or confirmed in the reasoning remain 'open'.\n"
+        "8. CRITICAL: If is_conclusive=true, ALL required gates for crash_class must have "
+        "status='closed' or 'n/a'. If any required gate is still 'open', set "
+        "is_conclusive=false and continue analysis instead.\n"
         "{force_conclusion}\n\n"
         "VMCoreAnalysisStep Schema:\n```json\n{schema_json}\n```\n\n"
         "The reasoning text to structure:\n---\n{reasoning}\n---"

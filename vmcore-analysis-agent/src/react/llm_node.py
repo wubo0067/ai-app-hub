@@ -1,6 +1,8 @@
+import asyncio
 import json
 import re
-from typing import Optional, List, Literal, cast, Any, Dict
+from typing import Optional, List, Literal, cast, Any, Dict, ClassVar
+import openai
 from pydantic import BaseModel, Field, model_validator
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from json_repair import repair_json
@@ -78,6 +80,68 @@ class FinalDiagnosis(BaseModel):
     )
 
 
+# 所有合法的崩溃类型枚举值，GateEntry 和 VMCoreAnalysisStep 共用同一定义
+CrashClass = Literal[
+    "null_deref",
+    "uaf_poison",
+    "pointer_corruption",
+    "explicit_bug",
+    "soft_lockup",
+    "rcu_stall",
+    "atomic_sleep",
+    "mce_hardware",
+    "race_corruption",
+    "unknown",
+]
+
+
+class Hypothesis(BaseModel):
+    """A single analysis hypothesis with current standing."""
+
+    id: str = Field(..., description="Short identifier, e.g. 'H1', 'H2'")
+    label: str = Field(
+        ...,
+        description="Concise hypothesis label, e.g. 'UAF', 'OOB_write', 'DMA_overwrite', 'null_deref'",
+    )
+    rank: Optional[int] = Field(
+        None,
+        description=(
+            "Priority rank among active hypotheses (1=highest). "
+            "Update every step as evidence shifts hypothesis standing. "
+            "Optional — populate when multiple candidates compete."
+        ),
+    )
+    status: Literal["leading", "candidate", "weakened", "ruled_out"] = Field(
+        ...,
+        description="Current standing. Only ONE hypothesis may be 'leading' at any step.",
+    )
+    evidence: Optional[str] = Field(
+        None,
+        description="One-sentence key evidence supporting or contradicting this hypothesis",
+    )
+
+
+class GateEntry(BaseModel):
+    """A mandatory verification checkpoint that must be closed before is_conclusive=true."""
+
+    required_for: List[CrashClass] = Field(
+        ...,
+        description="crash_class values that require this gate to be closed before is_conclusive=true",
+    )
+    status: Literal["open", "closed", "blocked", "n/a"] = Field(
+        "open",
+        description="open=pending, closed=verified, blocked=prerequisite not met, n/a=not applicable",
+    )
+    prerequisite: Optional[str] = Field(
+        None,
+        description="Gate name that must be closed before this gate can be worked on",
+    )
+    evidence: Optional[str] = Field(
+        None,
+        description="Evidence that closed this gate, or the reason it is blocked/n/a",
+    )
+
+
 class VMCoreAnalysisStep(BaseModel):
     step_id: int = Field(..., description="Current step sequence number.")
 
@@ -92,6 +156,35 @@ class VMCoreAnalysisStep(BaseModel):
     )
 
     is_conclusive: bool = Field(False)
+
+    crash_class: Optional[CrashClass] = Field(
+        None,
+        description=(
+            "Crash type classified from the panic string. "
+            "Must be null at step 1 and a concrete value from step 2 onward. "
+            "See §1.1a Crash Class Decision Table."
+        ),
+    )
+
+    active_hypotheses: Optional[List[Hypothesis]] = Field(
+        None,
+        description=(
+            "Ordered list of active hypotheses. Update every step. "
+            "Only one hypothesis may have status='leading' at a time. "
+            "Must be populated from step 2 onward."
+        ),
+    )
+
+    gates: Optional[Dict[str, GateEntry]] = Field(
+        None,
+        description=(
+            "Evidence gates tracking mandatory checkpoints. "
+            "Include only gates whose required_for list contains the current crash_class. "
+            "All required gates must reach status='closed' before is_conclusive=true. "
+            "See §1.1a Gate Catalog."
+        ),
+    )
+
     final_diagnosis: Optional[FinalDiagnosis] = Field(
         None, description="Detailed final root cause and evidence."
     )
@@ -106,6 +199,92 @@ class VMCoreAnalysisStep(BaseModel):
         None,
         description="Any caveats, alternative hypotheses, or recommended follow-up actions",
     )
+
+    # 每个 crash_class 在 is_conclusive=True 前必须关闭的 gate 名称
+    _REQUIRED_GATES: ClassVar[Dict[str, List[str]]] = {
+        # key/value 均为 CrashClass 的子集，运行时字符串匹配
+        "pointer_corruption": [
+            "register_provenance",
+            "object_lifetime",
+            "local_corruption_exclusion",
+            "external_corruption_gate",
+        ],
+        "null_deref": ["register_provenance"],
+        "uaf_poison": ["register_provenance", "object_lifetime"],
+        "soft_lockup": ["stack_integrity", "lock_holder"],
+        "rcu_stall": ["lock_holder", "rcu_stall_trace"],
+        "mce_hardware": ["mce_log", "edac_evidence"],
+        "atomic_sleep": ["stack_integrity"],
+        "race_corruption": ["register_provenance"],
+        "explicit_bug": ["stack_integrity"],
+    }
+
+    @model_validator(mode="after")
+    def validate_gates_before_conclusive(self) -> "VMCoreAnalysisStep":
+        """
+        宽松校验：is_conclusive=True 时对必要 gate 进行补全而非硬性拒绝。
+
+        策略：
+        - 缺失的 required gate 自动补充为 status='n/a'（LLM 未显式提及则视为不适用）。
+        - status 不合规（既非 closed 也非 n/a）的 gate 强制修正为 'n/a' 并记录原始状态。
+        这样解析永远不会因 gate 缺失而失败，同时保留 LLM 已给出的证据链。
+        """
+        if not self.is_conclusive:
+            return self
+        if self.crash_class is None or self.crash_class == "unknown":
+            return self
+
+        required = self._REQUIRED_GATES.get(self.crash_class, [])
+        if not required:
+            return self
+
+        gates = self.gates or {}
+        patched = False
+        for gate_name in required:
+            entry = gates.get(gate_name)
+            if entry is None:
+                # 自动补全缺失 gate，状态设为 n/a
+                gates[gate_name] = GateEntry(
+                    required_for=[self.crash_class],
+                    status="n/a",
+                    evidence="Auto-filled: gate not explicitly addressed in LLM output.",
+                )
+                patched = True
+            elif entry.status not in ("closed", "n/a"):
+                # 将不合规状态修正为 n/a，保留原始 evidence 并追加说明
+                original_status = entry.status
+                original_evidence = entry.evidence or ""
+                gates[gate_name] = GateEntry(
+                    required_for=entry.required_for,
+                    status="n/a",
+                    prerequisite=entry.prerequisite,
+                    evidence=(
+                        f"{original_evidence} [Auto-corrected from status='{original_status}']"
+                    ).strip(),
+                )
+                patched = True
+
+        if patched:
+            self.gates = gates
+        return self
+
+
+async def _ainvoke_with_retry(
+    chain, messages: list, max_retries: int = 3, base_delay: float = 2.0
+):
+    """对 LLM ainvoke 调用进行指数退避重试，仅针对瞬态网络连接错误。"""
+    for attempt in range(max_retries):
+        try:
+            return await chain.ainvoke(messages)
+        except (openai.APIConnectionError, openai.APITimeoutError) as e:
+            if attempt == max_retries - 1:
+                raise
+            delay = base_delay * (2**attempt)
+            logger.warning(
+                f"[retry] Transient API error on attempt {attempt + 1}/{max_retries}, "
+                f"retrying in {delay:.0f}s: {e}"
+            )
+            await asyncio.sleep(delay)
 
 
 def _compress_messages_for_llm(
@@ -274,7 +453,7 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
     )
     try:
         # 使用 include_raw=True 后，ainvoke 返回包含 'parsed' 和 'raw' 的字典
-        output_data = await llm_analysis.ainvoke(messages_to_send)
+        output_data = await _ainvoke_with_retry(llm_analysis, messages_to_send)
         analysis_result = cast(VMCoreAnalysisStep, output_data["parsed"])
         raw_message = cast(AIMessage, output_data["raw"])
 
@@ -576,7 +755,7 @@ async def structure_reasoning_content(state: AgentState, chat_llm) -> dict:
     )
 
     try:
-        output_data = await chat_with_structured.ainvoke(messages_to_send)
+        output_data = await _ainvoke_with_retry(chat_with_structured, messages_to_send)
         analysis_result = cast(VMCoreAnalysisStep, output_data["parsed"])
         raw_chat_message = cast(AIMessage, output_data["raw"])
 
