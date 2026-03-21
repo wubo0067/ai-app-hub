@@ -30,14 +30,14 @@ from .llm_node import call_llm_analysis, structure_reasoning_content
 from .edges import should_continue, after_crash_tool
 
 
-def create_agent_graph(llm, tools_list: List, chat_llm=None):
+def create_agent_graph(llm, tools_list: List, structured_llm=None):
     """
     构建并编译 VMCore 分析 Agent 的状态图。
 
     Args:
         llm: 语言模型实例（通常是 ChatOpenAI 或类似的模型）
         tools_list: 可用的工具列表（MCP crash 工具）
-        chat_llm: 可选的 deepseek-chat 模型实例，用于结构化 Reasoner 的纯文本推理内容
+        structured_llm: 可选的 deepseek-chat 模型实例，用于结构化 Reasoner 的纯文本推理内容
 
     Returns:
         CompiledGraph: 编译后的 LangGraph 图实例，可执行 invoke/astream 等方法
@@ -102,15 +102,15 @@ def create_agent_graph(llm, tools_list: List, chat_llm=None):
     # 添加节点 3：推理内容结构化节点
     # 当 DeepSeek-Reasoner 返回空 content 但有纯文本 reasoning_content 时，
     # 使用 deepseek-chat 将推理内容结构化为 VMCoreAnalysisStep
-    if chat_llm:
+    if structured_llm:
         builder.add_node(
             structure_reasoning_node,
-            partial(structure_reasoning_content, chat_llm=chat_llm),
+            partial(structure_reasoning_content, structured_llm=structured_llm),
         )
         logger.debug(f"Added node: {structure_reasoning_node}")
     else:
         logger.warning(
-            "No chat_llm provided. structure_reasoning_node will not be available. "
+            "No structured_llm provided. structure_reasoning_node will not be available. "
             "DeepSeek-Reasoner empty content fallback will be disabled."
         )
 
@@ -147,7 +147,7 @@ def create_agent_graph(llm, tools_list: List, chat_llm=None):
     #   - 最终答案 -> END
     #   - 错误状态 -> END
     llm_analysis_targets = [crash_tool_node, "__end__"]
-    if chat_llm:
+    if structured_llm:
         llm_analysis_targets.append(structure_reasoning_node)
     builder.add_conditional_edges(
         llm_analysis_node,
@@ -160,7 +160,7 @@ def create_agent_graph(llm, tools_list: List, chat_llm=None):
 
     # 条件边 3：structure_reasoning_node 结构化完成后路由
     # 结构化节点产生的 AIMessage 可能包含 tool_calls 或直接结束
-    if chat_llm:
+    if structured_llm:
         builder.add_conditional_edges(
             structure_reasoning_node,
             should_continue,

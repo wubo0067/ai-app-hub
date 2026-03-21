@@ -521,7 +521,7 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
     }
 
 
-async def structure_reasoning_content(state: AgentState, chat_llm) -> dict:
+async def structure_reasoning_content(state: AgentState, structured_llm) -> dict:
     """
     使用 deepseek-chat 模型将 DeepSeek-Reasoner 的纯文本 reasoning_content 结构化为 VMCoreAnalysisStep。
 
@@ -530,7 +530,7 @@ async def structure_reasoning_content(state: AgentState, chat_llm) -> dict:
 
     Args:
         state: AgentState，包含 reasoning_to_structure 和 reasoning_additional_kwargs
-        chat_llm: deepseek-chat LLM 实例
+        structured_llm: deepseek-chat LLM 实例
 
     Returns:
         dict: 包含 messages、reasoning_to_structure(清空) 等状态更新
@@ -571,7 +571,7 @@ async def structure_reasoning_content(state: AgentState, chat_llm) -> dict:
         SystemMessage(content=system_prompt),
     ]
 
-    chat_with_structured = chat_llm.with_structured_output(
+    chat_with_structured = structured_llm.with_structured_output(
         VMCoreAnalysisStep, method="json_mode", include_raw=True
     )
 

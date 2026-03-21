@@ -1,5 +1,6 @@
 import os
 from typing import Any
+from pydantic import SecretStr
 
 # from langchain_openai import ChatOpenAI
 from langchain_core.messages import AIMessage
@@ -48,8 +49,8 @@ class ChatDeepSeekReasoner(ChatDeepSeek):
         return payload
 
 
-def create_llm():
-    """Create and return ChatOpenAI instance"""
+def create_reasoning_llm():
+    """Create and return the reasoning LLM instance."""
     api_key = os.environ.get("DEEPSEEK_API_KEY")
     base_url = config_manager.get("BASE_URL")
     model_name = config_manager.get("LLM_MODEL")
@@ -70,12 +71,20 @@ def create_llm():
     # top_p=1.0     全部词汇       最高          最低          开放式创作
 
     try:
-        # 使用 ChatDeepSeekReasoner 以修复 reasoning_content 在多轮对话中丢失的问题
-        llm = ChatDeepSeekReasoner(
-            api_key=str(api_key),
+        if model_name == "deepseek-reasoner":
+            llm_class = ChatDeepSeekReasoner
+        elif model_name == "deepseek-chat":
+            llm_class = ChatDeepSeek
+        else:
+            error_msg = f"Unsupported reasoning model: {model_name}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        llm = llm_class(
+            api_key=SecretStr(str(api_key)),
             base_url=str(base_url),
             model=str(model_name),
-            max_tokens=8192,  # DeepSeek-Reasoner 模式需要更大的 max_tokens 来支持长对话历史和复杂推理
+            max_tokens=8192,
             top_p=0.1,  # 使用低随机性设置，适合代码生成和事实回答
             presence_penalty=0,  # 不需要模型通过增加多样性来“换个说法”，我们需要的是精确的原始符号
             temperature=temperature,  # https://api-docs.deepseek.com/zh-cn/quick_start/parameter_settings
@@ -89,8 +98,8 @@ def create_llm():
         raise
 
 
-def create_chat_llm():
-    """Create a ChatDeepSeek instance with deepseek-chat model.
+def create_structured_llm():
+    """Create the structured-output LLM instance.
 
     用于将 DeepSeek-Reasoner 的纯文本 reasoning_content 结构化为 JSON。
     当 Reasoner 模型返回空 content 但有 reasoning_content 时，
@@ -105,7 +114,7 @@ def create_chat_llm():
 
     try:
         llm = ChatDeepSeek(
-            api_key=str(api_key),
+            api_key=SecretStr(str(api_key)),
             base_url=str(base_url),
             model="deepseek-chat",
             max_tokens=8000,

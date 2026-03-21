@@ -3,7 +3,7 @@ LANGSMITH_PROJECT: vmcore-analysis-agent
 LANGSMITH_TRACING: false
 
 ## LLM choice:
-# LLM_MODEL: deepseek-chat
-LLM_MODEL: deepseek-reasoner
+LLM_MODEL: deepseek-chat
+#LLM_MODEL: deepseek-reasoner
 BASE_URL: https://api.deepseek.com
 TEMPERATURE: 0.1
