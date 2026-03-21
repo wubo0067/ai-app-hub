@@ -14,6 +14,8 @@ async def make_nws_request(url: str) -> dict[str, Any] | None:
     """Make a request to the NWS API and return the JSON response."""
     headers = {"User-Agent": USER_AGENT, "Accept": "application/geo+json"}
 
+    # async with 用于异步上下文管理器，确保在执行异步操作时能够正确地进行资源管理和清理工作。
+    # 与普通的 with 语句类似，但它适用于异步函数（async/def 函数）中，可以使用 await 关键字等待异步操作。
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(url, headers=headers, timeout=30.0)

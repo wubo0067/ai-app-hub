@@ -12,6 +12,7 @@ class GraphLoggingCallback(BaseCallbackHandler):
     def __init__(self):
         super().__init__()
         self.current_node = None
+        self._logged_error_ids: set = set()  # 防止嵌套 chain 层级重复打印同一错误
 
     def on_chain_start(
         self, serialized: Dict[str, Any], inputs: Dict[str, Any], **kwargs: Any
@@ -36,6 +37,11 @@ class GraphLoggingCallback(BaseCallbackHandler):
         if isinstance(error, asyncio.CancelledError):
             logger.info("⚠️ Graph execution was cancelled.")
             return
+
+        err_id = id(error)
+        if err_id in self._logged_error_ids:
+            return
+        self._logged_error_ids.add(err_id)
 
         # logger.error("=" * 80)
         logger.error(f"❌ Graph execution failed with error: {error}")
