@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# logging_callback.py - VMCore 分析 Agent 日志回调处理器
+# Author: CalmWU
+# Created: 2026-01-14
+
 from langchain_core.callbacks import BaseCallbackHandler
 from typing import Any, Dict, List, Optional
 import asyncio

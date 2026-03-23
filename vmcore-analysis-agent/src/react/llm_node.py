@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# llm_node.py - LLM 分析节点实现模块
+# Author: CalmWU
+# Created: 2026-01-19
+
 import json
 from typing import cast
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage

@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# os.py - 操作系统信息获取工具模块
+# Author: CalmWU
+# Created: 2026-01-07
+
 import re
 import distro
 

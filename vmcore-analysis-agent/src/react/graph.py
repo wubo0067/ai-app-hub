@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# graph.py - VMCore 分析 Agent 图构建模块
+# Author: CalmWU
+# Created: 2026-01-09
+
 """
 VMCore 分析 Agent 图构建模块
 

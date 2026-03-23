@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# __init__.py - Crash MCP 工具客户端模块包初始化
+# Author: CalmWU
+# Created: 2026-01-09
+
 # src/mcp_tools/crash/__init__.py
 """
 Crash MCP 工具客户端模块

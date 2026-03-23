@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# model.py - LLM模型配置和初始化模块
+# Author: CalmWU
+# Created: 2026-01-09
+
 import os
 from typing import Any
 from pydantic import SecretStr

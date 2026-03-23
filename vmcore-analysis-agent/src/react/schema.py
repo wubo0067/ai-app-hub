@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# schema.py - VMCore 分析 Agent 数据模型定义
+# Author: CalmWU
+# Created: 2026-03-23
+
 from typing import Any, ClassVar, Dict, List, Literal, Optional, cast
 
 from pydantic import BaseModel, Field, model_validator

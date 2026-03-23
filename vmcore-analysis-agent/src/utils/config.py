@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# config.py - 配置管理模块
+# Author: CalmWU
+# Created: 2026-01-06
+
 import json
 import os
 from typing import Any, Dict, Optional

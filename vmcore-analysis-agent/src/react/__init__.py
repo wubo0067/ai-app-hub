@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# __init__.py - VMCore 分析 Agent React 模块包初始化
+# Author: CalmWU
+# Created: 2026-01-09
+
 from .graph import create_agent_graph
 from .graph_state import AgentState
 from .llm_node import call_llm_analysis, structure_reasoning_content

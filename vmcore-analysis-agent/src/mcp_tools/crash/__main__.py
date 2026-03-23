@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# __main__.py - Crash MCP 工具客户端主入口
+# Author: CalmWU
+# Created: 2026-01-09
+
 import asyncio
 from langchain_mcp_adapters.tools import load_mcp_tools
 from src.utils.logging import logger

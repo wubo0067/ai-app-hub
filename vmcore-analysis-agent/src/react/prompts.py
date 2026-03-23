@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# prompts.py - VMCore 分析 Agent 提示词定义模块
+# Author: CalmWU
+# Created: 2026-01-09
+
+
 def analysis_crash_prompt() -> str:
     return """
 # Role

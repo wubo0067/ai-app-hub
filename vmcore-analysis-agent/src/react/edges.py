@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# edges.py - VMCore 分析 Agent 边（路由）逻辑模块
+# Author: CalmWU
+# Created: 2026-01-13
+
 """
 VMCore 分析 Agent 边（路由）逻辑
 

@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# client.py - Crash MCP 客户端实现
+# Author: CalmWU
+# Created: 2026-01-09
+
 # src/mcp_tools/crash/client.py
 import sys
 from typing import List, Optional

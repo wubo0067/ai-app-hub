@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# llm_runtime.py - LLM 运行时工具和重试机制模块
+# Author: CalmWU
+# Created: 2026-03-23
+
 import asyncio
 
 import openai

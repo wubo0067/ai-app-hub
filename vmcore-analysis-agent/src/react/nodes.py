@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# nodes.py - VMCore 分析 Agent 节点实现模块
+# Author: CalmWU
+# Created: 2026-01-09
+
 """
 VMCore 分析 Agent 节点实现
 

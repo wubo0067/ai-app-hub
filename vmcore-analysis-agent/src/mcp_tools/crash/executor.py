@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# executor.py - Crash 工具执行器实现
+# Author: CalmWU
+# Created: 2026-01-09
+
 import subprocess
 from src.utils.logging import logger
 from src.utils.os import get_linux_distro_version

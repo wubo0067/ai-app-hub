@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# output_parser.py - LLM 输出解析和修复模块
+# Author: CalmWU
+# Created: 2026-03-23
+
 import json
 import re
 from typing import Any

@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# logging.py - 日志配置和管理模块
+# Author: CalmWU
+# Created: 2026-01-06
+
 import logging
 import os
 

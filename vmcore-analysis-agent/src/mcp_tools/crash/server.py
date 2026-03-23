@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# server.py - Crash MCP 服务器实现
+# Author: CalmWU
+# Created: 2026-01-09
+
 """
 Crash MCP 服务器实现
 

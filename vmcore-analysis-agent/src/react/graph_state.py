@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# graph_state.py - VMCore 分析 Agent 图状态定义模块
+# Author: CalmWU
+# Created: 2026-01-09
+
 from dataclasses import dataclass, field
 from typing import Annotated, Optional, TypedDict, Union, cast, Sequence
 from pydantic import Field

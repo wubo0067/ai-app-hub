@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# report_generator.py - VMCore 分析报告生成模块
+# Author: CalmWU
+# Created: 2026-01-31
+
 """
 生成 vmcore 分析报告的工具模块
 """
