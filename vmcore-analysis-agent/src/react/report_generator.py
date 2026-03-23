@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import List
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, SystemMessage
 from .graph_state import AgentState
-from .llm_node import VMCoreAnalysisStep
+from .schema import VMCoreAnalysisStep
 from src.utils.logging import logger
 
 
@@ -111,6 +111,18 @@ def generate_markdown_report(state: AgentState) -> str:
                 lines.append("")
                 lines.append(analysis.reasoning)
                 lines.append("")
+
+                if analysis.signature_class:
+                    lines.append(f"**早期签名类**: {analysis.signature_class}")
+                    lines.append("")
+
+                if analysis.root_cause_class:
+                    lines.append(f"**最终根因类**: {analysis.root_cause_class}")
+                    lines.append("")
+
+                if analysis.partial_dump != "unknown":
+                    lines.append(f"**转储完整性**: {analysis.partial_dump}")
+                    lines.append("")
 
                 # 如果有工具调用
                 if analysis.action:
@@ -239,7 +251,7 @@ def generate_markdown_report(state: AgentState) -> str:
         '*This report was jointly created by <span style="color: red;">**CalmWU and his AI agent.**</span>*'
     )
     lines.append("")
-    lines.append("*🐶 xeon*")
+    lines.append("*🐶 xeon*")  # Navigator Oracle Explorer X-ray
     lines.append("")
 
     return "\n".join(lines)

@@ -85,7 +85,6 @@ Respond ONLY with valid JSON matching VMCoreAnalysisStep schema.
   "is_conclusive": false,
   "signature_class": "<null at step 1; concrete signature by step 2 — see §1.1a>",
   "root_cause_class": "<optional during investigation; concrete or unknown by conclusion>",
-  "partial_dump": "<unknown at step 1; 'full' or 'partial' from step 2 based on sys output>",
   "active_hypotheses": [
     {{{{"id": "H1", "label": "<UAF|OOB_write|null_deref|...>", "status": "leading", "evidence": "<one sentence>"}}}},
     {{{{"id": "H2", "label": "<...>", "status": "candidate", "evidence": null}}}}
@@ -101,7 +100,7 @@ Respond ONLY with valid JSON matching VMCoreAnalysisStep schema.
 }}}}
 ```
 
-When diagnosis complete, set `is_conclusive: true`, populate `final_diagnosis`, set a concrete `root_cause_class` when possible, and ensure ALL gates required for the current `signature_class` have `status: "closed"` or `"n/a"` (see §1.1a Gate Completion Rule).
+When diagnosis complete, set `is_conclusive: true`, populate `final_diagnosis`, set a concrete `root_cause_class` when possible, and ensure ALL gates required for the current `signature_class` have `status: "closed"` (see §1.1a Gate Completion Rule).
 
 ### Reasoning Depth Rule (MANDATORY)
 - The `reasoning` field is your **structured analytic summary**, not a place for uncontrolled
@@ -225,7 +224,7 @@ Gate `status` values:
 ### E. Gate Completion Rule (MANDATORY)
 
 **Before setting `is_conclusive: true`**, ALL gates whose `required_for` list contains the
-current `signature_class` MUST have `status: "closed"` or `"n/a"`.
+current `signature_class` MUST have `status: "closed"`.
 
 Setting `is_conclusive: true` with any required gate still `"open"` is a **Protocol Violation**.
 
@@ -233,59 +232,6 @@ Setting `is_conclusive: true` with any required gate still `"open"` is a **Proto
 Set `external_corruption_gate.status = "blocked"` until `local_corruption_exclusion.status = "closed"`.
 This structurally encodes the "no DMA escalation before local causes excluded" constraint
 (§1.2 Rule C, §2.3 Stage 5). The detailed exclusion logic remains in §2.3 Stage 5 and §3.12.
-
-## 1.1b Partial Dump Handling (MANDATORY)
-
-### What is a partial dump?
-
-If `sys` output contains `[PARTIAL DUMP]`, the vmcore was saved with
-makedumpfile at a dump level that excludes user-space pages and many
-anonymous pages. Physical addresses outside kernel-allocated memory
-(slab, vmalloc, module text) will typically be **absent** from the dump.
-
-### Mandatory rules
-
-1. **Detect and record at step 2**: Read the `sys` output. If `[PARTIAL DUMP]`
-  is present, set `partial_dump: "partial"` in the JSON and carry this value
-  unchanged for all subsequent steps.
-
-2. **One-strike rule for unreadable addresses**: If an `rd`, `rd -x`, or
-  `rd -a` command on any address returns **empty output or seek-error**,
-  that address is permanently unreadable in this dump. Record the fact in
-  `reasoning` as `"address 0x... not in dump (partial)"` and **never retry
-  it** — not with a different flag, not with ptov, not with an adjacent
-  offset. Move on immediately.
-
-3. **Do not chase phantom physical addresses**: When `partial_dump: "partial"`,
-  converting a suspicious PA to a VA via `ptov` and then attempting `rd` on
-  that VA is only permitted **once**. If `rd` returns empty, stop. Do not
-  try adjacent pages, do not try `rd -a`, do not retry with count=1.
-  The absence of data **is itself evidence** — record it as such.
-
-4. **Evidence value of empty reads**: An unreadable page in a partial dump
-  does NOT confirm or deny DMA corruption. Record it as:
-  `"Physical address 0x... maps to a page not saved in this partial dump;
-  content unverifiable."` This is a hard limit on what can be confirmed,
-  not a reason to keep probing.
-
-5. **Pivot immediately**: After one failed read, the next action MUST target
-  a different diagnostic path (kernel variable, slab state, adjacent
-  allocated object) — not another attempt to read the same inaccessible region.
-
-### Typical partial-dump false economy pattern (FORBIDDEN)
-
-```
-step N:   ptov 0xe500000000   → VA = 0xff29203780000000
-step N+1: vtop 0xff29203780000000  → PA confirmed  ← already proven, no value
-step N+2: rd -x 0xff29203780000000 512  → empty     ← page not in dump
-step N+3: rd -a 0xff29203780000000 512  → empty     ← FORBIDDEN retry
-step N+4: ptov 0xe4fff00000   → adjacent page       ← FORBIDDEN, same issue
-step N+5: rd -x 0xff2920377ff00000 512 → empty      ← FORBIDDEN retry
-```
-
-The correct pattern after step N+2 returns empty is to set
-`partial_dump: "partial"`, record the fact, and move to a completely
-different diagnostic target.
 
 ## 1.2 Tool Capability & Command Safety
 You can execute crash utility commands via the `action` field:
@@ -1276,7 +1222,7 @@ Set `is_conclusive: true` when ALL of:
    (e.g., register state + source code, or memory content + backtrace)
 2. ✅ The causal chain is complete: trigger → propagation → crash
 3. ✅ Alternative hypotheses considered and reflected in `active_hypotheses` (`status: "ruled_out"` or `"weakened"`)
-4. ✅ **All gates required for the current `signature_class` have `status: "closed"` or `"n/a"`** (see §1.1a Gate Catalog)
+4. ✅ **All gates required for the current `signature_class` have `status: "closed"`** (see §1.1a Gate Catalog)
 
 Continue investigation if:
 - ❌ You have a hypothesis but no supporting diagnostic evidence
@@ -1371,7 +1317,6 @@ When `is_conclusive: true`, provide complete structured diagnosis:
   "is_conclusive": true,
   "signature_class": "<concrete crash signature, e.g. pointer_corruption>",
   "root_cause_class": "<concrete root cause, e.g. out_of_bounds>",
-  "partial_dump": "<full|partial>",
   "active_hypotheses": [
     {{{{"id": "H1", "label": "<root cause label>", "status": "leading", "evidence": "<final evidence chain summary>"}}}}
   ],
@@ -1415,7 +1360,6 @@ Reference convergence examples for new signature classes:
   "is_conclusive": true,
   "signature_class": "hard_lockup",
   "root_cause_class": "deadlock",
-  "partial_dump": "full",
   "active_hypotheses": [
     {{{{"id": "H1", "label": "deadlock", "status": "leading", "evidence": "bt -a shows CPU 7 spinning on a contested lock while peer CPUs wait on the same lock chain"}}}},
     {{{{"id": "H2", "label": "race_condition", "status": "ruled_out", "evidence": "No inconsistent write ownership or transient state change was observed; the failure is stable lock non-progress"}}}}
@@ -1456,7 +1400,6 @@ Reference convergence examples for new signature classes:
   "is_conclusive": true,
   "signature_class": "hung_task",
   "root_cause_class": "deadlock",
-  "partial_dump": "full",
   "active_hypotheses": [
     {{{{"id": "H1", "label": "deadlock", "status": "leading", "evidence": "Blocked task and mutex owner backtraces form a circular wait chain"}}}},
     {{{{"id": "H2", "label": "io_hang", "status": "ruled_out", "evidence": "No storage timeout or request_queue stall evidence appears in dmesg or owner path"}}}}
@@ -1497,7 +1440,6 @@ Reference convergence examples for new signature classes:
   "is_conclusive": true,
   "signature_class": "oom_panic",
   "root_cause_class": "oom_panic",
-  "partial_dump": "full",
   "active_hypotheses": [
     {{{{"id": "H1", "label": "oom_panic", "status": "leading", "evidence": "panic_on_oom path is explicit in dmesg and memory pressure is confirmed by kmem -i"}}}},
     {{{{"id": "H2", "label": "memory_corruption", "status": "ruled_out", "evidence": "No faulting instruction, poison pattern, or corrupted object evidence appears; the panic follows the OOM handler directly"}}}}
@@ -2660,15 +2602,10 @@ def structure_reasoning_prompt() -> str:
         "6. Infer 'root_cause_class' from the causal explanation in the reasoning text. "
         "It may remain null if the reasoning is still exploratory, but if the reasoning reaches "
         "a final conclusion it should be concrete or 'unknown'.\n"
-        "7. Infer 'partial_dump' from the reasoning text or preserved session state. If the "
-        "reasoning mentions '[PARTIAL DUMP]' in sys output or explicitly says the vmcore is "
-        "partial, set partial_dump='partial'. If the reasoning states the dump is complete, set "
-        "partial_dump='full'. Otherwise preserve any explicitly stated prior value or leave it "
-        "as 'unknown' when dump completeness is not yet established.\n"
-        "8. Update 'active_hypotheses': list all hypotheses mentioned in the reasoning "
+        "7. Update 'active_hypotheses': list all hypotheses mentioned in the reasoning "
         "with their current status (leading/candidate/weakened/ruled_out) and optional rank "
         "(1=highest priority). Only one hypothesis may have status='leading'.\n"
-        "9. Reconstruct 'gates': infer each gate's status solely from evidence explicitly "
+        "8. Reconstruct 'gates': infer each gate's status solely from evidence explicitly "
         "stated in the reasoning text. Use gate names from the Gate Catalog in §1.1a. "
         "Only include gates whose required_for list contains the current signature_class. "
         "For each check confirmed in the reasoning (e.g., 'bt -f shows clean frames', "
@@ -2676,8 +2613,8 @@ def structure_reasoning_prompt() -> str:
         "'closed' with the confirming statement as the evidence field value. "
         "If the reasoning explicitly marks a gate as blocked or n/a, reflect that status. "
         "Gates not mentioned or confirmed in the reasoning remain 'open'.\n"
-        "10. CRITICAL: If is_conclusive=true, ALL required gates for signature_class must have "
-        "status='closed' or 'n/a'. If any required gate is still 'open', set "
+        "9. CRITICAL: If is_conclusive=true, ALL required gates for signature_class must have "
+        "status='closed'. If any required gate is still 'open', set "
         "is_conclusive=false and continue analysis instead.\n"
         "{force_conclusion}\n\n"
         "VMCoreAnalysisStep Schema:\n```json\n{schema_json}\n```\n\n"
