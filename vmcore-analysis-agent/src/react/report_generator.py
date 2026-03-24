@@ -247,8 +247,52 @@ def generate_markdown_report(state: AgentState) -> str:
     if not has_diagnosis:
         lines.append("")
         lines.append(
-            "⚠️ **注意**: 分析未得出最终结论，可能需要更多信息或达到了步数限制。"
+            "⚠️ **注意**: 分析未得出正式的最终结论，以下为最后一步的最佳可用分析状态："
         )
+        # Fallback: render best-available data from the last AIMessage
+        for msg in reversed(messages):
+            if not isinstance(msg, AIMessage):
+                continue
+            try:
+                raw = (
+                    msg.content
+                    if isinstance(msg.content, str)
+                    else json.dumps(msg.content)
+                )
+                last_step = VMCoreAnalysisStep.model_validate_json(raw)
+                lines.append("")
+                lines.append("---")
+                lines.append("")
+                lines.append("## 🔍 最佳可用分析（步骤未收敛）")
+                lines.append("")
+                if last_step.signature_class:
+                    lines.append(f"**崩溃类型签名**: {last_step.signature_class}")
+                    lines.append("")
+                if last_step.root_cause_class:
+                    lines.append(f"**初步根因分类**: {last_step.root_cause_class}")
+                    lines.append("")
+                if last_step.reasoning:
+                    lines.append("**最后推理摘要**:")
+                    lines.append("")
+                    lines.append(last_step.reasoning)
+                    lines.append("")
+                if last_step.active_hypotheses:
+                    lines.append("**当前假设列表**:")
+                    lines.append("")
+                    for h in last_step.active_hypotheses:
+                        lines.append(
+                            f"- [{h.status}] **{h.label}**: {h.evidence or '(无证据)'}"
+                        )
+                    lines.append("")
+                if last_step.confidence:
+                    lines.append(f"**可信度**: {last_step.confidence}")
+                    lines.append("")
+                if last_step.additional_notes:
+                    lines.append(f"**附加说明**: {last_step.additional_notes}")
+                    lines.append("")
+            except Exception:
+                pass
+            break
 
     lines.append("")
     lines.append("---")

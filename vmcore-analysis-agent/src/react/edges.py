@@ -10,9 +10,11 @@ VMCore 分析 Agent 边（路由）逻辑
 定义节点之间的转换条件和路由规则。
 """
 
+import json
 from typing import Literal
 from langchain_core.messages import AIMessage, HumanMessage
 from .graph_state import AgentState
+from .schema import VMCoreAnalysisStep
 from src.utils.logging import logger
 from .nodes import (
     crash_tool_node,
@@ -66,6 +68,27 @@ def should_continue(state: AgentState) -> str:
             )
             return crash_tool_node
         else:
+            # If the LLM returned no tool calls but also is_conclusive=False,
+            # route back to llm_analysis_node so it can produce a final conclusion.
+            # LangGraph's recursion_limit acts as the safety net against infinite loops.
+            if not is_last_step:
+                try:
+                    raw = (
+                        last_message.content
+                        if isinstance(last_message.content, str)
+                        else json.dumps(last_message.content)
+                    )
+                    step_obj = VMCoreAnalysisStep.model_validate_json(raw)
+                    if not step_obj.is_conclusive:
+                        logger.warning(
+                            "LLM returned no tool calls but is_conclusive=False "
+                            "(step %s). Routing back to %s to force a conclusion.",
+                            step_obj.step_id,
+                            llm_analysis_node,
+                        )
+                        return llm_analysis_node
+                except Exception:
+                    pass  # parse failure → fall through to __end__
             logger.info(
                 "No tool calls in AIMessage, analysis complete. Routing to __end__"
             )
