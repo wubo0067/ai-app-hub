@@ -204,39 +204,46 @@ result = await tool.ainvoke({
 ```
 vmcore-analysis-agent/
 ├── README.md                          # 项目说明文档
-├── README.us-EN.md                    # 英文项目说明文档
+├── README.zh-CN.md                    # 中文项目说明文档
 ├── main.py                            # FastAPI 服务入口
 ├── pyproject.toml                     # Python 项目配置
+├── uv.lock                            # 依赖锁定文件
+├── .python-version                    # Python 版本规范
 ├── config/
 │   └── config.yml                     # LLM / MCP 配置文件
 ├── client/
-│   └── client.py                      # 命令行客户端
+│   ├── client.py                      # HTTP 客户端实现
+│   └── main.py                        # 命令行客户端入口
 ├── src/
 │   ├── llm/
-│   │   └── model.py                   # DeepSeek LLM 初始化
+│   │   └── ...                        # DeepSeek LLM 初始化和工具函数
 │   ├── react/
+│   │   ├── __init__.py                # 包初始化文件
 │   │   ├── graph.py                   # LangGraph 图构建
-│   │   ├── nodes.py                   # 节点实现
-│   │   ├── edges.py                   # 路由逻辑
+│   │   ├── nodes.py                   # 核心节点实现
+│   │   ├── edges.py                   # 路由逻辑和状态转换
 │   │   ├── graph_state.py             # AgentState 定义
+│   │   ├── llm_node.py                # LLM 调用和响应处理
+│   │   ├── llm_runtime.py             # LLM 运行时配置
+│   │   ├── output_parser.py           # LLM 输出解析和验证
 │   │   ├── prompts.py                 # 专业分析 Prompt
-│   │   ├── llm_node.py                # LLM 调用与结构化
 │   │   ├── report_generator.py        # Markdown 报告生成
+│   │   ├── schema.py                  # 数据结构定义 (VMCoreAnalysisStep)
 │   │   └── logging_callback.py        # 图执行日志回调
 │   ├── mcp_tools/
-│   │   ├── crash/                     # crash MCP Server
-│   │   │   ├── server.py              # FastMCP 工具注册
-│   │   │   ├── executor.py            # crash 命令执行器
-│   │   │   └── client.py              # MCP 客户端封装
-│   │   └── source_patch/              # source_patch MCP Server
-│   │       ├── server.py              # patch 生成工具
-│   │       └── client.py              # MCP 客户端封装
-│   └── utils/                         # 日志、配置等工具函数
+│   │   ├── crash/                     # crash MCP Server 实现
+│   │   │   └── ...                    # crash 命令执行器和客户端
+│   │   └── source_patch/              # source_patch MCP Server 实现
+│   │       └── ...                    # 补丁生成工具
+│   └── utils/                         # 工具函数（日志、配置等）
 ├── simulate-crash/                    # 内核崩溃模拟模块
-│   ├── rcu_stall/                     # RCU stall 复现
-│   └── soft_lockup/                   # Soft lockup 复现
+│   ├── rcu_stall/                     # RCU stall 复现场景
+│   ├── soft_lockup/                   # Soft lockup 复现场景
+│   └── ...                            # 其他崩溃场景
 ├── reports/                           # 分析报告输出目录
 ├── logs/                              # 运行日志目录
+├── tests/                             # 测试套件
+│   └── ...                            # 单元测试和集成测试
 └── tools/
     └── show_first_global_func.sh      # 调试符号验证脚本
 ```

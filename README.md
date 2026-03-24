@@ -203,39 +203,46 @@ result = await tool.ainvoke({
 ```
 vmcore-analysis-agent/
 ├── README.md                          # Project documentation
-├── README.us-EN.md                    # English project documentation
+├── README.zh-CN.md                    # Chinese project documentation
 ├── main.py                            # FastAPI service entry point
 ├── pyproject.toml                     # Python project configuration
+├── uv.lock                            # Dependency lock file
+├── .python-version                    # Python version specification
 ├── config/
 │   └── config.yml                     # LLM / MCP configuration file
 ├── client/
-│   └── client.py                      # Command line client
+│   ├── client.py                      # HTTP client implementation
+│   └── main.py                        # Command line client entry point
 ├── src/
 │   ├── llm/
-│   │   └── model.py                   # DeepSeek LLM initialization
+│   │   └── ...                        # DeepSeek LLM initialization and utilities
 │   ├── react/
+│   │   ├── __init__.py                # Package initialization
 │   │   ├── graph.py                   # LangGraph graph construction
-│   │   ├── nodes.py                   # Node implementation
-│   │   ├── edges.py                   # Routing logic
+│   │   ├── nodes.py                   # Core node implementations
+│   │   ├── edges.py                   # Routing logic and state transitions
 │   │   ├── graph_state.py             # AgentState definition
+│   │   ├── llm_node.py                # LLM calling and response handling
+│   │   ├── llm_runtime.py             # LLM runtime configuration
+│   │   ├── output_parser.py           # LLM output parsing and validation
 │   │   ├── prompts.py                 # Professional analysis prompts
-│   │   ├── llm_node.py                # LLM calling and structuring
 │   │   ├── report_generator.py        # Markdown report generation
+│   │   ├── schema.py                  # Data schema definitions (VMCoreAnalysisStep)
 │   │   └── logging_callback.py        # Graph execution log callback
 │   ├── mcp_tools/
-│   │   ├── crash/                     # crash MCP Server
-│   │   │   ├── server.py              # FastMCP tool registration
-│   │   │   ├── executor.py            # crash command executor
-│   │   │   └── client.py              # MCP client wrapper
-│   │   └── source_patch/              # source_patch MCP Server
-│   │       ├── server.py              # patch generation tool
-│   │       └── client.py              # MCP client wrapper
-│   └── utils/                         # Log, configuration and other utility functions
+│   │   ├── crash/                     # crash MCP Server implementation
+│   │   │   └── ...                    # crash command executor and client
+│   │   └── source_patch/              # source_patch MCP Server implementation
+│   │       └── ...                    # patch generation tools
+│   └── utils/                         # Utility functions (logging, config, etc.)
 ├── simulate-crash/                    # Kernel crash simulation module
-│   ├── rcu_stall/                     # RCU stall reproduction
-│   └── soft_lockup/                   # Soft lockup reproduction
+│   ├── rcu_stall/                     # RCU stall reproduction scenarios
+│   ├── soft_lockup/                   # Soft lockup reproduction scenarios
+│   └── ...                            # Additional crash scenarios
 ├── reports/                           # Analysis report output directory
 ├── logs/                              # Runtime log directory
+├── tests/                             # Test suite
+│   └── ...                            # Unit and integration tests
 └── tools/
     └── show_first_global_func.sh      # Debug symbol verification script
 ```
