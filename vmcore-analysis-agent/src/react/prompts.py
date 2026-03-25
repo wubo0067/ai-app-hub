@@ -641,11 +641,17 @@ Validate in order — if ANY is corrupted → local/software cause, do NOT escal
 
 **ALL intact** → proceed to **Step 5b+**, then Stage 5 exclusion checklist.
 
-**Step 5b+ — Driver Object Validation** (MANDATORY when crash path crosses a driver struct)
+**Step 5b+ — Driver Object Validation** (MANDATORY when crash path involves a driver / third-party module)
 
-When RIP is inside a `.ko` function that loads a field from a named driver struct:
-1. `struct <type> <addr>` (with `mod -s` if module type) — read ALL fields.
-2. Classify: pointer fields must be `0xffff...`; index fields within hw limits; DMA address fields non-zero and aligned.
+Trigger condition — ANY of the following applies:
+- RIP is inside a `.ko` function, OR
+- RIP is in a kernel function (e.g., `kthread_stop`, `__free_pages`) AND `bt` shows a third-party module frame directly below it, OR
+- **`bt` contains ANY frame from a third-party module** (e.g., `dma_memory_corruption_exit+... [some_mod]`) regardless of where RIP points — this covers WARNING/panic-triggered crashes where RIP has already advanced to `machine_kexec` or `panic` by the time the vmcore is captured.
+
+When any trigger condition matches:
+1. **Caller Analysis**: Identify the module function frame(s) in `bt`. For EACH such frame, you MUST `dis -s <module_function>` (with `mod -s` first) to identify what pointer/argument the module passed into the kernel call. Do NOT skip this step because RIP has moved past the original fault site.
+2. `struct <type> <addr>` (with `mod -s` if module type) — read ALL fields.
+3. Classify: pointer fields must be `0xffff...`; index fields within hw limits; DMA address fields non-zero and aligned.
 3. **Scoring**: 1 field anomalous → weak (complete S4 first); 2+ fields simultaneously anomalous → strong struct corruption → classify OOB/UAF/stomper BEFORE considering DMA (satisfies S3).
 4. **Snapshot mismatch**: crash-time register ≠ current field → read ALL other fields:
    - Only faulting field differs → transient/race; apply Snapshot Mismatch Rule §1.3 Rule B.
@@ -658,6 +664,12 @@ When RIP is inside a `.ko` function that loads a field from a named driver struc
 | S1 | Stack overflow | `bt -f` clean; `thread_info.cpu` matches; no canary violation in dmesg |
 | S2 | UAF | `kmem -S` shows ALLOCATED; no SLUB poison pattern in adjacent memory |
 | S3 | Struct field OOB | Step 5b+ completed. Scan from **object base** (`kmem -S` → `OBJECT` column), NOT slab page base. |
+
+**refcount_warn_saturate / refcount_t: addition on 0 — Interpretation Rule** (apply at S2):
+This warning fires both for genuine UAF AND for external struct corruption. They share identical dmesg text but have different root causes:
+- **UAF**: `kmem -S <obj_addr>` shows FREED or SLUB poison pattern (`0x5a5a...` / `0x6b6b...` / `0xdead...`) in the refcount field. The object was deallocated before the operation.
+- **Struct corruption**: `kmem -S <obj_addr>` shows ALLOCATED, but the refcount field itself reads an illegal byte-fill pattern (e.g., `0x41414141` from DMA `memset(0x41)`, `0x0` from `memset(0)`, or any other non-SLUB-poison non-natural value). The object is still live but its metadata was externally overwritten.
+Before classifying S2 UAF: run `struct task_struct <obj_addr>` (or the relevant struct type) and read the `refcount`/`usage` field raw value. If the value is NOT a natural small integer AND NOT a SLUB poison pattern, treat it as **struct corruption** (S3 class), not UAF.
 | S4 | Register provenance | Last writer identified; load address traced; crash-time register vs vmcore field reconciled |
 | S5 | MCE / HW error | `log -m \| grep -iE "mce\|machine check\|corrected error\|uncorrected\|edac\|dimm"` clean. Elevated priority: >1 TB RAM or uptime >100 days. |
 
@@ -665,7 +677,9 @@ When RIP is inside a `.ko` function that loads a field from a named driver struc
 > "S1: excluded — \<reason\>. S2: excluded — \<reason\>. S3: excluded — \<reason\>. S4: excluded — \<reason\>. S5: excluded — \<reason\>."
 Vague prose summary is NOT equivalent. This is a Protocol Violation.
 
-**S4 Wording Constraint**: When the only evidence is a register-memory mismatch, these phrases are **FORBIDDEN**: "indicates in-memory corruption after load", "shows the field was overwritten", "memory was modified after the crash", "confirms corruption of the struct field". Required S4 formula: "S4: register-memory mismatch observed (RXX=0x... vs vmcore 0x...) but mismatch alone does not establish corruption mechanism per Snapshot Mismatch Rule §1.3 Rule B; last writer of RXX traced to load at offset 0x... of \<type\> at \<addr\>."
+**S4 Wording Constraint**:
+1. **Snapshot Mismatch**: When the only evidence is a register-memory mismatch, these phrases are **FORBIDDEN**: "indicates memory was overwritten", "confirms struct corruption", "proves DMA/external write", "shows the struct was stomped". **Required form**: State the observation precisely — e.g., "RBX=0xffff... at crash time; current vmcore field at offset 0x10 reads 0x0; mismatch is a snapshot observation, not proof of overwrite mechanism (§1.3 Rule B)." Acknowledge that a race or transient write could explain the discrepancy. Do NOT advance to DMA or UAF solely on this basis.
+2. **Struct Corruption**: When struct fields read as illegal byte-fill patterns (e.g., `0x41414141414141` / uniform repeated bytes), these conclusions are **FORBIDDEN** without completing register provenance first: "task_struct fields are zeroed/garbage, confirming struct was overwritten." **Required form**: Trace the last writer of the register that pointed to the struct, confirm the pointer itself is valid, then read ALL fields and identify the fill pattern. Example: "RBX last written at `kthread_stop+0x28` via `mov 0x10(%rdi),%rbx`; RDI=`ffff91ca79e20908` (`task_struct` addr); `struct task_struct 0xffff91ca79e20908` shows `__state=0` (field at offset 0x10), consistent with the load but does not itself prove overwrite mechanism. Other fields (`usage`, `stack`, `comm`) show uniform `0x4141...` pattern — this indicates external byte-fill overwrite, classify as S3 struct corruption."
 
 **Step 6 — Check Backtrace Context**
 - `bt` → identify execution context: `Process` / `<IRQ>` / `<SOFTIRQ>` / `<NMI>`
@@ -1686,6 +1700,34 @@ If NEITHER: `root_cause` MUST be: "Pointer corruption confirmed. Source unproven
 | Reproduction trigger | Correlates with I/O pressure | Correlates with specific code path/lifetime bug | Often random/intermittent |
 | IOMMU Passthrough impact | Strong risk amplifier | Usually unrelated | Unrelated |
 | Multi-location corruption | Common in ring/buffer overwrite patterns | Less common and object-local | Random distribution |
+
+### 3.12.11 struct page Metadata DMA Corruption — Dedicated Analysis Path
+
+**Scenario**: DMA overflow writes directly into `struct page` metadata (the kernel's per-physical-page bookkeeping structure), corrupting `flags`, `_refcount`, `_mapcount`, list pointers, or `lru` fields. This is a distinct, high-danger failure class separate from payload corruption into data buffers.
+
+**Detection signals**:
+- `kmem -S <addr>` fails or returns nonsensical slab info because `page->flags` is an illegal value (e.g., `0x4141414141414141` from DMA `memset(0x41)`, `0x0000000000000000` from zero-fill).
+- `struct page <page_addr>` shows `flags` field with uniform repeated byte pattern NOT matching any valid `PG_*` flag combination.
+- Crash occurs in page allocator / slab paths: `__free_pages`, `put_page`, `free_unref_page`, `__page_cache_release`, `refcount_warn_saturate`.
+- `refcount_t: addition on 0` warning fires when `page->_refcount` has been zeroed or byte-filled.
+
+**Distinguishing struct page corruption from UAF**:
+
+| Feature | struct page DMA Corruption | UAF (use-after-free) |
+|---------|---------------------------|---------------------|
+| `page->flags` value | Uniform byte fill (0x4141.../0x0000...) — NOT a valid flag combination | May still have valid-looking flags if only data fields are stale |
+| SLUB poison | Absent — object was never freed through SLUB | Present (0x6b6b.../0x5a5a... for SLUB debug) |
+| `kmem -S` result | Fails or reports impossible slab — page metadata itself is invalid | Shows FREED or ALLOCATED depending on timing |
+| refcount pattern | `_refcount` = uniform fill byte (e.g., `0x41`) or 0 from memset | `_refcount` = 0 from legitimate dec-to-zero or SLUB poison |
+| DMA alias evidence | dmesg shows `dma_map_single` / overrun log; `simulate_dma_write` or driver DMA ring overflow | No DMA evidence |
+
+**Mandatory analysis steps when struct page corruption is suspected**:
+1. `struct page <victim_page_addr>` — read ALL fields: `flags`, `_refcount`, `_mapcount`, `mapping`, `lru`, `private`.
+2. Verify `flags` against valid PG_* bitmask: any value with uniform repeated bytes (0x41..., 0x00...) is definitive corruption evidence.
+3. Run `kmem -p <phys_addr>` (from `vtop <victim_vaddr>`) — if page state is already incoherent, record as struct page corruption evidence.
+4. Search for DMA alias: check dmesg for `dma_map_single`, `dma_alloc_coherent`, or driver-specific DMA log adjacent to the victim address range.
+5. Do NOT run `kmem -S <victim_page_addr>` expecting a valid slab result — instead, document the failure as corroborating evidence of metadata corruption.
+6. Classify as S3 (Struct field OOB / external overwrite) in Stage 5 checklist; this is NOT S2 UAF even if `refcount_warn_saturate` appeared.
 
 ## 3.13 Bad IRQ / IRQ Storm
 **Pattern**: "nobody cared (try booting with the 'irqpoll' option)",

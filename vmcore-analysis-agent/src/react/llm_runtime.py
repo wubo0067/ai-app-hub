@@ -33,32 +33,24 @@ async def ainvoke_with_retry(
 def compress_messages_for_llm(
     messages: list,
     max_tool_output_chars: int = 4000,
-    old_reasoning_head: int = 200,
-    old_reasoning_tail: int = 500,
-    recent_ai_messages_to_keep: int = 2,
     recent_tool_messages_to_keep: int = 2,
 ) -> list:
     """
     在发送给 LLM 前对消息历史进行保守压缩，降低 token 消耗。
 
     策略：
-    1. 保留最近几条 AIMessage 和 ToolMessage 的完整内容，尽量减少对当前推理链的干扰。
-    2. 更早的 AIMessage 的 reasoning_content 保留头部 + 尾部，中间截断。
-       - 头部（old_reasoning_head）：保留"当前在分析什么"的上下文
-       - 尾部（old_reasoning_tail）：保留"结论和下一步决策"（推理链结论在尾部）
-       ⚠️ DeepSeek-Reasoner API 要求所有 assistant 消息必须包含 reasoning_content 字段，
-       不可删除、不可设为 None，否则返回 400 错误。
-    3. 对更早的 ToolMessage，仅在超过 max_tool_output_chars 时才截断。
+    1. 绝对保留所有 AIMessage 的完整内容（包括 content 和 reasoning_content）。
+       由于 DeepSeek-Reasoner API 对思维链对齐高度敏感，对历史 assistant 消息的截断
+       会严重破坏其逻辑或导致大模型产生幻觉（如模型在输出中自行生成截断占位符）或报错。
+    2. 保留最近几条 ToolMessage 的完整内容。
+    3. 对更早的 ToolMessage，当其返回内容超过 max_tool_output_chars 时，截断其中间部分。
 
     此函数不修改 AgentState，仅返回压缩后的副本用于当次 LLM 调用。
     """
-    ai_msg_indices = [i for i, msg in enumerate(messages) if isinstance(msg, AIMessage)]
     tool_msg_indices = [
         i for i, msg in enumerate(messages) if isinstance(msg, ToolMessage)
     ]
-    recent_ai_indices = set(ai_msg_indices[-recent_ai_messages_to_keep:])
     recent_tool_indices = set(tool_msg_indices[-recent_tool_messages_to_keep:])
-    keep_threshold = old_reasoning_head + old_reasoning_tail
 
     def truncate_middle(text: str, head_chars: int, tail_chars: int) -> str:
         keep_chars = head_chars + tail_chars
@@ -68,34 +60,21 @@ def compress_messages_for_llm(
         omitted = len(text) - keep_chars
         return (
             text[:head_chars]
-            + f"\n...[{omitted} chars truncated]...\n"
+            + f"\n\n[SYSTEM LOG: {omitted} characters from this older tool execution have been pruned to save context window]\n\n"
             + text[-tail_chars:]
         )
 
     compressed = []
-    truncated_reasoning_count = 0
     truncated_tool_count = 0
-    reasoning_chars_before = 0
-    reasoning_chars_after = 0
     tool_chars_before = 0
     tool_chars_after = 0
 
     for index, msg in enumerate(messages):
-        if isinstance(msg, AIMessage) and index not in recent_ai_indices:
-            reasoning_content = msg.additional_kwargs.get("reasoning_content", "")
-            if isinstance(reasoning_content, str):
-                reasoning_chars_before += len(reasoning_content)
-            if reasoning_content and len(reasoning_content) > keep_threshold:
-                new_kwargs = dict(msg.additional_kwargs)
-                new_kwargs["reasoning_content"] = truncate_middle(
-                    reasoning_content,
-                    old_reasoning_head,
-                    old_reasoning_tail,
-                )
-                msg = msg.model_copy(update={"additional_kwargs": new_kwargs})
-                truncated_reasoning_count += 1
-            if isinstance(msg.additional_kwargs.get("reasoning_content"), str):
-                reasoning_chars_after += len(msg.additional_kwargs["reasoning_content"])
+        if isinstance(msg, AIMessage):
+            # 绝对不能修改 AIMessage 的 reasoning_content 或内容，
+            # 否则会破坏 DeepSeek-Reasoner 的思维链对齐，导致大模型产生幻觉（如自己生成截断字符）或报错
+            compressed.append(msg)
+            continue
         elif (
             isinstance(msg, ToolMessage)
             and index not in recent_tool_indices
@@ -113,24 +92,19 @@ def compress_messages_for_llm(
             msg = msg.model_copy(update={"content": truncated_content})
             truncated_tool_count += 1
             tool_chars_after += len(msg.content)
-        elif (
-            isinstance(msg, ToolMessage)
-            and index not in recent_tool_indices
-            and isinstance(msg.content, str)
-        ):
+            compressed.append(msg)
+        elif isinstance(msg, ToolMessage) and isinstance(msg.content, str):
             tool_chars_before += len(msg.content)
             tool_chars_after += len(msg.content)
-        compressed.append(msg)
+            compressed.append(msg)
+        else:
+            compressed.append(msg)
 
-    if truncated_reasoning_count or truncated_tool_count:
-        reasoning_saved = reasoning_chars_before - reasoning_chars_after
+    if truncated_tool_count:
         tool_saved = tool_chars_before - tool_chars_after
         logger.info(
-            f"[compress] truncated reasoning_content in {truncated_reasoning_count} old AIMessages "
-            f"(head={old_reasoning_head}+tail={old_reasoning_tail} chars, "
-            f"before={reasoning_chars_before}, after={reasoning_chars_after}, saved={reasoning_saved}), "
-            f"truncated {truncated_tool_count} old ToolMessages (limit={max_tool_output_chars}, "
+            f"[compress] truncated {truncated_tool_count} old ToolMessages (limit={max_tool_output_chars}, "
             f"before={tool_chars_before}, after={tool_chars_after}, saved={tool_saved}, "
-            f"kept recent ai/tool messages full: {recent_ai_messages_to_keep}/{recent_tool_messages_to_keep})"
+            f"kept recent tool messages full: {recent_tool_messages_to_keep})"
         )
     return compressed

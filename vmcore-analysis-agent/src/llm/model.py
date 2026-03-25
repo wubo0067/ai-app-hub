@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# model.py - LLM模型配置和初始化模块
+# model.py - LLM 模型配置和初始化模块
 # Author: CalmWU
 # Created: 2026-01-09
 
@@ -123,7 +123,7 @@ def create_structured_llm():
             api_key=SecretStr(str(api_key)),
             base_url=str(base_url),
             model="deepseek-chat",
-            max_tokens=8000,
+            max_tokens=8192,
             top_p=0.1,
             temperature=0.0,
             timeout=120,

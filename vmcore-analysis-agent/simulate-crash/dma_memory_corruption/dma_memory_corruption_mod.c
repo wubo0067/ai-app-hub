@@ -23,6 +23,7 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/io.h>
+#include <linux/platform_device.h> // 添加 platform_device 头文件
 
 #include "mem_vaddr_page_dump.h"
 
@@ -36,6 +37,9 @@ module_param(enable_dma_corruption, bool, 0644);
 
 static bool corrupt_page_struct = false; // ⭐ 新增
 module_param(corrupt_page_struct, bool, 0644);
+
+static unsigned int start_delay_ms = 1000; // 添加缺失的 start_delay_ms 参数
+module_param(start_delay_ms, uint, 0644);
 
 /* ================= victim ================= */
 
@@ -56,7 +60,7 @@ module_param(corruption_len, uint, 0644);
 
 /* ================= 全局 ================= */
 
-static struct device *dma_dev;
+static struct platform_device *dma_pdev; // 改为 platform_device
 static struct task_struct *corrupt_task;
 
 /* ================= DMA 写 ================= */
@@ -89,18 +93,18 @@ static int dma_corruption_thread(void *data)
     dma_addr_t dma_handle;
     struct page *victim_page;
     size_t total_size = PAGE_SIZE * 2;
+    unsigned int region_order = get_order(total_size);
 
-    msleep(1000);
+    msleep(start_delay_ms); // 使用 start_delay_ms 参数而不是硬编码的 1000
 
     /*
      * ⭐ 分配连续区域：
      * [ DMA buffer | victim ]
+     * 使用页级连续分配，确保 PAGE_SIZE 偏移后确实落在下一页。
      */
-    region = kmalloc(total_size, GFP_KERNEL);
+    region = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, region_order);
     if (!region)
         return -ENOMEM;
-
-    memset(region, 0, total_size);
 
     dma_area = region;
     // victim 在第 2 个 page 中，明确构造“跨 page / 跨区域 overwrite”
@@ -116,7 +120,7 @@ static int dma_corruption_thread(void *data)
     dump_kvaddr_page_info(victim, sizeof(*victim), "victim");
 
     /*
-     * ⭐ 为 DMA buffer 建立 mapping
+     * ⭐ 为 DMA buffer 建立映射
      * 是 linux 内核中用于流式 DMA 映射的核心 API 之一
      * 功能：为一块单个、物理连续的内存缓冲区创建 DMA 映射。这个缓冲区通常是之前通过 kmalloc 或类似方式分配的。
      *      这种映射是临时的，用于一次或短期的 I/O 操作。操作完成后，需要通过 dma_unmap_single 来解除映射
@@ -129,10 +133,10 @@ static int dma_corruption_thread(void *data)
      *       无 IOMMU，简单直通：DMA address ≈ physical address
      *       有 IOMMU，地址转换：device DMA address -> IOMMU translation -> physical address
      */
-    dma_handle =
-            dma_map_single(dma_dev, dma_area, PAGE_SIZE, DMA_BIDIRECTIONAL);
+    dma_handle = dma_map_single(&dma_pdev->dev, dma_area, PAGE_SIZE,
+                                DMA_BIDIRECTIONAL);
 
-    if (dma_mapping_error(dma_dev, dma_handle)) {
+    if (dma_mapping_error(&dma_pdev->dev, dma_handle)) {
         pr_err("dma_map_single failed\n");
         kfree(region);
         return -EIO;
@@ -177,14 +181,14 @@ static int dma_corruption_thread(void *data)
      */
     pr_emerg("triggering page free to detect corruption\n");
 
-    __free_pages(victim_page, 0); // 高概率 crash
+    __free_pages(virt_to_page(region), region_order); // 高概率 crash
 
     /*
      * 即使在触发 crash 之前，也应该有清理代码。
      * 这展示了完整的 DMA mapping 生命周期。
      */
-    dma_unmap_single(dma_dev, dma_handle, PAGE_SIZE, DMA_BIDIRECTIONAL);
-    kfree(region);
+    dma_unmap_single(&dma_pdev->dev, dma_handle, PAGE_SIZE, DMA_BIDIRECTIONAL);
+    free_pages((unsigned long)region, region_order);
     return 0;
 }
 
@@ -192,28 +196,36 @@ static int dma_corruption_thread(void *data)
 
 static int __init dma_memory_corruption_init(void)
 {
-    // 在路径/sys/devices 下创建设备文件 dma_memory_corruption_dev
-    // 用来模拟一个可以咨询 DMA 操作的硬件设备。以便后续进行内存的破坏仿真
-    dma_dev = root_device_register("dma_memory_corruption_dev");
-    if (IS_ERR(dma_dev))
-        return PTR_ERR(dma_dev);
+    int ret;
 
-    // 为创建的模拟设备设置 DMA 寻址能力，它告诉内核，这个设备能够对 64 位的物理地址进行 DMA 操作
-    // 一个设备的 DMA 掩码定义了该设备能够访问的物理内存地址范围。
-    // 这行代码是在初始化一个用于模拟 DMA 内存破坏的虚拟设备，并将其配置为能够访问系统中的所有 64 位物理地址，
-    // 为后续模拟 DMA 写操作（包括越界写入）提供了必要的前提条件。
-    if (dma_set_mask_and_coherent(dma_dev, DMA_BIT_MASK(64))) {
-        pr_err("dma_set_mask_and_coherent failed\n");
-        root_device_unregister(dma_dev);
-        return -EIO;
+    // 使用 platform_device_register_simple 创建 platform 设备
+    dma_pdev = platform_device_register_simple("dma_memory_corruption_dev", -1,
+                                               NULL, 0);
+    if (IS_ERR(dma_pdev)) {
+        ret = PTR_ERR(dma_pdev);
+        pr_err("platform_device_register_simple failed: %d\n", ret);
+        return ret;
+    }
+
+    // 为创建的模拟设备设置 DMA 寻址能力
+    ret = dma_set_mask_and_coherent(&dma_pdev->dev, DMA_BIT_MASK(64));
+    if (ret) {
+        pr_err("dma_set_mask_and_coherent failed: %d\n", ret);
+        platform_device_unregister(dma_pdev);
+        return ret;
     }
 
     if (!enable_dma_corruption)
         return 0;
 
     corrupt_task = kthread_run(dma_corruption_thread, NULL, "dma_corrupt");
+    if (IS_ERR(corrupt_task)) {
+        ret = PTR_ERR(corrupt_task);
+        platform_device_unregister(dma_pdev);
+        return ret;
+    }
 
-    return PTR_ERR_OR_ZERO(corrupt_task);
+    return 0;
 }
 
 static void __exit dma_memory_corruption_exit(void)
@@ -221,8 +233,8 @@ static void __exit dma_memory_corruption_exit(void)
     if (corrupt_task)
         kthread_stop(corrupt_task);
 
-    if (dma_dev)
-        root_device_unregister(dma_dev);
+    if (dma_pdev)
+        platform_device_unregister(dma_pdev);
 }
 
 module_init(dma_memory_corruption_init);

@@ -43,7 +43,7 @@ sudo insmod dma_memory_corruption_mod.ko
 ### 4.2 触发加载（会导致内核崩溃）
 
 ```bash
-sudo insmod dma_memory_corruption_mod.ko enable_dma_corruption=1 start_delay_ms=1500 corruption_len=96
+sudo insmod dma_memory_corruption_mod.ko enable_dma_corruption=1 start_delay_ms=1500 corruption_len=4144
 ```
 
 参数说明：

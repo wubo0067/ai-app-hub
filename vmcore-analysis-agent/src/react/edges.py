@@ -80,6 +80,16 @@ def should_continue(state: AgentState) -> str:
                     )
                     step_obj = VMCoreAnalysisStep.model_validate_json(raw)
                     if not step_obj.is_conclusive:
+                        # Sometimes json_repair fixes a truncated model output and sets is_conclusive=False
+                        # by default, even though final_diagnosis is populated. Check if we actually have
+                        # a final_diagnosis, and if so, consider it conclusive to prevent an infinite loop.
+                        if step_obj.final_diagnosis is not None:
+                            logger.info(
+                                "LLM returned is_conclusive=False but final_diagnosis is populated. "
+                                "Treating as conclusive to prevent infinite loop. Routing to __end__."
+                            )
+                            return "__end__"
+
                         logger.warning(
                             "LLM returned no tool calls but is_conclusive=False "
                             "(step %s). Routing back to %s to force a conclusion.",

@@ -6,7 +6,7 @@
 
 import json
 from typing import cast
-from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage, HumanMessage
 from .graph_state import AgentState
 from .nodes import llm_analysis_node, structure_reasoning_node
 from .output_parser import (
@@ -65,6 +65,24 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
     # 压缩消息历史后再发送给 LLM，避免 reasoning_content 累积和大工具输出导致 token 暴增
     compressed_messages = compress_messages_for_llm(state["messages"])
     messages_to_send = [SystemMessage(content=system_message), *compressed_messages]
+
+    # 如果上一条消息是 AIMessage 且没有工具调用，说明在此之前发生过 fallback（如 LLM 返回了无效的动作或未提供结论）
+    # 增加一条 HumanMessage 提示 LLM 不能空转
+    last_msg = messages_to_send[-1] if messages_to_send else None
+    if isinstance(last_msg, AIMessage) and not last_msg.tool_calls:
+        logger.warning(
+            "Last message was an AIMessage without tool calls. Injecting HumanMessage to force action or conclusion."
+        )
+        messages_to_send.append(
+            HumanMessage(
+                content=(
+                    "Your previous response neither invoked any tools nor concluded the analysis (is_conclusive=false). "
+                    "You cannot remain in this state. Please EITHER call a tool out of the available options to "
+                    "gather more information, OR set 'is_conclusive'=true and provide your final_diagnosis."
+                )
+            )
+        )
+
     # 结构化输出，设置 include_raw=True 以获取 token 消耗等元数据
     llm_analysis = llm_with_tools.with_structured_output(
         VMCoreAnalysisStep, method="json_mode", include_raw=True

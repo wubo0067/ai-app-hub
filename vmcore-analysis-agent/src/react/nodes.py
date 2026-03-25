@@ -25,7 +25,6 @@ from .graph_state import AgentState
 from .prompts import crash_init_data_prompt
 from src.mcp_tools.crash.client import crash_client
 
-
 # =========================================================================
 # 节点名称常量定义
 # =========================================================================
@@ -51,45 +50,6 @@ DEFAULT_CRASH_COMMANDS: list[str] = [
     # "ipcs",  # IPC 信息
     # "waitq",  # 等待队列
 ]
-
-
-async def _invoke_tool(tool, cmd: str, state: AgentState) -> str:
-    """
-    安全地调用 crash MCP 工具执行指定命令。
-
-    Args:
-        tool: MCP 工具实例
-        cmd: crash 命令字符串
-        state: 当前 Agent 状态，包含 vmcore 和 vmlinux 路径
-
-    Returns:
-        str: 工具执行的输出结果，如果失败则返回错误信息字符串
-    """
-    try:
-        logger.debug(f"Invoking tool for command: {cmd}")
-        result = await tool.ainvoke(
-            {
-                "command": cmd,
-                "vmcore_path": state["vmcore_path"],
-                "vmlinux_path": state["vmlinux_path"],
-            }
-        )
-        logger.debug(f"Tool invocation succeeded for: {cmd}")
-
-        # 处理可能返回的列表结构（LangChain MCP 工具通常返回 [{'type': 'text', 'text': '...'}]）
-        if isinstance(result, list):
-            text_parts = [
-                item.get("text", "")
-                for item in result
-                if isinstance(item, dict) and item.get("type") == "text"
-            ]
-            return "".join(text_parts).strip()
-
-        return str(result).strip()
-    except Exception as exc:
-        error_msg = f"[error] Tool invocation failed for '{cmd}': {exc}"
-        logger.error(error_msg)
-        return error_msg
 
 
 async def dispatch_crash_commands(

@@ -151,8 +151,9 @@ def create_agent_graph(llm, tools_list: List, structured_llm=None):
     #   - 工具调用请求 -> crash_tool_node
     #   - 需要结构化 reasoning_content -> structure_reasoning_node
     #   - 最终答案 -> END
+    #   - 如果 is_conclusive=False 且没有 tool_calls -> llm_analysis_node
     #   - 错误状态 -> END
-    llm_analysis_targets = [crash_tool_node, "__end__"]
+    llm_analysis_targets = [crash_tool_node, "__end__", llm_analysis_node]
     if structured_llm:
         llm_analysis_targets.append(structure_reasoning_node)
     builder.add_conditional_edges(
