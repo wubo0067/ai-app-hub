@@ -15,10 +15,24 @@ from src.utils.logging import logger
 async def ainvoke_with_retry(
     chain, messages: list, max_retries: int = 3, base_delay: float = 2.0
 ):
-    """对 LLM ainvoke 调用进行指数退避重试，仅针对瞬态网络连接错误。"""
+    """对 LLM ainvoke 调用进行指数退避重试，仅针对瞬态网络连接错误。
+
+    同时捕获 LengthFinishReasonError（reasoning_tokens 耗尽 max_tokens 导致
+    content 为空），此类错误带有随机性（同样的 prompt 下次可能不会触发），
+    因此也纳入重试范围。
+    """
     for attempt in range(max_retries):
         try:
             return await chain.ainvoke(messages)
+        except openai.LengthFinishReasonError as exc:
+            if attempt == max_retries - 1:
+                raise
+            delay = base_delay * (2**attempt)
+            logger.warning(
+                f"[retry] LLM output hit max_tokens (reasoning exhausted budget) "
+                f"on attempt {attempt + 1}/{max_retries}, retrying in {delay:.0f}s: {exc}"
+            )
+            await asyncio.sleep(delay)
         except (openai.APIConnectionError, openai.APITimeoutError) as exc:
             if attempt == max_retries - 1:
                 raise

@@ -83,6 +83,8 @@ Each step: (1) Reason about current evidence → (2) Identify missing informatio
 - ❌ Re-disassembling the same function or re-reading the same bucket after register provenance is closed
 - ❌ Searching module `.text`/`.data` segments for DMA buffer content (module text ≠ DMA buffers)
 - ❌ Re-validating a physical address already confirmed reserved via `kmem -p`
+- ❌ **Producing reasoning that ignores or fails to reference the latest ToolMessage output.** Every non-first step MUST begin reasoning with "What did I just learn from the tool output?" If your reasoning does not reference specific data from the most recent tool result, you are reasoning in a loop.
+- ❌ **Emitting an action identical to a prior step's action.** If `dis -rl <addr>` or any other command already appeared in a prior ToolMessage, you MUST use that output — not re-execute it.
 
 ## Log Query Budget
 
@@ -127,9 +129,11 @@ When conclusive: set `is_conclusive: true`, populate `final_diagnosis`, set a co
 ### Reasoning Field Discipline
 
 Structure each `reasoning` block around three questions:
-1. **What did I just learn?** (interpret latest tool output)
+1. **What did I just learn?** (interpret latest tool output — cite specific values, addresses, or instruction sequences)
 2. **What does this imply for live hypotheses?** (promote/demote/rule out)
 3. **What is the ONE most diagnostic next action?** (justify over alternatives)
+
+**MANDATORY**: Question 1 MUST reference concrete data from the most recent ToolMessage. If a ToolMessage was returned but your reasoning does not mention any specific value from it, you are likely re-reasoning from scratch instead of advancing. Stop and re-read the tool output before proceeding.
 
 Default: 3–6 short sentences. Do NOT restate already-established facts. Do NOT narrate ruled-out hypotheses in full — record as "ruled out: X because Y" and move on.
 
@@ -282,8 +286,24 @@ different diagnostic target.
 
 ## 1.2 Agent Execution Rules
 
-### Anti-Repetition (ZERO TOLERANCE)
-Before generating ANY action, scan ALL prior `action` fields. If an identical command already ran, reuse its output — do NOT run it again. Exception: `run_script` with `mod -s` must be repeated per session (session state is not preserved).
+### Anti-Repetition (ZERO TOLERANCE — HARD ENFORCEMENT)
+
+**Before generating ANY action**, perform this mandatory pre-flight check:
+
+1. **Scan ALL prior ToolMessage outputs** in the conversation history. For each prior tool invocation, note the command and its result.
+2. If your proposed command (ignoring `mod -s` prefix) matches any previously executed command:
+   - **DO NOT emit it.** Instead, reference the prior step's output in your `reasoning`.
+   - The system will REJECT duplicate commands automatically. Emitting one wastes an entire step.
+3. For `run_script` containing multiple commands: `mod -s` MUST be repeated (session state is not preserved), but all other commands in the script are subject to deduplication. If `dis -rl <addr>` already ran in a prior `run_script`, do NOT include it again — use the prior output.
+
+**Self-check template** (execute mentally before every action):
+```
+Q: "Has this exact command (or substantial equivalent) appeared in any prior ToolMessage?"
+   YES → Reuse output. Cite step N.
+   NO  → Proceed.
+```
+
+**Violation consequence**: Repeating a command that already succeeded is a Protocol Violation equivalent to a wasted step. The system enforces this by intercepting duplicate commands and returning a dedup notice instead of re-executing.
 
 ### Query Efficiency
 Use `struct <type> -o` immediately when offsets are needed. Never run `struct <type>` followed by `struct <type> -o`.
@@ -608,7 +628,7 @@ corresponding gate is met is FORBIDDEN.
 - Trace backward: loaded from memory? function return value? parameter corruption?
 - Determine true origin of bad register value
 
-**Register Last-Writer Rule**: When a register holds a suspicious value, identify the **last instruction that wrote to it** before the crash: scan backward from RIP via `dis -rl <function>`; find the last `mov`/`lea`/`pop`/`call` that set it; trace the source (memory load → `rd`; per-CPU → §1.9; function return → callee args). Classifying corruption WITHOUT identifying the last writer is FORBIDDEN.
+**Register Last-Writer Rule**: When a register holds a suspicious value, identify the **last instruction that wrote to it** before the crash: scan backward from RIP via `dis -rl <function>`; find the last `mov`/`lea`/`pop`/`call` that set it; trace the source (memory load → `rd`; per-CPU → §1.9; function return → callee args). Classifying corruption WITHOUT identifying the last writer is FORBIDDEN. When the last writer is identified and its source is a memory load from a struct field, use `dis -s <function>` (with `mod -s` if applicable) to read the surrounding allocation/assignment logic before concluding on the corruption source.
 
 **Step 5a — RIP-CR2 Contradiction** (MANDATORY when RIP instruction cannot cause a page fault)
 If `dis -rl <RIP>` shows `pause`, `nop`, `sti`, `cli`, `ret`, `hlt`, or any instruction that CANNOT fault:
@@ -1935,28 +1955,38 @@ def structure_reasoning_prompt() -> str:
         "into a structured JSON format.\n\n"
         "Given the analysis reasoning text about a vmcore crash dump, "
         "convert it into a VMCoreAnalysisStep JSON object.\n\n"
+        "Current analysis step number: {current_step}\n\n"
         "Rules:\n"
         "1. Summarize the reasoning into the 'reasoning' field\n"
-        "2. If the reasoning suggests running another crash command, populate 'action'\n"
-        "3. If the reasoning reaches a final conclusion, set 'is_conclusive' to true "
+        "2. Set 'step_id' to {current_step}\n"
+        "3. If the reasoning suggests running another crash command, populate 'action' "
+        "with a COMPLETE, syntactically valid crash utility command. "
+        "The command must include all required arguments (e.g., 'p /x <expression>', "
+        "NOT just 'p /x'). If the reasoning text does not contain enough information "
+        "to form a complete command, set 'action' to null and explain in 'reasoning'.\n"
+        "4. If the reasoning reaches a final conclusion, set 'is_conclusive' to true "
         "and populate 'final_diagnosis', 'fix_suggestion', 'confidence'\n"
-        "4. Output MUST be valid JSON matching the schema below\n"
-        "5. Classify 'signature_class' from the panic string and crash symptoms described in "
+        "5. Output MUST be valid JSON matching the schema below\n"
+        "6. CRITICAL: You MUST either provide a valid 'action' with a complete command, "
+        "OR set 'is_conclusive' to true with a 'final_diagnosis'. "
+        "Returning action=null with is_conclusive=false is FORBIDDEN unless "
+        "the reasoning text genuinely contains no actionable next step.\n"
+        "7. Classify 'signature_class' from the panic string and crash symptoms described in "
         "the reasoning text, using the Decision Table in §1.1a of the analysis prompt. "
         "If the reasoning explicitly states a previously determined signature_class value, "
         "preserve that value.\n"
-        "6. Infer 'root_cause_class' from the causal explanation in the reasoning text. "
+        "8. Infer 'root_cause_class' from the causal explanation in the reasoning text. "
         "It may remain null if the reasoning is still exploratory, but if the reasoning reaches "
         "a final conclusion it should be concrete or 'unknown'.\n"
-        "7. Infer 'partial_dump' from the reasoning text or preserved session state. If the "
+        "9. Infer 'partial_dump' from the reasoning text or preserved session state. If the "
         "reasoning mentions '[PARTIAL DUMP]' in sys output or explicitly says the vmcore is "
         "partial, set partial_dump='partial'. If the reasoning states the dump is complete, set "
         "partial_dump='full'. Otherwise preserve any explicitly stated prior value or leave it "
         "as 'unknown' when dump completeness is not yet established.\n"
-        "8. Update 'active_hypotheses': list all hypotheses mentioned in the reasoning "
+        "10. Update 'active_hypotheses': list all hypotheses mentioned in the reasoning "
         "with their current status (leading/candidate/weakened/ruled_out) and optional rank "
         "(1=highest priority). Only one hypothesis may have status='leading'.\n"
-        "9. Reconstruct 'gates': infer each gate's status solely from evidence explicitly "
+        "11. Reconstruct 'gates': infer each gate's status solely from evidence explicitly "
         "stated in the reasoning text. Use gate names from the Gate Catalog in §1.1a. "
         "Only include gates whose required_for list contains the current signature_class. "
         "For each check confirmed in the reasoning (e.g., 'bt -f shows clean frames', "
@@ -1964,7 +1994,7 @@ def structure_reasoning_prompt() -> str:
         "'closed' with the confirming statement as the evidence field value. "
         "If the reasoning explicitly marks a gate as blocked or n/a, reflect that status. "
         "Gates not mentioned or confirmed in the reasoning remain 'open'.\n"
-        "10. CRITICAL: If is_conclusive=true, ALL required gates for signature_class must have "
+        "12. CRITICAL: If is_conclusive=true, ALL required gates for signature_class must have "
         "status='closed' or 'n/a'. If any required gate is still 'open', set "
         "is_conclusive=false and continue analysis instead.\n"
         "{force_conclusion}\n\n"

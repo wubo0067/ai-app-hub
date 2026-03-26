@@ -171,10 +171,10 @@ def create_agent_graph(llm, tools_list: List, structured_llm=None):
         builder.add_conditional_edges(
             structure_reasoning_node,
             should_continue,
-            [crash_tool_node, "__end__"],
+            [crash_tool_node, llm_analysis_node, "__end__"],
         )
         logger.debug(
-            f"Added conditional edge: {structure_reasoning_node} -> [crash_tool_node, __end__]"
+            f"Added conditional edge: {structure_reasoning_node} -> [crash_tool_node, llm_analysis_node, __end__]"
         )
 
     # 条件边 3：crash_tool_node 执行完毕后，检查是否是最后一步

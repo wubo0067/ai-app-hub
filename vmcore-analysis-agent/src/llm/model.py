@@ -90,7 +90,7 @@ def create_reasoning_llm():
             api_key=SecretStr(str(api_key)),
             base_url=str(base_url),
             model=str(model_name),
-            max_tokens=8192,
+            max_tokens=48000,  # Reasoner 模型的 max_tokens 同时包含 reasoning_tokens + content_tokens，需要足够大
             top_p=0.1,  # 使用低随机性设置，适合代码生成和事实回答
             presence_penalty=0,  # 不需要模型通过增加多样性来“换个说法”，我们需要的是精确的原始符号
             temperature=temperature,  # https://api-docs.deepseek.com/zh-cn/quick_start/parameter_settings

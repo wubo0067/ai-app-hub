@@ -304,6 +304,8 @@ async def call_crash_tool(state: AgentState) -> dict:
 
     此节点从 LLM 的响应中提取所有工具调用请求，并发执行对应的 crash 命令，
     并为每个调用生成对应的 ToolMessage 返回给 LLM。
+    包含命令去重检测：如果本次命令的实质部分（排除 mod -s 前缀）与历史已执行命令完全一致，
+    则直接返回历史输出而不重复执行。
 
     Args:
         state: AgentState，包含 LLM 的工具调用请求
@@ -316,6 +318,23 @@ async def call_crash_tool(state: AgentState) -> dict:
 
     last_message = state["messages"][-1]
     tool_messages = []
+
+    # ---- 构建历史已执行命令的指纹集合 ----
+    # 从 ToolMessage 中提取之前执行过的实质命令（去除 mod -s 前缀）
+    prior_tool_outputs: dict[str, str] = {}  # fingerprint -> output content
+    for msg in state["messages"][:-1]:  # 排除最后一条消息（即当前 AIMessage）
+        if isinstance(msg, ToolMessage) and isinstance(msg.content, str):
+            # 从 ToolMessage 内容中提取 "crash> <cmd>" 行来识别已执行命令
+            content = msg.content
+            executed_cmds = []
+            for line in content.splitlines():
+                if line.startswith("crash> "):
+                    executed_cmds.append(line[7:].strip())
+            # 对于 run_script，生成去除 mod -s 行的指纹
+            substantive_cmds = [c for c in executed_cmds if not c.startswith("mod -s ")]
+            if substantive_cmds:
+                fingerprint = "\n".join(substantive_cmds)
+                prior_tool_outputs[fingerprint] = content
 
     # 提取所有工具调用的命令，准备批量执行
     # 为了后续能将结果匹配回 tool_call_id，我们需要维护一个映射或顺序
@@ -336,6 +355,45 @@ async def call_crash_tool(state: AgentState) -> dict:
                     else str(args)
                 )
                 full_cmd = f"{name} {args_str}".strip()
+
+                # ---- 去重检测 ----
+                # 提取本次命令的实质部分用于比对
+                if name == "run_script":
+                    script_content = (
+                        args.get("script", args_str)
+                        if isinstance(args, dict)
+                        else args_str
+                    )
+                    current_substantive = [
+                        line.strip()
+                        for line in script_content.splitlines()
+                        if line.strip() and not line.strip().startswith("mod -s ")
+                    ]
+                else:
+                    current_substantive = [full_cmd]
+
+                current_fingerprint = "\n".join(current_substantive)
+                prior_output = prior_tool_outputs.get(current_fingerprint)
+
+                if prior_output is not None:
+                    # 命令已执行过，直接返回历史输出 + 提示
+                    dedup_msg = (
+                        f"[DEDUP] This command was already executed in a prior step. "
+                        f"Reusing prior output to save budget.\n"
+                        f"---\n{prior_output}"
+                    )
+                    tool_messages.append(
+                        ToolMessage(
+                            content=dedup_msg,
+                            tool_call_id=tool_call_id,
+                            name=name,
+                        )
+                    )
+                    logger.warning(
+                        f"Command deduplication: '{current_fingerprint[:80]}...' already executed. "
+                        f"Returning cached output instead of re-executing."
+                    )
+                    continue
 
                 tool_calls_data.append((tool_call_id, name, full_cmd))
                 commands_to_run.append(full_cmd)

@@ -166,7 +166,7 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
 
         reasoning_content = raw_message.additional_kwargs.get("reasoning_content")
         if reasoning_content:
-            logger.debug(f"reasoning_content: {reasoning_content[:100]}...")
+            logger.debug(f"reasoning_content: {reasoning_content}...")
         else:
             logger.warning(
                 f"No reasoning_content found in additional_kwargs. additional_kwargs keys: {raw_message.additional_kwargs.keys()}"
@@ -237,6 +237,7 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
         )
 
     system_prompt = structure_reasoning_prompt().format(
+        current_step=current_step,
         force_conclusion=force_conclusion,
         schema_json=schema_json,
         reasoning=reasoning,
@@ -273,6 +274,9 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
                 f"Chat model failed to structure reasoning. "
                 f"Raw: {repr(raw_chat_message.content[:200])}"
             )
+
+        # 强制覆盖 step_id 为当前实际步数，chat 模型可能输出错误值
+        analysis_result.step_id = current_step
 
         logger.info(
             f"structure_reasoning_node: Successfully structured reasoning content. "

@@ -154,13 +154,17 @@ static int dma_corruption_thread(void *data)
 
     if (!corrupt_page_struct) {
         pr_emerg("trigger via corrupted function pointer\n");
+        /*
+         * 函数指针地址被破坏了，调用它会导致内核崩溃
+         */
         victim->fn(); // crash
     }
 
-    /* ================= 模式 B：page struct 污染 ================= */
-    // 调用 virt_to_page 宏，将 victim 对象的内核虚拟地址转换为管理这块内存的 struct page 描述地址
-    // victim 是一个内核虚拟地址，该虚拟地址由内存管理子系统分配，并映射到某个物理内存页上。
-    // 内核为每一个物理内存都维护一个名为 struct page 的元数据结构，来追踪这个页的状态
+    /* ================= 模式 B：page struct 污染 =================
+    *调用 virt_to_page 宏，将 victim 对象的内核虚拟地址转换为管理这块内存的 struct page 描述地址
+    *victim 是一个内核虚拟地址，该虚拟地址由内存管理子系统分配，并映射到某个物理内存页上。
+    *内核为每一个物理内存都维护一个名为 struct page 的元数据结构，来追踪这个页的状态
+    */
     victim_page = virt_to_page(victim);
 
     pr_emerg("corrupting struct page at %px\n", victim_page);
