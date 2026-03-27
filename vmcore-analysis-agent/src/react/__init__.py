@@ -19,6 +19,7 @@ from .schema import (
     SuspectCode,
     ToolCall,
     VMCoreAnalysisStep,
+    VMCoreLLMAnalysisStep,
 )
 
 __all__ = [
@@ -38,4 +39,5 @@ __all__ = [
     "Hypothesis",
     "GateEntry",
     "VMCoreAnalysisStep",
+    "VMCoreLLMAnalysisStep",
 ]

@@ -6,13 +6,45 @@
 
 import json
 import re
-from typing import Any
+from typing import Any, TypeVar
 
 from json_repair import repair_json
+from pydantic import BaseModel
 
 from src.utils.logging import logger
 
 from .schema import VMCoreAnalysisStep
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
+
+
+def _normalize_root_cause_class(content_str: str) -> str:
+    """
+    在 JSON 解析前对 root_cause_class 字段进行语义归一化。
+    将常见的别名映射到合法的枚举值，避免因 schema 严格验证导致的解析失败。
+    """
+    # 定义常见别名到合法值的映射
+    alias_mapping = {
+        "pointer_corruption": "wild_pointer",  # pointer_corruption 更接近 wild_pointer 的语义
+        "corruption": "memory_corruption",
+        "memory_error": "memory_corruption",
+        "address_corruption": "wild_pointer",
+        "invalid_pointer": "wild_pointer",
+    }
+
+    # 使用正则表达式匹配并替换 root_cause_class 字段值
+    for alias, canonical in alias_mapping.items():
+        # 匹配 "root_cause_class": "pointer_corruption" 这样的模式
+        pattern = r'("root_cause_class"\s*:\s*")' + re.escape(alias) + r'"'
+        replacement = r"\1" + canonical + r'"'
+        content_str = re.sub(pattern, replacement, content_str)
+
+        # 也处理 null 值的情况（虽然不太可能）
+        pattern_null = r'("root_cause_class"\s*:\s*)null'
+        replacement_null = r'\1"' + canonical + r'"'
+        # 只在特定上下文中替换 null，避免误替换
+
+    return content_str
 
 
 def select_analysis_content(
@@ -41,8 +73,24 @@ def repair_analysis_step(
     *,
     log_prefix: str = "",
 ) -> VMCoreAnalysisStep | None:
-    """尝试从原始 LLM 文本中修复并恢复 VMCoreAnalysisStep。"""
+    return repair_structured_output(
+        content_str,
+        model_class=VMCoreAnalysisStep,
+        log_prefix=log_prefix,
+    )
+
+
+def repair_structured_output(
+    content_str: str,
+    *,
+    model_class: type[ModelT],
+    log_prefix: str = "",
+) -> ModelT | None:
+    """尝试从原始 LLM 文本中修复并恢复指定的结构化模型。"""
     repaired_prefix = f"{log_prefix}: " if log_prefix else ""
+
+    # 在任何修复尝试之前，先进行语义归一化
+    content_str = _normalize_root_cause_class(content_str)
 
     try:
         repaired_obj = repair_json(content_str, return_objects=True)
@@ -57,7 +105,7 @@ def repair_analysis_step(
                 "%sSuccessfully repaired malformed JSON from LLM using json_repair.",
                 repaired_prefix,
             )
-            return VMCoreAnalysisStep.model_validate(repaired_obj)
+            return model_class.model_validate(repaired_obj)
     except Exception as exc:
         logger.debug(
             "%sjson_repair failed: '%s', falling back to manual fix",
@@ -69,7 +117,9 @@ def repair_analysis_step(
         fixed_content = _extract_outer_json_object(content_str)
         fixed_content = _normalize_invalid_escapes(fixed_content)
         fixed_content = _inject_missing_arguments_field(fixed_content)
-        result = VMCoreAnalysisStep.model_validate_json(fixed_content)
+        # 再次应用语义归一化，确保手动修复后的内容也被处理
+        fixed_content = _normalize_root_cause_class(fixed_content)
+        result = model_class.model_validate_json(fixed_content)
         logger.warning(
             "%sSuccessfully repaired malformed JSON from LLM (manual fix). Original: %s... Fixed: %s...",
             repaired_prefix,
@@ -83,7 +133,7 @@ def repair_analysis_step(
 
 
 def build_tool_calls(
-    analysis_result: VMCoreAnalysisStep,
+    analysis_result,
     *,
     is_last_step: bool,
     log_prefix: str = "",

@@ -211,6 +211,15 @@ async def analyze_vmcore(request: VmcoreAnalysisRequest):
             "token_usage": 0,
             "is_last_step": False,
             "agent_answer": "",
+            "executed_fingerprints": [],
+            "tool_output_cache": {},
+            "managed_active_hypotheses": None,
+            "managed_gates": None,
+            "current_signature_class": None,
+            "current_root_cause_class": None,
+            "current_partial_dump": None,
+            "crash_path_struct_offsets": None,
+            "struct_layout_cache": {},
             "error": None,
         }
 
@@ -306,6 +315,15 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
                 "token_usage": 0,
                 "is_last_step": False,
                 "agent_answer": "",
+                "executed_fingerprints": [],
+                "tool_output_cache": {},
+                "managed_active_hypotheses": None,
+                "managed_gates": None,
+                "current_signature_class": None,
+                "current_root_cause_class": None,
+                "current_partial_dump": None,
+                "crash_path_struct_offsets": None,
+                "struct_layout_cache": {},
                 "error": None,
             }
 

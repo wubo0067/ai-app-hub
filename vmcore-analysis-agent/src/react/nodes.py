@@ -15,6 +15,7 @@ VMCore 分析 Agent 节点实现
 """
 
 import asyncio
+import json
 import re
 from typing import List, Tuple, Any
 
@@ -23,6 +24,14 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from src.utils.logging import logger
 from .graph_state import AgentState
 from .prompts import crash_init_data_prompt
+from .action_guard import (
+    build_command_fingerprint,
+    extract_crash_path_struct_offsets,
+    build_fingerprint_from_lines,
+    extract_struct_layouts,
+    extract_command_lines,
+    validate_tool_call_request,
+)
 from src.mcp_tools.crash.client import crash_client
 
 # =========================================================================
@@ -318,28 +327,28 @@ async def call_crash_tool(state: AgentState) -> dict:
 
     last_message = state["messages"][-1]
     tool_messages = []
+    allow_bt_a = False
 
-    # ---- 构建历史已执行命令的指纹集合 ----
-    # 从 ToolMessage 中提取之前执行过的实质命令（去除 mod -s 前缀）
-    prior_tool_outputs: dict[str, str] = {}  # fingerprint -> output content
-    for msg in state["messages"][:-1]:  # 排除最后一条消息（即当前 AIMessage）
-        if isinstance(msg, ToolMessage) and isinstance(msg.content, str):
-            # 从 ToolMessage 内容中提取 "crash> <cmd>" 行来识别已执行命令
-            content = msg.content
-            executed_cmds = []
-            for line in content.splitlines():
-                if line.startswith("crash> "):
-                    executed_cmds.append(line[7:].strip())
-            # 对于 run_script，生成去除 mod -s 行的指纹
-            substantive_cmds = [c for c in executed_cmds if not c.startswith("mod -s ")]
-            if substantive_cmds:
-                fingerprint = "\n".join(substantive_cmds)
-                prior_tool_outputs[fingerprint] = content
+    if isinstance(last_message, AIMessage) and isinstance(last_message.content, str):
+        try:
+            parsed_content = json.loads(last_message.content)
+            allow_bt_a = parsed_content.get("signature_class") == "hard_lockup"
+        except (TypeError, json.JSONDecodeError):
+            logger.debug(
+                "Failed to decode AIMessage content for executor guard context; bt -a will remain forbidden."
+            )
+
+    prior_fingerprints = set(state.get("executed_fingerprints", []))
+    prior_tool_outputs = dict(state.get("tool_output_cache", {}))
+    crash_path_struct_offsets = state.get("crash_path_struct_offsets")
+    struct_layout_cache = dict(state.get("struct_layout_cache", {}))
 
     # 提取所有工具调用的命令，准备批量执行
     # 为了后续能将结果匹配回 tool_call_id，我们需要维护一个映射或顺序
-    tool_calls_data = []  # List[(tool_call_id, tool_name, command_string)]
+    tool_calls_data = []  # List[(tool_call_id, tool_name, command_string, fingerprint)]
     commands_to_run = []  # List[str]
+    new_tool_output_cache: dict[str, str] = {}
+    new_fingerprints: list[str] = []
 
     try:
         if isinstance(last_message, AIMessage) and last_message.tool_calls:
@@ -356,31 +365,42 @@ async def call_crash_tool(state: AgentState) -> dict:
                 )
                 full_cmd = f"{name} {args_str}".strip()
 
-                # ---- 去重检测 ----
-                # 提取本次命令的实质部分用于比对
-                if name == "run_script":
-                    script_content = (
-                        args.get("script", args_str)
-                        if isinstance(args, dict)
-                        else args_str
+                validation_error = validate_tool_call_request(
+                    name,
+                    args,
+                    allow_bt_a=allow_bt_a,
+                    observed_struct_offsets=crash_path_struct_offsets,
+                    struct_layout_cache=struct_layout_cache,
+                )
+                if validation_error is not None:
+                    tool_messages.append(
+                        ToolMessage(
+                            content=f"[executor-guard] Rejected action: {validation_error}",
+                            tool_call_id=tool_call_id,
+                            name=name,
+                        )
                     )
-                    current_substantive = [
-                        line.strip()
-                        for line in script_content.splitlines()
-                        if line.strip() and not line.strip().startswith("mod -s ")
-                    ]
-                else:
-                    current_substantive = [full_cmd]
+                    logger.warning(
+                        "Executor guard rejected tool call %s (ID: %s): %s",
+                        name,
+                        tool_call_id,
+                        validation_error,
+                    )
+                    continue
 
-                current_fingerprint = "\n".join(current_substantive)
+                # ---- 去重检测 ----
+                current_fingerprint = build_command_fingerprint(name, args)
                 prior_output = prior_tool_outputs.get(current_fingerprint)
 
-                if prior_output is not None:
+                if current_fingerprint and (
+                    current_fingerprint in prior_fingerprints
+                    or prior_output is not None
+                ):
                     # 命令已执行过，直接返回历史输出 + 提示
                     dedup_msg = (
                         f"[DEDUP] This command was already executed in a prior step. "
                         f"Reusing prior output to save budget.\n"
-                        f"---\n{prior_output}"
+                        f"---\n{prior_output or '[DEDUP] Fingerprint found in state, but no cached output was retained.'}"
                     )
                     tool_messages.append(
                         ToolMessage(
@@ -395,7 +415,18 @@ async def call_crash_tool(state: AgentState) -> dict:
                     )
                     continue
 
-                tool_calls_data.append((tool_call_id, name, full_cmd))
+                current_lines = extract_command_lines(name, args)
+                logger.debug(
+                    "Validated tool call %s (ID: %s): lines=%s, fingerprint=%s",
+                    name,
+                    tool_call_id,
+                    current_lines,
+                    current_fingerprint,
+                )
+
+                tool_calls_data.append(
+                    (tool_call_id, name, full_cmd, current_fingerprint)
+                )
                 commands_to_run.append(full_cmd)
 
                 logger.debug(
@@ -408,7 +439,12 @@ async def call_crash_tool(state: AgentState) -> dict:
                 # matched_results 是 List[(cmd, output)]，只包含成功匹配并执行的结果
 
                 # 将结果映射回 ToolMessage
-                for tool_call_id, tool_name, original_cmd in tool_calls_data:
+                for (
+                    tool_call_id,
+                    tool_name,
+                    original_cmd,
+                    fingerprint,
+                ) in tool_calls_data:
                     found_result = False
 
                     # 在执行结果中查找匹配的命令
@@ -426,6 +462,22 @@ async def call_crash_tool(state: AgentState) -> dict:
                                     name=tool_name,
                                 )
                             )
+                            if fingerprint:
+                                prior_tool_outputs[fingerprint] = content
+                                new_tool_output_cache[fingerprint] = content
+                                if fingerprint not in prior_fingerprints:
+                                    prior_fingerprints.add(fingerprint)
+                                    new_fingerprints.append(fingerprint)
+
+                            observed_offsets = extract_crash_path_struct_offsets(
+                                content
+                            )
+                            if observed_offsets:
+                                crash_path_struct_offsets = observed_offsets
+
+                            discovered_layouts = extract_struct_layouts(content)
+                            if discovered_layouts:
+                                struct_layout_cache.update(discovered_layouts)
                             found_result = True
                             # 找到一个就可以停止内层循环，进入下一个 tool_call
                             # 实际上这可以处理重复命令的情况：每个 tool_call 都能匹配到结果
@@ -453,5 +505,12 @@ async def call_crash_tool(state: AgentState) -> dict:
     return {
         "step_count": 1,
         "messages": tool_messages,
+        "executed_fingerprints": new_fingerprints,
+        "tool_output_cache": {
+            **state.get("tool_output_cache", {}),
+            **new_tool_output_cache,
+        },
+        "crash_path_struct_offsets": crash_path_struct_offsets,
+        "struct_layout_cache": struct_layout_cache,
         "error": None,
     }

@@ -3,7 +3,6 @@ import unittest
 
 from src.react import VMCoreAnalysisStep
 
-
 HARD_LOCKUP_SAMPLE = {
     "step_id": 18,
     "reasoning": "hard lockup convergence sample",
@@ -192,7 +191,7 @@ class VMCoreAnalysisStepRegressionTests(unittest.TestCase):
         model = VMCoreAnalysisStep.model_validate(payload)
         self.assertEqual(model.signature_class, "soft_lockup")
 
-    def test_conclusive_missing_new_gate_is_autofilled(self) -> None:
+    def test_conclusive_missing_new_gate_is_not_autofilled(self) -> None:
         payload = {
             "step_id": 5,
             "reasoning": "missing gate sample",
@@ -215,7 +214,7 @@ class VMCoreAnalysisStepRegressionTests(unittest.TestCase):
         }
         model = VMCoreAnalysisStep.model_validate(payload)
         self.assertEqual(model.root_cause_class, "divide_error")
-        self.assertEqual(model.gates["divisor_validation"].status, "n/a")
+        self.assertIsNone(model.gates)
 
 
 if __name__ == "__main__":

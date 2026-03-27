@@ -11,6 +11,13 @@ from langgraph.graph import MessagesState
 from langgraph.managed import IsLastStep
 from operator import add
 
+from .schema import (
+    CrashSignatureClass,
+    GateEntry,
+    Hypothesis,
+    PartialDumpStatus,
+    RootCauseClass,
+)
 
 # def add_and_trim_messages(
 #     left: list[AnyMessage], right: Union[list[AnyMessage], AnyMessage]
@@ -77,5 +84,17 @@ class AgentState(MessagesState):
     reasoning_additional_kwargs: Optional[dict]
     # 分析结果
     agent_answer: str
+    # 已执行命令指纹集合（append-only，读取时按 set 视角使用）
+    executed_fingerprints: Annotated[list[str], add]
+    # 指纹到最近一次工具输出的缓存，用于 executor 去重复用
+    tool_output_cache: dict[str, str]
+    # managed analysis state
+    managed_active_hypotheses: Optional[list[Hypothesis]]
+    managed_gates: Optional[dict[str, GateEntry]]
+    current_signature_class: Optional[CrashSignatureClass]
+    current_root_cause_class: Optional[RootCauseClass]
+    current_partial_dump: Optional[PartialDumpStatus]
+    crash_path_struct_offsets: Optional[list[int]]
+    struct_layout_cache: dict[str, dict[str, object]]
     # 错误状态
     error: Optional[AgentError]

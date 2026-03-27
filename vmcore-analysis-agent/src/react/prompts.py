@@ -19,7 +19,7 @@ Identify the root cause of the kernel crash: the faulty subsystem/driver, failur
 
 - **User-Provided Initial Context**: Baseline crash info (sys, bt, vmcore-dmesg, third-party module paths) supplied before tool actions.
 - **Diagnostic Evidence**: A concrete observation (from initial context or tool output) that supports or rejects a hypothesis.
-- **Hypothesis**: A candidate explanation; may be `leading`, `candidate`, `weakened`, or `ruled_out`.
+- **Alternative Explanation**: A competing candidate explanation that may be promoted, weakened, or ruled out as evidence accumulates.
 - **Root Cause**: The most probable underlying fault mechanism — not the panic site or last faulting instruction.
 - **Final Diagnosis**: The structured conclusive output in `final_diagnosis`.
 - **Execution Context**: Runtime crash context: process, idle, IRQ, softirq, NMI, or atomic.
@@ -64,7 +64,9 @@ Each step: (1) Reason about current evidence → (2) Identify missing informatio
 | `$(...)` `$((...))` `$VAR` in any crash argument | Evaluate in reasoning; use literal hex result |
 | `%gs:0x1440` `(%rax)` `%rip+0x20` `$rbx` (register/segment syntax) | Compute numeric address first (§1.9) |
 | `rd -x` / `ptov` / `struct -o` with no address or type | Must include required operand |
-| `struct -o` before type name (e.g., `struct -o task_struct`) | Must be `struct <type> -o` |
+| `rd -x <addr>+<offset> <count>` or `rd <addr>+<offset> <count>` | Pre-compute the final literal address first, then issue `rd` with that literal |
+| `struct <type> -o` | Must be `struct -o <type>` |
+| `struct -o \| grep -i <pattern>` or any piped `struct` discovery | Use a concrete type name directly; never pipe `struct` output |
 | `kmem -p <kernel_VA>` (`0xffff...`) | `vtop <VA>` first to get PA, then `kmem -p <PA>` |
 | `0x0` or NULL as address in `struct`/`rd` | Report NULL as diagnostic finding; do not read it |
 | VA exceeding 16 hex chars (e.g., `ff73d8e1c09baacf8`) | Extract exactly 16 chars, pad with leading zeros |
@@ -77,12 +79,14 @@ Each step: (1) Reason about current evidence → (2) Identify missing informatio
 - ❌ `intel_iommu=on` interpreted as Passthrough mode (see §3.12.1)
 - ❌ `root_cause` set to DMA without payload fingerprint (§3.12.2 Sub-step A) OR DMA range overlap (§3.12.2 Sub-step B)
 - ❌ `high` confidence for DMA without BOTH fingerprint AND range overlap confirmed
-- ❌ Using `struct <module_type>` in a new `run_script` without `mod -s`
+- ❌ Using `struct -o <module_type>` in a new `run_script` without `mod -s`
 - ❌ Retrying a command that already failed (seek error, symbol not found, etc.)
 - ❌ Loading `mod -s` then concluding before using any module symbols
 - ❌ Re-disassembling the same function or re-reading the same bucket after register provenance is closed
 - ❌ Searching module `.text`/`.data` segments for DMA buffer content (module text ≠ DMA buffers)
 - ❌ Re-validating a physical address already confirmed reserved via `kmem -p`
+- ❌ Treating a type as validated just because `struct -o <type>` succeeds; symbol existence does NOT prove the runtime object has that type
+- ❌ Interpreting fields from `struct <type> <addr>` when disassembly already accessed offsets beyond that type's `SIZE`
 - ❌ **Producing reasoning that ignores or fails to reference the latest ToolMessage output.** Every non-first step MUST begin reasoning with "What did I just learn from the tool output?" If your reasoning does not reference specific data from the most recent tool result, you are reasoning in a loop.
 - ❌ **Emitting an action identical to a prior step's action.** If `dis -rl <addr>` or any other command already appeared in a prior ToolMessage, you MUST use that output — not re-execute it.
 
@@ -97,7 +101,12 @@ Each step: (1) Reason about current evidence → (2) Identify missing informatio
 ================================================================================
 
 ## 1.1 JSON Output Rules
-Respond ONLY with valid JSON matching VMCoreAnalysisStep schema.
+Respond ONLY with valid JSON matching the minimal structured-output schema.
+
+**Minimal-output contract**:
+- Return only the fields defined in the provided schema.
+- `active_hypotheses` and `gates` are executor-managed internal state and MUST NOT appear in your JSON.
+- Do not invent bookkeeping fields beyond the schema.
 
 **Ongoing analysis step** (non-conclusive):
 ```json
@@ -109,14 +118,6 @@ Respond ONLY with valid JSON matching VMCoreAnalysisStep schema.
   "signature_class": "<null at step 1; concrete by step 2 — see §1.1a>",
   "root_cause_class": "<null or concrete>",
   "partial_dump": "<unknown at step 1; 'full' or 'partial' from step 2>",
-  "active_hypotheses": [
-    {{{{"id": "H1", "label": "<UAF|null_deref|...>", "status": "leading", "evidence": "<one sentence>"}}}},
-    {{{{"id": "H2", "label": "<...>", "status": "candidate", "evidence": null}}}}
-  ],
-  "gates": {{{{
-    "register_provenance": {{{{"required_for": ["pointer_corruption", "null_deref"], "status": "open", "evidence": null}}}},
-    "object_lifetime":     {{{{"required_for": ["pointer_corruption", "use_after_free"], "status": "open", "evidence": null}}}}
-  }}}},
   "final_diagnosis": null,
   "fix_suggestion": null,
   "confidence": null,
@@ -124,7 +125,7 @@ Respond ONLY with valid JSON matching VMCoreAnalysisStep schema.
 }}}}
 ```
 
-When conclusive: set `is_conclusive: true`, populate `final_diagnosis`, set a concrete `root_cause_class`, ensure ALL required gates are `"closed"` or `"n/a"` (see §1.1a Gate Completion Rule).
+When conclusive: set `is_conclusive: true`, populate `final_diagnosis`, and set a concrete `root_cause_class` whenever the evidence supports one.
 
 ### Reasoning Field Discipline
 
@@ -149,7 +150,7 @@ Default: 3–6 short sentences. Do NOT restate already-established facts. Do NOT
 **Schema Definition**:
 {VMCoreAnalysisStep_Schema}
 
-## 1.1a Signature Class, Root Cause Class, Hypotheses & Gates
+## 1.1a Signature Class and Root Cause Class
 
 ### A. Crash Signature Decision Table (set at step 2)
 
@@ -173,63 +174,22 @@ Default: 3–6 short sentences. Do NOT restate already-established facts. Do NOT
 | "Machine Check Exception" | `mce` |
 | "general protection fault" | `general_protection_fault` |
 
-`signature_class` MUST be `null` at step 1, concrete by step 2. Do NOT use late-stage root causes (`out_of_bounds`, `dma_corruption`, `race_condition`) as `signature_class`; model those as `active_hypotheses` labels.
+`signature_class` MUST be `null` at step 1, concrete by step 2. Do NOT use late-stage root causes (`out_of_bounds`, `dma_corruption`, `race_condition`) as `signature_class`.
 
 ### B. Root Cause Class
 
 `root_cause_class` represents the **underlying cause**, not the panic entry signature. May remain `null` during investigation. By the final step: concrete (`use_after_free`, `out_of_bounds`, `race_condition`, `deadlock`, `dma_corruption`, `iommu_fault`, `mce`, `warn_on`, `divide_error`, `invalid_opcode`, `oom_panic`, or `unknown`). MUST NOT simply mirror `signature_class` unless genuinely appropriate.
 
-### C. Active Hypotheses (mandatory from step 2, updated every step)
+### C. Executor-Managed Verification State
 
-`status` values: `leading` (best-supported; only ONE at a time), `candidate`, `weakened`, `ruled_out` (populate `evidence` with reason).
+Internal verification checkpoints and alternative-explanation tracking are maintained by the executor, not by the LLM JSON payload.
 
-### D. Gate Catalog
+Your responsibility is:
+- reflect the latest evidence clearly in `reasoning`
+- update `signature_class`, `root_cause_class`, and `partial_dump` when justified
+- choose the next most diagnostic action or conclude when the evidence chain is sufficient
 
-Gates track mandatory verification checkpoints before `is_conclusive: true`.
-**Include only gates whose `required_for` list contains the current `signature_class`.**
-
-The `evidence` field of each gate MUST be populated with the specific tool output or
-observation that satisfied the gate — not a summary statement like "gate closed".
-
-| Gate name | `required_for` | Closure standard (what to put in `evidence`) |
-|-----------|---------------|----------------------------------------------|
-| `register_provenance` | pointer_corruption, null_deref, general_protection_fault, use_after_free | Last writer of suspect register identified: instruction address + load source. E.g. "RCX last written at +0x28 via `mov 0x10(%r13),%rcx`; r13=0xffff..." |
-| `object_lifetime` | pointer_corruption, use_after_free | `kmem -S <addr>` result: state (ALLOCATED/FREE), slab cache name. E.g. "kmem -S 0xffff... → ALLOCATED, cache=dentry" |
-| `local_corruption_exclusion` | pointer_corruption | **ALL FIVE sub-checks (S1–S5 from §2.3 Stage 5) must be addressed in evidence field**: S1: stack overflow excluded (`bt -f` clean, `thread_info.cpu` matches); S2: UAF excluded (`kmem -S` ALLOCATED, no poison); S3: struct field OOB excluded (Step 5b+ completed); S4: register provenance closed (last writer traced, mismatch reconciled); S5: MCE/HW excluded (`log -m \| grep -iE "mce\|edac"` clean). Evidence must cite specific tool output for each sub-check, not a generic statement. A gate set to `closed` with fewer than 5 sub-checks addressed is a Protocol Violation. |
-| `external_corruption_gate` | pointer_corruption | **prerequisite**: `local_corruption_exclusion` must be `closed` first. Then: IOMMU mode confirmed from dmesg/cmdline; DMA range vs faulting PA overlap assessed; active device DMA context identified or excluded. E.g. "IOMMU: intel_iommu=on without iommu=pt → translation enabled; DMA as primary hypothesis capped at LOW confidence" |
-| `stack_integrity` | soft_lockup, atomic_sleep, bug_on | `bt -f` result: frames clean (all return addresses in kernel text); `thread_info.cpu` value matches bt CPU= field. E.g. "bt -f: all frames canonical; thread_info.cpu=3 matches CPU#3" |
-| `warning_site` | warn_on | Exact warning site identified from dmesg/backtrace, including function or source line. E.g. "WARNING at mm/page_alloc.c:1234 via __alloc_pages_nodemask+0x..." |
-| `warning_timeline` | warn_on | Relationship between warning and fatal path established from dmesg timeline and subsystem match. E.g. "Warning fired 200 ms before panic in same netfs path; treated as trigger rather than unrelated taint noise" |
-| `lock_holder` | soft_lockup, rcu_stall | Lock holder PID/task identified and its bt obtained. E.g. "mutex owner=ffff...(pid=1234, comm=kworker); bt 1234 shows held at ..." |
-| `nmi_watchdog_evidence` | hard_lockup | Hard-lockup watchdog evidence confirmed from panic string/dmesg and all-CPU backtraces collected. E.g. "NMI watchdog fired on CPU 7; bt -a captured spinning CPU and peer CPUs waiting on same lock" |
-| `cpu_progress_state` | hard_lockup | Stuck CPU made no forward progress and current spin/interrupt state was identified. E.g. "runq shows runnable pile-up; bt -a shows CPU 7 looping in raw_spin_lock with interrupts disabled" |
-| `rcu_stall_trace` | rcu_stall | Stalled task path from bt; `rcu_read_lock` nesting depth; blocking call or long loop within read-side critical section identified. |
-| `blocked_task_context` | hung_task | Blocked task PID/comm, wait state, and blocking object or wait site identified. E.g. "task 1234 in D state waiting on mutex 0xffff... from ext4_writepages" |
-| `wait_chain` | hung_task | Wait chain classified as deadlock, starvation, or I/O hang with supporting owner/path evidence. E.g. "mutex owner pid=88; bt 88 shows waiting on journal lock -> circular wait confirmed" |
-| `divisor_validation` | divide_error | Faulting `div`/`idiv` instruction and zero divisor register/value confirmed. E.g. "dis -rl RIP shows idiv %ecx; bt/registers show ECX=0" |
-| `opcode_site` | invalid_opcode | Faulting invalid opcode site identified and classified (e.g. `ud2`, unsupported instruction, trap macro). E.g. "dis -rl RIP shows ud2 in WARN_ON path at drivers/..." |
-| `oom_context` | oom_panic | OOM panic context established: global vs memcg, panic_on_oom setting, and victim selection context. E.g. "panic_on_oom=1; dmesg shows global OOM followed by panic instead of kill-only recovery" |
-| `memory_pressure` | oom_panic | Memory exhaustion confirmed from dmesg snapshot and/or `kmem -i`, with dominant consumer or limit identified. E.g. "MemAvailable near zero; slab cache xfs_inode dominates; memcg limit hit for container foo" |
-| `mce_log` | mce | MCE bank number, MCACOD/MSCOD bits decoded, affected memory range from dmesg. E.g. "Bank 4: MCACOD=0x0135 (memory controller); UE on DIMM slot A1" |
-| `edac_evidence` | mce | EDAC CE/UE event count and DIMM location from `log -m \| grep -i edac`; or explicit "no EDAC events found" if absent. |
-
-Gate `status` values:
-- `open` — not yet investigated
-- `closed` — verified (populate `evidence` field with specific tool output)
-- `blocked` — prerequisite gate not yet closed (set for `external_corruption_gate` while `local_corruption_exclusion` is open)
-- `n/a` — genuinely not applicable; **MUST** explain why in the `evidence` field
-
-### E. Gate Completion Rule (MANDATORY)
-
-**Before setting `is_conclusive: true`**, ALL gates whose `required_for` list contains the
-current `signature_class` MUST have `status: "closed"` or `"n/a"`.
-
-Setting `is_conclusive: true` with any required gate still `"open"` is a **Protocol Violation**.
-
-**Prerequisite enforcement**: `external_corruption_gate.prerequisite = "local_corruption_exclusion"`.
-Set `external_corruption_gate.status = "blocked"` until `local_corruption_exclusion.status = "closed"`.
-This structurally encodes the "no DMA escalation before local causes excluded" constraint
-(§1.3 Rule C, §2.3 Stage 5). The detailed exclusion logic remains in §2.3 Stage 5 and §3.12.
+Do NOT emit any explicit gate bookkeeping or hypothesis arrays in JSON. If local-corruption exclusion, register provenance, object lifetime, or DMA attribution changed, describe that progress in plain language inside `reasoning`.
 
 ## 1.1b Partial Dump Handling (MANDATORY)
 
@@ -306,7 +266,7 @@ Q: "Has this exact command (or substantial equivalent) appeared in any prior Too
 **Violation consequence**: Repeating a command that already succeeded is a Protocol Violation equivalent to a wasted step. The system enforces this by intercepting duplicate commands and returning a dedup notice instead of re-executing.
 
 ### Query Efficiency
-Use `struct <type> -o` immediately when offsets are needed. Never run `struct <type>` followed by `struct <type> -o`.
+Use `struct -o <type>` immediately when offsets are needed. Never run `struct <type>` followed by `struct -o <type>`.
 
 If a module symbol/type is involved, the action MUST be `run_script` with `mod -s` first (§1.4). Do NOT emit standalone `struct/dis/sym` for module types.
 
@@ -320,11 +280,19 @@ Before emitting any `struct <type>` action, answer all three questions explicitl
 
 **Q3 — Size sanity**: Does the type fit in the slab object? (`kmem -S <addr>` OBJSIZE is the hard upper bound.)
 
-Only after Q1–Q3 are answered:
+**Q4 — Offset coverage**: Does the candidate type cover EVERY offset already used by the faulting code path? Compare the largest offset seen in disassembly with the `SIZE` reported by `struct -o <type>`. If the code reads offset `0x262`, any candidate type with `SIZE <= 0x262` is INVALID for that crash-path pointer.
+
+Only after Q1–Q4 are answered:
 1. `struct <crash_path_type> -o` → all field offsets
 2. `struct <crash_path_type> <crash_address>` → validate every field
 
 Querying a DIFFERENT struct first (including parent/context structs) is a **Protocol Violation**.
+
+**Type-validation hard rules**:
+- `struct -o <type>` succeeding proves only that debug info contains that type. It does NOT prove the runtime object at `<addr>` has that type.
+- If disassembly touches offsets beyond the candidate type's `SIZE`, you MUST reject that type immediately and continue searching for the correct container/object type.
+- Once a candidate type is rejected by offset coverage, you MUST NOT interpret its field values as corruption evidence.
+- Do NOT conclude "the struct is overwritten" from weird field values until the candidate type survives the offset-coverage check.
 
 ### `run_script` Bundling
 
@@ -345,7 +313,7 @@ Action N+1: rd 0xffff8cd9befdb440 1   ← use the LITERAL hex result
 
 **Typed pointer arithmetic trap**: `p /x (ptr_variable + offset)` performs C-scaled arithmetic. Materialize the base as raw hex first, then add byte offset.
 
-**crash DOES support**: `rd ffff888012340000+0x80` (simple addr+offset is valid)
+**Agent rule**: Even if crash itself may accept some simple `addr+offset` forms, this agent forbids emitting address arithmetic directly. Always resolve the final literal address in reasoning first, then issue `rd <literal>` or `rd -x <literal> <count>`.
 
 ### `p → rd` Always Spans TWO Actions
 
@@ -464,7 +432,7 @@ If only flags with no target (e.g., `"ptov"`, `"rd -x"`, `"struct -o"`, `"sym"`)
 | `kmem -i` | `kmem` |
 | `kmem -S <addr>` | `kmem -S` |
 | `kmem -p <PA>` | `kmem -p <VA>` (must be physical) |
-| `struct <type> -o` | `struct -o` |
+| `struct -o <type>` | `struct -o` |
 | `dis -rl <RIP>` | `dis -rl` |
 | `ptov <PA>` | `ptov` |
 | `rd -x <addr> <count>` | `rd -x` |
@@ -514,7 +482,7 @@ Many kernel containers store a link node embedded inside the object (`hlist_bl_n
 - the container object base, OR
 - an embedded member address inside the container
 
-Before interpreting offsets, combine disassembly semantics with `struct <type> -o` and embedded-member offsets. Do NOT reason about fields as if an embedded-node pointer were the object base.
+Before interpreting offsets, combine disassembly semantics with `struct -o <type>` and embedded-member offsets. Do NOT reason about fields as if an embedded-node pointer were the object base.
 
 ## 1.12 Symbol vs Variable Value
 
@@ -548,7 +516,7 @@ For detailed workflows, see the matching section in **PART 3**. Use this table o
 | Panic String Pattern | Likely Cause | Key Register/Value | First Action |
 |---------------------|--------------|-------------------|--------------|
 | "NULL pointer dereference at 0x0000000000000000" | Deref of NULL itself | CR2=0x0 | Check which reg is NULL in `bt` |
-| "NULL pointer dereference at 0x0...00XX" (small offset) | Struct member access via NULL ptr | CR2=offset | `struct <type> -o` to find member at CR2 offset |
+| "NULL pointer dereference at 0x0...00XX" (small offset) | Struct member access via NULL ptr | CR2=offset | `struct -o <type>` to find member at CR2 offset |
 | "paging request at 0xdead000000000100" | SLUB use-after-free (UAF) | Look for 0xdead... | `kmem -S <object_addr>`, check free trace |
 | "paging request at 0x5a5a... / 0x6b6b..." | Poison / freed-memory access | Poison pattern | `kmem -S <addr>`, then follow §3.4 |
 | "paging request at <non-canonical high addr>" | Wild/corrupted pointer or OOB heap write | Non-canonical addr | Check pointer source in caller; `kmem -S` on surrounding slab |
@@ -597,7 +565,7 @@ corresponding gate is met is FORBIDDEN.
 | CR2 Value | Diagnosis Direction |
 |-----------|---------------------|
 | `0x0` | NULL dereference → register provenance analysis |
-| Small offset (`0x10`/`0x18`/`0x20`...) | Struct member via NULL ptr → `struct <type> -o` |
+| Small offset (`0x10`/`0x18`/`0x20`...) | Struct member via NULL ptr → `struct -o <type>` |
 | Canonical slab addr (`0xffff8880...`) | UAF / OOB / double-free → `kmem -S <addr>` |
 | Poison pattern (`0x5a5a...` / `0x6b6b...` / `0xdead...`) | Freed-memory access → UAF path |
 | Non-canonical address | Corrupted pointer / race / write-tear → prioritize software wild-pointer causes first; also consider hardware bit-flip / ECC if data looks random |
@@ -646,7 +614,7 @@ If `dis -rl <RIP>` shows `pause`, `nop`, `sti`, `cli`, `ret`, `hlt`, or any inst
 - **Consistency check**: Treat discrepancy as transient/race/chain-corruption until proven otherwise. Mismatch alone is NOT evidence of DMA or a static overwrite.
 - **Exception-frame RAX** (`mov (%rax),%rax` faults): x86 traps BEFORE writing destination — frame RAX = CR2 (load address). Frame RAX ≠ CR2 means handler modified it; NOT corruption. Confirm via `rd <per_cpu_base + 0x1b440>`.
 - **Register-memory mismatch SOP**: (1) Check embedded-node vs object base (§1.11); (2) verify crash bytes reproducible from current node; (3) inspect downstream chain / adjacent slots; (4) only then consider race/transient/stale-snapshot.
-- **Bucket-mismatch priority**: First ask: embedded node? Could corrupted value come from bytes within that node/container? Priority: `struct <type> -o` → container base → `rd`/`struct` → adjacent-object validation. Max **one** step on "bucket changed after crash" without direct evidence.
+- **Bucket-mismatch priority**: First ask: embedded node? Could corrupted value come from bytes within that node/container? Priority: `struct -o <type>` → container base → `rd`/`struct` → adjacent-object validation. Max **one** step on "bucket changed after crash" without direct evidence.
 - **Provenance-closure**: Once (1) container/node address, (2) raw bytes, and (3) bytes reproduce corrupt register are all confirmed → provenance closed. Do NOT re-read the same bucket, re-disassemble, or re-argue the same path. Pivot to object lifetime and corruption attribution.
 
 **Step 5b — Key Object Validation** (MANDATORY before any external-corruption hypothesis)
@@ -671,6 +639,7 @@ Trigger condition — ANY of the following applies:
 When any trigger condition matches:
 1. **Caller Analysis**: Identify the module function frame(s) in `bt`. For EACH such frame, you MUST `dis -s <module_function>` (with `mod -s` first) to identify what pointer/argument the module passed into the kernel call. Do NOT skip this step because RIP has moved past the original fault site.
 2. `struct <type> <addr>` (with `mod -s` if module type) — read ALL fields.
+2a. **Offset-coverage re-check**: Before interpreting any printed field, verify that the candidate type's `SIZE` covers the largest offset already seen in disassembly for this same pointer. If not, abandon the type immediately.
 3. Classify: pointer fields must be `0xffff...`; index fields within hw limits; DMA address fields non-zero and aligned.
 3. **Scoring**: 1 field anomalous → weak (complete S4 first); 2+ fields simultaneously anomalous → strong struct corruption → classify OOB/UAF/stomper BEFORE considering DMA (satisfies S3).
 4. **Snapshot mismatch**: crash-time register ≠ current field → read ALL other fields:
@@ -736,15 +705,15 @@ Set `is_conclusive: true` when ALL of:
 1. ✅ Root cause identified with supporting diagnostic evidence from at least 2 independent sources
    (e.g., register state + source code, or memory content + backtrace)
 2. ✅ The causal chain is complete: trigger → propagation → crash
-3. ✅ Alternative hypotheses considered and reflected in `active_hypotheses` (`status: "ruled_out"` or `"weakened"`)
-4. ✅ **All gates required for the current `signature_class` have `status: "closed"` or `"n/a"`** (see §1.1a Gate Catalog)
+3. ✅ Alternative explanations were considered and the strongest remaining one is explicit in `reasoning`
+4. ✅ The evidence chain is strong enough that no unresolved mandatory verification gap remains for the chosen conclusion
 
 Continue investigation if:
 - ❌ You have a hypothesis but no supporting diagnostic evidence
 - ❌ Multiple equally plausible root causes remain
 - ❌ The backtrace suggests the crash is a SYMPTOM of an earlier corruption
   (trace back to the actual corruption point)
-- ❌ Any gate required for the current `signature_class` still has `status: "open"` (must be closed before concluding)
+- ❌ A mandatory verification checkpoint is still unresolved (for example, register provenance or object lifetime is still unknown)
 ## 2.4a Step Budget Management (Efficiency Rule)
 
 To prevent step exhaustion on unproductive paths, follow this budget discipline:
@@ -790,7 +759,7 @@ To prevent step exhaustion on unproductive paths, follow this budget discipline:
 - ❌ Advancing past Stage 5 without the mandatory per-item S1–S5 reasoning audit. Each must appear as an explicit sentence in `reasoning`. Vague summary = Protocol Violation.
 - ❌ Skipping Step 5b+ driver object validation; reading only the faulting field and ignoring all other struct fields (index, DMA address, sibling pointers) is incomplete.
 - ❌ Maintaining `medium`+ DMA confidence when the IOMMU log query returned empty — cap at LOW.
-- ❌ Using `struct <module_type>` in a new `run_script` without `mod -s` (see §1.4).
+- ❌ Using `struct -o <module_type>` in a new `run_script` without `mod -s` (see §1.4).
 - ❌ Spending 3+ steps on a structure already verified as intact; re-disassembling the same function after provenance is reconstructed.
 - ❌ Treating a generic corrupted register value as a PA candidate without first justifying why it is PA-plausible.
 - ❌ Multiple steps speculating a bucket/list head changed after crash before testing embedded-node/container semantics — max one step (§1.11).
@@ -811,15 +780,6 @@ When `is_conclusive: true`, provide complete structured diagnosis:
   "signature_class": "<concrete crash signature, e.g. pointer_corruption>",
   "root_cause_class": "<concrete root cause, e.g. out_of_bounds>",
   "partial_dump": "<full|partial>",
-  "active_hypotheses": [
-    {{{{"id": "H1", "label": "<root cause label>", "status": "leading", "evidence": "<final evidence chain summary>"}}}}
-  ],
-  "gates": {{{{
-    "register_provenance":        {{{{"required_for": ["pointer_corruption"], "status": "closed", "evidence": "<trace result>"}}}},
-    "object_lifetime":            {{{{"required_for": ["pointer_corruption", "use_after_free"], "status": "closed", "evidence": "<kmem -S result>"}}}},
-    "local_corruption_exclusion": {{{{"required_for": ["pointer_corruption"], "status": "closed", "evidence": "S1: excluded — ...; S2: excluded — ...; S3: excluded — ...; S4: excluded — ...; S5: excluded — ..."}}}},
-    "external_corruption_gate":   {{{{"required_for": ["pointer_corruption"], "prerequisite": "local_corruption_exclusion", "status": "closed", "evidence": "<DMA/hw source assessment>"}}}}
-  }}}},
   "final_diagnosis": {{{{
     "crash_type": "NULL pointer dereference | use-after-free | soft lockup | ...",
     "panic_string": "<exact panic string from dmesg>",
@@ -849,20 +809,12 @@ Reference convergence examples for new signature classes:
 ```json
 {{{{
   "step_id": 18,
-  "reasoning": "The panic string and watchdog output identify a hard lockup on CPU 7. bt -a shows CPU 7 spinning in raw_spin_lock with interrupts disabled, while peer CPUs are stalled behind the same lock. This closes the hard-lockup gates and supports a deadlock-style lock holder failure as the leading root cause.",
+  "reasoning": "The panic string and watchdog output identify a hard lockup on CPU 7. bt -a shows CPU 7 spinning in raw_spin_lock with interrupts disabled, while peer CPUs are stalled behind the same lock. The watchdog evidence and no-progress state are both directly supported by the latest tool output, so the evidence chain converges on a deadlock-style lock-holder failure.",
   "action": null,
   "is_conclusive": true,
   "signature_class": "hard_lockup",
   "root_cause_class": "deadlock",
   "partial_dump": "full",
-  "active_hypotheses": [
-    {{{{"id": "H1", "label": "deadlock", "status": "leading", "evidence": "bt -a shows CPU 7 spinning on a contested lock while peer CPUs wait on the same lock chain"}}}},
-    {{{{"id": "H2", "label": "race_condition", "status": "ruled_out", "evidence": "No inconsistent write ownership or transient state change was observed; the failure is stable lock non-progress"}}}}
-  ],
-  "gates": {{{{
-    "nmi_watchdog_evidence": {{{{"required_for": ["hard_lockup"], "status": "closed", "evidence": "vmcore-dmesg shows 'NMI watchdog: hard LOCKUP' and bt -a captured all CPU backtraces"}}}},
-    "cpu_progress_state": {{{{"required_for": ["hard_lockup"], "status": "closed", "evidence": "CPU 7 is looping in raw_spin_lock with interrupts disabled; runq and peer backtraces show no forward progress"}}}}
-  }}}},
   "final_diagnosis": {{{{
     "crash_type": "hard lockup",
     "panic_string": "NMI watchdog: hard LOCKUP on cpu 7",
@@ -890,20 +842,12 @@ Reference convergence examples for new signature classes:
 ```json
 {{{{
   "step_id": 16,
-  "reasoning": "The panic path is a hung task report rather than a CPU watchdog event. foreach UN bt and mutex owner tracing show the blocked task waiting on a mutex held by another task in the same subsystem. The wait chain is explicit, so the hung-task gates are closed and the root cause is a deadlock rather than generic I/O delay.",
+  "reasoning": "The panic path is a hung task report rather than a CPU watchdog event. foreach UN bt and mutex owner tracing show the blocked task waiting on a mutex held by another task in the same subsystem. The wait chain is explicit, so the evidence supports a deadlock rather than generic I/O delay.",
   "action": null,
   "is_conclusive": true,
   "signature_class": "hung_task",
   "root_cause_class": "deadlock",
   "partial_dump": "full",
-  "active_hypotheses": [
-    {{{{"id": "H1", "label": "deadlock", "status": "leading", "evidence": "Blocked task and mutex owner backtraces form a circular wait chain"}}}},
-    {{{{"id": "H2", "label": "io_hang", "status": "ruled_out", "evidence": "No storage timeout or request_queue stall evidence appears in dmesg or owner path"}}}}
-  ],
-  "gates": {{{{
-    "blocked_task_context": {{{{"required_for": ["hung_task"], "status": "closed", "evidence": "task 1234 is in D state waiting on mutex 0xffff... from ext4_writepages"}}}},
-    "wait_chain": {{{{"required_for": ["hung_task"], "status": "closed", "evidence": "mutex owner pid=88; bt 88 shows the reverse wait edge, confirming a circular wait"}}}}
-  }}}},
   "final_diagnosis": {{{{
     "crash_type": "hung task",
     "panic_string": "INFO: task foo:1234 blocked for more than 120 seconds",
@@ -931,20 +875,12 @@ Reference convergence examples for new signature classes:
 ```json
 {{{{
   "step_id": 14,
-  "reasoning": "The panic is caused by the OOM path rather than a memory corruption exception. vmcore-dmesg shows panic_on_oom behavior after a global OOM snapshot, and kmem -i confirms severe memory pressure with near-zero free memory. The OOM-specific gates are closed, so the signature and root cause both converge on oom_panic.",
+  "reasoning": "The panic is caused by the OOM path rather than a memory corruption exception. vmcore-dmesg shows panic_on_oom behavior after a global OOM snapshot, and kmem -i confirms severe memory pressure with near-zero free memory. Those two independent sources are sufficient to converge on oom_panic.",
   "action": null,
   "is_conclusive": true,
   "signature_class": "oom_panic",
   "root_cause_class": "oom_panic",
   "partial_dump": "full",
-  "active_hypotheses": [
-    {{{{"id": "H1", "label": "oom_panic", "status": "leading", "evidence": "panic_on_oom path is explicit in dmesg and memory pressure is confirmed by kmem -i"}}}},
-    {{{{"id": "H2", "label": "memory_corruption", "status": "ruled_out", "evidence": "No faulting instruction, poison pattern, or corrupted object evidence appears; the panic follows the OOM handler directly"}}}}
-  ],
-  "gates": {{{{
-    "oom_context": {{{{"required_for": ["oom_panic"], "status": "closed", "evidence": "dmesg shows global OOM followed by panic_on_oom-triggered kernel panic"}}}},
-    "memory_pressure": {{{{"required_for": ["oom_panic"], "status": "closed", "evidence": "kmem -i and dmesg snapshot show MemAvailable near zero with dominant slab growth in xfs_inode"}}}}
-  }}}},
   "final_diagnosis": {{{{
     "crash_type": "OOM panic",
     "panic_string": "Kernel panic - not syncing: Out of memory",
@@ -968,7 +904,7 @@ Reference convergence examples for new signature classes:
 }}}}
 ```
 
-**CRITICAL**: All fields in `final_diagnosis` are required. `suspect_code.line` can be "unknown" if not available. All gates required for the current `signature_class` must have `status: "closed"` before `is_conclusive: true` (see §1.1a Gate Completion Rule). `root_cause_class` should be concrete unless the failure can only be bounded to an unresolved family, in which case use `unknown`.
+**CRITICAL**: All fields in `final_diagnosis` are required. `suspect_code.line` can be "unknown" if not available. `root_cause_class` should be concrete unless the failure can only be bounded to an unresolved family, in which case use `unknown`.
 
 ## 2.6 Kernel Version & Architecture Awareness
 
@@ -996,7 +932,7 @@ Reference convergence examples for new signature classes:
    - Small non-zero offset (e.g., `0x08`, `0x18`): Struct member access via NULL pointer
 2. Check registers in `bt` output → Which register was 0?
 3. `sym <RIP>` → Quickly locate symbol name; then `dis -rl <RIP>` → See the faulting instruction
-4. If offset non-zero (e.g., 0x08), use `struct <type> -o` to find member at that offset
+4. If offset non-zero (e.g., 0x08), use `struct -o <type>` to find member at that offset
 5. Trace back: Where did the NULL pointer come from?
    - **Single-level**: Which function returned NULL without a NULL check?
    - **Multi-level**: NULL pointer passed as a struct member — trace the assignment path layer by layer
@@ -1357,9 +1293,9 @@ Only after Sub-step A above (adjacent-page content check), or when those adjacen
 # ⚠️ Any run_script using mlx5 module structs must start with mod -s mlx5_core in that SAME run_script.
 # Example bootstrap for mlx5 symbol work:
 #   Start a run_script with `mod -s mlx5_core <path_to_mlx5_core.ko.debug>`.
-#   In that SAME run_script, run `struct <type> -o` on the mlx5 module type already
+#   In that SAME run_script, run `struct -o <type>` on the mlx5 module type already
 #   validated for the current kernel to obtain offsets for DMA-relevant fields.
-#   ⚠️ MANDATORY: ALWAYS use `struct <type> -o` (type name BEFORE -o). NEVER emit bare `struct -o`.
+#   ⚠️ MANDATORY: ALWAYS use `struct -o <type>` (-o BEFORE type name). NEVER emit bare `struct -o`.
 
 # ── LOCATING THE mlx5 RUNTIME DRIVER OBJECT ───────────────────────────────────
 # The module base is NOT the runtime mlx5 driver object.
@@ -1408,7 +1344,7 @@ Only after Sub-step A above (adjacent-page content check), or when those adjacen
 #   # First inspect the current kernel's mlx5 struct layout; do NOT hard-code a
 #   # top-level object path that may differ across kernels.
 #   # In one run_script: load mlx5 symbols, then inspect the current kernel's
-#   # relevant mlx5 queue/buffer struct types with `struct <type> -o` (type name BEFORE -o).
+#   # relevant mlx5 queue/buffer struct types with `struct -o <type>` (-o BEFORE type name).
 #   # In a later run_script: use the validated current-kernel path to reach the
 #   # target EQ/CQ instance and read buf.dma / buf.npages.
 #   # read buf.dma and buf.npages
@@ -1421,7 +1357,7 @@ Only after Sub-step A above (adjacent-page content check), or when those adjacen
 # For nvme (all structs are in nvme_core module — mod -s nvme_core required):
 #   run_script [
 #     "mod -s nvme_core <path>",
-#     "struct nvme_queue -o"
+#     "struct -o nvme_queue"
 #   ]
 #   # find sq_dma_addr and cq_dma_addr offsets
 #
@@ -1780,7 +1716,7 @@ Note: If `<func>` is from a third-party module, do NOT emit standalone `dis` act
 ## 4.2 Memory & Structure
 | Command | Use Case |
 |---------|----------|
-| `struct <type> -o` | Show structure definition and member offsets |
+| `struct -o <type>` | Show structure definition and member offsets |
 | `struct <type> <addr>` | Show structure at address |
 | `rd -x <addr> <count>` | Read memory (hex) - Recommend count >= 32 |
 | `kmem -S <addr>` | Find slab for address |
@@ -1948,56 +1884,54 @@ The following is the User-Provided Initial Context for this Linux kernel crash a
 """
 
 
-def structure_reasoning_prompt() -> str:
-    """用于将 DeepSeek-Reasoner 的纯文本 reasoning_content 结构化为 VMCoreAnalysisStep JSON 的提示词。"""
+def simplified_structure_reasoning_prompt() -> str:
+    """
+    简化版结构化推理提示词，仅要求模型输出核心字段，降低输出负担。
+    复杂字段（如 gates、active_hypotheses）将在后处理阶段自动补齐。
+    """
     return (
-        "You are a helper that converts unstructured vmcore crash analysis reasoning "
-        "into a structured JSON format.\n\n"
-        "Given the analysis reasoning text about a vmcore crash dump, "
-        "convert it into a VMCoreAnalysisStep JSON object.\n\n"
+        "You are a helper that extracts CORE information from unstructured vmcore crash analysis reasoning "
+        "into a minimal structured JSON format.\n\n"
+        "The analysis reasoning text will be provided in the next user message. Extract ONLY the following core fields from that text:\n\n"
         "Current analysis step number: {current_step}\n\n"
-        "Rules:\n"
-        "1. Summarize the reasoning into the 'reasoning' field\n"
-        "2. Set 'step_id' to {current_step}\n"
-        "3. If the reasoning suggests running another crash command, populate 'action' "
-        "with a COMPLETE, syntactically valid crash utility command. "
-        "The command must include all required arguments (e.g., 'p /x <expression>', "
-        "NOT just 'p /x'). If the reasoning text does not contain enough information "
-        "to form a complete command, set 'action' to null and explain in 'reasoning'.\n"
-        "4. If the reasoning reaches a final conclusion, set 'is_conclusive' to true "
-        "and populate 'final_diagnosis', 'fix_suggestion', 'confidence'\n"
-        "5. Output MUST be valid JSON matching the schema below\n"
-        "6. CRITICAL: You MUST either provide a valid 'action' with a complete command, "
-        "OR set 'is_conclusive' to true with a 'final_diagnosis'. "
-        "Returning action=null with is_conclusive=false is FORBIDDEN unless "
-        "the reasoning text genuinely contains no actionable next step.\n"
-        "7. Classify 'signature_class' from the panic string and crash symptoms described in "
-        "the reasoning text, using the Decision Table in §1.1a of the analysis prompt. "
-        "If the reasoning explicitly states a previously determined signature_class value, "
-        "preserve that value.\n"
-        "8. Infer 'root_cause_class' from the causal explanation in the reasoning text. "
-        "It may remain null if the reasoning is still exploratory, but if the reasoning reaches "
-        "a final conclusion it should be concrete or 'unknown'.\n"
-        "9. Infer 'partial_dump' from the reasoning text or preserved session state. If the "
-        "reasoning mentions '[PARTIAL DUMP]' in sys output or explicitly says the vmcore is "
-        "partial, set partial_dump='partial'. If the reasoning states the dump is complete, set "
-        "partial_dump='full'. Otherwise preserve any explicitly stated prior value or leave it "
-        "as 'unknown' when dump completeness is not yet established.\n"
-        "10. Update 'active_hypotheses': list all hypotheses mentioned in the reasoning "
-        "with their current status (leading/candidate/weakened/ruled_out) and optional rank "
-        "(1=highest priority). Only one hypothesis may have status='leading'.\n"
-        "11. Reconstruct 'gates': infer each gate's status solely from evidence explicitly "
-        "stated in the reasoning text. Use gate names from the Gate Catalog in §1.1a. "
-        "Only include gates whose required_for list contains the current signature_class. "
-        "For each check confirmed in the reasoning (e.g., 'bt -f shows clean frames', "
-        "'kmem -S returns ALLOCATED', 'IOMMU log shows no fault'), set that gate to "
-        "'closed' with the confirming statement as the evidence field value. "
-        "If the reasoning explicitly marks a gate as blocked or n/a, reflect that status. "
-        "Gates not mentioned or confirmed in the reasoning remain 'open'.\n"
-        "12. CRITICAL: If is_conclusive=true, ALL required gates for signature_class must have "
-        "status='closed' or 'n/a'. If any required gate is still 'open', set "
-        "is_conclusive=false and continue analysis instead.\n"
-        "{force_conclusion}\n\n"
-        "VMCoreAnalysisStep Schema:\n```json\n{schema_json}\n```\n\n"
-        "The reasoning text to structure:\n---\n{reasoning}\n---"
+        "{force_conclusion}"
+        "REQUIRED FIELDS TO EXTRACT:\n"
+        "1. 'reasoning': Summarize the key reasoning points (3-6 sentences)\n"
+        "2. 'step_id': Set to {current_step}\n"
+        "3. 'action': If the reasoning suggests a specific crash command, provide the COMPLETE command with all arguments. "
+        "Otherwise set to null.\n"
+        "4. 'is_conclusive': Set to true ONLY if the reasoning explicitly states a final conclusion with root cause. "
+        "Otherwise set to false.\n"
+        "5. 'signature_class': Extract the crash signature class from panic string analysis (e.g., 'null_deref', "
+        "'use_after_free', 'pointer_corruption', etc.)\n"
+        "6. 'root_cause_class': Extract the underlying root cause if mentioned (can be null during exploration)\n"
+        "7. 'partial_dump': Set this only if dump completeness is explicitly mentioned; otherwise use 'unknown'\n\n"
+        "FIELDS TO SKIP (will be auto-filled later):\n"
+        "- active_hypotheses\n"
+        "- gates\n"
+        "- final_diagnosis\n"
+        "- fix_suggestion\n"
+        "- confidence\n"
+        "- additional_notes\n\n"
+        "RULES:\n"
+        "- Focus ONLY on extracting the required fields above\n"
+        "- Keep reasoning concise and focused on what was learned from tool output\n"
+        "- For root_cause_class, use values like 'null_deref', 'use_after_free', 'wild_pointer', 'memory_corruption', "
+        "'dma_corruption', etc. If uncertain, use 'unknown'\n"
+        "- DO NOT attempt to reconstruct complex hypothesis lists or gate statuses\n"
+        "- Output MUST be valid JSON with ONLY the required fields above\n\n"
+        "Schema for required fields only:\n"
+        "```json\n"
+        "{{\n"
+        '  "step_id": {current_step},\n'
+        '  "reasoning": "<3-6 sentence summary>",\n'
+        '  "action": null,\n'
+        '  "is_conclusive": false,\n'
+        '  "signature_class": "null_deref",\n'
+        '  "root_cause_class": "unknown",\n'
+        '  "partial_dump": "unknown"\n'
+        "}}\n"
+        "```\n\n"
+        "If a follow-up command is needed, replace action=null with a complete command object.\n\n"
+        "REMEMBER: Skip complex fields! They will be handled automatically after your response.\n"
     )

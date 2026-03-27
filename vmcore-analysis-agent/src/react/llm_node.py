@@ -12,11 +12,17 @@ from .nodes import llm_analysis_node, structure_reasoning_node
 from .output_parser import (
     build_tool_calls,
     repair_analysis_step,
+    repair_structured_output,
     select_analysis_content,
 )
 from .llm_runtime import ainvoke_with_retry, compress_messages_for_llm
-from .prompts import analysis_crash_prompt, structure_reasoning_prompt
-from .schema import VMCoreAnalysisStep
+from .prompts import (
+    analysis_crash_prompt,
+    crash_init_data_prompt,
+    simplified_structure_reasoning_prompt,
+)
+from .schema import VMCoreAnalysisStep, VMCoreLLMAnalysisStep
+from .state_manager import project_managed_analysis_step
 from src.utils.logging import logger
 
 
@@ -44,8 +50,12 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
     # 准备系统消息，包含诊断知识库和输出格式
     system_message = analysis_crash_prompt().format(
         VMCoreAnalysisStep_Schema=json.dumps(
-            VMCoreAnalysisStep.model_json_schema(), indent=2
+            VMCoreLLMAnalysisStep.model_json_schema(), indent=2
         ),
+    )
+    system_message += (
+        "\n\n[STRUCTURED OUTPUT CONTRACT]\n"
+        "active_hypotheses and gates are executor-managed. Omit them entirely from your JSON and return only the minimal schema fields."
     )
 
     # 检查是否是最后一步 (LangGraph recursion_limit 触发前)
@@ -66,6 +76,10 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
     compressed_messages = compress_messages_for_llm(state["messages"])
     messages_to_send = [SystemMessage(content=system_message), *compressed_messages]
 
+    logger.info(
+        f"Prepared messages for LLM analysis (step {current_step}): {[type(m).__name__ for m in messages_to_send]} with system prompt length {len(system_message)}"
+    )
+
     # 如果上一条消息是 AIMessage 且没有工具调用，说明在此之前发生过 fallback（如 LLM 返回了无效的动作或未提供结论）
     # 增加一条 HumanMessage 提示 LLM 不能空转
     last_msg = messages_to_send[-1] if messages_to_send else None
@@ -85,12 +99,12 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
 
     # 结构化输出，设置 include_raw=True 以获取 token 消耗等元数据
     llm_analysis = llm_with_tools.with_structured_output(
-        VMCoreAnalysisStep, method="json_mode", include_raw=True
+        VMCoreLLMAnalysisStep, method="json_mode", include_raw=True
     )
     try:
         # 使用 include_raw=True 后，ainvoke 返回包含 'parsed' 和 'raw' 的字典
         output_data = await ainvoke_with_retry(llm_analysis, messages_to_send)
-        analysis_result = cast(VMCoreAnalysisStep, output_data["parsed"])
+        llm_step = cast(VMCoreLLMAnalysisStep, output_data["parsed"])
         raw_message = cast(AIMessage, output_data["raw"])
 
         # 获取并记录 token 消耗数量
@@ -98,7 +112,7 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         curr_token_usage = usage_metadata.get("total_tokens", 0)
 
         # 检查解析结果是否为空
-        if analysis_result is None:
+        if llm_step is None:
             # 尝试修复常见的 JSON 格式错误
             logger.warning(
                 "LLM output is empty or could not be parsed. Attempting to repair JSON..."
@@ -126,9 +140,12 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
                 }
 
             if content_str:
-                analysis_result = repair_analysis_step(content_str)
+                llm_step = repair_structured_output(
+                    content_str,
+                    model_class=VMCoreLLMAnalysisStep,
+                )
 
-            if analysis_result is None:
+            if llm_step is None:
                 if reasoning and len(reasoning) > 50:
                     logger.warning(
                         "JSON repair failed but reasoning_content available. "
@@ -150,6 +167,15 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
                 raise ValueError(error_msg)
 
         # 记录 response
+        analysis_result, managed_updates = project_managed_analysis_step(
+            llm_step,
+            state,
+            original_reasoning=raw_message.additional_kwargs.get(
+                "reasoning_content", ""
+            )
+            or str(raw_message.content),
+        )
+
         logger.debug(
             f"LLM Analysis Result: {analysis_result.model_dump_json(indent=2)}"
         )
@@ -166,7 +192,7 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
 
         reasoning_content = raw_message.additional_kwargs.get("reasoning_content")
         if reasoning_content:
-            logger.debug(f"reasoning_content: {reasoning_content}...")
+            logger.debug(f"reasoning_content: {reasoning_content[:50]}...")
         else:
             logger.warning(
                 f"No reasoning_content found in additional_kwargs. additional_kwargs keys: {raw_message.additional_kwargs.keys()}"
@@ -194,6 +220,7 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         "step_count": 1,
         "token_usage": curr_token_usage,
         "messages": [response],
+        **managed_updates,
         "error": None,
     }
 
@@ -226,57 +253,58 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
 
     curr_token_usage = 0
 
-    # 构建结构化提示
-    schema_json = json.dumps(VMCoreAnalysisStep.model_json_schema(), indent=2)
+    # 构建简化结构化提示（只提取核心字段）
 
     force_conclusion = ""
     if is_last_step:
-        force_conclusion = (
-            "\n\nIMPORTANT: This is the LAST STEP. You MUST set 'is_conclusive' to true, "
-            "'action' to null, and provide a 'final_diagnosis' based on the reasoning."
-        )
+        force_conclusion = "IMPORTANT: This is the LAST STEP. You MUST set 'is_conclusive' to true and 'action' to null.\n\n"
 
-    system_prompt = structure_reasoning_prompt().format(
+    system_prompt = simplified_structure_reasoning_prompt().format(
         current_step=current_step,
         force_conclusion=force_conclusion,
-        schema_json=schema_json,
-        reasoning=reasoning,
     )
 
-    # 只需传入 system_prompt（已包含完整 reasoning 内容和目标 schema）
-    # 无需携带历史对话，避免浪费 token
+    # 只发送最小上下文：系统提示 + 待结构化的 reasoning 文本
     messages_to_send = [
         SystemMessage(content=system_prompt),
+        HumanMessage(content=reasoning),
     ]
 
     chat_with_structured = structured_llm.with_structured_output(
-        VMCoreAnalysisStep, method="json_mode", include_raw=True
+        VMCoreLLMAnalysisStep, method="json_mode", include_raw=True
     )
 
     try:
         output_data = await ainvoke_with_retry(chat_with_structured, messages_to_send)
-        analysis_result = cast(VMCoreAnalysisStep, output_data["parsed"])
+        llm_step = cast(VMCoreLLMAnalysisStep, output_data["parsed"])
         raw_chat_message = cast(AIMessage, output_data["raw"])
 
         usage_metadata = getattr(raw_chat_message, "usage_metadata", {}) or {}
         curr_token_usage = usage_metadata.get("total_tokens", 0)
 
-        if analysis_result is None:
+        if llm_step is None:
             content = raw_chat_message.content
             content_str = content if isinstance(content, str) else json.dumps(content)
-            analysis_result = repair_analysis_step(
+            llm_step = repair_structured_output(
                 content_str,
+                model_class=VMCoreLLMAnalysisStep,
                 log_prefix=structure_reasoning_node,
             )
 
-        if analysis_result is None:
+        if llm_step is None:
             raise ValueError(
                 f"Chat model failed to structure reasoning. "
                 f"Raw: {repr(raw_chat_message.content[:200])}"
             )
 
         # 强制覆盖 step_id 为当前实际步数，chat 模型可能输出错误值
-        analysis_result.step_id = current_step
+        llm_step.step_id = current_step
+
+        analysis_result, managed_updates = project_managed_analysis_step(
+            llm_step,
+            state,
+            original_reasoning=reasoning,
+        )
 
         logger.info(
             f"structure_reasoning_node: Successfully structured reasoning content. "
@@ -318,5 +346,6 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
         "messages": [response],
         "reasoning_to_structure": None,
         "reasoning_additional_kwargs": None,
+        **managed_updates,
         "error": None,
     }

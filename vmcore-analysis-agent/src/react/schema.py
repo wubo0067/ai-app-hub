@@ -68,6 +68,53 @@ class FinalDiagnosis(BaseModel):
     )
 
 
+class VMCoreLLMAnalysisStep(BaseModel):
+    """LLM 直接输出的最小结构，不包含 executor 管理的状态字段。"""
+
+    step_id: int = Field(..., description="Current step sequence number.")
+    reasoning: str = Field(
+        ...,
+        description=(
+            "3-6 sentence structured analytic summary. Answer: "
+            "(1) What did I just learn from the latest tool output? "
+            "(2) How does this update the live hypotheses? "
+            "(3) What is the ONE most diagnostic next action and why? "
+            "Do NOT restate established facts. Do NOT produce free-form monologue."
+        ),
+    )
+    action: Optional[ToolCall] = Field(
+        None,
+        description="The next command to run. Must be None when is_conclusive=True.",
+    )
+    is_conclusive: bool = Field(False)
+    signature_class: Optional["CrashSignatureClass"] = Field(None)
+    root_cause_class: Optional["RootCauseClass"] = Field(None)
+    partial_dump: "PartialDumpStatus" = Field("unknown")
+    final_diagnosis: Optional[FinalDiagnosis] = Field(
+        None, description="Populated only when is_conclusive=True."
+    )
+    fix_suggestion: Optional[str] = Field(
+        None,
+        description="Recommended fix or workaround.",
+    )
+    confidence: Optional[Literal["high", "medium", "low"]] = Field(
+        None, description="Confidence level of the diagnosis."
+    )
+    additional_notes: Optional[str] = Field(
+        None,
+        description="Caveats, unresolved alternatives, or recommended follow-up actions.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_crash_class(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "signature_class" not in data:
+            legacy_value = data.get("crash_class")
+            if legacy_value is not None:
+                data["signature_class"] = legacy_value
+        return data
+
+
 CrashSignatureClass = Literal[
     "null_deref",
     "use_after_free",
@@ -111,6 +158,7 @@ RootCauseClass = Literal[
     "invalid_opcode",
     "oom",
     "oom_panic",
+    "pointer_corruption",
     "unknown",
 ]
 
@@ -313,12 +361,7 @@ class VMCoreAnalysisStep(BaseModel):
     @model_validator(mode="after")
     def validate_and_patch(self) -> "VMCoreAnalysisStep":
         """
-        后置校验策略（宽松模式）：
-        1. is_conclusive=True 时自动填充 root_cause_class（如果为 null 且有默认映射）。
-        2. 缺失的 required gate 自动补充为 status='n/a'（LLM 未显式提及视为不适用）。
-        3. status 不合规的 gate 强制修正为 'n/a' 并记录原始状态。
-
-        此验证器不会因 gate 缺失而硬性拒绝解析，保留 LLM 已给出的所有证据链。
+        仅保留根因类默认映射；managed gates/hypotheses 由外部状态机维护。
         """
         if self.root_cause_class is None and self.is_conclusive:
             default_root_cause = self._DEFAULT_ROOT_CAUSE_FROM_SIGNATURE.get(
@@ -328,40 +371,4 @@ class VMCoreAnalysisStep(BaseModel):
                 RootCauseClass,
                 default_root_cause or "unknown",
             )
-
-        if not self.is_conclusive:
-            return self
-        if self.signature_class is None or self.signature_class == "unknown":
-            return self
-
-        required = self._REQUIRED_GATES.get(self.signature_class, [])
-        if not required:
-            return self
-
-        gates = self.gates or {}
-        patched = False
-        for gate_name in required:
-            entry = gates.get(gate_name)
-            if entry is None:
-                gates[gate_name] = GateEntry(
-                    required_for=[self.signature_class],
-                    status="n/a",
-                    evidence="Auto-filled: gate not explicitly addressed in LLM output.",
-                )
-                patched = True
-            elif entry.status not in ("closed", "n/a"):
-                original_status = entry.status
-                original_evidence = entry.evidence or ""
-                gates[gate_name] = GateEntry(
-                    required_for=entry.required_for,
-                    status="n/a",
-                    prerequisite=entry.prerequisite,
-                    evidence=(
-                        f"{original_evidence} [Auto-corrected from status='{original_status}']"
-                    ).strip(),
-                )
-                patched = True
-
-        if patched:
-            self.gates = gates
         return self
