@@ -37,9 +37,9 @@ graph TB
     end
 
     subgraph "LangGraph ReAct Agent"
-        C --> E["collect_crash_init_data_node\nsys / bt"]
+        C --> E["collect_crash_init_data_node\nsys / sys -t / bt"]
         E -->|HumanMessage| F{should_continue}
-        F -->|Initial data ready| G["llm_analysis_node\nDeepSeek-Reasoner"]
+        F -->|Initial data ready | G["llm_analysis_node\nDeepSeek-Reasoner"]
         G -->|AIMessage with tool_calls| H{should_continue}
         H -->|Need tools| I[crash_tool_node]
         H -->|reasoning_to_structure| J["structure_reasoning_node\ndeepseek-chat"]
@@ -49,7 +49,7 @@ graph TB
     end
 
     subgraph "MCP Tools"
-        I -->|crash commands| L["crash MCP Server\nmcp_tools/crash"]
+        I -->|crash commands| L["crash MCP Server\nmcp_tools/crash/server.py"]
         I -->|Source code patches| M["source_patch MCP Server\nmcp_tools/source_patch"]
         L --> N["crash utility\nvmcore + vmlinux"]
         M --> O[unified diff patch]
@@ -58,6 +58,12 @@ graph TB
     K --> D
     D -->|Markdown report| P[reports]
 ```
+
+**Architecture Diagram Explanation**:
+- **Solid arrows** represent data flow or invocation relationships
+- **Curly brace nodes** (e.g., `{should_continue}`) represent conditional routing decisions
+- **Bracket nodes** represent concrete functional nodes or external services
+- The flow starts from `START`, goes through initial data collection, enters the loop of LLM analysis and tool invocation, and ends when `is_conclusive=true` or the recursion limit is reached
 
 ## Vmcore Analysis React Agent
 
@@ -114,28 +120,50 @@ Execution results are written to the message queue as `HumanMessage`, serving as
 
 #### Node 2: llm_analysis_node
 
-**Function**: Calls DeepSeek-Reasoner, outputs structured analysis steps following ReAct pattern
+**Function**: Calls DeepSeek-Reasoner to output structured analysis steps following the ReAct pattern
+
+**Core Implementation Logic** ([`call_llm_analysis`](vmcore-analysis-agent/src/react/llm_node.py#L27-L212) function):
+
+1. **Message Compression**: Compresses historical messages via [`compress_messages_for_llm`](vmcore-analysis-agent/src/react/llm_runtime.py#L104-L134) to prevent token explosion from reasoning_content accumulation
+2. **System Prompt Construction**: Uses [`analysis_crash_prompt`](vmcore-analysis-agent/src/react/prompts.py#L8-L1936), including:
+   - Role definition: Senior Linux Kernel Crash Dump analysis expert
+   - Output contract: Strictly follows `VMCoreLLMAnalysisStep` JSON Schema
+   - Final step constraint: When `is_last_step=True`, must provide conclusion and prohibit tool calls
+3. **Structured Output**: Uses `llm_with_tools.with_structured_output(VMCoreLLMAnalysisStep, method="json_mode", include_raw=True)`
+4. **Error Handling**:
+   - Attempts JSON repair on format errors ([`repair_structured_output`](vmcore-analysis-agent/src/react/output_parser.py#L56-L94))
+   - Routes plain text `reasoning_content` to [`structure_reasoning_node`](vmcore-analysis-agent/src/react/llm_node.py#L215-L350)
+   - Injects HumanMessage on empty response to force LLM action or conclusion
+5. **State Management**: Merges LLM output with managed state (hypotheses, gates) via [`project_managed_analysis_step`](vmcore-analysis-agent/src/react/state_manager.py#L123-L198)
 
 **Core Prompt Design**:
-- Role defined as senior Linux Kernel Crash Dump analysis expert
-- Strictly follows `VMCoreAnalysisStep` JSON Schema output
 - Built-in anti-repetition policy to prevent executing the same command repeatedly
 - Prohibits high-risk commands that trigger token overflow (`sym -l`, `bt -a`, `ps -m`, etc.)
 - Supports `run_script` for batch execution, ensuring module symbols are loaded within the same crash session
+- Emphasizes evidence-based reasoning, prohibiting speculation without diagnostic evidence
 
-**Output Schema**:
+**Output Schema** ([`VMCoreLLMAnalysisStep`](vmcore-analysis-agent/src/react/schema.py#L70-L114)):
 ```json
 {
   "step_id": 1,
-  "reasoning": "Analyze current state, decide next step",
+  "reasoning": "3-6 sentence structured analytic summary: (1) What did I learn from latest tool output? (2) How does this update hypotheses? (3) What is the ONE most diagnostic next action and why?",
   "action": { "command_name": "bt", "arguments": ["-c", "3"] },
   "is_conclusive": false,
+  "signature_class": "soft_lockup",
+  "root_cause_class": null,
+  "partial_dump": "full",
+  "active_hypotheses": null,  // Executor-managed, LLM omits
+  "gates": null,              // Executor-managed, LLM omits
   "final_diagnosis": null,
   "fix_suggestion": null,
   "confidence": null,
   "additional_notes": null
 }
 ```
+
+**Token Management**:
+- Records token consumption per invocation (`usage_metadata`)
+- Accumulates `token_usage` in state for monitoring and optimization
 
 #### Node 3: crash_tool_node
 

@@ -38,27 +38,33 @@ graph TB
     end
 
     subgraph "LangGraph ReAct Agent"
-        C --> E["collect_crash_init_data_node\nsys / bt"]
+        C --> E["collect_crash_init_data_node\nsys / sys -t / bt"]
         E -->|HumanMessage| F{should_continue}
-        F -->|初始数据就绪| G["llm_analysis_node\nDeepSeek-Reasoner"]
+        F -->|初始数据就绪 | G["llm_analysis_node\nDeepSeek-Reasoner"]
         G -->|AIMessage with tool_calls| H{should_continue}
-        H -->|需要工具| I[crash_tool_node]
+        H -->|需要工具 | I[crash_tool_node]
         H -->|reasoning_to_structure| J["structure_reasoning_node\ndeepseek-chat"]
-        H -->|分析完毕| K[__end__]
+        H -->|分析完毕 | K[__end__]
         I -->|after_crash_tool| G
-        J -->|结构化后| H
+        J -->|结构化后 | H
     end
 
     subgraph "MCP Tools"
-        I -->|crash 命令| L["crash MCP Server\nmcp_tools/crash"]
-        I -->|源码补丁| M["source_patch MCP Server\nmcp_tools/source_patch"]
+        I -->|crash 命令 | L["crash MCP Server\nmcp_tools/crash/server.py"]
+        I -->|源码补丁 | M["source_patch MCP Server\nmcp_tools/source_patch"]
         L --> N["crash utility\nvmcore + vmlinux"]
         M --> O[unified diff patch]
     end
 
     K --> D
-    D -->|Markdown 报告| P[reports]
+    D -->|Markdown 报告 | P[reports]
 ```
+
+**架构图说明**：
+- **实线箭头** 表示数据流或调用关系
+- **花括号节点**（如 `{should_continue}`）表示条件路由判断
+- **方括号节点** 表示具体的功能节点或外部服务
+- 流程从 `START` 开始，经过初始化数据收集，进入 LLM 分析与工具调用的循环，直到 `is_conclusive=true` 或达到递归限制时结束
 
 ## Vmcore Analysis React Agent
 
@@ -117,26 +123,48 @@ DEFAULT_CRASH_COMMANDS = [
 
 **功能**：调用 DeepSeek-Reasoner，按 ReAct 模式输出结构化分析步骤
 
+**核心实现逻辑**（[`call_llm_analysis`](vmcore-analysis-agent/src/react/llm_node.py#L27-L212) 函数）：
+
+1. **消息压缩**：通过 [`compress_messages_for_llm`](vmcore-analysis-agent/src/react/llm_runtime.py#L104-L134) 压缩历史消息，避免 reasoning_content 累积导致 token 暴增
+2. **系统提示构建**：使用 [`analysis_crash_prompt`](vmcore-analysis-agent/src/react/prompts.py#L8-L1936)，包含：
+   - 角色定义：资深 Linux Kernel Crash Dump 分析专家
+   - 输出契约：严格遵循 `VMCoreLLMAnalysisStep` JSON Schema
+   - 最后一步强制约束：当 `is_last_step=True` 时，必须给出结论且禁止工具调用
+3. **结构化输出**：使用 `llm_with_tools.with_structured_output(VMCoreLLMAnalysisStep, method="json_mode", include_raw=True)`
+4. **容错处理**：
+   - JSON 格式错误时尝试修复（[`repair_structured_output`](vmcore-analysis-agent/src/react/output_parser.py#L56-L94)）
+   - 纯文本 `reasoning_content` 路由到 [`structure_reasoning_node`](vmcore-analysis-agent/src/react/llm_node.py#L215-L350)
+   - 空响应时注入 HumanMessage 强制 LLM 行动或得出结论
+5. **状态管理**：通过 [`project_managed_analysis_step`](vmcore-analysis-agent/src/react/state_manager.py#L123-L198) 将 LLM 输出与托管状态（hypotheses、gates）合并
+
 **核心 Prompt 设计**：
-- 角色定义为资深 Linux Kernel Crash Dump 分析专家
-- 严格遵循 `VMCoreAnalysisStep` JSON Schema 输出
 - 内置防止重复执行同一命令的规则（Anti-Repetition Policy）
 - 禁止触发 token 溢出的高危命令（`sym -l`、`bt -a`、`ps -m` 等）
 - 支持 `run_script` 批量执行，确保模块符号在同一 crash session 内加载
+- 强调基于诊断证据的推理，禁止无证据猜测
 
-**输出 Schema**：
-```
+**输出 Schema**（[`VMCoreLLMAnalysisStep`](vmcore-analysis-agent/src/react/schema.py#L70-L114)）：
+```json
 {
   "step_id": 1,
-  "reasoning": "分析当前状态，决定下一步",
+  "reasoning": "3-6 句结构化分析总结： (1) 从最新工具输出中学到什么？(2) 如何更新假设？(3) 下一步最诊断性的行动及原因",
   "action": { "command_name": "bt", "arguments": ["-c", "3"] },
   "is_conclusive": false,
+  "signature_class": "soft_lockup",
+  "root_cause_class": null,
+  "partial_dump": "full",
+  "active_hypotheses": null,  // 由 executor 维护，LLM 无需输出
+  "gates": null,              // 由 executor 维护，LLM 无需输出
   "final_diagnosis": null,
   "fix_suggestion": null,
   "confidence": null,
   "additional_notes": null
 }
 ```
+
+**Token 管理**：
+- 记录每次调用的 token 消耗（`usage_metadata`）
+- 在状态中累积 `token_usage`，用于监控和优化
 
 #### 节点 3：crash_tool_node
 
