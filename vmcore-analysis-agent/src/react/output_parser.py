@@ -13,9 +13,56 @@ from pydantic import BaseModel
 
 from src.utils.logging import logger
 
-from .schema import VMCoreAnalysisStep
+from .schema import VMCoreAnalysisStep, VMCoreLLMAnalysisStep
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+
+_DISASM_LINE_RE = re.compile(
+    r"^\s*0x(?P<addr>[0-9a-fA-F]+)\s+<[^>]+>:\s+(?P<inst>.+)$",
+    re.MULTILINE,
+)
+_RIP_RE = re.compile(r"\bRIP:\s*(?:[0-9a-fA-F]+:)?(?P<addr>[0-9a-fA-F]{8,16})\b")
+_OOPS_RE = re.compile(r"\bOops:\s*(?P<code>[0-9a-fA-F]{4})\b")
+_NON_FAULTING_MNEMONICS = {
+    "pause",
+    "nop",
+    "nopl",
+    "nopw",
+    "sti",
+    "cli",
+    "ret",
+    "hlt",
+    "lfence",
+    "sfence",
+    "mfence",
+}
+_WRITE_MNEMONICS = {
+    "push",
+    "call",
+    "stos",
+    "stosb",
+    "stosw",
+    "stosl",
+    "stosq",
+}
+_READWRITE_MNEMONICS = {
+    "xchg",
+    "cmpxchg",
+    "cmpxchg8b",
+    "cmpxchg16b",
+    "xadd",
+    "inc",
+    "dec",
+    "not",
+    "neg",
+    "or",
+    "and",
+    "xor",
+    "add",
+    "sub",
+    "adc",
+    "sbb",
+}
 
 
 def _normalize_root_cause_class(content_str: str) -> str:
@@ -169,6 +216,56 @@ def build_tool_calls(
     ]
 
 
+def apply_executor_consistency_audit(
+    analysis_step: VMCoreLLMAnalysisStep,
+    state: dict[str, Any],
+    *,
+    log_prefix: str = "",
+) -> VMCoreLLMAnalysisStep:
+    """在 structured output 落地前执行额外的一致性审计。"""
+    prefix = f"{log_prefix}: " if log_prefix else ""
+    mismatch = _detect_page_fault_access_mismatch(state)
+    if mismatch is None:
+        return analysis_step
+
+    if _mentions_access_type_mismatch(analysis_step, mismatch):
+        logger.debug(
+            "%sExecutor audit found an access-type mismatch, but the model already referenced it.",
+            prefix,
+        )
+        return analysis_step
+
+    audit_note = (
+        "Executor audit: unresolved x86 page-fault access-type contradiction. "
+        f"{mismatch['summary']}"
+    )
+    logger.warning("%s%s", prefix, audit_note)
+
+    if audit_note not in analysis_step.reasoning:
+        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
+
+    if analysis_step.additional_notes:
+        if audit_note not in analysis_step.additional_notes:
+            analysis_step.additional_notes = (
+                f"{analysis_step.additional_notes} {audit_note}"
+            ).strip()
+    else:
+        analysis_step.additional_notes = audit_note
+
+    if analysis_step.root_cause_class not in {None, "unknown"}:
+        analysis_step.root_cause_class = "unknown"
+
+    if analysis_step.is_conclusive:
+        analysis_step.is_conclusive = False
+        analysis_step.final_diagnosis = None
+        analysis_step.fix_suggestion = None
+
+    if analysis_step.confidence not in {None, "low"}:
+        analysis_step.confidence = "low"
+
+    return analysis_step
+
+
 def _extract_outer_json_object(content_str: str) -> str:
     first_brace = content_str.find("{")
     if first_brace == -1:
@@ -209,3 +306,175 @@ def _normalize_invalid_escapes(content_str: str) -> str:
 def _inject_missing_arguments_field(content_str: str) -> str:
     pattern = r'("command_name"\s*:\s*"[^"]*"\s*,)\s*(\[)'
     return re.sub(pattern, r'\1 "arguments": \2', content_str)
+
+
+def _detect_page_fault_access_mismatch(
+    state: dict[str, Any],
+) -> dict[str, str] | None:
+    text = _collect_state_text(state)
+    if not text:
+        return None
+
+    oops_match = _OOPS_RE.search(text)
+    rip_match = _RIP_RE.search(text)
+    if oops_match is None or rip_match is None:
+        return None
+
+    error_code = int(oops_match.group("code"), 16)
+    access_direction = _decode_access_direction(error_code)
+    if access_direction == "unknown":
+        return None
+
+    instructions = [
+        (int(match.group("addr"), 16), match.group("inst").strip())
+        for match in _DISASM_LINE_RE.finditer(text)
+    ]
+    if not instructions:
+        return None
+
+    rip_addr = int(rip_match.group("addr"), 16)
+    rip_index = next(
+        (index for index, (addr, _) in enumerate(instructions) if addr == rip_addr),
+        None,
+    )
+    if rip_index is None:
+        return None
+
+    rip_instruction = instructions[rip_index][1]
+    candidate_instruction = rip_instruction
+    candidate_access = _classify_instruction_access(rip_instruction)
+
+    if candidate_access in {"none", "unknown"}:
+        for previous_index in range(rip_index - 1, -1, -1):
+            previous_instruction = instructions[previous_index][1]
+            previous_access = _classify_instruction_access(previous_instruction)
+            if previous_access not in {"none", "unknown"}:
+                candidate_instruction = previous_instruction
+                candidate_access = previous_access
+                break
+
+    if candidate_access == "unknown":
+        return None
+
+    mismatch = False
+    if access_direction == "write" and candidate_access not in {"write", "readwrite"}:
+        mismatch = True
+    elif access_direction == "read" and candidate_access not in {"read", "readwrite"}:
+        mismatch = True
+    elif access_direction == "execute" and candidate_access != "execute":
+        mismatch = True
+
+    if not mismatch:
+        return None
+
+    return {
+        "summary": (
+            f"Oops 0x{oops_match.group('code')} decodes to {access_direction} fault, but "
+            f"the candidate instruction `{candidate_instruction}` is classified as {candidate_access}; "
+            f"RIP instruction `{rip_instruction}` must not be accepted as a complete explanation until this is reconciled."
+        ),
+        "expected": access_direction,
+        "candidate": candidate_access,
+        "instruction": candidate_instruction,
+        "rip_instruction": rip_instruction,
+    }
+
+
+def _collect_state_text(state: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for message in state.get("messages", []):
+        content = getattr(message, "content", "")
+        if isinstance(content, str):
+            parts.append(content)
+        elif content:
+            try:
+                parts.append(json.dumps(content, ensure_ascii=False))
+            except TypeError:
+                parts.append(str(content))
+    return "\n".join(parts)
+
+
+def _decode_access_direction(error_code: int) -> str:
+    if error_code & 0x10:
+        return "execute"
+    if error_code & 0x2:
+        return "write"
+    return "read"
+
+
+def _classify_instruction_access(instruction: str) -> str:
+    cleaned = instruction.strip().lower()
+    for prefix in ("lock ", "rep ", "repz ", "repnz "):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix) :]
+
+    if not cleaned:
+        return "unknown"
+
+    mnemonic, _, operand_text = cleaned.partition(" ")
+    if mnemonic in _NON_FAULTING_MNEMONICS:
+        return "none"
+    if mnemonic in _WRITE_MNEMONICS:
+        return "write"
+    if mnemonic in _READWRITE_MNEMONICS and _has_memory_operand(operand_text):
+        return "readwrite"
+    if mnemonic == "lea":
+        return "none"
+    if mnemonic.startswith("j"):
+        return "none"
+    if mnemonic == "mov":
+        operands = [operand.strip() for operand in operand_text.split(",", maxsplit=1)]
+        if len(operands) == 2:
+            src, dst = operands
+            if _is_memory_operand(src) and not _is_memory_operand(dst):
+                return "read"
+            if not _is_memory_operand(src) and _is_memory_operand(dst):
+                return "write"
+            if _is_memory_operand(src) and _is_memory_operand(dst):
+                return "readwrite"
+    if mnemonic in {"cmp", "test", "bt", "bts", "btr", "btc"} and _has_memory_operand(
+        operand_text
+    ):
+        return "read"
+    if _has_memory_operand(operand_text):
+        return "read"
+    return "none"
+
+
+def _has_memory_operand(operand_text: str) -> bool:
+    return any(_is_memory_operand(operand) for operand in operand_text.split(","))
+
+
+def _is_memory_operand(operand: str) -> bool:
+    token = operand.strip().lower()
+    return "(" in token or token.startswith("%gs:") or token.startswith("%fs:")
+
+
+def _mentions_access_type_mismatch(
+    analysis_step: VMCoreLLMAnalysisStep,
+    mismatch: dict[str, str],
+) -> bool:
+    text_parts = [analysis_step.reasoning]
+    if analysis_step.additional_notes:
+        text_parts.append(analysis_step.additional_notes)
+    if analysis_step.final_diagnosis is not None:
+        text_parts.append(analysis_step.final_diagnosis.root_cause)
+        text_parts.append(analysis_step.final_diagnosis.detailed_analysis)
+        text_parts.extend(analysis_step.final_diagnosis.evidence)
+
+    lowered = " ".join(text_parts).lower()
+    keywords = [
+        "error code",
+        "write fault",
+        "read fault",
+        "access-type",
+        "write-vs-read",
+        "read-vs-write",
+        "w/r",
+        mismatch["instruction"].lower(),
+    ]
+    return (
+        mismatch["expected"] in lowered
+        and "contrad" in lowered
+        and any(keyword in lowered for keyword in keywords)
+    )

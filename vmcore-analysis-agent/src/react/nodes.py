@@ -364,7 +364,34 @@ async def call_crash_tool(state: AgentState) -> dict:
                     else str(args)
                 )
                 full_cmd = f"{name} {args_str}".strip()
+                """
+                它主要校验几类事情：
 
+                1. 基本合法性
+                    比如 run_script 不能为空，命令不能是空的，某些命令必须带必要参数。
+
+                2. 危险或高成本命令
+                    具体规则在 action_guard.py:229。
+                    会拦住这类情况：
+                    sym -l 这种输出过大的命令；
+                    bt -a，除非当前 signature_class 是 hard_lockup，这个开关来源于 nodes.py:335；
+                    单独跑 log，或者某些 log 变体不带 grep；
+                    裸 kmem、裸 rd、裸 ptov、裸 vtop、裸 sym 之类不完整请求；
+                    包含 shell 变量、寄存器表达式、未解析地址算术的命令。
+
+                3. run_script 的结构约束
+                    如果脚本里用了模块相关符号，必须先有 mod -s 加载模块符号；
+                    脚本不能只做 mod -s 而没有真正诊断命令。
+
+                4. struct 查询是否和当前已知上下文一致
+                    这部分在 action_guard.py:460。
+                    它会结合你这里传进去的 observed_struct_offsets 和 struct_layout_cache，检查：
+                    当前想查的 struct 类型，是否覆盖了前面从反汇编里观察到的偏移；
+                    是否把第一次 struct -o 类型查询 和 struct 类型 地址实例查询 混在一起；
+                    缓存里已知的 struct 大小是否足够容纳观察到的偏移。
+
+                所以一句话概括：这里调用 validate_tool_call_request 的目的，是在执行 crash 命令前做“安全校验 + 上下文一致性校验 + 命令规范化约束”，避免 LLM 发出危险、不完整、无意义或和当前分析上下文矛盾的工具调用。
+                """
                 validation_error = validate_tool_call_request(
                     name,
                     args,
@@ -501,7 +528,8 @@ async def call_crash_tool(state: AgentState) -> dict:
         }
 
     logger.info(f"Generated {len(tool_messages)} tool messages.")
-
+    # 这个返回字典会被 LangGraph 用来更新当前运行中的 AgentState 状态；
+    # 它不是更新 nodes.py 里的某个本地变量，而是更新整个状态图在这一轮执行中的共享 state。
     return {
         "step_count": 1,
         "messages": tool_messages,

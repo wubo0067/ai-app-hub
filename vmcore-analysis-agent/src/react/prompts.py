@@ -560,6 +560,8 @@ corresponding gate is met is FORBIDDEN.
 **Step 1 — Read Panic String → Record Crash Context (Do NOT conclude yet)**
 - Capture: RIP, CR2, error_code, CPU, PID, taint flags, kernel version
 - Treat panic string as a classification *hint* only; ground truth comes from CR2 + error_code
+- If vmcore-dmesg contains an x86 `Oops: xxxx` line, you MUST decode the page-fault error code bits before reasoning about the faulting instruction.
+- You MUST carry the decoded access type forward explicitly: read (`W/R=0`), write (`W/R=1`), instruction fetch (`I/D=1`), user (`U/S=1`), protection (`P=1`), or not-present (`P=0`).
 
 **Step 2 — Classify Fault Address via CR2 (Primary Branch)**
 | CR2 Value | Diagnosis Direction |
@@ -579,6 +581,32 @@ corresponding gate is met is FORBIDDEN.
 - `U/S=1` → user-mode origin
 - `I/D=1` → instruction fetch (text corruption / function pointer corruption)
 - **Combine with CR2 classification before branching**
+
+### Step 3a — Access-Type Consistency Check (x86 mandatory)
+
+You MUST verify that the decoded page-fault access type is consistent with the candidate faulting instruction.
+
+**Required checks**:
+- If `W/R=0`, the candidate instruction must be a read-side memory access, instruction fetch, or another non-write fault source.
+- If `W/R=1`, the candidate instruction must have an explicit or implicit write side effect.
+- If `I/D=1`, the candidate must be an instruction fetch or execute path, not an ordinary data load/store.
+
+**Treat these as READ-side by default**:
+- `mov (mem), reg`
+- `cmp mem, reg` / `test mem, reg`
+- plain pointer dereference used only as a source operand
+
+**Treat these as WRITE-side by default**:
+- `mov reg, (mem)`
+- `xchg`, `cmpxchg`, `xadd`, atomic RMW ops, `lock`-prefixed memory ops
+- stack writes such as `push`, `call`, interrupt/trap frame pushes
+- string stores such as `stos*`, `movs*` when writing destination memory
+
+**Hard rule**:
+- If the decoded error-code access type contradicts the disassembled instruction semantics, you MUST state the contradiction explicitly in `reasoning` and keep the actual fault source unresolved.
+- Do NOT claim that a plain read instruction such as `mov (%rax), %rax` caused a write fault.
+- Do NOT use speculative execution, prefetch side effects, or NOPTI/PTI state as the default explanation for such a contradiction; they require separate corroborating evidence.
+- When a contradiction exists, treat it as a first-class anomaly equal in importance to RIP-CR2 mismatch.
 
 **Step 4 — Branch by Crash Category**
 - **NULL PTR** → `dis -rl <RIP>`, identify NULL register, trace assignment origin
@@ -609,6 +637,11 @@ If `dis -rl <RIP>` shows `pause`, `nop`, `sti`, `cli`, `ret`, `hlt`, or any inst
    - Value shape is PA-plausible (not ordinary object bytes)
    → If met: `kmem -p <CR2>` to find page owner; `ptov <CR2>` for VA candidate. `ptov` result alone does NOT prove CR2 was a valid PA.
 5. Proceed to §3.12 if: RIP can't fault AND `iommu=pt` confirmed AND active mlx5/nvme/qla2xxx present.
+
+**Additional access-type rule**:
+- The "last memory access before RIP" is only a viable candidate if its access direction matches the decoded error code.
+- Example: `Oops: 0002` (`P=0`, supervisor, write) is INCONSISTENT with `mov (%rax), %rax`, which is a plain read. In that case, you MUST report a write-vs-read contradiction and continue looking for a write-capable fault source or conclude that the exact faulting micro-path is unresolved.
+- A RIP contradiction plus an access-type contradiction is stronger than either one alone. Do NOT collapse them into a generic "pointer corruption" statement without discussing both.
 
 **Mismatch rules (apply in order when crash register ≠ current vmcore value)**:
 - **Consistency check**: Treat discrepancy as transient/race/chain-corruption until proven otherwise. Mismatch alone is NOT evidence of DMA or a static overwrite.

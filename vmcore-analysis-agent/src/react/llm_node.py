@@ -10,6 +10,7 @@ from langchain_core.messages import AIMessage, SystemMessage, ToolMessage, Human
 from .graph_state import AgentState
 from .nodes import llm_analysis_node, structure_reasoning_node
 from .output_parser import (
+    apply_executor_consistency_audit,
     build_tool_calls,
     repair_analysis_step,
     repair_structured_output,
@@ -166,6 +167,12 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
                 logger.error(error_msg)
                 raise ValueError(error_msg)
 
+        llm_step = apply_executor_consistency_audit(
+            llm_step,
+            state,
+            log_prefix=llm_analysis_node,
+        )
+
         # 记录 response
         analysis_result, managed_updates = project_managed_analysis_step(
             llm_step,
@@ -296,6 +303,12 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
                 f"Chat model failed to structure reasoning. "
                 f"Raw: {repr(raw_chat_message.content[:200])}"
             )
+
+        llm_step = apply_executor_consistency_audit(
+            llm_step,
+            state,
+            log_prefix=structure_reasoning_node,
+        )
 
         # 强制覆盖 step_id 为当前实际步数，chat 模型可能输出错误值
         llm_step.step_id = current_step
