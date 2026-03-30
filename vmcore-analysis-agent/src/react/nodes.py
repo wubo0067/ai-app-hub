@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# nodes.py - VMCore 分析 Agent 节点实现模块
+# Author: CalmWU
+# Created: 2026-01-09
+
 """
 VMCore 分析 Agent 节点实现
 
@@ -9,6 +15,7 @@ VMCore 分析 Agent 节点实现
 """
 
 import asyncio
+import json
 import re
 from typing import List, Tuple, Any
 
@@ -17,8 +24,15 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from src.utils.logging import logger
 from .graph_state import AgentState
 from .prompts import crash_init_data_prompt
+from .action_guard import (
+    build_command_fingerprint,
+    extract_crash_path_struct_offsets,
+    build_fingerprint_from_lines,
+    extract_struct_layouts,
+    extract_command_lines,
+    validate_tool_call_request,
+)
 from src.mcp_tools.crash.client import crash_client
-
 
 # =========================================================================
 # 节点名称常量定义
@@ -26,12 +40,14 @@ from src.mcp_tools.crash.client import crash_client
 crash_tool_node = "crash_tool_node"
 collect_crash_init_data_node = "collect_crash_init_data_node"
 llm_analysis_node = "llm_analysis_node"
+structure_reasoning_node = "structure_reasoning_node"
 
 # =========================================================================
 # 默认 crash 命令集合
 # =========================================================================
 DEFAULT_CRASH_COMMANDS: list[str] = [
     "sys",  # 系统信息
+    "sys -t",  # 内核的 taint 状态（kernel taint flags
     "bt",  # 所有线程的堆栈回溯
     # "ps -a",  # 进程列表
     # "runq",  # 运行队列
@@ -43,45 +59,6 @@ DEFAULT_CRASH_COMMANDS: list[str] = [
     # "ipcs",  # IPC 信息
     # "waitq",  # 等待队列
 ]
-
-
-async def _invoke_tool(tool, cmd: str, state: AgentState) -> str:
-    """
-    安全地调用 crash MCP 工具执行指定命令。
-
-    Args:
-        tool: MCP 工具实例
-        cmd: crash 命令字符串
-        state: 当前 Agent 状态，包含 vmcore 和 vmlinux 路径
-
-    Returns:
-        str: 工具执行的输出结果，如果失败则返回错误信息字符串
-    """
-    try:
-        logger.debug(f"Invoking tool for command: {cmd}")
-        result = await tool.ainvoke(
-            {
-                "command": cmd,
-                "vmcore_path": state["vmcore_path"],
-                "vmlinux_path": state["vmlinux_path"],
-            }
-        )
-        logger.debug(f"Tool invocation succeeded for: {cmd}")
-
-        # 处理可能返回的列表结构（LangChain MCP 工具通常返回 [{'type': 'text', 'text': '...'}]）
-        if isinstance(result, list):
-            text_parts = [
-                item.get("text", "")
-                for item in result
-                if isinstance(item, dict) and item.get("type") == "text"
-            ]
-            return "".join(text_parts).strip()
-
-        return str(result).strip()
-    except Exception as exc:
-        error_msg = f"[error] Tool invocation failed for '{cmd}': {exc}"
-        logger.error(error_msg)
-        return error_msg
 
 
 async def dispatch_crash_commands(
@@ -258,23 +235,30 @@ async def collect_crash_init_data(state: AgentState) -> dict:
         def _read_dmesg_context(path: str, t_cpu: int, t_pid: int, t_comm: str) -> str:
             """Synchronous helper to read dmesg, to be run in a thread."""
             try:
+                # 读取 vmcore-dmesg.txt 全部内容
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
                     dmesg_lines = f.readlines()
 
+                # 对进程名进行正则转义，防止特殊字符干扰匹配
                 esc_comm = re.escape(t_comm)
+                # 构建正则：匹配包含指定 CPU、PID 和进程名的 dmesg 行，
+                # 用于定位崩溃现场在 dmesg 日志中的位置
                 pattern = re.compile(
                     rf"CPU:\s*{t_cpu}.*PID:\s*{t_pid}.*Comm:\s*{esc_comm}"
                 )
 
+                # 逐行扫描，找到匹配行后提取上下文窗口
                 for i, line in enumerate(dmesg_lines):
                     if pattern.search(line):
-                        start = max(0, i - 20)
-                        end = min(len(dmesg_lines), i + 100)
+                        # 向前取 50 行（崩溃前的上下文），向后取 50 行（崩溃后的调用栈/日志）
+                        start = max(0, i - 50)
+                        end = min(len(dmesg_lines), i + 50)
                         return (
-                            f"$ vmcore-dmesg.txt (extracted around CPU:{t_cpu} PID:{t_pid} Comm:{t_comm})\n"
+                            f"$ vmcore-dmesg (extracted around CPU:{t_cpu} PID:{t_pid} Comm:{t_comm})\n"
                             + "".join(dmesg_lines[start:end])
                             + "\n\n"
                         )
+                # 未找到匹配行，返回空字符串
                 return ""
             except Exception as e:
                 logger.error(f"Failed to read dmesg: {e}")
@@ -289,17 +273,17 @@ async def collect_crash_init_data(state: AgentState) -> dict:
             if dmesg_output:
                 crash_output_parts.append(dmesg_output)
                 logger.info(
-                    f"Extracted vmcore-dmesg.txt content around CPU:{cpu} PID:{pid} Comm:{command}. dmesg_output: {dmesg_output}"
+                    f"Extracted vmcore-dmesg content around CPU:{cpu} PID:{pid} Comm:{command}. dmesg_output: {dmesg_output}"
                 )
             else:
                 logger.warning(
-                    f"No matching line found in vmcore-dmesg.txt for CPU:{cpu} PID:{pid} Comm:{command}."
+                    f"No matching line found in vmcore-dmesg for CPU:{cpu} PID:{pid} Comm:{command}."
                 )
         except Exception as exc:
             logger.error(f"Error during dmesg extraction: {exc}", exc_info=True)
     else:
         logger.warning(
-            "Skipping vmcore-dmesg.txt extraction: match info (PID/CPU/COMMAND) not found in 'bt' output."
+            "Skipping vmcore-dmesg extraction: match info (PID/CPU/COMMAND) not found in 'bt' output."
         )
 
     if state.get("debug_symbol_paths"):
@@ -329,6 +313,8 @@ async def call_crash_tool(state: AgentState) -> dict:
 
     此节点从 LLM 的响应中提取所有工具调用请求，并发执行对应的 crash 命令，
     并为每个调用生成对应的 ToolMessage 返回给 LLM。
+    包含命令去重检测：如果本次命令的实质部分（排除 mod -s 前缀）与历史已执行命令完全一致，
+    则直接返回历史输出而不重复执行。
 
     Args:
         state: AgentState，包含 LLM 的工具调用请求
@@ -341,11 +327,28 @@ async def call_crash_tool(state: AgentState) -> dict:
 
     last_message = state["messages"][-1]
     tool_messages = []
+    allow_bt_a = False
+
+    if isinstance(last_message, AIMessage) and isinstance(last_message.content, str):
+        try:
+            parsed_content = json.loads(last_message.content)
+            allow_bt_a = parsed_content.get("signature_class") == "hard_lockup"
+        except (TypeError, json.JSONDecodeError):
+            logger.debug(
+                "Failed to decode AIMessage content for executor guard context; bt -a will remain forbidden."
+            )
+
+    prior_fingerprints = set(state.get("executed_fingerprints", []))
+    prior_tool_outputs = dict(state.get("tool_output_cache", {}))
+    crash_path_struct_offsets = state.get("crash_path_struct_offsets")
+    struct_layout_cache = dict(state.get("struct_layout_cache", {}))
 
     # 提取所有工具调用的命令，准备批量执行
     # 为了后续能将结果匹配回 tool_call_id，我们需要维护一个映射或顺序
-    tool_calls_data = []  # List[(tool_call_id, tool_name, command_string)]
+    tool_calls_data = []  # List[(tool_call_id, tool_name, command_string, fingerprint)]
     commands_to_run = []  # List[str]
+    new_tool_output_cache: dict[str, str] = {}
+    new_fingerprints: list[str] = []
 
     try:
         if isinstance(last_message, AIMessage) and last_message.tool_calls:
@@ -361,8 +364,96 @@ async def call_crash_tool(state: AgentState) -> dict:
                     else str(args)
                 )
                 full_cmd = f"{name} {args_str}".strip()
+                """
+                它主要校验几类事情：
 
-                tool_calls_data.append((tool_call_id, name, full_cmd))
+                1. 基本合法性
+                    比如 run_script 不能为空，命令不能是空的，某些命令必须带必要参数。
+
+                2. 危险或高成本命令
+                    具体规则在 action_guard.py:229。
+                    会拦住这类情况：
+                    sym -l 这种输出过大的命令；
+                    bt -a，除非当前 signature_class 是 hard_lockup，这个开关来源于 nodes.py:335；
+                    单独跑 log，或者某些 log 变体不带 grep；
+                    裸 kmem、裸 rd、裸 ptov、裸 vtop、裸 sym 之类不完整请求；
+                    包含 shell 变量、寄存器表达式、未解析地址算术的命令。
+
+                3. run_script 的结构约束
+                    如果脚本里用了模块相关符号，必须先有 mod -s 加载模块符号；
+                    脚本不能只做 mod -s 而没有真正诊断命令。
+
+                4. struct 查询是否和当前已知上下文一致
+                    这部分在 action_guard.py:460。
+                    它会结合你这里传进去的 observed_struct_offsets 和 struct_layout_cache，检查：
+                    当前想查的 struct 类型，是否覆盖了前面从反汇编里观察到的偏移；
+                    是否把第一次 struct -o 类型查询 和 struct 类型 地址实例查询 混在一起；
+                    缓存里已知的 struct 大小是否足够容纳观察到的偏移。
+
+                所以一句话概括：这里调用 validate_tool_call_request 的目的，是在执行 crash 命令前做“安全校验 + 上下文一致性校验 + 命令规范化约束”，避免 LLM 发出危险、不完整、无意义或和当前分析上下文矛盾的工具调用。
+                """
+                validation_error = validate_tool_call_request(
+                    name,
+                    args,
+                    allow_bt_a=allow_bt_a,
+                    observed_struct_offsets=crash_path_struct_offsets,
+                    struct_layout_cache=struct_layout_cache,
+                )
+                if validation_error is not None:
+                    tool_messages.append(
+                        ToolMessage(
+                            content=f"[executor-guard] Rejected action: {validation_error}",
+                            tool_call_id=tool_call_id,
+                            name=name,
+                        )
+                    )
+                    logger.warning(
+                        "Executor guard rejected tool call %s (ID: %s): %s",
+                        name,
+                        tool_call_id,
+                        validation_error,
+                    )
+                    continue
+
+                # ---- 去重检测 ----
+                current_fingerprint = build_command_fingerprint(name, args)
+                prior_output = prior_tool_outputs.get(current_fingerprint)
+
+                if current_fingerprint and (
+                    current_fingerprint in prior_fingerprints
+                    or prior_output is not None
+                ):
+                    # 命令已执行过，直接返回历史输出 + 提示
+                    dedup_msg = (
+                        f"[DEDUP] This command was already executed in a prior step. "
+                        f"Reusing prior output to save budget.\n"
+                        f"---\n{prior_output or '[DEDUP] Fingerprint found in state, but no cached output was retained.'}"
+                    )
+                    tool_messages.append(
+                        ToolMessage(
+                            content=dedup_msg,
+                            tool_call_id=tool_call_id,
+                            name=name,
+                        )
+                    )
+                    logger.warning(
+                        f"Command deduplication: '{current_fingerprint[:80]}...' already executed. "
+                        f"Returning cached output instead of re-executing."
+                    )
+                    continue
+
+                current_lines = extract_command_lines(name, args)
+                logger.debug(
+                    "Validated tool call %s (ID: %s): lines=%s, fingerprint=%s",
+                    name,
+                    tool_call_id,
+                    current_lines,
+                    current_fingerprint,
+                )
+
+                tool_calls_data.append(
+                    (tool_call_id, name, full_cmd, current_fingerprint)
+                )
                 commands_to_run.append(full_cmd)
 
                 logger.debug(
@@ -375,7 +466,12 @@ async def call_crash_tool(state: AgentState) -> dict:
                 # matched_results 是 List[(cmd, output)]，只包含成功匹配并执行的结果
 
                 # 将结果映射回 ToolMessage
-                for tool_call_id, tool_name, original_cmd in tool_calls_data:
+                for (
+                    tool_call_id,
+                    tool_name,
+                    original_cmd,
+                    fingerprint,
+                ) in tool_calls_data:
                     found_result = False
 
                     # 在执行结果中查找匹配的命令
@@ -393,6 +489,22 @@ async def call_crash_tool(state: AgentState) -> dict:
                                     name=tool_name,
                                 )
                             )
+                            if fingerprint:
+                                prior_tool_outputs[fingerprint] = content
+                                new_tool_output_cache[fingerprint] = content
+                                if fingerprint not in prior_fingerprints:
+                                    prior_fingerprints.add(fingerprint)
+                                    new_fingerprints.append(fingerprint)
+
+                            observed_offsets = extract_crash_path_struct_offsets(
+                                content
+                            )
+                            if observed_offsets:
+                                crash_path_struct_offsets = observed_offsets
+
+                            discovered_layouts = extract_struct_layouts(content)
+                            if discovered_layouts:
+                                struct_layout_cache.update(discovered_layouts)
                             found_result = True
                             # 找到一个就可以停止内层循环，进入下一个 tool_call
                             # 实际上这可以处理重复命令的情况：每个 tool_call 都能匹配到结果
@@ -416,9 +528,17 @@ async def call_crash_tool(state: AgentState) -> dict:
         }
 
     logger.info(f"Generated {len(tool_messages)} tool messages.")
-
+    # 这个返回字典会被 LangGraph 用来更新当前运行中的 AgentState 状态；
+    # 它不是更新 nodes.py 里的某个本地变量，而是更新整个状态图在这一轮执行中的共享 state。
     return {
         "step_count": 1,
         "messages": tool_messages,
+        "executed_fingerprints": new_fingerprints,
+        "tool_output_cache": {
+            **state.get("tool_output_cache", {}),
+            **new_tool_output_cache,
+        },
+        "crash_path_struct_offsets": crash_path_struct_offsets,
+        "struct_layout_cache": struct_layout_cache,
         "error": None,
     }

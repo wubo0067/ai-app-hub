@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# logging_callback.py - VMCore 分析 Agent 日志回调处理器
+# Author: CalmWU
+# Created: 2026-01-14
+
 from langchain_core.callbacks import BaseCallbackHandler
 from typing import Any, Dict, List, Optional
 import asyncio
@@ -12,6 +18,7 @@ class GraphLoggingCallback(BaseCallbackHandler):
     def __init__(self):
         super().__init__()
         self.current_node = None
+        self._logged_error_ids: set = set()  # 防止嵌套 chain 层级重复打印同一错误
 
     def on_chain_start(
         self, serialized: Dict[str, Any], inputs: Dict[str, Any], **kwargs: Any
@@ -37,9 +44,14 @@ class GraphLoggingCallback(BaseCallbackHandler):
             logger.info("⚠️ Graph execution was cancelled.")
             return
 
-        logger.error("=" * 80)
+        err_id = id(error)
+        if err_id in self._logged_error_ids:
+            return
+        self._logged_error_ids.add(err_id)
+
+        # logger.error("=" * 80)
         logger.error(f"❌ Graph execution failed with error: {error}")
-        logger.error("=" * 80)
+        # logger.error("=" * 80)
 
     def on_tool_start(
         self,

@@ -1,14 +1,26 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# edges.py - VMCore 分析 Agent 边（路由）逻辑模块
+# Author: CalmWU
+# Created: 2026-01-13
+
 """
 VMCore 分析 Agent 边（路由）逻辑
 
 定义节点之间的转换条件和路由规则。
 """
 
+import json
 from typing import Literal
 from langchain_core.messages import AIMessage, HumanMessage
 from .graph_state import AgentState
+from .schema import VMCoreAnalysisStep
 from src.utils.logging import logger
-from .nodes import crash_tool_node, llm_analysis_node
+from .nodes import (
+    crash_tool_node,
+    llm_analysis_node,
+    structure_reasoning_node,
+)
 
 
 def should_continue(state: AgentState) -> str:
@@ -35,6 +47,13 @@ def should_continue(state: AgentState) -> str:
         logger.error(f"Routing to __end__ from node '{node}' due to error: {msg}")
         return "__end__"
 
+    # 1.5 检查是否需要结构化 reasoning_content
+    if state.get("reasoning_to_structure"):
+        logger.info(
+            f"reasoning_to_structure is set, routing to {structure_reasoning_node}"
+        )
+        return structure_reasoning_node
+
     # 2. 根据消息类型判断路由
     if isinstance(last_message, AIMessage):
         tool_calls = getattr(last_message, "tool_calls", None) or []
@@ -49,6 +68,37 @@ def should_continue(state: AgentState) -> str:
             )
             return crash_tool_node
         else:
+            # If the LLM returned no tool calls but also is_conclusive=False,
+            # route back to llm_analysis_node so it can produce a final conclusion.
+            # LangGraph's recursion_limit acts as the safety net against infinite loops.
+            if not is_last_step:
+                try:
+                    raw = (
+                        last_message.content
+                        if isinstance(last_message.content, str)
+                        else json.dumps(last_message.content)
+                    )
+                    step_obj = VMCoreAnalysisStep.model_validate_json(raw)
+                    if not step_obj.is_conclusive:
+                        # Sometimes json_repair fixes a truncated model output and sets is_conclusive=False
+                        # by default, even though final_diagnosis is populated. Check if we actually have
+                        # a final_diagnosis, and if so, consider it conclusive to prevent an infinite loop.
+                        if step_obj.final_diagnosis is not None:
+                            logger.info(
+                                "LLM returned is_conclusive=False but final_diagnosis is populated. "
+                                "Treating as conclusive to prevent infinite loop. Routing to __end__."
+                            )
+                            return "__end__"
+
+                        logger.warning(
+                            "LLM returned no tool calls but is_conclusive=False "
+                            "(step %s). Routing back to %s to force a conclusion.",
+                            step_obj.step_id,
+                            llm_analysis_node,
+                        )
+                        return llm_analysis_node
+                except Exception:
+                    pass  # parse failure → fall through to __end__
             logger.info(
                 "No tool calls in AIMessage, analysis complete. Routing to __end__"
             )

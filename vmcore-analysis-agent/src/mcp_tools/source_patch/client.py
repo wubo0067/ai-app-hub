@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# client.py - Source Patch MCP 客户端实现
+# Author: CalmWU
+# Created: 2026-01-28
+
 # src/mcp_tools/source_patch/client.py
 import sys
 from typing import List, Optional

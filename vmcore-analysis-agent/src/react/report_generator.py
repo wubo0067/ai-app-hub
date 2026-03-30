@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# report_generator.py - VMCore 分析报告生成模块
+# Author: CalmWU
+# Created: 2026-01-31
+
 """
 生成 vmcore 分析报告的工具模块
 """
@@ -7,7 +13,7 @@ from datetime import datetime
 from typing import List
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, SystemMessage
 from .graph_state import AgentState
-from .llm_node import VMCoreAnalysisStep
+from .schema import VMCoreAnalysisStep
 from src.utils.logging import logger
 
 
@@ -82,16 +88,12 @@ def generate_markdown_report(state: AgentState) -> str:
                         lines.append("```")
                     else:
                         lines.append("```")
-                        lines.append(content[:500])  # 限制长度
-                        if len(content) > 500:
-                            lines.append("...")
+                        lines.append(content)
                         lines.append("```")
                 except:
                     # 不是 JSON，直接显示
                     lines.append("```")
-                    lines.append(content[:500])
-                    if len(content) > 500:
-                        lines.append("...")
+                    lines.append(content)
                     lines.append("```")
 
             lines.append("")
@@ -115,6 +117,18 @@ def generate_markdown_report(state: AgentState) -> str:
                 lines.append("")
                 lines.append(analysis.reasoning)
                 lines.append("")
+
+                if analysis.signature_class:
+                    lines.append(f"**早期签名类**: {analysis.signature_class}")
+                    lines.append("")
+
+                if analysis.root_cause_class:
+                    lines.append(f"**最终根因类**: {analysis.root_cause_class}")
+                    lines.append("")
+
+                if analysis.partial_dump != "unknown":
+                    lines.append(f"**转储完整性**: {analysis.partial_dump}")
+                    lines.append("")
 
                 # 如果有工具调用
                 if analysis.action:
@@ -164,9 +178,9 @@ def generate_markdown_report(state: AgentState) -> str:
             except Exception as e:
                 logger.warning(f"Failed to parse AIMessage as VMCoreAnalysisStep: {e}")
                 lines.append("```json")
-                lines.append(msg.content[:500])
-                if len(msg.content) > 500:
-                    lines.append("...")
+                lines.append(
+                    msg.content if isinstance(msg.content, str) else str(msg.content)
+                )
                 lines.append("```")
                 lines.append("")
 
@@ -183,11 +197,9 @@ def generate_markdown_report(state: AgentState) -> str:
             lines.append("```")
             content = msg.content
             if isinstance(content, str):
-                lines.append(content[:1000])  # 限制长度
-                if len(content) > 1000:
-                    lines.append("...")
+                lines.append(content)
             else:
-                lines.append(str(content)[:1000])
+                lines.append(str(content))
             lines.append("```")
             lines.append("")
             step_number += 1
@@ -209,8 +221,11 @@ def generate_markdown_report(state: AgentState) -> str:
     lines.append("## 总结")
     lines.append("")
     lines.append(
-        f"本次分析共执行 {step_number} 个步骤，使用了 {state.get('token_usage', 0)} 个 Token。"
+        f"本次分析共执行 {step_number} 个步骤，使用了 {state.get('token_usage', 0)} 个 Token"
     )
+    if state.get("model_name"):
+        lines.append(f"，使用的模型：{state.get('model_name')}")
+    lines.append("。")
 
     # 检查是否有最终诊断
     has_diagnosis = False
@@ -232,8 +247,52 @@ def generate_markdown_report(state: AgentState) -> str:
     if not has_diagnosis:
         lines.append("")
         lines.append(
-            "⚠️ **注意**: 分析未得出最终结论，可能需要更多信息或达到了步数限制。"
+            "⚠️ **注意**: 分析未得出正式的最终结论，以下为最后一步的最佳可用分析状态："
         )
+        # Fallback: render best-available data from the last AIMessage
+        for msg in reversed(messages):
+            if not isinstance(msg, AIMessage):
+                continue
+            try:
+                raw = (
+                    msg.content
+                    if isinstance(msg.content, str)
+                    else json.dumps(msg.content)
+                )
+                last_step = VMCoreAnalysisStep.model_validate_json(raw)
+                lines.append("")
+                lines.append("---")
+                lines.append("")
+                lines.append("## 🔍 最佳可用分析（步骤未收敛）")
+                lines.append("")
+                if last_step.signature_class:
+                    lines.append(f"**崩溃类型签名**: {last_step.signature_class}")
+                    lines.append("")
+                if last_step.root_cause_class:
+                    lines.append(f"**初步根因分类**: {last_step.root_cause_class}")
+                    lines.append("")
+                if last_step.reasoning:
+                    lines.append("**最后推理摘要**:")
+                    lines.append("")
+                    lines.append(last_step.reasoning)
+                    lines.append("")
+                if last_step.active_hypotheses:
+                    lines.append("**当前假设列表**:")
+                    lines.append("")
+                    for h in last_step.active_hypotheses:
+                        lines.append(
+                            f"- [{h.status}] **{h.label}**: {h.evidence or '(无证据)'}"
+                        )
+                    lines.append("")
+                if last_step.confidence:
+                    lines.append(f"**可信度**: {last_step.confidence}")
+                    lines.append("")
+                if last_step.additional_notes:
+                    lines.append(f"**附加说明**: {last_step.additional_notes}")
+                    lines.append("")
+            except Exception:
+                pass
+            break
 
     lines.append("")
     lines.append("---")
@@ -242,7 +301,7 @@ def generate_markdown_report(state: AgentState) -> str:
         '*This report was jointly created by <span style="color: red;">**CalmWU and his AI agent.**</span>*'
     )
     lines.append("")
-    lines.append("*🐶 xeon*")
+    lines.append("*🐶 xeon*")  # Navigator Oracle Explorer X-ray
     lines.append("")
 
     return "\n".join(lines)

@@ -5,6 +5,7 @@ from openai import OpenAI
 import json
 import os
 
+
 class MCPCalculatorClient:
     def __init__(self, server_script_path: str):
         self.server_script_path = server_script_path
@@ -18,8 +19,7 @@ class MCPCalculatorClient:
     async def __aenter__(self):
         """作为异步上下文管理器进入"""
         server_params = StdioServerParameters(
-            command='python',
-            args=[self.server_script_path]
+            command="python", args=[self.server_script_path]
         )
 
         # 启动服务器并保持上下文
@@ -44,9 +44,9 @@ class MCPCalculatorClient:
                     "parameters": {
                         "type": "object",
                         "properties": tool.inputSchema.get("properties", {}),
-                        "required": tool.inputSchema.get("required", [])
-                    }
-                }
+                        "required": tool.inputSchema.get("required", []),
+                    },
+                },
             }
             for tool in tools_result.tools
         ]
@@ -67,18 +67,22 @@ class MCPCalculatorClient:
         result = await self.session.call_tool(tool_name, arguments)
         return result.content[0].text if result.content else ""
 
+
 async def main():
     # 使用 async with 确保正确的资源管理
     async with MCPCalculatorClient("mcp/llm_calc/calculator_server.py") as mcp_client:
         # 配置 OpenAI 客户端
         client = OpenAI(
-            api_key='sk-b5480f840a794c69a0af1732459f3ae4',
-            base_url="https://api.deepseek.com"
+            api_key=os.environ.get("DEEPSEEK_API_KEY"),
+            base_url="https://api.deepseek.com",
         )
 
         # 发送聊天请求
         messages = [
-            {"role": "user", "content": "计算 12.5 加上 7.3, 然后再乘以 0.5，并返回结果。"}
+            {
+                "role": "user",
+                "content": "计算 12.5 加上 7.3, 然后再乘以 0.5，并返回结果。",
+            }
         ]
 
         while True:
@@ -86,7 +90,7 @@ async def main():
                 model="deepseek-chat",
                 messages=messages,
                 tools=mcp_client.tools,
-                tool_choice="auto"
+                tool_choice="auto",
             )
 
             message = response.choices[0].message
@@ -102,14 +106,17 @@ async def main():
                     tool_result = await mcp_client.call_tool(tool_name, arguments)
                     print(f"Tool result: {tool_result}")
 
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": str(tool_result)
-                    })
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": str(tool_result),
+                        }
+                    )
             else:
                 print(f"AI: {message.content}")
                 break
+
 
 if __name__ == "__main__":
     asyncio.run(main())

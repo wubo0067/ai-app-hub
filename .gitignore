@@ -4,6 +4,8 @@ scrapy_rhel/solutions/
 scrapy_rhel/import_solutions/logs/
 __pycache__/
 .vscode/
-vmcore-analysis-agent/rag-preprocessing/data/md/*.md
+rag-preprocessing/data/md/rcu_stall/*.md
+rag-preprocessing/data/md/ssl/*.md
+rag-preprocessing/data/md/*.md
 *.xml
 *.log

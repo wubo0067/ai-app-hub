@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# __main__.py - Crash MCP 工具客户端主入口
+# Author: CalmWU
+# Created: 2026-01-09
+
 import asyncio
 from langchain_mcp_adapters.tools import load_mcp_tools
 from src.utils.logging import logger
@@ -65,7 +71,7 @@ bt"""
         async with crash_client.session("crash") as session:
             logger.info("Session established")
             tools = await load_mcp_tools(session)
-
+            # next 从迭代器 tools 中找到 name 为 "run_script" 的工具，如果没有则返回 None
             run_script_tool = next((t for t in tools if t.name == "run_script"), None)
             if run_script_tool:
                 logger.info("Executing 'run_script' tool")

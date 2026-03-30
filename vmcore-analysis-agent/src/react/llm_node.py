@@ -1,110 +1,30 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# llm_node.py - LLM 分析节点实现模块
+# Author: CalmWU
+# Created: 2026-01-19
+
 import json
-import re
-from typing import Optional, List, Literal, cast, Any, Dict
-from pydantic import BaseModel, Field, model_validator
-from langchain_core.messages import AIMessage, SystemMessage
+from typing import cast
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage, HumanMessage
 from .graph_state import AgentState
-from .nodes import llm_analysis_node
-from .prompts import analysis_crash_prompt
+from .nodes import llm_analysis_node, structure_reasoning_node
+from .output_parser import (
+    apply_executor_consistency_audit,
+    build_tool_calls,
+    repair_analysis_step,
+    repair_structured_output,
+    select_analysis_content,
+)
+from .llm_runtime import ainvoke_with_retry, compress_messages_for_llm
+from .prompts import (
+    analysis_crash_prompt,
+    crash_init_data_prompt,
+    simplified_structure_reasoning_prompt,
+)
+from .schema import VMCoreAnalysisStep, VMCoreLLMAnalysisStep
+from .state_manager import project_managed_analysis_step
 from src.utils.logging import logger
-
-
-class ToolCall(BaseModel):
-    command_name: str = Field(
-        ..., description="The crash command (e.g., 'dis', 'rd') or 'run_script'."
-    )
-    arguments: List[str] = Field(
-        default_factory=list,
-        description="Command arguments. For 'run_script', each string is a separate command line.",
-    )
-
-    # 模型验证器，用于修复 LLM 输出的格式错误，作用：定义一个在模型实例化之前运行的验证器
-    # 模式："before" 表示在 Pydantic 解析输入数据到模型字段之前执行
-    # 参数：接收原始输入数据，可以修改后再传递给模型
-    @model_validator(mode="before")
-    # 作用：将方法标记为类方法
-    # 访问权限：允许方法通过类而不是实例被调用
-    # 参数：第一个参数是 cls（代表类本身）
-    @classmethod
-    def fix_malformed_action(cls, data: Any) -> Any:
-        """修复 LLM 输出的常见格式错误"""
-        if isinstance(data, dict):
-            # 修复：{"command_name": "ps", ["-m"]} -> {"command_name": "ps", "arguments": ["-m"]}
-            if "command_name" in data and "arguments" not in data:
-                # 查找字典中除 command_name 外的列表值
-                for key, value in list(data.items()):
-                    if isinstance(value, list):
-                        data["arguments"] = value
-                        if key != "command_name":
-                            del data[key]
-                        break
-                # 如果还是没有 arguments，设置为空列表
-                if "arguments" not in data:
-                    data["arguments"] = []
-        return data
-
-
-class SuspectCode(BaseModel):
-    """可疑代码位置"""
-
-    file: str = Field(..., description="Source file path")
-    function: str = Field(..., description="Function name")
-    line: str = Field(..., description="Line number or 'unknown'")
-
-
-class FinalDiagnosis(BaseModel):
-    """最终诊断结果的完整结构"""
-
-    crash_type: str = Field(
-        ...,
-        description="Crash type (e.g., NULL pointer dereference, use-after-free, soft lockup)",
-    )
-    panic_string: str = Field(..., description="Exact panic string from dmesg")
-    faulting_instruction: str = Field(
-        ..., description="RIP address and disassembly of faulting instruction"
-    )
-    root_cause: str = Field(
-        ..., description="1-2 sentence root cause explanation with evidence"
-    )
-    detailed_analysis: str = Field(
-        ...,
-        description="Multi-paragraph analysis with full evidence chain and kernel subsystem context",
-    )
-    suspect_code: SuspectCode = Field(..., description="Suspected source code location")
-    evidence: List[str] = Field(
-        ...,
-        description="List of key evidence points (register values, memory contents, etc.)",
-    )
-
-
-class VMCoreAnalysisStep(BaseModel):
-    step_id: int = Field(..., description="Current step sequence number.")
-
-    reasoning: str = Field(
-        ...,
-        description="Detailed thought process. Explain which kernel subsystem (Memory, FS, Scheduler) you are investigating and why.",
-    )
-
-    action: Optional[ToolCall] = Field(
-        None,
-        description="The next command to run. Should be None if is_conclusive is True.",
-    )
-
-    is_conclusive: bool = Field(False)
-    final_diagnosis: Optional[FinalDiagnosis] = Field(
-        None, description="Detailed final root cause and evidence."
-    )
-    fix_suggestion: Optional[str] = Field(
-        None,
-        description="Recommended fix or workaround (e.g., 'Update kernel', 'Hardware replacement needed')",
-    )
-    confidence: Optional[Literal["high", "medium", "low"]] = Field(
-        None, description="Confidence level of the diagnosis"
-    )
-    additional_notes: Optional[str] = Field(
-        None,
-        description="Any caveats, alternative hypotheses, or recommended follow-up actions",
-    )
 
 
 async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
@@ -131,8 +51,12 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
     # 准备系统消息，包含诊断知识库和输出格式
     system_message = analysis_crash_prompt().format(
         VMCoreAnalysisStep_Schema=json.dumps(
-            VMCoreAnalysisStep.model_json_schema(), indent=2
+            VMCoreLLMAnalysisStep.model_json_schema(), indent=2
         ),
+    )
+    system_message += (
+        "\n\n[STRUCTURED OUTPUT CONTRACT]\n"
+        "active_hypotheses and gates are executor-managed. Omit them entirely from your JSON and return only the minimal schema fields."
     )
 
     # 检查是否是最后一步 (LangGraph recursion_limit 触发前)
@@ -149,19 +73,39 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
             "Set 'is_conclusive' to true and do NOT request any further tool calls (action must be null)."
         )
 
-    # 核心原因：LLM 是无状态的
-    # LLM 本身没有记忆。每次调用 invoke() 都是一个独立的 API 请求，LLM 不会"记住"之前的对话。这和我们使用的聊天界面不同：
+    # 压缩消息历史后再发送给 LLM，避免 reasoning_content 累积和大工具输出导致 token 暴增
+    compressed_messages = compress_messages_for_llm(state["messages"])
+    messages_to_send = [SystemMessage(content=system_message), *compressed_messages]
 
-    # 每次调用都需要传入完整的上下文消息列表，包括系统消息和之前的对话历史。
-    messages_to_send = [SystemMessage(content=system_message), *state["messages"]]
+    logger.info(
+        f"Prepared messages for LLM analysis (step {current_step}): {[type(m).__name__ for m in messages_to_send]} with system prompt length {len(system_message)}"
+    )
+
+    # 如果上一条消息是 AIMessage 且没有工具调用，说明在此之前发生过 fallback（如 LLM 返回了无效的动作或未提供结论）
+    # 增加一条 HumanMessage 提示 LLM 不能空转
+    last_msg = messages_to_send[-1] if messages_to_send else None
+    if isinstance(last_msg, AIMessage) and not last_msg.tool_calls:
+        logger.warning(
+            "Last message was an AIMessage without tool calls. Injecting HumanMessage to force action or conclusion."
+        )
+        messages_to_send.append(
+            HumanMessage(
+                content=(
+                    "Your previous response neither invoked any tools nor concluded the analysis (is_conclusive=false). "
+                    "You cannot remain in this state. Please EITHER call a tool out of the available options to "
+                    "gather more information, OR set 'is_conclusive'=true and provide your final_diagnosis."
+                )
+            )
+        )
+
     # 结构化输出，设置 include_raw=True 以获取 token 消耗等元数据
     llm_analysis = llm_with_tools.with_structured_output(
-        VMCoreAnalysisStep, method="json_mode", include_raw=True
+        VMCoreLLMAnalysisStep, method="json_mode", include_raw=True
     )
     try:
         # 使用 include_raw=True 后，ainvoke 返回包含 'parsed' 和 'raw' 的字典
-        output_data = await llm_analysis.ainvoke(messages_to_send)
-        analysis_result = cast(VMCoreAnalysisStep, output_data["parsed"])
+        output_data = await ainvoke_with_retry(llm_analysis, messages_to_send)
+        llm_step = cast(VMCoreLLMAnalysisStep, output_data["parsed"])
         raw_message = cast(AIMessage, output_data["raw"])
 
         # 获取并记录 token 消耗数量
@@ -169,76 +113,76 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         curr_token_usage = usage_metadata.get("total_tokens", 0)
 
         # 检查解析结果是否为空
-        if analysis_result is None:
+        if llm_step is None:
             # 尝试修复常见的 JSON 格式错误
-            try:
-                content = raw_message.content
-                content_str = (
-                    content if isinstance(content, str) else json.dumps(content)
-                )
+            logger.warning(
+                "LLM output is empty or could not be parsed. Attempting to repair JSON..."
+            )
+            reasoning = raw_message.additional_kwargs.get("reasoning_content", "")
+            content_str, reasoning_fallback = select_analysis_content(
+                raw_message.content,
+                reasoning,
+            )
+            logger.debug(
+                f"use reasoning content: '{reasoning[:50] if reasoning else ''}' to attempt JSON repair"
+            )
 
-                # Fix 0: 提取 JSON 部分并移除 trailing characters
-                # 尝试找到最外层的 JSON 对象
-                # 查找第一个 '{' 和最后一个匹配的 '}'
-                first_brace = content_str.find("{")
-                if first_brace != -1:
-                    # 查找匹配的结束大括号
-                    brace_count = 0
-                    last_brace = -1
-                    for i in range(first_brace, len(content_str)):
-                        if content_str[i] == "{":
-                            brace_count += 1
-                        elif content_str[i] == "}":
-                            brace_count -= 1
-                            if brace_count == 0:
-                                last_brace = i
-                                break
-
-                    if last_brace != -1:
-                        content_str = content_str[first_brace : last_brace + 1]
-                        logger.info(
-                            f"Extracted JSON from position {first_brace} to {last_brace+1}"
-                        )
-
-                # Fix 1: 修复无效的 JSON 转义序列（LLM 经常混淆 bash 和 JSON 转义）
-                # \| → | (管道符在 JSON 中不需要转义)
-                # \/ → / (斜杠在 JSON 中不需要转义)
-                # \> → > (重定向符在 JSON 中不需要转义)
-                # \< → < (重定向符在 JSON 中不需要转义)
-                # \& → & (与符号在 JSON 中不需要转义)
-                invalid_escapes = [
-                    (r"\|", "|"),
-                    (r"\/", "/"),
-                    (r"\>", ">"),
-                    (r"\<", "<"),
-                    (r"\&", "&"),
-                ]
-                for pattern, replacement in invalid_escapes:
-                    content_str = content_str.replace(pattern, replacement)
-
-                # Fix 2: 修复缺失的 arguments 字段
-                # "action":{"command_name":"ps",["-m"]} -> "action":{"command_name":"ps","arguments":["-m"]}
-                pattern = r'("command_name"\s*:\s*"[^"]*"\s*,)\s*(\[)'
-                content_str = re.sub(pattern, r'\1 "arguments": \2', content_str)
-
-                analysis_result = VMCoreAnalysisStep.model_validate_json(content_str)
+            if reasoning_fallback:
                 logger.warning(
-                    "Successfully repaired malformed JSON from LLM. "
-                    f"Original: {content[:200]}... Fixed: {content_str[:200]}..."
+                    "Content is empty and reasoning_content is plain text (no JSON). "
+                    "Routing to structure_reasoning_node for structuring."
                 )
-            except Exception as repair_err:
-                logger.warning(f"JSON repair failed: {repair_err}")
+                return {
+                    "step_count": 1,
+                    "token_usage": curr_token_usage,
+                    "reasoning_to_structure": reasoning_fallback,
+                    "reasoning_additional_kwargs": raw_message.additional_kwargs.copy(),
+                    "error": None,
+                }
+
+            if content_str:
+                llm_step = repair_structured_output(
+                    content_str,
+                    model_class=VMCoreLLMAnalysisStep,
+                )
+
+            if llm_step is None:
+                if reasoning and len(reasoning) > 50:
+                    logger.warning(
+                        "JSON repair failed but reasoning_content available. "
+                        "Routing to structure_reasoning_node for structuring."
+                    )
+                    return {
+                        "step_count": 1,
+                        "token_usage": curr_token_usage,
+                        "reasoning_to_structure": reasoning,
+                        "reasoning_additional_kwargs": raw_message.additional_kwargs.copy(),
+                        "error": None,
+                    }
 
                 parsing_error = output_data.get("parsing_error")
-                error_msg = (
-                    f"Failed to parse LLM output. Raw content: {raw_message.content}"
-                )
+                error_msg = f"Failed to parse LLM output. Raw content: {repr(raw_message.content)}"
                 if parsing_error:
                     error_msg += f". Parsing error: {parsing_error}"
                 logger.error(error_msg)
                 raise ValueError(error_msg)
 
+        llm_step = apply_executor_consistency_audit(
+            llm_step,
+            state,
+            log_prefix=llm_analysis_node,
+        )
+
         # 记录 response
+        analysis_result, managed_updates = project_managed_analysis_step(
+            llm_step,
+            state,
+            original_reasoning=raw_message.additional_kwargs.get(
+                "reasoning_content", ""
+            )
+            or str(raw_message.content),
+        )
+
         logger.debug(
             f"LLM Analysis Result: {analysis_result.model_dump_json(indent=2)}"
         )
@@ -246,60 +190,25 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         # 手动构造 AIMessage 以便 edges.py 识别路由。
         # 如果 LLM 决定调用工具 (action 不为空)，我们需要手动填充 tool_calls
         # 安全屏障：当 is_last_step=True 时，强制清除 action，阻止生成 tool_calls
-        tool_calls = []
-        if is_last_step and analysis_result.action:
-            logger.warning(
-                "is_last_step=True but LLM still returned action. "
-                "Stripping tool_calls to force conclusion."
-            )
-            analysis_result.action = None
-        if analysis_result.action:
-            logger.info(
-                f"LLM decided to call tool: {analysis_result.action.command_name}"
-            )
-
-            # 根据工具类型构建参数
-            tool_name = analysis_result.action.command_name
-            tool_args = {}
-
-            if tool_name == "run_script":
-                # 对于 run_script，将参数列表拼接为换行分隔的脚本
-                script_content = "\n".join(analysis_result.action.arguments)
-                tool_args = {"script": script_content}
-            else:
-                # 对于普通命令，将参数列表拼接为单个命令字符串
-                # 注意：这里我们使用 'command' 作为参数名，以匹配 MCP server 的定义
-                # 之前代码可能使用了 'cmd'，这取决于 nodes.py 的处理。
-                # 为了兼容性，我们可以暂时保留 cmd 或者同时提供（如果允许额外参数）
-                # 但根据规范，应该是 command。此处假设 nodes.py 能透传或已调整。
-                # 修正：为了最稳妥，我们查看之前的代码使用的是 args={"cmd": ...}
-                # 如果 run_script 走的是同样的 tool invoke 路径，我们需要确保参数名正确。
-                cmd_args = " ".join(analysis_result.action.arguments)
-                # 使用 legacy 的 'cmd' 还是标准的 'command'？
-                # 鉴于 run_script 必须用 script，我们这里尝试使用 command 以对齐 server。
-                # 如果之前代码用 cmd 能跑，说明 nodes.py 可能做了映射 command = args['cmd']
-                # 为了安全，我们还是沿用之前的模式，但是 run_script 必须是 script
-                tool_args = {"command": cmd_args}
-
-            tool_calls.append(
-                {
-                    "name": tool_name,
-                    "args": tool_args,
-                    "id": f"call_{analysis_result.step_id}",
-                }
-            )
-        else:
-            logger.info("LLM did not call any tools, returning result directly.")
+        tool_calls = build_tool_calls(analysis_result, is_last_step=is_last_step)
 
         # 将结构化后的对象序列化存入 content，并携带调用的工具信息
         # 必须保留 additional_kwargs 中的 reasoning_content，否则下一轮对话 DeepSeek-Reasoner 会报错 (Error 400)
         # DeepSeek-Reasoner 模式下，之前的 assistant 消息必须包含 reasoning_content
-        additional_kwargs = raw_message.additional_kwargs.copy()
+        # 如果 reasoning_content 存在，日志记录 reasoning_content 的前 100 字符以供调试
+
+        reasoning_content = raw_message.additional_kwargs.get("reasoning_content")
+        if reasoning_content:
+            logger.debug(f"reasoning_content: {reasoning_content[:50]}...")
+        else:
+            logger.warning(
+                f"No reasoning_content found in additional_kwargs. additional_kwargs keys: {raw_message.additional_kwargs.keys()}"
+            )
 
         response = AIMessage(
             content=analysis_result.model_dump_json(),
             tool_calls=tool_calls,
-            additional_kwargs=additional_kwargs,
+            additional_kwargs=raw_message.additional_kwargs.copy(),
         )
 
     except Exception as e:
@@ -318,5 +227,138 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         "step_count": 1,
         "token_usage": curr_token_usage,
         "messages": [response],
+        **managed_updates,
+        "error": None,
+    }
+
+
+async def structure_reasoning_content(state: AgentState, structured_llm) -> dict:
+    """
+    使用 deepseek-chat 模型将 DeepSeek-Reasoner 的纯文本 reasoning_content 结构化为 VMCoreAnalysisStep。
+
+    当 Reasoner 模型返回空 content 但有纯文本 reasoning_content 时，
+    此节点接收该文本并通过 Chat 模型将其转换为结构化的分析步骤。
+
+    Args:
+        state: AgentState，包含 reasoning_to_structure 和 reasoning_additional_kwargs
+        structured_llm: deepseek-chat LLM 实例
+
+    Returns:
+        dict: 包含 messages、reasoning_to_structure(清空) 等状态更新
+    """
+    reasoning = state.get("reasoning_to_structure", "")
+    original_kwargs = state.get("reasoning_additional_kwargs", {}) or {}
+    current_step = state.get("step_count", 0)
+    is_last_step = state.get("is_last_step", False)
+
+    logger.info(
+        f"Starting {structure_reasoning_node} node execution (step {current_step})..."
+    )
+    logger.debug(
+        f"Reasoning to structure (first 200 chars): {(reasoning or '')[:200]}..."
+    )
+
+    curr_token_usage = 0
+
+    # 构建简化结构化提示（只提取核心字段）
+
+    force_conclusion = ""
+    if is_last_step:
+        force_conclusion = "IMPORTANT: This is the LAST STEP. You MUST set 'is_conclusive' to true and 'action' to null.\n\n"
+
+    system_prompt = simplified_structure_reasoning_prompt().format(
+        current_step=current_step,
+        force_conclusion=force_conclusion,
+    )
+
+    # 只发送最小上下文：系统提示 + 待结构化的 reasoning 文本
+    messages_to_send = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=reasoning),
+    ]
+
+    chat_with_structured = structured_llm.with_structured_output(
+        VMCoreLLMAnalysisStep, method="json_mode", include_raw=True
+    )
+
+    try:
+        output_data = await ainvoke_with_retry(chat_with_structured, messages_to_send)
+        llm_step = cast(VMCoreLLMAnalysisStep, output_data["parsed"])
+        raw_chat_message = cast(AIMessage, output_data["raw"])
+
+        usage_metadata = getattr(raw_chat_message, "usage_metadata", {}) or {}
+        curr_token_usage = usage_metadata.get("total_tokens", 0)
+
+        if llm_step is None:
+            content = raw_chat_message.content
+            content_str = content if isinstance(content, str) else json.dumps(content)
+            llm_step = repair_structured_output(
+                content_str,
+                model_class=VMCoreLLMAnalysisStep,
+                log_prefix=structure_reasoning_node,
+            )
+
+        if llm_step is None:
+            raise ValueError(
+                f"Chat model failed to structure reasoning. "
+                f"Raw: {repr(raw_chat_message.content[:200])}"
+            )
+
+        llm_step = apply_executor_consistency_audit(
+            llm_step,
+            state,
+            log_prefix=structure_reasoning_node,
+        )
+
+        # 强制覆盖 step_id 为当前实际步数，chat 模型可能输出错误值
+        llm_step.step_id = current_step
+
+        analysis_result, managed_updates = project_managed_analysis_step(
+            llm_step,
+            state,
+            original_reasoning=reasoning,
+        )
+
+        logger.info(
+            f"structure_reasoning_node: Successfully structured reasoning content. "
+            f"LLM Analysis Result: {analysis_result.model_dump_json(indent=2)}"
+        )
+
+        # 构建 tool_calls（与 call_llm_analysis 相同逻辑）
+        tool_calls = build_tool_calls(
+            analysis_result,
+            is_last_step=is_last_step,
+            log_prefix=structure_reasoning_node,
+        )
+
+        # 使用原始的 additional_kwargs（含 reasoning_content）以确保
+        # 下一轮 DeepSeek-Reasoner 调用时 assistant 消息包含 reasoning_content
+        response = AIMessage(
+            content=analysis_result.model_dump_json(),
+            tool_calls=tool_calls,
+            additional_kwargs=original_kwargs,
+        )
+
+    except Exception as e:
+        logger.error(f"Error in structure_reasoning_node: {e}", exc_info=True)
+        return {
+            "step_count": 0,
+            "token_usage": curr_token_usage,
+            "reasoning_to_structure": None,
+            "reasoning_additional_kwargs": None,
+            "error": {
+                "message": str(e),
+                "node": structure_reasoning_node,
+                "is_error": True,
+            },
+        }
+
+    return {
+        "step_count": 0,  # 步数已在 llm_analysis_node 中计入
+        "token_usage": curr_token_usage,
+        "messages": [response],
+        "reasoning_to_structure": None,
+        "reasoning_additional_kwargs": None,
+        **managed_updates,
         "error": None,
     }

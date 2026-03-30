@@ -8,17 +8,27 @@ from typing import cast, Optional, Any
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
+from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 from langchain_core.runnables import RunnableConfig
 from src.utils.logging import logger
 from src.utils.config import config_manager
-from src.llm.model import create_llm
-from src.react.graph import create_agent_graph
-from src.react.graph_state import AgentState
-from src.react.logging_callback import graph_logging_callback
-from src.react.report_generator import generate_markdown_report
+from src.llm.model import create_reasoning_llm, create_structured_llm
+from src.react import (
+    AgentState,
+    create_agent_graph,
+    generate_markdown_report,
+    graph_logging_callback,
+)
 from src.mcp_tools.crash.client import initialize_crash_tools
 from src.mcp_tools.source_patch.client import initialize_patch_tools
+
+# Agent 图最大递归轮次（LangGraph superstep 上限）
+# 注意：每轮可见分析消耗 3 个 superstep：
+#   llm_analysis_node (1) + structure_reasoning_node (1) + crash_tool_node (1)
+# 加上初始 collect_crash_init_data_node (1)，公式为：1 + N_rounds × 3
+# 例如：支持 ~30 轮分析 → 1 + 30×3 = 91；支持 ~40 轮 → 1 + 40×3 = 121
+AGENT_RECURSION_LIMIT = 60
 
 
 # 请求模型
@@ -81,7 +91,8 @@ def validate_file_paths(request: VmcoreAnalysisRequest) -> Optional[str]:
 
 # 全局变量存储初始化的组件
 app_state: dict[str, Any] = {
-    "llm": None,
+    "reasoning_llm": None,
+    "structured_llm": None,
     "crash_tools": None,
     "source_patch_tools": None,
     "agent_graph": None,
@@ -96,9 +107,13 @@ async def lifespan(app: FastAPI):
         f"config: \n{yaml.dump(config_manager.get_all(), allow_unicode=True, sort_keys=False)}"
     )
 
-    # 初始化 LLM
-    app_state["llm"] = create_llm()
-    logger.info(f"LLM Model: {app_state['llm'].model_name}")
+    # 初始化 推理 LLM
+    app_state["reasoning_llm"] = create_reasoning_llm()
+    logger.info(f"LLM Model: {app_state['reasoning_llm'].model_name}")
+
+    # 初始化结构化 LLM（用于结构化 Reasoner 的纯文本推理内容）
+    app_state["structured_llm"] = create_structured_llm()
+    logger.info(f"Chat LLM Model: {app_state['structured_llm'].model_name}")
 
     # 初始化工具
     logger.info("Initializing crash and patch tools...")
@@ -114,7 +129,11 @@ async def lifespan(app: FastAPI):
     all_tools = (app_state["crash_tools"] or []) + (
         app_state["source_patch_tools"] or []
     )
-    app_state["agent_graph"] = create_agent_graph(app_state["llm"], all_tools)
+    app_state["agent_graph"] = create_agent_graph(
+        app_state["reasoning_llm"],
+        all_tools,
+        structured_llm=app_state["structured_llm"],
+    )
     logger.info("Agent graph created successfully.")
 
     yield
@@ -129,6 +148,10 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+# Initialize Prometheus instrumentation
+Instrumentator().instrument(app).expose(app)
 
 
 @app.get("/health")
@@ -171,7 +194,7 @@ async def analyze_vmcore(request: VmcoreAnalysisRequest):
     config = cast(
         RunnableConfig,
         {
-            "recursion_limit": 50,
+            "recursion_limit": AGENT_RECURSION_LIMIT,
             "callbacks": [graph_logging_callback],
             **thread,
         },
@@ -188,6 +211,15 @@ async def analyze_vmcore(request: VmcoreAnalysisRequest):
             "token_usage": 0,
             "is_last_step": False,
             "agent_answer": "",
+            "executed_fingerprints": [],
+            "tool_output_cache": {},
+            "managed_active_hypotheses": None,
+            "managed_gates": None,
+            "current_signature_class": None,
+            "current_root_cause_class": None,
+            "current_partial_dump": None,
+            "crash_path_struct_offsets": None,
+            "struct_layout_cache": {},
             "error": None,
         }
 
@@ -266,7 +298,7 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
         config = cast(
             RunnableConfig,
             {
-                "recursion_limit": 40,
+                "recursion_limit": AGENT_RECURSION_LIMIT,
                 "callbacks": [graph_logging_callback],
                 **thread,
             },
@@ -283,29 +315,69 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
                 "token_usage": 0,
                 "is_last_step": False,
                 "agent_answer": "",
+                "executed_fingerprints": [],
+                "tool_output_cache": {},
+                "managed_active_hypotheses": None,
+                "managed_gates": None,
+                "current_signature_class": None,
+                "current_root_cause_class": None,
+                "current_partial_dump": None,
+                "crash_path_struct_offsets": None,
+                "struct_layout_cache": {},
                 "error": None,
             }
 
             yield f"data: {json.dumps({'event': 'start', 'task_id': task_id})}\n\n"
 
-            # 使用 astream 获取节点级别的更新（自动去重）
-            # stream_mode="updates" 会在每个节点完成后返回该节点的输出
-            async for event in app_state["agent_graph"].astream(
-                initial_state,
-                config=config,
-                stream_mode="updates",  # 返回节点更新，key 是节点名
-            ):
-                # event 格式：{节点名：节点输出}
-                for node_name, node_output in event.items():
-                    if node_name != "__end__":  # 忽略结束标记
-                        # 获取当前总 token 使用量
-                        snapshot = app_state["agent_graph"].get_state(
-                            cast(RunnableConfig, thread)
-                        )
-                        token_usage = snapshot.values.get("token_usage", 0)
-                        step_count = snapshot.values.get("step_count", 0)
+            # 使用队列 + 心跳机制：将 astream 放入独立 Task，
+            # 每 15s 发送一个 SSE 注释心跳，防止客户端因"无数据"断连。
+            # （crash 工具执行 log / search 等大命令时可能超过 2 分钟，
+            #   executor 的 COMMAND_TIMEOUT=120s 会终止进程，但在此期间
+            #   SSE 连接需保持活跃。）
+            event_queue: asyncio.Queue = asyncio.Queue()
 
-                        yield f"data: {json.dumps({'event': 'node_complete', 'node': node_name, 'token_usage': token_usage, 'step': step_count})}\n\n"
+            async def _run_graph():
+                try:
+                    async for ev in app_state["agent_graph"].astream(
+                        initial_state,
+                        config=config,
+                        stream_mode="updates",
+                    ):
+                        await event_queue.put(("event", ev))
+                except Exception as exc:
+                    await event_queue.put(("error", exc))
+                finally:
+                    await event_queue.put(("done", None))
+
+            graph_task = asyncio.create_task(_run_graph())
+
+            HEARTBEAT_INTERVAL = 15  # 秒
+            while True:
+                try:
+                    kind, payload = await asyncio.wait_for(
+                        event_queue.get(), timeout=HEARTBEAT_INTERVAL
+                    )
+                except asyncio.TimeoutError:
+                    # 心跳：SSE 注释行，客户端忽略，但可刷新 TCP keep-alive
+                    yield ": heartbeat\n\n"
+                    continue
+
+                if kind == "done":
+                    break
+                elif kind == "error":
+                    raise payload
+                else:
+                    # kind == "event"
+                    for node_name, node_output in payload.items():
+                        if node_name != "__end__":
+                            snapshot = app_state["agent_graph"].get_state(
+                                cast(RunnableConfig, thread)
+                            )
+                            token_usage = snapshot.values.get("token_usage", 0)
+                            step_count = snapshot.values.get("step_count", 0)
+                            yield f"data: {json.dumps({'event': 'node_complete', 'node': node_name, 'token_usage': token_usage, 'step': step_count})}\n\n"
+
+            await graph_task  # 确保异常被传播
 
             snapshot = app_state["agent_graph"].get_state(cast(RunnableConfig, thread))
             final_values = snapshot.values

@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# output_parser.py - LLM 输出解析和修复模块
+# Author: CalmWU
+# Created: 2026-03-23
+
+import json
+import re
+from typing import Any, TypeVar
+
+from json_repair import repair_json
+from pydantic import BaseModel
+
+from src.utils.logging import logger
+
+from .schema import VMCoreAnalysisStep, VMCoreLLMAnalysisStep
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
+
+_DISASM_LINE_RE = re.compile(
+    r"^\s*0x(?P<addr>[0-9a-fA-F]+)\s+<[^>]+>:\s+(?P<inst>.+)$",
+    re.MULTILINE,
+)
+_RIP_RE = re.compile(r"\bRIP:\s*(?:[0-9a-fA-F]+:)?(?P<addr>[0-9a-fA-F]{8,16})\b")
+_OOPS_RE = re.compile(r"\bOops:\s*(?P<code>[0-9a-fA-F]{4})\b")
+_NON_FAULTING_MNEMONICS = {
+    "pause",
+    "nop",
+    "nopl",
+    "nopw",
+    "sti",
+    "cli",
+    "ret",
+    "hlt",
+    "lfence",
+    "sfence",
+    "mfence",
+}
+_WRITE_MNEMONICS = {
+    "push",
+    "call",
+    "stos",
+    "stosb",
+    "stosw",
+    "stosl",
+    "stosq",
+}
+_READWRITE_MNEMONICS = {
+    "xchg",
+    "cmpxchg",
+    "cmpxchg8b",
+    "cmpxchg16b",
+    "xadd",
+    "inc",
+    "dec",
+    "not",
+    "neg",
+    "or",
+    "and",
+    "xor",
+    "add",
+    "sub",
+    "adc",
+    "sbb",
+}
+
+
+def _normalize_root_cause_class(content_str: str) -> str:
+    """
+    在 JSON 解析前对 root_cause_class 字段进行语义归一化。
+    将常见的别名映射到合法的枚举值，避免因 schema 严格验证导致的解析失败。
+    """
+    # 定义常见别名到合法值的映射
+    alias_mapping = {
+        "pointer_corruption": "wild_pointer",  # pointer_corruption 更接近 wild_pointer 的语义
+        "corruption": "memory_corruption",
+        "memory_error": "memory_corruption",
+        "address_corruption": "wild_pointer",
+        "invalid_pointer": "wild_pointer",
+    }
+
+    # 使用正则表达式匹配并替换 root_cause_class 字段值
+    for alias, canonical in alias_mapping.items():
+        # 匹配 "root_cause_class": "pointer_corruption" 这样的模式
+        pattern = r'("root_cause_class"\s*:\s*")' + re.escape(alias) + r'"'
+        replacement = r"\1" + canonical + r'"'
+        content_str = re.sub(pattern, replacement, content_str)
+
+        # 也处理 null 值的情况（虽然不太可能）
+        pattern_null = r'("root_cause_class"\s*:\s*)null'
+        replacement_null = r'\1"' + canonical + r'"'
+        # 只在特定上下文中替换 null，避免误替换
+
+    return content_str
+
+
+def select_analysis_content(
+    content: Any, reasoning: str | None
+) -> tuple[str | None, str | None]:
+    """选择用于结构化解析的内容源，必要时回退到 reasoning_content。"""
+    content_str = content if isinstance(content, str) else json.dumps(content)
+
+    if content_str and content_str.strip():
+        return content_str, None
+
+    if reasoning and "{" in reasoning:
+        logger.warning(
+            "Content is empty/whitespace, attempting to extract JSON from reasoning_content"
+        )
+        return reasoning, None
+
+    if reasoning and len(reasoning) > 50:
+        return None, reasoning
+
+    return content_str, None
+
+
+def repair_analysis_step(
+    content_str: str,
+    *,
+    log_prefix: str = "",
+) -> VMCoreAnalysisStep | None:
+    return repair_structured_output(
+        content_str,
+        model_class=VMCoreAnalysisStep,
+        log_prefix=log_prefix,
+    )
+
+
+def repair_structured_output(
+    content_str: str,
+    *,
+    model_class: type[ModelT],
+    log_prefix: str = "",
+) -> ModelT | None:
+    """尝试从原始 LLM 文本中修复并恢复指定的结构化模型。"""
+    repaired_prefix = f"{log_prefix}: " if log_prefix else ""
+
+    # 在任何修复尝试之前，先进行语义归一化
+    content_str = _normalize_root_cause_class(content_str)
+
+    try:
+        repaired_obj = repair_json(content_str, return_objects=True)
+        if isinstance(repaired_obj, list):
+            for item in repaired_obj:
+                if isinstance(item, dict):
+                    repaired_obj = item
+                    break
+
+        if isinstance(repaired_obj, dict):
+            logger.warning(
+                "%sSuccessfully repaired malformed JSON from LLM using json_repair.",
+                repaired_prefix,
+            )
+            return model_class.model_validate(repaired_obj)
+    except Exception as exc:
+        logger.debug(
+            "%sjson_repair failed: '%s', falling back to manual fix",
+            repaired_prefix,
+            exc,
+        )
+
+    try:
+        fixed_content = _extract_outer_json_object(content_str)
+        fixed_content = _normalize_invalid_escapes(fixed_content)
+        fixed_content = _inject_missing_arguments_field(fixed_content)
+        # 再次应用语义归一化，确保手动修复后的内容也被处理
+        fixed_content = _normalize_root_cause_class(fixed_content)
+        result = model_class.model_validate_json(fixed_content)
+        logger.warning(
+            "%sSuccessfully repaired malformed JSON from LLM (manual fix). Original: %s... Fixed: %s...",
+            repaired_prefix,
+            content_str[:200],
+            fixed_content[:200],
+        )
+        return result
+    except Exception as exc:
+        logger.warning("%sJSON repair failed: '%s'", repaired_prefix, exc)
+        return None
+
+
+def build_tool_calls(
+    analysis_result,
+    *,
+    is_last_step: bool,
+    log_prefix: str = "",
+) -> list[dict[str, Any]]:
+    """从结构化分析结果中构造 LangChain tool_calls。"""
+    prefix = f"{log_prefix}: " if log_prefix else ""
+
+    if is_last_step and analysis_result.action:
+        logger.warning(
+            "%sis_last_step=True but LLM still returned action. Stripping tool_calls to force conclusion.",
+            prefix,
+        )
+        analysis_result.action = None
+
+    if not analysis_result.action:
+        logger.info("%sLLM did not call any tools, returning result directly.", prefix)
+        return []
+
+    tool_name = analysis_result.action.command_name
+    logger.info("%sLLM decided to call tool: %s", prefix, tool_name)
+
+    if tool_name == "run_script":
+        tool_args = {"script": "\n".join(analysis_result.action.arguments)}
+    else:
+        tool_args = {"command": " ".join(analysis_result.action.arguments)}
+
+    return [
+        {
+            "name": tool_name,
+            "args": tool_args,
+            "id": f"call_{analysis_result.step_id}",
+        }
+    ]
+
+
+def apply_executor_consistency_audit(
+    analysis_step: VMCoreLLMAnalysisStep,
+    state: dict[str, Any],
+    *,
+    log_prefix: str = "",
+) -> VMCoreLLMAnalysisStep:
+    """在 structured output 落地前执行额外的一致性审计。"""
+    prefix = f"{log_prefix}: " if log_prefix else ""
+    mismatch = _detect_page_fault_access_mismatch(state)
+    if mismatch is None:
+        return analysis_step
+
+    if _mentions_access_type_mismatch(analysis_step, mismatch):
+        logger.debug(
+            "%sExecutor audit found an access-type mismatch, but the model already referenced it.",
+            prefix,
+        )
+        return analysis_step
+
+    audit_note = (
+        "Executor audit: unresolved x86 page-fault access-type contradiction. "
+        f"{mismatch['summary']}"
+    )
+    logger.warning("%s%s", prefix, audit_note)
+
+    if audit_note not in analysis_step.reasoning:
+        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
+
+    if analysis_step.additional_notes:
+        if audit_note not in analysis_step.additional_notes:
+            analysis_step.additional_notes = (
+                f"{analysis_step.additional_notes} {audit_note}"
+            ).strip()
+    else:
+        analysis_step.additional_notes = audit_note
+
+    if analysis_step.root_cause_class not in {None, "unknown"}:
+        analysis_step.root_cause_class = "unknown"
+
+    if analysis_step.is_conclusive:
+        analysis_step.is_conclusive = False
+        analysis_step.final_diagnosis = None
+        analysis_step.fix_suggestion = None
+
+    if analysis_step.confidence not in {None, "low"}:
+        analysis_step.confidence = "low"
+
+    return analysis_step
+
+
+def _extract_outer_json_object(content_str: str) -> str:
+    first_brace = content_str.find("{")
+    if first_brace == -1:
+        return content_str
+
+    brace_count = 0
+    last_brace = -1
+    for index in range(first_brace, len(content_str)):
+        if content_str[index] == "{":
+            brace_count += 1
+        elif content_str[index] == "}":
+            brace_count -= 1
+            if brace_count == 0:
+                last_brace = index
+                break
+
+    if last_brace == -1:
+        return content_str
+
+    logger.info("Extracted JSON from position %s to %s", first_brace, last_brace + 1)
+    return content_str[first_brace : last_brace + 1]
+
+
+def _normalize_invalid_escapes(content_str: str) -> str:
+    invalid_escapes = [
+        (r"\|", "|"),
+        (r"\/", "/"),
+        (r"\>", ">"),
+        (r"\<", "<"),
+        (r"\&", "&"),
+    ]
+    fixed_content = content_str
+    for pattern, replacement in invalid_escapes:
+        fixed_content = fixed_content.replace(pattern, replacement)
+    return fixed_content
+
+
+def _inject_missing_arguments_field(content_str: str) -> str:
+    pattern = r'("command_name"\s*:\s*"[^"]*"\s*,)\s*(\[)'
+    return re.sub(pattern, r'\1 "arguments": \2', content_str)
+
+
+def _detect_page_fault_access_mismatch(
+    state: dict[str, Any],
+) -> dict[str, str] | None:
+    text = _collect_state_text(state)
+    if not text:
+        return None
+
+    oops_match = _OOPS_RE.search(text)
+    rip_match = _RIP_RE.search(text)
+    if oops_match is None or rip_match is None:
+        return None
+
+    error_code = int(oops_match.group("code"), 16)
+    access_direction = _decode_access_direction(error_code)
+    if access_direction == "unknown":
+        return None
+
+    instructions = [
+        (int(match.group("addr"), 16), match.group("inst").strip())
+        for match in _DISASM_LINE_RE.finditer(text)
+    ]
+    if not instructions:
+        return None
+
+    rip_addr = int(rip_match.group("addr"), 16)
+    rip_index = next(
+        (index for index, (addr, _) in enumerate(instructions) if addr == rip_addr),
+        None,
+    )
+    if rip_index is None:
+        return None
+
+    rip_instruction = instructions[rip_index][1]
+    candidate_instruction = rip_instruction
+    candidate_access = _classify_instruction_access(rip_instruction)
+
+    if candidate_access in {"none", "unknown"}:
+        for previous_index in range(rip_index - 1, -1, -1):
+            previous_instruction = instructions[previous_index][1]
+            previous_access = _classify_instruction_access(previous_instruction)
+            if previous_access not in {"none", "unknown"}:
+                candidate_instruction = previous_instruction
+                candidate_access = previous_access
+                break
+
+    if candidate_access == "unknown":
+        return None
+
+    mismatch = False
+    if access_direction == "write" and candidate_access not in {"write", "readwrite"}:
+        mismatch = True
+    elif access_direction == "read" and candidate_access not in {"read", "readwrite"}:
+        mismatch = True
+    elif access_direction == "execute" and candidate_access != "execute":
+        mismatch = True
+
+    if not mismatch:
+        return None
+
+    return {
+        "summary": (
+            f"Oops 0x{oops_match.group('code')} decodes to {access_direction} fault, but "
+            f"the candidate instruction `{candidate_instruction}` is classified as {candidate_access}; "
+            f"RIP instruction `{rip_instruction}` must not be accepted as a complete explanation until this is reconciled."
+        ),
+        "expected": access_direction,
+        "candidate": candidate_access,
+        "instruction": candidate_instruction,
+        "rip_instruction": rip_instruction,
+    }
+
+
+def _collect_state_text(state: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for message in state.get("messages", []):
+        content = getattr(message, "content", "")
+        if isinstance(content, str):
+            parts.append(content)
+        elif content:
+            try:
+                parts.append(json.dumps(content, ensure_ascii=False))
+            except TypeError:
+                parts.append(str(content))
+    return "\n".join(parts)
+
+
+def _decode_access_direction(error_code: int) -> str:
+    if error_code & 0x10:
+        return "execute"
+    if error_code & 0x2:
+        return "write"
+    return "read"
+
+
+def _classify_instruction_access(instruction: str) -> str:
+    cleaned = instruction.strip().lower()
+    for prefix in ("lock ", "rep ", "repz ", "repnz "):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix) :]
+
+    if not cleaned:
+        return "unknown"
+
+    mnemonic, _, operand_text = cleaned.partition(" ")
+    if mnemonic in _NON_FAULTING_MNEMONICS:
+        return "none"
+    if mnemonic in _WRITE_MNEMONICS:
+        return "write"
+    if mnemonic in _READWRITE_MNEMONICS and _has_memory_operand(operand_text):
+        return "readwrite"
+    if mnemonic == "lea":
+        return "none"
+    if mnemonic.startswith("j"):
+        return "none"
+    if mnemonic == "mov":
+        operands = [operand.strip() for operand in operand_text.split(",", maxsplit=1)]
+        if len(operands) == 2:
+            src, dst = operands
+            if _is_memory_operand(src) and not _is_memory_operand(dst):
+                return "read"
+            if not _is_memory_operand(src) and _is_memory_operand(dst):
+                return "write"
+            if _is_memory_operand(src) and _is_memory_operand(dst):
+                return "readwrite"
+    if mnemonic in {"cmp", "test", "bt", "bts", "btr", "btc"} and _has_memory_operand(
+        operand_text
+    ):
+        return "read"
+    if _has_memory_operand(operand_text):
+        return "read"
+    return "none"
+
+
+def _has_memory_operand(operand_text: str) -> bool:
+    return any(_is_memory_operand(operand) for operand in operand_text.split(","))
+
+
+def _is_memory_operand(operand: str) -> bool:
+    token = operand.strip().lower()
+    return "(" in token or token.startswith("%gs:") or token.startswith("%fs:")
+
+
+def _mentions_access_type_mismatch(
+    analysis_step: VMCoreLLMAnalysisStep,
+    mismatch: dict[str, str],
+) -> bool:
+    text_parts = [analysis_step.reasoning]
+    if analysis_step.additional_notes:
+        text_parts.append(analysis_step.additional_notes)
+    if analysis_step.final_diagnosis is not None:
+        text_parts.append(analysis_step.final_diagnosis.root_cause)
+        text_parts.append(analysis_step.final_diagnosis.detailed_analysis)
+        text_parts.extend(analysis_step.final_diagnosis.evidence)
+
+    lowered = " ".join(text_parts).lower()
+    keywords = [
+        "error code",
+        "write fault",
+        "read fault",
+        "access-type",
+        "write-vs-read",
+        "read-vs-write",
+        "w/r",
+        mismatch["instruction"].lower(),
+    ]
+    return (
+        mismatch["expected"] in lowered
+        and "contrad" in lowered
+        and any(keyword in lowered for keyword in keywords)
+    )

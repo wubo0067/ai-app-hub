@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# server.py - Crash MCP 服务器实现
+# Author: CalmWU
+# Created: 2026-01-09
+
 """
 Crash MCP 服务器实现
 
@@ -232,6 +238,54 @@ commands = [
         "rd [-adDsSupxmfNR][-8|-16|-32|-64][-o offs][-e addr][-r file][address|symbol] [count]",
         "rd -a linux_banner",
         "This command displays the contents of memory, with the output formatted in several different manners",
+    ),
+    (
+        "vtop",
+        "vtop [-c [pid | taskp]] [-u|-k] address ...",
+        "vtop c806e000",
+        "This command translates a user or kernel virtual address to its physical address.",
+    ),
+    (
+        "set",
+        "set [[-a] [pid | taskp] | [-c cpu] | -p] | [crash_variable [setting]] | -v",
+        "set -p; set c2fe8000",
+        "This command either sets a new context, or gets the current context for display.",
+    ),
+    (
+        "sym",
+        "sym [-l] | [-M] | [-m module] | [-p|-n] | [-q string] | [symbol | vaddr]",
+        "sym jiffies; sym c0109944",
+        "This command translates a symbol to its virtual address, or a static kernel virtual address to its symbol -- or to a symbol-plus-offset value.",
+    ),
+    (
+        "task",
+        "task [-R member[,member]] [-dx] [pid | taskp] ...; task -R se.on_rq",
+        "task -x; task -R ngroups,groups 2958",
+        "This command dumps a formatted display of the contents of a task's task_struct and thread_info structures.",
+    ),
+    (
+        "ptov",
+        "ptov [address | offset:cpuspec]",
+        "ptov 56e000; ptov b0c0:a",
+        "This command translates a hexadecimal physical address into a kernel virtual address.",
+    ),
+    (
+        "ptob",
+        "ptob page_number ...",
+        "ptob 512a",
+        "This command translates a page frame number to its byte value.",
+    ),
+    (
+        "irq",
+        "irq [[[index ...] | -u ] | -d | -b | -a | -s [-c cpu]]",
+        "irq -d; irq 21",
+        "This command collaborates the data in an irq_desc_t, along with its associated hw_interrupt_type and irqaction structure data, into a consolidated per-IRQ display.",
+    ),
+    (
+        "sbitmapq",
+        "sbitmapq [-s struct[.member[,member]] -a address [-p] [-v]] -[x|d] address",
+        "sbitmapq -s iscsi_cmd -a 0xc0000000671c0000 -v c0000000e118c808",
+        "The command dumps the contents of the sbitmap_queue structure and the used bits in the bitmap.",
     ),
 ]
 
