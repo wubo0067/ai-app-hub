@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import List
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, SystemMessage
 from .graph_state import AgentState
+from .output_parser import render_action_arguments
 from .schema import VMCoreAnalysisStep
 from src.utils.logging import logger
 
@@ -134,7 +135,9 @@ def generate_markdown_report(state: AgentState) -> str:
                 if analysis.action:
                     lines.append(f"**执行动作**: {analysis.action.command_name}")
                     if analysis.action.arguments:
-                        lines.append(f"**参数**: {' '.join(analysis.action.arguments)}")
+                        lines.append(
+                            f"**参数**: {render_action_arguments(analysis.action.arguments)}"
+                        )
                     lines.append("")
 
                 # 如果有最终诊断

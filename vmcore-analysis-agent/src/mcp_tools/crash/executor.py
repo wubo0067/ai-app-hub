@@ -12,7 +12,7 @@ distro, version = get_linux_distro_version()
 
 # crash 命令单次执行的最长等待时间（秒）。
 # log | grep 等大输出命令可能导致无限期阻塞，超时后强制终止进程并返回截断结果。
-COMMAND_TIMEOUT = 120
+COMMAND_TIMEOUT = 180
 
 # 单次命令返回的最大字符数。超出部分将被截断以防止 LLM token 溢出。
 MAX_OUTPUT_CHARS = 100_000

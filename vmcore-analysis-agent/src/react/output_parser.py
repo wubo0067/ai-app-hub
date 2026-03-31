@@ -65,6 +65,43 @@ _READWRITE_MNEMONICS = {
 }
 
 
+def render_action_arguments(arguments: list[str]) -> str:
+    """将结构化 action 参数渲染为可执行的 crash 命令字符串。
+
+    LLM 输出的 arguments 是 JSON 字符串数组，不携带 shell 引号语义。
+    对于 grep -E/-Ei 之后包含 alternation 的模式，需要在拼回命令时恢复引号，
+    否则 `a|b|c` 会和真正的管道符混淆。
+    """
+    rendered_tokens: list[str] = []
+    grep_expects_pattern = False
+
+    for token in arguments:
+        if token == "|":
+            rendered_tokens.append(token)
+            grep_expects_pattern = False
+            continue
+
+        if token == "grep":
+            rendered_tokens.append(token)
+            grep_expects_pattern = False
+            continue
+
+        if token.startswith("-E") and rendered_tokens and rendered_tokens[-1] == "grep":
+            rendered_tokens.append(token)
+            grep_expects_pattern = True
+            continue
+
+        if grep_expects_pattern and "|" in token:
+            rendered_tokens.append(f'"{token}"')
+            grep_expects_pattern = False
+            continue
+
+        rendered_tokens.append(token)
+        grep_expects_pattern = False
+
+    return " ".join(rendered_tokens)
+
+
 def _normalize_root_cause_class(content_str: str) -> str:
     """
     在 JSON 解析前对 root_cause_class 字段进行语义归一化。
@@ -205,7 +242,9 @@ def build_tool_calls(
     if tool_name == "run_script":
         tool_args = {"script": "\n".join(analysis_result.action.arguments)}
     else:
-        tool_args = {"command": " ".join(analysis_result.action.arguments)}
+        tool_args = {
+            "command": render_action_arguments(analysis_result.action.arguments)
+        }
 
     return [
         {
@@ -224,6 +263,16 @@ def apply_executor_consistency_audit(
 ) -> VMCoreLLMAnalysisStep:
     """在 structured output 落地前执行额外的一致性审计。"""
     prefix = f"{log_prefix}: " if log_prefix else ""
+    analysis_step = _normalize_signature_class_from_fault_context(
+        analysis_step,
+        state,
+        log_prefix=log_prefix,
+    )
+    analysis_step = _normalize_final_diagnosis_for_fault_context(
+        analysis_step,
+        state,
+        log_prefix=log_prefix,
+    )
     mismatch = _detect_page_fault_access_mismatch(state)
     if mismatch is None:
         return analysis_step
@@ -264,6 +313,128 @@ def apply_executor_consistency_audit(
         analysis_step.confidence = "low"
 
     return analysis_step
+
+
+def _normalize_signature_class_from_fault_context(
+    analysis_step: VMCoreLLMAnalysisStep,
+    state: dict[str, Any],
+    *,
+    log_prefix: str = "",
+) -> VMCoreLLMAnalysisStep:
+    prefix = f"{log_prefix}: " if log_prefix else ""
+    if analysis_step.signature_class != "general_protection_fault":
+        return analysis_step
+
+    text = _collect_state_text(state)
+    if not _is_kernel_paging_request_page_fault_context(text):
+        return analysis_step
+
+    analysis_step.signature_class = "pointer_corruption"
+    audit_note = (
+        "Executor audit: Oops 0x0000 with BUG: unable to handle kernel paging request "
+        "is a page-fault context, so signature_class was corrected from "
+        "general_protection_fault to pointer_corruption."
+    )
+    logger.warning("%s%s", prefix, audit_note)
+
+    if audit_note not in analysis_step.reasoning:
+        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
+
+    if analysis_step.additional_notes:
+        if audit_note not in analysis_step.additional_notes:
+            analysis_step.additional_notes = (
+                f"{analysis_step.additional_notes} {audit_note}"
+            ).strip()
+    else:
+        analysis_step.additional_notes = audit_note
+
+    return analysis_step
+
+
+def _normalize_final_diagnosis_for_fault_context(
+    analysis_step: VMCoreLLMAnalysisStep,
+    state: dict[str, Any],
+    *,
+    log_prefix: str = "",
+) -> VMCoreLLMAnalysisStep:
+    prefix = f"{log_prefix}: " if log_prefix else ""
+    diagnosis = analysis_step.final_diagnosis
+    if diagnosis is None:
+        return analysis_step
+
+    text = _collect_state_text(state)
+    if not _is_kernel_paging_request_page_fault_context(text):
+        return analysis_step
+
+    changed_fields: list[str] = []
+    if _contains_general_protection_fault_text(diagnosis.crash_type):
+        diagnosis.crash_type = _replace_general_protection_fault_text(
+            diagnosis.crash_type,
+            replacement="kernel paging request",
+        )
+        changed_fields.append("final_diagnosis.crash_type")
+
+    if _contains_general_protection_fault_text(diagnosis.root_cause):
+        diagnosis.root_cause = _replace_general_protection_fault_text(
+            diagnosis.root_cause,
+            replacement="page fault",
+        )
+        changed_fields.append("final_diagnosis.root_cause")
+
+    if _contains_general_protection_fault_text(diagnosis.detailed_analysis):
+        diagnosis.detailed_analysis = _replace_general_protection_fault_text(
+            diagnosis.detailed_analysis,
+            replacement="page fault",
+        )
+        changed_fields.append("final_diagnosis.detailed_analysis")
+
+    if not changed_fields:
+        return analysis_step
+
+    audit_note = (
+        "Executor audit: page-fault context wording corrected in "
+        + ", ".join(changed_fields)
+        + "; general protection fault phrasing was normalized to page-fault wording."
+    )
+    logger.warning("%s%s", prefix, audit_note)
+
+    if audit_note not in analysis_step.reasoning:
+        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
+
+    if analysis_step.additional_notes:
+        if audit_note not in analysis_step.additional_notes:
+            analysis_step.additional_notes = (
+                f"{analysis_step.additional_notes} {audit_note}"
+            ).strip()
+    else:
+        analysis_step.additional_notes = audit_note
+
+    return analysis_step
+
+
+def _is_kernel_paging_request_page_fault_context(text: str) -> bool:
+    if not text:
+        return False
+
+    lowered = text.lower()
+    if "bug: unable to handle kernel paging request" not in lowered:
+        return False
+
+    oops_match = _OOPS_RE.search(text)
+    return oops_match is not None and oops_match.group("code").lower() == "0000"
+
+
+def _contains_general_protection_fault_text(text: str) -> bool:
+    return bool(re.search(r"\bgeneral protection fault\b", text, flags=re.IGNORECASE))
+
+
+def _replace_general_protection_fault_text(text: str, *, replacement: str) -> str:
+    return re.sub(
+        r"\bgeneral protection fault\b",
+        replacement,
+        text,
+        flags=re.IGNORECASE,
+    )
 
 
 def _extract_outer_json_object(content_str: str) -> str:

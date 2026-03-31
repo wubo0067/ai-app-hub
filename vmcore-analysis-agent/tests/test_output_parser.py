@@ -2,11 +2,150 @@ import unittest
 
 from langchain_core.messages import HumanMessage, ToolMessage
 
-from src.react.output_parser import apply_executor_consistency_audit
+from src.react.output_parser import (
+    apply_executor_consistency_audit,
+    build_tool_calls,
+    render_action_arguments,
+)
 from src.react.schema import FinalDiagnosis, SuspectCode, VMCoreLLMAnalysisStep
 
 
 class OutputParserAuditTests(unittest.TestCase):
+    def test_corrects_gpf_signature_for_oops_0000_kernel_paging_request(self) -> None:
+        state = {
+            "messages": [
+                HumanMessage(
+                    content=(
+                        "BUG: unable to handle kernel paging request at 000000e500080008\n"
+                        "Oops: 0000 [#1] SMP NOPTI\n"
+                        "RIP: 0010:ffffffffc051a3c4\n"
+                    )
+                )
+            ]
+        }
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 2,
+                "reasoning": "The crash should be treated as a protection fault first.",
+                "action": {
+                    "command_name": "dis",
+                    "arguments": ["-rl", "ffffffffc051a3c4"],
+                },
+                "is_conclusive": False,
+                "signature_class": "general_protection_fault",
+                "root_cause_class": None,
+                "partial_dump": "partial",
+            }
+        )
+
+        audited = apply_executor_consistency_audit(llm_step, state)
+
+        self.assertEqual(audited.signature_class, "pointer_corruption")
+        self.assertIn(
+            "corrected from general_protection_fault to pointer_corruption",
+            audited.reasoning,
+        )
+        self.assertIn("page-fault context", audited.additional_notes)
+
+    def test_normalizes_final_diagnosis_page_fault_wording(self) -> None:
+        state = {
+            "messages": [
+                HumanMessage(
+                    content=(
+                        "BUG: unable to handle kernel paging request at 000000e500080008\n"
+                        "Oops: 0000 [#1] SMP NOPTI\n"
+                        "RIP: 0010:ffffffffc051a3c4\n"
+                    )
+                )
+            ]
+        }
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 12,
+                "reasoning": "The evidence chain has converged.",
+                "action": None,
+                "is_conclusive": True,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": "wild_pointer",
+                "partial_dump": "partial",
+                "confidence": "high",
+                "final_diagnosis": FinalDiagnosis(
+                    crash_type="general protection fault",
+                    panic_string="BUG: unable to handle kernel paging request at 000000e500080008",
+                    faulting_instruction="movzbl (%rcx,%rax,1),%eax",
+                    root_cause=(
+                        "A wild pointer led to a general protection fault in interrupt context."
+                    ),
+                    detailed_analysis=(
+                        "The register provenance points to a corrupted queue pointer, and the final "
+                        "failure manifests as a general protection fault during queue processing."
+                    ),
+                    suspect_code=SuspectCode(
+                        file="drivers/scsi/mpt3sas/mpt3sas_base.c",
+                        function="_base_process_reply_queue",
+                        line="unknown",
+                    ),
+                    evidence=[
+                        "Oops: 0000",
+                        "BUG: unable to handle kernel paging request",
+                    ],
+                ),
+            }
+        )
+
+        audited = apply_executor_consistency_audit(llm_step, state)
+
+        self.assertEqual(
+            audited.final_diagnosis.crash_type,
+            "kernel paging request",
+        )
+        self.assertIn("page fault", audited.final_diagnosis.root_cause.lower())
+        self.assertNotIn(
+            "general protection fault",
+            audited.final_diagnosis.detailed_analysis.lower(),
+        )
+        self.assertIn(
+            "page-fault context wording corrected in final_diagnosis.crash_type",
+            audited.additional_notes,
+        )
+
+    def test_render_action_arguments_quotes_grep_alternation_pattern(self) -> None:
+        rendered = render_action_arguments(
+            ["-m", "|", "grep", "-Ei", "dma|iommu|mapping|buffer"]
+        )
+
+        self.assertEqual(rendered, '-m | grep -Ei "dma|iommu|mapping|buffer"')
+
+    def test_build_tool_calls_preserves_grep_pattern_quoting(self) -> None:
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 8,
+                "reasoning": "Need a filtered log query next.",
+                "action": {
+                    "command_name": "log",
+                    "arguments": [
+                        "-m",
+                        "|",
+                        "grep",
+                        "-Ei",
+                        "dma|iommu|mapping|buffer",
+                    ],
+                },
+                "is_conclusive": False,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": None,
+                "partial_dump": "partial",
+            }
+        )
+
+        tool_calls = build_tool_calls(llm_step, is_last_step=False)
+
+        self.assertEqual(tool_calls[0]["name"], "log")
+        self.assertEqual(
+            tool_calls[0]["args"]["command"],
+            '-m | grep -Ei "dma|iommu|mapping|buffer"',
+        )
+
     def test_downgrades_conclusion_when_write_fault_is_attributed_to_plain_read(
         self,
     ) -> None:

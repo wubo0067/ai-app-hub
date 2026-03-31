@@ -17,8 +17,8 @@ from .output_parser import (
     select_analysis_content,
 )
 from .llm_runtime import ainvoke_with_retry, compress_messages_for_llm
+from .prompt_builder import build_analysis_system_prompt, build_executor_state_section
 from .prompts import (
-    analysis_crash_prompt,
     crash_init_data_prompt,
     simplified_structure_reasoning_prompt,
 )
@@ -49,16 +49,6 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
     curr_token_usage = 0
 
     # 准备系统消息，包含诊断知识库和输出格式
-    system_message = analysis_crash_prompt().format(
-        VMCoreAnalysisStep_Schema=json.dumps(
-            VMCoreLLMAnalysisStep.model_json_schema(), indent=2
-        ),
-    )
-    system_message += (
-        "\n\n[STRUCTURED OUTPUT CONTRACT]\n"
-        "active_hypotheses and gates are executor-managed. Omit them entirely from your JSON and return only the minimal schema fields."
-    )
-
     # 检查是否是最后一步 (LangGraph recursion_limit 触发前)
     # 如果是最后一步，要求 LLM 必须给出最终结论，停止工具调用
     is_last_step = state.get("is_last_step", False)
@@ -66,12 +56,11 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         logger.warning(
             f"Agent reached the last step (is_last_step=True). Forcing conclusion."
         )
-        system_message += (
-            "\n\n[CRITICAL WARNING]\n"
-            "This is your LAST STEP. You have reached the execution limit.\n"
-            "You MUST provide a 'final_diagnosis' based on the information you have gathered so far.\n"
-            "Set 'is_conclusive' to true and do NOT request any further tool calls (action must be null)."
-        )
+
+    system_message = build_analysis_system_prompt(
+        state,
+        is_last_step=is_last_step,
+    )
 
     # 压缩消息历史后再发送给 LLM，避免 reasoning_content 累积和大工具输出导致 token 暴增
     compressed_messages = compress_messages_for_llm(state["messages"])
@@ -270,6 +259,7 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
         current_step=current_step,
         force_conclusion=force_conclusion,
     )
+    system_prompt += "\n\n" + build_executor_state_section(state)
 
     # 只发送最小上下文：系统提示 + 待结构化的 reasoning 文本
     messages_to_send = [

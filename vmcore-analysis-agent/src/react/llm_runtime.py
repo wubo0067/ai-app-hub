@@ -7,7 +7,7 @@
 import asyncio
 
 import openai
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import ToolMessage
 
 from src.utils.logging import logger
 
@@ -52,19 +52,20 @@ def compress_messages_for_llm(
     """
     在发送给 LLM 前对消息历史进行保守压缩，降低 token 消耗。
 
-    策略：
-    1. 绝对保留所有 AIMessage 的完整内容（包括 content 和 reasoning_content）。
-       由于 DeepSeek-Reasoner API 对思维链对齐高度敏感，对历史 assistant 消息的截断
-       会严重破坏其逻辑或导致大模型产生幻觉（如模型在输出中自行生成截断占位符）或报错。
-    2. 保留最近几条 ToolMessage 的完整内容。
-    3. 对更早的 ToolMessage，当其返回内容超过 max_tool_output_chars 时，截断其中间部分。
+     策略：
+     1. 所有 AIMessage 一律原样保留，尤其禁止改写 reasoning_content。
+     2. 保留最近几条 ToolMessage 的完整内容。
+     3. 对更早的 ToolMessage，当其返回内容超过 max_tool_output_chars 时，截断其中间部分。
 
     此函数不修改 AgentState，仅返回压缩后的副本用于当次 LLM 调用。
     """
     tool_msg_indices = [
         i for i, msg in enumerate(messages) if isinstance(msg, ToolMessage)
     ]
-    recent_tool_indices = set(tool_msg_indices[-recent_tool_messages_to_keep:])
+    recent_tool_indices = _recent_index_set(
+        tool_msg_indices,
+        recent_tool_messages_to_keep,
+    )
 
     def truncate_middle(text: str, head_chars: int, tail_chars: int) -> str:
         keep_chars = head_chars + tail_chars
@@ -84,12 +85,7 @@ def compress_messages_for_llm(
     tool_chars_after = 0
 
     for index, msg in enumerate(messages):
-        if isinstance(msg, AIMessage):
-            # 绝对不能修改 AIMessage 的 reasoning_content 或内容，
-            # 否则会破坏 DeepSeek-Reasoner 的思维链对齐，导致大模型产生幻觉（如自己生成截断字符）或报错
-            compressed.append(msg)
-            continue
-        elif (
+        if (
             isinstance(msg, ToolMessage)
             and index not in recent_tool_indices
             and isinstance(msg.content, str)
@@ -122,3 +118,9 @@ def compress_messages_for_llm(
             f"kept recent tool messages full: {recent_tool_messages_to_keep})"
         )
     return compressed
+
+
+def _recent_index_set(indices: list[int], keep_count: int) -> set[int]:
+    if keep_count <= 0:
+        return set()
+    return set(indices[-keep_count:])
