@@ -260,34 +260,55 @@ vmcore-analysis-agent/
 │   └── main.py                        # 命令行客户端入口
 ├── src/
 │   ├── llm/
-│   │   └── ...                        # DeepSeek LLM 初始化和工具函数
+│   │   └── model.py                   # DeepSeek LLM 初始化和模型配置
 │   ├── react/
 │   │   ├── __init__.py                # 包初始化文件
-│   │   ├── graph.py                   # LangGraph 图构建
-│   │   ├── nodes.py                   # 核心节点实现
+│   │   ├── action_guard.py            # 行动保护和安全验证
 │   │   ├── edges.py                   # 路由逻辑和状态转换
+│   │   ├── fragment_flags.py          # 片段标志管理
+│   │   ├── graph.py                   # LangGraph 图构建
 │   │   ├── graph_state.py             # AgentState 定义
+│   │   ├── layer0_system.py           # 系统层 Prompt 定义
 │   │   ├── llm_node.py                # LLM 调用和响应处理
 │   │   ├── llm_runtime.py             # LLM 运行时配置
+│   │   ├── logging_callback.py        # 图执行日志回调
+│   │   ├── nodes.py                   # 核心节点实现
 │   │   ├── output_parser.py           # LLM 输出解析和验证
+│   │   ├── playbooks.py               # 分析剧本定义
+│   │   ├── prompt_builder.py          # Prompt 构建器
+│   │   ├── prompt_layers.py           # Prompt 分层管理
 │   │   ├── prompts.py                 # 专业分析 Prompt
 │   │   ├── report_generator.py        # Markdown 报告生成
 │   │   ├── schema.py                  # 数据结构定义 (VMCoreAnalysisStep)
-│   │   └── logging_callback.py        # 图执行日志回调
+│   │   ├── sop_fragments.py           # 标准操作程序片段
+│   │   └── state_manager.py           # 状态管理器
 │   ├── mcp_tools/
 │   │   ├── crash/                     # crash MCP Server 实现
-│   │   │   └── ...                    # crash 命令执行器和客户端
+│   │   │   ├── server.py              # crash MCP 服务器
+│   │   │   ├── client.py              # crash MCP 客户端
+│   │   │   ├── executor.py            # crash 命令执行器
+│   │   │   └── __init__.py            # crash 工具包初始化
 │   │   └── source_patch/              # source_patch MCP Server 实现
-│   │       └── ...                    # 补丁生成工具
-│   └── utils/                         # 工具函数（日志、配置等）
+│   │       ├── server.py              # 源码补丁 MCP 服务器
+│   │       ├── client.py              # 源码补丁 MCP 客户端
+│   │       └── __init__.py            # 源码补丁工具包初始化
+│   └── utils/                         # 工具函数
+│       ├── config.py                  # 配置管理
+│       ├── logging.py                 # 日志配置
+│       ├── os.py                      # 操作系统工具函数
+│       └── __init__.py                # 工具包初始化
 ├── simulate-crash/                    # 内核崩溃模拟模块
 │   ├── rcu_stall/                     # RCU stall 复现场景
 │   ├── soft_lockup/                   # Soft lockup 复现场景
-│   └── ...                            # 其他崩溃场景
+│   └── dma_memory_corruption/         # DMA 内存破坏复现场景
 ├── reports/                           # 分析报告输出目录
 ├── logs/                              # 运行日志目录
 ├── tests/                             # 测试套件
-│   └── ...                            # 单元测试和集成测试
+│   ├── test_action_guard.py           # 行动保护测试
+│   ├── test_output_parser.py          # 输出解析器测试
+│   ├── test_prompts.py                # Prompt 测试
+│   ├── test_state_manager.py          # 状态管理器测试
+│   └── test_vmcore_analysis_step.py   # VMCore 分析步骤测试
 └── tools/
     └── show_first_global_func.sh      # 调试符号验证脚本
 ```

@@ -259,34 +259,55 @@ vmcore-analysis-agent/
 │   └── main.py                        # Command line client entry point
 ├── src/
 │   ├── llm/
-│   │   └── ...                        # DeepSeek LLM initialization and utilities
+│   │   └── model.py                   # DeepSeek LLM initialization and model configuration
 │   ├── react/
 │   │   ├── __init__.py                # Package initialization
-│   │   ├── graph.py                   # LangGraph graph construction
-│   │   ├── nodes.py                   # Core node implementations
+│   │   ├── action_guard.py            # Action guard and safety validation
 │   │   ├── edges.py                   # Routing logic and state transitions
+│   │   ├── fragment_flags.py          # Fragment flags management
+│   │   ├── graph.py                   # LangGraph graph construction
 │   │   ├── graph_state.py             # AgentState definition
+│   │   ├── layer0_system.py           # System layer prompt definitions
 │   │   ├── llm_node.py                # LLM calling and response handling
 │   │   ├── llm_runtime.py             # LLM runtime configuration
+│   │   ├── logging_callback.py        # Graph execution log callback
+│   │   ├── nodes.py                   # Core node implementations
 │   │   ├── output_parser.py           # LLM output parsing and validation
+│   │   ├── playbooks.py               # Analysis playbook definitions
+│   │   ├── prompt_builder.py          # Prompt builder
+│   │   ├── prompt_layers.py           # Prompt layer management
 │   │   ├── prompts.py                 # Professional analysis prompts
 │   │   ├── report_generator.py        # Markdown report generation
 │   │   ├── schema.py                  # Data schema definitions (VMCoreAnalysisStep)
-│   │   └── logging_callback.py        # Graph execution log callback
+│   │   ├── sop_fragments.py           # Standard operating procedure fragments
+│   │   └── state_manager.py           # State manager
 │   ├── mcp_tools/
 │   │   ├── crash/                     # crash MCP Server implementation
-│   │   │   └── ...                    # crash command executor and client
+│   │   │   ├── server.py              # crash MCP server
+│   │   │   ├── client.py              # crash MCP client
+│   │   │   ├── executor.py            # crash command executor
+│   │   │   └── __init__.py            # crash tools package initialization
 │   │   └── source_patch/              # source_patch MCP Server implementation
-│   │       └── ...                    # patch generation tools
-│   └── utils/                         # Utility functions (logging, config, etc.)
+│   │       ├── server.py              # Source patch MCP server
+│   │       ├── client.py              # Source patch MCP client
+│   │       └── __init__.py            # Source patch tools package initialization
+│   └── utils/                         # Utility functions
+│       ├── config.py                  # Configuration management
+│       ├── logging.py                 # Logging configuration
+│       ├── os.py                      # Operating system utility functions
+│       └── __init__.py                # Utilities package initialization
 ├── simulate-crash/                    # Kernel crash simulation module
 │   ├── rcu_stall/                     # RCU stall reproduction scenarios
 │   ├── soft_lockup/                   # Soft lockup reproduction scenarios
-│   └── ...                            # Additional crash scenarios
+│   └── dma_memory_corruption/         # DMA memory corruption reproduction scenarios
 ├── reports/                           # Analysis report output directory
 ├── logs/                              # Runtime log directory
 ├── tests/                             # Test suite
-│   └── ...                            # Unit and integration tests
+│   ├── test_action_guard.py           # Action guard tests
+│   ├── test_output_parser.py          # Output parser tests
+│   ├── test_prompts.py                # Prompt tests
+│   ├── test_state_manager.py          # State manager tests
+│   └── test_vmcore_analysis_step.py   # VMCore analysis step tests
 └── tools/
     └── show_first_global_func.sh      # Debug symbol verification script
 ```
