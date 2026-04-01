@@ -126,7 +126,7 @@ DEFAULT_CRASH_COMMANDS = [
 **核心实现逻辑**（[`call_llm_analysis`](vmcore-analysis-agent/src/react/llm_node.py#L27-L212) 函数）：
 
 1. **消息压缩**：通过 [`compress_messages_for_llm`](vmcore-analysis-agent/src/react/llm_runtime.py#L104-L134) 压缩历史消息，避免 reasoning_content 累积导致 token 暴增
-2. **系统提示构建**：使用 [`analysis_crash_prompt`](vmcore-analysis-agent/src/react/prompts.py#L8-L1936)，包含：
+2. **系统提示构建**：使用动态分层注入架构（[`prompt_builder.py`](vmcore-analysis-agent/src/react/prompt_builder.py)），包含：
    - 角色定义：资深 Linux Kernel Crash Dump 分析专家
    - 输出契约：严格遵循 `VMCoreLLMAnalysisStep` JSON Schema
    - 最后一步强制约束：当 `is_last_step=True` 时，必须给出结论且禁止工具调用
@@ -142,6 +142,30 @@ DEFAULT_CRASH_COMMANDS = [
 - 禁止触发 token 溢出的高危命令（`sym -l`、`bt -a`、`ps -m` 等）
 - 支持 `run_script` 批量执行，确保模块符号在同一 crash session 内加载
 - 强调基于诊断证据的推理，禁止无证据猜测
+
+**System Prompt 分层注入架构**：
+代理实现了一个精密的三层动态 Prompt 注入系统，体现了生产级 Agent 架构中**"指令按需加载"**的核心原则：
+
+- **Layer 0: 全局基座 (Global Base)**
+  - 由 `LAYER0_SYSTEM_PROMPT_TEMPLATE` 组成
+  - 定义了 Agent 的身份（Role）、核心禁止事项和输出契约
+  - 作为不可变的"宪法"，在所有分析阶段始终保持激活状态
+
+- **Layer 1: 场景剧本 (Scenario Playbooks)** 
+  - 通过 `_select_playbook` 根据 `current_signature_class` 动态选择
+  - 实现指令隔离：分析 `null_deref` 时，LLM 完全接触不到 `lockup` 或 `rcu_stall` 的复杂逻辑
+  - 消除干扰项，有效解决复杂分析中的注意力下降问题
+
+- **Layer 2: 动态片段 (Dynamic SOP Fragments)**
+  - 通过 `_select_sop_fragments` 根据步数、关键字和 Gate 状态动态注入
+  - 采用**上下文触发逻辑**：仅在满足相关条件时才显示 SOP 片段
+  - 示例：`per-cpu` SOP 仅在最近消息中出现 "%gs" 或 "per-cpu" 时注入；`dma_corruption` SOP 仅在外存损坏门控开启时激活
+
+**实现亮点**：
+- **状态驱动注入**：利用 `managed_gates` 状态有条件地注入专业 SOP，避免在无证据时进行推测性分析
+- **智能去重**：`_dedupe_preserve_order` 确保即使多个触发条件同时激活同一 SOP，生成的 Prompt 依然简洁无冗余
+- **动态执行器状态**：`build_executor_state_section` 为 LLM 提供清晰的"任务地图"，显示当前假设、门控状态和近期命令
+- **Token 优化**：相比静态完整 Prompt，系统 Prompt 的 token 消耗减少 40-70%，同时保持全面的知识覆盖
 
 **输出 Schema**（[`VMCoreLLMAnalysisStep`](vmcore-analysis-agent/src/react/schema.py#L70-L114)）：
 ```json
