@@ -113,7 +113,10 @@ def simplified_structure_reasoning_prompt() -> str:
         "5. 'signature_class': Extract the crash signature class from panic string analysis (e.g., 'null_deref', "
         "'use_after_free', 'pointer_corruption', etc.)\n"
         "6. 'root_cause_class': Extract the underlying root cause if mentioned (can be null during exploration)\n"
-        "7. 'partial_dump': Set this only if dump completeness is explicitly mentioned; otherwise use 'unknown'\n\n"
+        "7. 'corruption_mechanism': Extract a finer-grained mechanism only when the reasoning supports it "
+        "(e.g., 'field_type_misuse', 'missing_conversion', 'write_corruption', 'reinit_path_bug'). "
+        "If absent or unsupported, set to null.\n"
+        "8. 'partial_dump': Set this only if dump completeness is explicitly mentioned; otherwise use 'unknown'\n\n"
         "FIELDS TO SKIP (will be auto-filled later):\n"
         "- active_hypotheses\n"
         "- gates\n"
@@ -126,6 +129,10 @@ def simplified_structure_reasoning_prompt() -> str:
         "- Keep reasoning concise and focused on what was learned from tool output\n"
         "- For root_cause_class, use values like 'null_deref', 'use_after_free', 'wild_pointer', 'memory_corruption', "
         "'dma_corruption', etc. If uncertain, use 'unknown'\n"
+        "- corruption_mechanism is narrower than root_cause_class. Put labels like 'field_type_misuse' or "
+        "'missing_conversion' there, NEVER in root_cause_class\n"
+        "- If labels like 'field_type_misuse', 'missing_conversion', 'write_corruption', or 'reinit_path_bug' appear "
+        "in root_cause_class, that is a schema error and must be corrected before you answer\n"
         "- DO NOT attempt to reconstruct complex hypothesis lists or gate statuses\n"
         "- Output MUST be valid JSON with ONLY the required fields above\n\n"
         "Schema for required fields only:\n"
@@ -137,6 +144,7 @@ def simplified_structure_reasoning_prompt() -> str:
         '  "is_conclusive": false,\n'
         '  "signature_class": "null_deref",\n'
         '  "root_cause_class": "unknown",\n'
+        '  "corruption_mechanism": null,\n'
         '  "partial_dump": "unknown"\n'
         "}}\n"
         "```\n\n"

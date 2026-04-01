@@ -125,6 +125,26 @@ def _select_sop_fragments(state: AgentState) -> list[str]:
         fragments.append(SOP_FRAGMENTS["address_search"])
 
     if (
+        signature_class in {"pointer_corruption", "use_after_free"}
+        and step_count >= 8
+        and any(
+            token in lowered_recent_text
+            for token in (
+                "function pointer",
+                "_base_",
+                "mod -s",
+                "sym ",
+                "apic",
+                "fee0",
+                "list_head",
+                "self-referential",
+                "self reference",
+            )
+        )
+    ):
+        fragments.append(SOP_FRAGMENTS["driver_source_correlation"])
+
+    if (
         "stack overflow" in lowered_recent_text
         or "stack corruption" in lowered_recent_text
     ):

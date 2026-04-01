@@ -33,6 +33,7 @@ class StateManagerTests(unittest.TestCase):
         self.assertEqual(step.active_hypotheses[0].label, "pointer_corruption")
         self.assertEqual(step.gates["register_provenance"].status, "open")
         self.assertEqual(step.gates["external_corruption_gate"].status, "blocked")
+        self.assertEqual(step.gates["field_type_classification"].status, "open")
         self.assertEqual(updates["current_signature_class"], "pointer_corruption")
 
     def test_reuses_prior_managed_state_when_llm_omits_signature(self) -> None:

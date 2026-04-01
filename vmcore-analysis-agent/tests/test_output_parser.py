@@ -5,6 +5,7 @@ from langchain_core.messages import HumanMessage, ToolMessage
 from src.react.output_parser import (
     apply_executor_consistency_audit,
     build_tool_calls,
+    repair_structured_output,
     render_action_arguments,
 )
 from src.react.schema import FinalDiagnosis, SuspectCode, VMCoreLLMAnalysisStep
@@ -116,6 +117,18 @@ class OutputParserAuditTests(unittest.TestCase):
 
         self.assertEqual(rendered, '-m | grep -Ei "dma|iommu|mapping|buffer"')
 
+    def test_render_action_arguments_quotes_plain_grep_pattern_with_pipe_chars(
+        self,
+    ) -> None:
+        rendered = render_action_arguments(
+            ["-m", "|", "grep", "-i", "dma|iommu|mapping|buffer", "|", "head", "-10"]
+        )
+
+        self.assertEqual(
+            rendered,
+            '-m | grep -i "dma|iommu|mapping|buffer" | head -10',
+        )
+
     def test_build_tool_calls_preserves_grep_pattern_quoting(self) -> None:
         llm_step = VMCoreLLMAnalysisStep.model_validate(
             {
@@ -145,6 +158,77 @@ class OutputParserAuditTests(unittest.TestCase):
             tool_calls[0]["args"]["command"],
             '-m | grep -Ei "dma|iommu|mapping|buffer"',
         )
+
+    def test_build_tool_calls_quotes_plain_grep_pattern_with_pipe_chars(self) -> None:
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 9,
+                "reasoning": "Need a broader filtered log query next.",
+                "action": {
+                    "command_name": "log",
+                    "arguments": [
+                        "-m",
+                        "|",
+                        "grep",
+                        "-i",
+                        "dma|iommu|mapping|buffer",
+                        "|",
+                        "head",
+                        "-10",
+                    ],
+                },
+                "is_conclusive": False,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": None,
+                "partial_dump": "partial",
+            }
+        )
+
+        tool_calls = build_tool_calls(llm_step, is_last_step=False)
+
+        self.assertEqual(
+            tool_calls[0]["args"]["command"],
+            '-m | grep -i "dma|iommu|mapping|buffer" | head -10',
+        )
+
+    def test_repair_structured_output_normalizes_mechanism_into_root_cause_class(
+        self,
+    ) -> None:
+        repaired = repair_structured_output(
+            (
+                "{"
+                '"step_id": 22,'
+                '"reasoning": "source typing confirms a dma field misuse",'
+                '"action": null,'
+                '"is_conclusive": true,'
+                '"signature_class": "pointer_corruption",'
+                '"root_cause_class": "field_type_misuse",'
+                '"partial_dump": "partial"'
+                "}"
+            ),
+            model_class=VMCoreLLMAnalysisStep,
+        )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(repaired.root_cause_class, "dma_corruption")
+        self.assertEqual(repaired.corruption_mechanism, "field_type_misuse")
+
+    def test_top_level_step_accepts_explicit_corruption_mechanism(self) -> None:
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 22,
+                "reasoning": "The driver dereferenced a DMA-side field as a virtual pointer.",
+                "action": None,
+                "is_conclusive": True,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": "dma_corruption",
+                "corruption_mechanism": "field_type_misuse",
+                "partial_dump": "partial",
+            }
+        )
+
+        self.assertEqual(llm_step.root_cause_class, "dma_corruption")
+        self.assertEqual(llm_step.corruption_mechanism, "field_type_misuse")
 
     def test_downgrades_conclusion_when_write_fault_is_attributed_to_plain_read(
         self,

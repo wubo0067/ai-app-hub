@@ -1,6 +1,9 @@
 import unittest
 
-from src.react.prompts import analysis_crash_prompt
+from src.react.prompts import (
+    analysis_crash_prompt,
+    simplified_structure_reasoning_prompt,
+)
 
 
 class PromptContractTests(unittest.TestCase):
@@ -109,6 +112,48 @@ class PromptContractTests(unittest.TestCase):
             "If struct -o <guessed_type> fails on a module crash path", prompt
         )
         self.assertIn("sym -l <module> | grep -i <keyword>", prompt)
+
+    def test_analysis_prompt_adds_driver_source_correlation_rules(self) -> None:
+        prompt = analysis_crash_prompt()
+
+        self.assertIn("## 2.3b Driver Source Correlation", prompt)
+        self.assertIn("Function Pointer Anchoring", prompt)
+        self.assertIn("Open Source Cross-Reference", prompt)
+        self.assertIn(
+            "field type must drive the corruption-mechanism classification", prompt
+        )
+
+    def test_analysis_prompt_requires_field_type_disambiguation(self) -> None:
+        prompt = analysis_crash_prompt()
+
+        self.assertIn(
+            "Sub-step D: field-type disambiguation before naming the root cause", prompt
+        )
+        self.assertIn("If the field type is dma_addr_t", prompt)
+        self.assertIn("Do not conflate these mechanisms", prompt)
+
+    def test_simplified_prompt_separates_root_cause_class_and_corruption_mechanism(
+        self,
+    ) -> None:
+        prompt = simplified_structure_reasoning_prompt()
+
+        self.assertIn(
+            "'corruption_mechanism': Extract a finer-grained mechanism", prompt
+        )
+        self.assertIn("NEVER in root_cause_class", prompt)
+        self.assertIn("that is a schema error and must be corrected", prompt)
+        self.assertIn('"corruption_mechanism": null', prompt)
+
+    def test_analysis_prompt_treats_mechanism_in_root_cause_class_as_schema_error(
+        self,
+    ) -> None:
+        prompt = analysis_crash_prompt()
+
+        self.assertIn(
+            "field_type_misuse, missing_conversion, write_corruption, and reinit_path_bug belong only in corruption_mechanism",
+            prompt,
+        )
+        self.assertIn("treat that output as a schema error", prompt)
 
 
 if __name__ == "__main__":

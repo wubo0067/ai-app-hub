@@ -106,6 +106,9 @@ Signature class is the early crash signature from the panic string and must be n
 
 Root cause class represents the underlying cause rather than the panic entry signature. It may remain null during investigation but should be concrete by the final step whenever the evidence supports one.
 
+Mechanism labels such as field_type_misuse, missing_conversion, write_corruption, and reinit_path_bug belong only in corruption_mechanism, never in root_cause_class.
+If any of those labels appears in root_cause_class, treat that output as a schema error and correct it before finalizing the step.
+
 ## 1.1b Partial Dump Handling
 
 - If sys output contains [PARTIAL DUMP], set partial_dump to partial at step 2 and carry it forward unchanged.
@@ -206,6 +209,7 @@ Use the seven-stage protocol below as the always-on backbone. The active crash-t
 | 3 | Fault Address Classification | CR2 value range classified; page state confirmed if needed |
 | 4 | Key Object Validation | task_struct, thread_info, and kernel stack integrity verified |
 | 5 | Corruption Source Analysis | UAF, stack overflow, and local overwrite each ruled out or confirmed |
+| 5b | Driver Source Correlation | Runtime object offsets mapped to source-level struct fields or explicitly bounded |
 | 6 | Root Cause Hypothesis | Root cause stated with at least two independent evidence sources |
 
 Three non-negotiable constraints:
@@ -213,9 +217,45 @@ Three non-negotiable constraints:
 2. Constrained reasoning: do not name a specific driver or device before object validation and source exclusion are complete.
 3. No speculative jumps: DMA and hardware hypotheses require explicit exclusion of stronger software explanations.
 
+## 2.3b Driver Source Correlation (when driver symbols are unavailable)
+
+When struct -o fails for a third-party or out-of-tree module, reconstruct the runtime object layout with the following inference chain before naming the corruption mechanism.
+
+### Step A: Function Pointer Anchoring
+- If an extended object dump such as rd -x <addr> 32 contains a value inside the module text range [mod_base, mod_base + mod_size), treat it as a candidate function pointer.
+- Run sym <value> to resolve the function name.
+- Use that resolved function as a structural anchor: prefer the object type whose source layout places that callback or ISR field at the observed offset.
+- Example: if a pointer at offset 0x60 resolves to _base_interrupt in mpt3sas, treat that as a strong cue for a reply-queue descriptor style object rather than a generic queue guess.
+
+### Step B: APIC or MSI Address Recognition
+- Values matching 0xFEE0xxxx are Local APIC MSI target addresses.
+- When such a value appears at a stable offset, use it as a structural fingerprint for hardware-interrupt queue objects rather than dismissing it as random corruption.
+
+### Step C: Embedded list_head Self-Reference
+- If *(addr+N) == addr+N or adjacent pointers self-reference the same embedded node, identify that region as a list_head and use it for container-of style reasoning.
+- Record the embedded-node offset explicitly; it is evidence about the enclosing struct identity.
+
+### Step D: Open Source Cross-Reference
+- For in-tree or historically open drivers such as mpt3sas, megaraid, mlx5, qla2xxx, and bnx2x, correlate the crashing function and observed offsets against the upstream kernel source when crash debug info cannot name the private type.
+- Preferred reference is https://elixir.bootlin.com/linux/<version>/source, or a version-appropriate downstream kernel tree when available.
+- Report the inferred field name and declared C type at the corrupted offset. The field type must drive the corruption-mechanism classification.
+
+### Step E: Field Type Classification
+- If the field type is dma_addr_t and the observed value is a bus or physical address later used as a virtual pointer, classify this as field-type misuse or missing address conversion.
+- If the field type is a pointer type such as void * or struct X *, and it contains a low canonical physical-looking value, classify this as write corruption, incorrect assignment, or a reinit-path bug.
+- Do not conflate these mechanisms. Same bad address, different fix vector.
+
+### Step F: Upstream Fix Correlation
+- Once the driver and function are known, look for known upstream fixes, stable backports, or CVEs touching the same queue, reset, or reinitialization path.
+- If you cannot verify an exact patch, state the bounded pattern only. Do not invent commit IDs.
+
 ## 2.4 Convergence Criteria
 
 Set is_conclusive to true only when root cause is identified with at least two independent evidence sources, the causal chain is complete, the strongest remaining alternative is explicit, and no mandatory verification gap remains.
+
+For third-party or driver-private object corruption, root cause is not complete until one of the following is true:
+- the corrupted field's declared type is identified, or
+- you explicitly state why field-type classification is not possible from available symbols, source, or dump coverage.
 
 ## 2.4a Step Budget Management
 
@@ -242,6 +282,7 @@ When conclusive, include crash type, panic string, faulting instruction, root ca
 - dis -rl <RIP>: reverse from crash point
 - dis -l <func> 100: forward disassembly from function start
 - dis -s <func>: source-aware disassembly when debuginfo exists
+- If dis -s fails on a module path, pivot to source correlation using function-pointer anchors, upstream source cross-reference, and offset reconstruction; do not stop at raw disassembly alone.
 
 ## 4.2 Memory and Structure
 - struct -o <type>
@@ -289,6 +330,7 @@ When conclusive, include crash type, panic string, faulting instruction, root ca
 - rd seek error: do not retry; treat as evidence and pivot according to the Address Search SOP.
 - bt garbage or truncated: use bt -f and validate return addresses.
 - mod -s failure: continue with raw disassembly and avoid source-level assumptions.
+- dis -s failure on a driver path: use source-correlation fallback. Anchor on resolved function pointers, APIC or MSI fingerprints, list_head self-references, and open-source driver layouts before declaring the object type unknown.
 
 ## Advanced Forensics (Condensed)
 

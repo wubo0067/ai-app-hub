@@ -147,6 +147,38 @@ class PromptBuilderTests(unittest.TestCase):
         self.assertIn("## 3.12 DMA Memory Corruption (Stray DMA Write)", layered_prompt)
         self.assertIn("Current Investigation State (Step 14)", layered_prompt)
 
+    def test_driver_source_fragment_is_injected_when_function_pointer_cues_appear(
+        self,
+    ) -> None:
+        state = {
+            "step_count": 12,
+            "current_signature_class": "pointer_corruption",
+            "current_root_cause_class": "unknown",
+            "current_partial_dump": "partial",
+            "managed_active_hypotheses": None,
+            "managed_gates": {
+                "field_type_classification": GateEntry(
+                    required_for=["pointer_corruption"],
+                    status="open",
+                    evidence="awaiting source-level field typing",
+                )
+            },
+            "messages": [
+                HumanMessage(
+                    content=(
+                        "object dump shows function pointer ffffffffc051ad40, use mod -s and sym "
+                        "to anchor _base_interrupt before guessing the type"
+                    )
+                )
+            ],
+        }
+
+        layered_prompt = build_analysis_system_prompt(state, is_last_step=False)
+
+        self.assertIn("## 3.13 Driver Source Correlation", layered_prompt)
+        self.assertIn("Function-pointer anchor", layered_prompt)
+        self.assertIn("Open-source cross-reference", layered_prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

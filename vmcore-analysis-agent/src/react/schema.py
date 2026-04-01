@@ -43,6 +43,40 @@ class SuspectCode(BaseModel):
     line: str = Field(..., description="Line number or 'unknown'")
 
 
+class DriverSourceEvidence(BaseModel):
+    """驱动源码层面的结构和字段推断证据。"""
+
+    object_type: Optional[str] = Field(
+        None,
+        description="Inferred or confirmed struct type name, e.g. 'struct adapter_reply_queue'",
+    )
+    corrupted_field_name: Optional[str] = Field(
+        None,
+        description="Field name at the corrupted offset, e.g. 'reply_post_free_dma'",
+    )
+    corrupted_field_type: Optional[str] = Field(
+        None,
+        description="Declared C type of the corrupted field, e.g. 'dma_addr_t' vs 'void *'",
+    )
+    field_semantics: Optional[str] = Field(
+        None,
+        description="What the field should hold versus what the crash evidence shows it actually contains",
+    )
+    inference_method: Literal[
+        "function_pointer_anchor",
+        "symbol_lookup",
+        "open_source_crossref",
+        "apic_fingerprint",
+        "list_head_selfref",
+        "disassembly_offset_inference",
+        "unknown",
+    ] = Field("unknown", description="How the struct or field identity was determined")
+    upstream_reference: Optional[str] = Field(
+        None,
+        description="Upstream commit, CVE, stable patch, or source-file reference if known",
+    )
+
+
 class FinalDiagnosis(BaseModel):
     """最终诊断结果的完整结构"""
 
@@ -65,6 +99,23 @@ class FinalDiagnosis(BaseModel):
     evidence: List[str] = Field(
         ...,
         description="List of key evidence points (register values, memory contents, etc.)",
+    )
+    driver_source_evidence: Optional[DriverSourceEvidence] = Field(
+        None,
+        description="Source-level structural inference for third-party or driver-private crash objects",
+    )
+    corruption_mechanism: Optional[
+        Literal[
+            "field_type_misuse",
+            "write_corruption",
+            "race_condition",
+            "missing_conversion",
+            "reinit_path_bug",
+            "unknown",
+        ]
+    ] = Field(
+        None,
+        description="Specific corruption mechanism once source-level field semantics are known",
     )
 
 
@@ -89,6 +140,23 @@ class VMCoreLLMAnalysisStep(BaseModel):
     is_conclusive: bool = Field(False)
     signature_class: Optional["CrashSignatureClass"] = Field(None)
     root_cause_class: Optional["RootCauseClass"] = Field(None)
+    corruption_mechanism: Optional[
+        Literal[
+            "field_type_misuse",
+            "write_corruption",
+            "race_condition",
+            "missing_conversion",
+            "reinit_path_bug",
+            "unknown",
+        ]
+    ] = Field(
+        None,
+        description=(
+            "Optional finer-grained mechanism beneath root_cause_class. "
+            "Use this for distinctions such as field_type_misuse versus write_corruption. "
+            "Do not put these mechanism labels into root_cause_class."
+        ),
+    )
     partial_dump: "PartialDumpStatus" = Field("unknown")
     final_diagnosis: Optional[FinalDiagnosis] = Field(
         None, description="Populated only when is_conclusive=True."
@@ -237,6 +305,7 @@ class VMCoreAnalysisStep(BaseModel):
             "object_lifetime",
             "local_corruption_exclusion",
             "external_corruption_gate",
+            "field_type_classification",
         ],
         "null_deref": ["register_provenance"],
         "use_after_free": ["register_provenance", "object_lifetime"],
@@ -311,6 +380,23 @@ class VMCoreAnalysisStep(BaseModel):
             "May be null during early investigation. "
             "Must be a concrete value (or 'unknown') when is_conclusive=True. "
             "Set to unknown only when evidence bounds the failure family but cannot isolate the mechanism."
+        ),
+    )
+
+    corruption_mechanism: Optional[
+        Literal[
+            "field_type_misuse",
+            "write_corruption",
+            "race_condition",
+            "missing_conversion",
+            "reinit_path_bug",
+            "unknown",
+        ]
+    ] = Field(
+        None,
+        description=(
+            "Optional finer-grained corruption mechanism nested under root_cause_class. "
+            "Examples: field_type_misuse, missing_conversion, write_corruption."
         ),
     )
 

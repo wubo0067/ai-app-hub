@@ -9,12 +9,21 @@ from src.react.action_guard import (
 
 
 class ActionGuardTests(unittest.TestCase):
-    def test_rejects_sym_list_in_run_script(self) -> None:
+    def test_rejects_unfiltered_sym_list_in_run_script(self) -> None:
         error = validate_tool_call_request(
             "run_script",
-            {"script": "mod -s mpt3sas /tmp/mpt3sas.ko.debug\nsym -l | grep -i reply"},
+            {"script": "mod -s mpt3sas /tmp/mpt3sas.ko.debug\nsym -l mpt3sas"},
         )
         self.assertIn("sym -l is forbidden", error)
+
+    def test_allows_grep_filtered_sym_list_in_run_script(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {
+                "script": "mod -s mpt3sas /tmp/mpt3sas.ko.debug\nsym -l mpt3sas | grep -i reply"
+            },
+        )
+        self.assertIsNone(error)
 
     def test_rejects_bt_a_without_hard_lockup_context(self) -> None:
         error = validate_tool_call_request("bt", {"command": "bt -a"})

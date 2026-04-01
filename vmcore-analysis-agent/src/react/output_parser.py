@@ -69,64 +69,105 @@ def render_action_arguments(arguments: list[str]) -> str:
     """将结构化 action 参数渲染为可执行的 crash 命令字符串。
 
     LLM 输出的 arguments 是 JSON 字符串数组，不携带 shell 引号语义。
-    对于 grep -E/-Ei 之后包含 alternation 的模式，需要在拼回命令时恢复引号，
+    对于 grep 模式中包含 alternation 的场景，需要在拼回命令时恢复引号，
     否则 `a|b|c` 会和真正的管道符混淆。
     """
     rendered_tokens: list[str] = []
+    in_grep_command = False
     grep_expects_pattern = False
 
     for token in arguments:
         if token == "|":
             rendered_tokens.append(token)
+            in_grep_command = False
             grep_expects_pattern = False
             continue
 
         if token == "grep":
             rendered_tokens.append(token)
-            grep_expects_pattern = False
+            in_grep_command = True
+            grep_expects_pattern = True
             continue
 
-        if token.startswith("-E") and rendered_tokens and rendered_tokens[-1] == "grep":
+        if in_grep_command and grep_expects_pattern and token.startswith("-"):
             rendered_tokens.append(token)
             grep_expects_pattern = True
             continue
 
-        if grep_expects_pattern and "|" in token:
+        if in_grep_command and grep_expects_pattern and "|" in token:
             rendered_tokens.append(f'"{token}"')
             grep_expects_pattern = False
             continue
 
         rendered_tokens.append(token)
-        grep_expects_pattern = False
+        if in_grep_command and grep_expects_pattern:
+            grep_expects_pattern = False
 
     return " ".join(rendered_tokens)
 
 
 def _normalize_root_cause_class(content_str: str) -> str:
     """
-    在 JSON 解析前对 root_cause_class 字段进行语义归一化。
-    将常见的别名映射到合法的枚举值，避免因 schema 严格验证导致的解析失败。
+    在 JSON 解析前对 root_cause_class / corruption_mechanism 做语义归一化。
+
+    兼容两类常见错位：
+    1. root_cause_class 使用了旧别名；
+    2. 模型把细粒度 corruption_mechanism 错塞进 root_cause_class。
     """
-    # 定义常见别名到合法值的映射
-    alias_mapping = {
-        "pointer_corruption": "wild_pointer",  # pointer_corruption 更接近 wild_pointer 的语义
+    root_cause_alias_mapping = {
+        "pointer_corruption": "wild_pointer",
         "corruption": "memory_corruption",
         "memory_error": "memory_corruption",
         "address_corruption": "wild_pointer",
         "invalid_pointer": "wild_pointer",
     }
+    mechanism_to_root_cause_mapping = {
+        "field_type_misuse": "dma_corruption",
+        "missing_conversion": "dma_corruption",
+        "write_corruption": "memory_corruption",
+        "reinit_path_bug": "race_condition",
+        "race_condition": "race_condition",
+        "unknown": "unknown",
+    }
 
-    # 使用正则表达式匹配并替换 root_cause_class 字段值
-    for alias, canonical in alias_mapping.items():
-        # 匹配 "root_cause_class": "pointer_corruption" 这样的模式
-        pattern = r'("root_cause_class"\s*:\s*")' + re.escape(alias) + r'"'
+    mechanism_pattern = "|".join(
+        re.escape(value) for value in mechanism_to_root_cause_mapping
+    )
+
+    def _replace_root_cause(match: re.Match[str]) -> str:
+        prefix = match.group("prefix")
+        value = match.group("value")
+
+        if value in mechanism_to_root_cause_mapping:
+            suffix = f',\n  "corruption_mechanism": "{value}"'
+            if re.search(r'"corruption_mechanism"\s*:', content_str):
+                suffix = ""
+            return f'{prefix}{mechanism_to_root_cause_mapping[value]}"{suffix}'
+
+        canonical = root_cause_alias_mapping.get(value, value)
+        return f'{prefix}{canonical}"'
+
+    root_cause_pattern = re.compile(
+        r'(?P<prefix>"root_cause_class"\s*:\s*")(?P<value>[^"]+)"'
+    )
+    content_str = root_cause_pattern.sub(_replace_root_cause, content_str)
+
+    corruption_mechanism_alias_mapping = {
+        "type_misuse": "field_type_misuse",
+        "dma_type_misuse": "field_type_misuse",
+        "overwrite": "write_corruption",
+        "write_overwrite": "write_corruption",
+        "reinit_bug": "reinit_path_bug",
+    }
+    for alias, canonical in corruption_mechanism_alias_mapping.items():
+        pattern = r'("corruption_mechanism"\s*:\s*")' + re.escape(alias) + r'"'
         replacement = r"\1" + canonical + r'"'
         content_str = re.sub(pattern, replacement, content_str)
 
-        # 也处理 null 值的情况（虽然不太可能）
-        pattern_null = r'("root_cause_class"\s*:\s*)null'
-        replacement_null = r'\1"' + canonical + r'"'
-        # 只在特定上下文中替换 null，避免误替换
+    if re.search(rf'"root_cause_class"\s*:\s*"(?:{mechanism_pattern})"', content_str):
+        logger.warning(
+            "root_cause_class still contains a mechanism label after normalization; check mapping coverage."
+        )
 
     return content_str
 

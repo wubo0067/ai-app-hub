@@ -157,6 +157,15 @@ def _build_managed_gates(
                 prerequisite="local_corruption_exclusion",
                 evidence="Managed by executor state: waiting for local_corruption_exclusion to close.",
             )
+        elif gate_name == "field_type_classification":
+            managed[gate_name] = GateEntry(
+                required_for=[signature_class],
+                status="open",
+                evidence=(
+                    "Managed by executor state: awaiting source-level field typing via "
+                    "function-pointer anchoring, source cross-reference, or defensible offset inference."
+                ),
+            )
         else:
             managed[gate_name] = GateEntry(
                 required_for=[signature_class],

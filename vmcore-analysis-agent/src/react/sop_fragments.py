@@ -97,6 +97,12 @@ Sub-step B: extract suspect-device DMA ranges only after fingerprint work or whe
 
 Sub-step C: when driver structs are unavailable, inspect generic dma_ops and coherent_dma_mask to understand protection level.
 
+Sub-step D: field-type disambiguation before naming the root cause.
+- After identifying the corrupted object and field offset, determine the declared C type of that field from driver source, debug info, or a defensible offset-to-source correlation.
+- If the field type is dma_addr_t: the observed bus address may be type-correct but used in the wrong semantic role. Classify this as field_type_misuse or missing_conversion, not generic overwrite.
+- If the field type is void * or another pointer type: a low canonical physical-looking value in that field indicates write_corruption, race_condition, or reinit_path_bug.
+- Do not conflate these mechanisms. Same bad value, different fix direction.
+
 ### Step 3: Corrupted Page DMA Mapping State
 - Use vtop and kmem -p to understand page ownership.
 - Distinguish reserved, slab, anonymous, and swap-backed pages.
@@ -112,6 +118,34 @@ Sub-step C: when driver structs are unavailable, inspect generic dma_ops and coh
 - Medium confidence may use one of the two, but must state what remains unproven.
 - If neither fingerprint nor range overlap exists, DMA remains low-confidence only.
 - Do not name a specific device without at least one device-side evidence item.
+""".strip(),
+    "driver_source_correlation": """
+## 3.13 Driver Source Correlation
+
+Use this SOP when the crash path is inside a driver, struct -o cannot validate the private type, or offset-only reasoning is stalling.
+
+### Step 1: Function-pointer anchor
+- If an object dump contains a pointer inside the active module text range, resolve it with sym.
+- Treat the resolved function name as a structural anchor and infer which runtime object type would legally store that callback at the observed offset.
+
+### Step 2: Structural fingerprints
+- 0xFEE0xxxx values are APIC or MSI target addresses and can fingerprint interrupt-queue objects.
+- Self-referential pointers usually indicate embedded list_head nodes and provide container offsets.
+- Combine these fingerprints with disassembly-derived offsets before guessing any type name.
+
+### Step 3: Open-source cross-reference
+- For drivers with upstream or historically open source, correlate the crashing function, nearby helper names, and observed offsets against the matching kernel source tree.
+- Primary reference: https://elixir.bootlin.com/linux/<version>/source
+- Prefer identifying the exact field name and declared type at the corrupted offset over naming the entire struct family only.
+
+### Step 4: Field-type classification
+- dma_addr_t field holding a bus address later dereferenced as a virtual pointer => field_type_misuse or missing_conversion.
+- void * or struct pointer field holding a low canonical physical-looking address => write_corruption, race_condition, or reinit_path_bug.
+- If source correlation cannot identify the field type, explicitly say so and keep the corruption_mechanism bounded as unknown.
+
+### Step 5: Upstream fix correlation
+- After confirming driver and function, search for known upstream fixes, CVEs, or stable backports in the same queue, reset, reinit, or reply-processing path.
+- Cite only verifiable references. If you cannot verify an exact patch, report the bug pattern without inventing a commit.
 """.strip(),
     "advanced_techniques": """
 ## PART 5: ADVANCED TECHNIQUES

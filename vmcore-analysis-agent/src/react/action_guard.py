@@ -269,9 +269,10 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
     parts = normalized.split()
     command = parts[0]
 
-    # sym -l 禁止：列出所有符号输出过大
+    # sym -l 默认禁止；若后续立即通过 grep 过滤，则允许受限查询
     if command == "sym" and len(parts) > 1 and parts[1] == "-l":
-        return "sym -l is forbidden; use sym <symbol>."
+        if "|" not in parts or "grep" not in parts[parts.index("|") + 1 :]:
+            return "sym -l is forbidden unless it is piped to grep; otherwise use sym <symbol>."
 
     # bt -a 默认禁止：除非是 hard_lockup 场景
     if command == "bt" and "-a" in parts[1:] and not allow_bt_a:
