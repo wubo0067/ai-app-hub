@@ -129,6 +129,26 @@ class OutputParserAuditTests(unittest.TestCase):
             '-m | grep -i "dma|iommu|mapping|buffer" | head -10',
         )
 
+    def test_render_action_arguments_preserves_existing_grep_quotes(self) -> None:
+        rendered = render_action_arguments(
+            [
+                "-m",
+                "|",
+                "grep",
+                "-i",
+                "mpt3sas",
+                "|",
+                "grep",
+                "-Ei",
+                '"fail|error|timeout|fault|xid|mmu|fifo|dma|map|reset"',
+            ]
+        )
+
+        self.assertEqual(
+            rendered,
+            '-m | grep -i mpt3sas | grep -Ei "fail|error|timeout|fault|xid|mmu|fifo|dma|map|reset"',
+        )
+
     def test_build_tool_calls_preserves_grep_pattern_quoting(self) -> None:
         llm_step = VMCoreLLMAnalysisStep.model_validate(
             {
@@ -189,6 +209,39 @@ class OutputParserAuditTests(unittest.TestCase):
         self.assertEqual(
             tool_calls[0]["args"]["command"],
             '-m | grep -i "dma|iommu|mapping|buffer" | head -10',
+        )
+
+    def test_build_tool_calls_preserves_existing_grep_quotes(self) -> None:
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 10,
+                "reasoning": "Need a quoted filtered driver log query next.",
+                "action": {
+                    "command_name": "log",
+                    "arguments": [
+                        "-m",
+                        "|",
+                        "grep",
+                        "-i",
+                        "mpt3sas",
+                        "|",
+                        "grep",
+                        "-Ei",
+                        '"fail|error|timeout|fault|xid|mmu|fifo|dma|map|reset"',
+                    ],
+                },
+                "is_conclusive": False,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": None,
+                "partial_dump": "partial",
+            }
+        )
+
+        tool_calls = build_tool_calls(llm_step, is_last_step=False)
+
+        self.assertEqual(
+            tool_calls[0]["args"]["command"],
+            '-m | grep -i mpt3sas | grep -Ei "fail|error|timeout|fault|xid|mmu|fifo|dma|map|reset"',
         )
 
     def test_repair_structured_output_normalizes_mechanism_into_root_cause_class(

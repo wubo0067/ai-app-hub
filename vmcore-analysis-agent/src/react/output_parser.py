@@ -94,6 +94,11 @@ def render_action_arguments(arguments: list[str]) -> str:
             grep_expects_pattern = True
             continue
 
+        if in_grep_command and grep_expects_pattern and _is_quoted_shell_token(token):
+            rendered_tokens.append(token)
+            grep_expects_pattern = False
+            continue
+
         if in_grep_command and grep_expects_pattern and "|" in token:
             rendered_tokens.append(f'"{token}"')
             grep_expects_pattern = False
@@ -104,6 +109,10 @@ def render_action_arguments(arguments: list[str]) -> str:
             grep_expects_pattern = False
 
     return " ".join(rendered_tokens)
+
+
+def _is_quoted_shell_token(token: str) -> bool:
+    return len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"}
 
 
 def _normalize_root_cause_class(content_str: str) -> str:
