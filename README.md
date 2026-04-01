@@ -8,18 +8,13 @@ An intelligent Linux kernel crash (vmcore) analysis agent based on LangGraph ReA
 
 ### Linux Kernel Crash Analysis
 
-Linux kernel crash analysis is the crown jewel of system engineering and one of the most challenging technical problems.
-
-**Challenges and Difficulties**:
-- **Complex knowledge system**: Requires proficiency in C language, operating system principles, common data structures and algorithms, and kernel subsystem architecture (memory management, scheduling, file systems, etc.).
-- **Extremely high skill requirements**: Need to master various hardware working principles and kernel basic architecture implementation, and be proficient in complex debugging tools like crash and gdb.
-- **High reasoning ability threshold**: Requires extremely strong logical reasoning and analytical skills to extract insights from massive stacks and memory data.
-
-**Core Project Advantages**:
-This project innovatively introduces an **ReAct (Reasoning + Acting)** AI Agent architecture combined with **MCP (Model Context Protocol)** tool system, achieving automated vmcore deep analysis:
-- **Expert experience digitization**: Replicates RHEL senior engineers' analytical thinking through carefully designed professional prompts, enabling LLMs to learn top experts' reasoning paths.
-- **Intelligent tool usage**: AI can autonomously plan and execute crash debugging commands, dynamically exploring memory scenes like human experts rather than simple static matching.
-- **Transparent analysis process**: Provides complete chain of thought (Chain of Thought) and operation records, showing not only conclusions but also the complete analytical logic.
+**VMCore Analysis Agent** is a production-grade automated Linux kernel crash (vmcore) diagnosis platform. By integrating the **LangGraph ReAct** pattern with the **MCP (Model Context Protocol)** tooling system, it transforms the traditionally highly manual and experience-dependent complex kernel debugging process into an executable AI workflow.
+### Core Technical Highlights
+- **Layered Expert Knowledge System**: Unlike simple RAG, this project implements a **Three-Tier Dynamic Prompt Injection Architecture** (Global Foundation, Scenario Script, SOP Fragment). The system loads diagnostic logic on-demand based on crash characteristics (e.g., Soft Lockup or memory corruption), significantly reducing token noise and improving reasoning accuracy.
+- **Evidence-Driven State Machine Management**: The agent maintains a structured state containing **Active Hypotheses** and **Verification Gates**. It mandates that the LLM must collect specific diagnostic evidence (e.g., register source tracing, stack backtrace) before drawing conclusions, ensuring the rigor and traceability of the analysis process.
+- **Deep Tool Integration via MCP**: Leveraging the Model Context Protocol (MCP), the agent achieves high-fidelity connectivity with the Linux `crash` tool. The AI no longer "blindly guesses"; instead, it dynamically explores memory, disassembles code, and retrieves kernel object states based on its reasoning path.
+- **Executor-Level Safety Protection**: The built-in `action_guard` module prevents the LLM from executing commands that are overly resource-intensive or high-risk (e.g., blindly running `bt -a` on a large system). Simultaneously, a command deduplication mechanism ensures analysis efficiency and prevents reasoning from falling into infinite loops.
+- **Transparent Chain-of-Thought Reporting**: Each analysis generates a structured Markdown report, fully documenting the intent behind every command execution, the verification process of hypotheses, and the evidence-based final root cause isolation.
 
 ## Architecture Design
 
@@ -150,7 +145,7 @@ The agent implements a sophisticated three-layer dynamic prompt injection system
   - Defines the Agent's identity (Role), core forbidden operations, and output contracts
   - Acts as the immutable "constitution" that remains active throughout all analysis stages
 
-- **Layer 1: Scenario Playbooks** 
+- **Layer 1: Scenario Playbooks**
   - Dynamically selected via `_select_playbook` based on `current_signature_class`
   - Implements instruction isolation: when analyzing `null_deref`, the LLM has zero exposure to `lockup` or `rcu_stall` logic
   - Eliminates interference and solves attention degradation issues during complex analyses
