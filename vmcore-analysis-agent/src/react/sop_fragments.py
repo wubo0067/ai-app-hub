@@ -12,6 +12,12 @@ Strategy 1: targeted region search.
 - search -u <address> after set <pid> for user-space.
 - search -s <start> -e <end> <address> for bounded VA ranges.
 
+Strategy 1a: symbol-oriented raw region sweep.
+- When you need to inspect a suspicious kernel memory region deeply and reinterpret raw bytes as likely kernel symbol addresses, prefer run_script with rd -SS <address> | grep "<pattern>".
+- Use this when page-fault, pointer-corruption, or object-shape analysis has already identified a bounded suspect region and you need candidate function-pointer or embedded-string anchors.
+- If a wider bounded region is required, add an explicit count to rd instead of switching to an unbounded search.
+- Treat grep hits only as candidate anchors. Validate each hit with sym, dis, struct, or neighboring rd output before concluding pointer provenance or root cause.
+
 Strategy 2: reverse physical-address resolution.
 1. Align the PA to 4 KB.
 2. Run kmem -p <aligned_PA>.
@@ -44,9 +50,16 @@ Pattern: kernel stack overflow, corrupted stack end detected, or crash in random
 
 Analysis:
 1. Distinguish process, IRQ, and exception stack overflows.
-2. Use bt and bt -f to validate stack boundaries and call-chain plausibility.
-3. Inspect STACK_END_MAGIC and the raw stack contents with rd -x when needed.
-4. Look for recursive call patterns or overwritten return-address regions.
+2. Treat bt as provisional when frames are context-inconsistent; first validate return addresses, stack progression, and control-flow plausibility before trusting the call chain.
+3. Use bt -f only with a concrete pid or task when you need per-frame details for that task; never use bt -f with a frame number.
+4. On x86_64 with a frame-pointer prologue, saved caller RBP is at [RBP] and the return address is at [RBP+8]; compute the canary slot from the disassembly-derived offset such as rbp-0x18 instead of guessing from older frames.
+5. On x86-64, the stack grows downward (high → low). A buffer overflow in function F writes UPWARD and can only corrupt F's own canary and frames of F's callers (at higher addresses). It CANNOT corrupt frames pushed after F (at lower addresses). Always verify overflow direction vs victim frame address before attributing a corruption source.
+6. When an exception (page fault, interrupt) fires during a function's execution, the exception handler pushes new frames at even lower addresses on the same stack. Identify these nested exception frames (often prefixed with ?) and consider the exception handler call chain as a candidate corruption source — not the interrupted function's callers.
+7. Inspect task_struct and thread_info fields with task -R when you need stack boundaries or execution-context validation.
+8. Inspect STACK_END_MAGIC and the raw stack contents with rd -x when needed.
+9. For kernel-stack pages, use vtop or task-derived stack boundaries when page validation is required; do not use kmem -S on stack addresses.
+10. In panic backtraces, frames prefixed with ? are stack-scan candidates rather than trusted frame-pointer links; treat them as hints only, not proven caller-callee relationships. However, ? frames from exception handlers are diagnostically significant.
+11. Look for recursive call patterns, overwritten return-address regions, and frames that jump into unrelated subsystems.
 """.strip(),
     "kasan_ubsan": """
 ## 3.11 KASAN / UBSAN Reports

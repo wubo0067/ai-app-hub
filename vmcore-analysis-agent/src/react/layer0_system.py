@@ -54,10 +54,12 @@ bt -a is permitted only when confirming a hard_lockup or NMI watchdog panic. Use
 | $(...), $((...)), $VAR in crash arguments | Evaluate in reasoning and use a literal hex result |
 | %gs:0x1440, (%rax), %rip+0x20, $rbx | Compute the numeric address first |
 | rd -x, ptov, struct -o with no operand | Include the required target |
+| bt -f <frame_no> | Use bt for frame numbering, or bt -f <pid/task> for that task's frame details |
 | rd -x <addr>+<offset> <count> | Pre-compute the literal address, then call rd |
 | struct <type> -o | struct -o <type> |
 | struct -o piped through grep | Use a concrete type name directly |
 | kmem -p <kernel_VA> | vtop <VA> first, then kmem -p <PA> |
+| kmem -S <kernel_stack_addr> | Use task -R or vtop to validate kernel stack pages |
 | NULL as address in struct or rd | Report NULL as a diagnostic finding; do not read it |
 | grep -E or grep -Ei with alternation but no quotes | Quote the regex, e.g. grep -Ei "dma|iommu|mapping|buffer" |
 
@@ -108,6 +110,7 @@ Root cause class represents the underlying cause rather than the panic entry sig
 
 Mechanism labels such as field_type_misuse, missing_conversion, write_corruption, and reinit_path_bug belong only in corruption_mechanism, never in root_cause_class.
 If any of those labels appears in root_cause_class, treat that output as a schema error and correct it before finalizing the step.
+Root-cause families such as out_of_bounds, double_free, wild_pointer, and dma_corruption belong in root_cause_class, not in corruption_mechanism.
 
 ## 1.1b Partial Dump Handling
 
@@ -119,6 +122,8 @@ If any of those labels appears in root_cause_class, treat that output as a schem
 
 - Never emit search -k or search -p directly against an unvalidated value.
 - First classify whether the candidate is a VA, PA, embedded node, or plain payload bytes.
+- When deep-inspecting a suspicious kernel memory region for a page-fault or pointer-corruption case, you may use run_script with rd -SS <address> | grep "<pattern>" to surface candidate function-pointer or string anchors; add an explicit rd count if the bounded region must be widened.
+- Treat rd -SS | grep matches as search hints only. Confirm each candidate with sym, dis, struct, or adjacent raw-memory reads before escalating to provenance or device attribution.
 - Load the full Address Search SOP fragment only when the latest evidence actually requires page or payload search work.
 
 ## 1.7 Command Argument Rules
@@ -133,6 +138,7 @@ Correct examples:
 - dis -rl <RIP>
 - ptov <PA>
 - rd -x <addr> <count>
+- run_script rd -SS <address> | grep "<pattern>"
 
 ## 1.7a Data Width and Alignment Discipline
 
@@ -253,6 +259,10 @@ When struct -o fails for a third-party or out-of-tree module, reconstruct the ru
 
 Set is_conclusive to true only when root cause is identified with at least two independent evidence sources, the causal chain is complete, the strongest remaining alternative is explicit, and no mandatory verification gap remains.
 
+In memory_corruption, out_of_bounds, or stack-corruption style cases, a seemingly complete causal chain is not valid unless the backtrace itself has been checked for plausibility. If frames jump into unrelated subsystems, repeat the same function unexpectedly, or contradict the surrounding execution context, downgrade bt reliability and pivot to raw stack or return-address validation before finalizing root cause.
+
+In stack-corruption cases specifically, before naming a suspect function as the overflow source, you MUST verify stack-address causality: on x86-64, a local buffer overflow writes toward higher addresses. Therefore only a function whose frame is at a LOWER address than the corrupted canary could have overflowed upward into that canary. A function whose frame is at a HIGHER address (an earlier caller) cannot overflow downward into a canary that was placed later at a lower address. If the backtrace contains exception-handler frames (page fault, interrupt) nested below the interrupted function, the exception handler call chain is the primary suspect region, not the original call chain above it.
+
 For third-party or driver-private object corruption, root cause is not complete until one of the following is true:
 - the corrupted field's declared type is identified, or
 - you explicitly state why field-type classification is not possible from available symbols, source, or dump coverage.
@@ -298,6 +308,9 @@ When conclusive, include crash type, panic string, faulting instruction, root ca
 - ps, ps <pid>, ps -G <task>
 - task -R <field>
 
+bt -f is for expanded frame details of a concrete task context, not for selecting frame number N from an existing bt listing.
+In crash backtraces, frames prefixed with ? are scan-derived candidates and must not be treated as reliable caller-callee edges unless independently validated.
+
 ## 4.4 Kernel Log
 - log -m | grep -i <pattern>
 - log -t | grep -i <pattern>
@@ -328,7 +341,7 @@ When conclusive, include crash type, panic string, faulting instruction, root ca
 
 - invalid address or no data found: verify via vtop or nearby rd before drawing conclusions.
 - rd seek error: do not retry; treat as evidence and pivot according to the Address Search SOP.
-- bt garbage or truncated: use bt -f and validate return addresses.
+- bt garbage, context-inconsistent, or truncated: validate return addresses and stack progression first; use bt -f only with a concrete pid or task, and use task -R or raw stack reads when the backtrace itself may be corrupted.
 - mod -s failure: continue with raw disassembly and avoid source-level assumptions.
 - dis -s failure on a driver path: use source-correlation fallback. Anchor on resolved function pointers, APIC or MSI fingerprints, list_head self-references, and open-source driver layouts before declaring the object type unknown.
 

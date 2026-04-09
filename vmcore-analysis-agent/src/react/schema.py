@@ -8,6 +8,122 @@ from typing import Any, ClassVar, Dict, List, Literal, Optional, cast
 
 from pydantic import BaseModel, Field, model_validator
 
+_CORRUPTION_MECHANISM_VALUES = {
+    "field_type_misuse",
+    "write_corruption",
+    "race_condition",
+    "missing_conversion",
+    "reinit_path_bug",
+    "unknown",
+}
+
+_CORRUPTION_MECHANISM_ALIASES = {
+    "type_misuse": "field_type_misuse",
+    "dma_type_misuse": "field_type_misuse",
+    "overwrite": "write_corruption",
+    "write_overwrite": "write_corruption",
+    "reinit_bug": "reinit_path_bug",
+}
+
+_ROOT_CAUSE_LIKE_MECHANISMS = {
+    "out_of_bounds",
+    "double_free",
+    "wild_pointer",
+    "slab_corruption",
+    "memory_corruption",
+    "pointer_corruption",
+    "use_after_free",
+    "null_deref",
+    "dma_corruption",
+}
+
+# ---------------------------------------------------------------------------
+# signature_class 容错归一化
+# ---------------------------------------------------------------------------
+_SIGNATURE_CLASS_VALUES = {
+    "null_deref",
+    "use_after_free",
+    "pointer_corruption",
+    "bug_on",
+    "warn_on",
+    "soft_lockup",
+    "hard_lockup",
+    "rcu_stall",
+    "hung_task",
+    "atomic_sleep",
+    "divide_error",
+    "invalid_opcode",
+    "oom_panic",
+    "mce",
+    "general_protection_fault",
+    "stack_corruption",
+    "unknown",
+}
+
+_SIGNATURE_CLASS_ALIASES: dict[str, str] = {
+    "stack_protector": "stack_corruption",
+    "stack_smash": "stack_corruption",
+    "kernel_stack_corruption": "stack_corruption",
+    "gp_fault": "general_protection_fault",
+    "gpf": "general_protection_fault",
+    "null_pointer": "null_deref",
+    "nullptr": "null_deref",
+    "uaf": "use_after_free",
+    "oob": "pointer_corruption",
+    "machine_check": "mce",
+    "oom": "oom_panic",
+}
+
+
+def _coerce_signature_class(data: Any) -> Any:
+    """对 signature_class 做有边界的容错归一化，防止 LLM 未知值中断管线。"""
+    if not isinstance(data, dict):
+        return data
+
+    raw = data.get("signature_class")
+    if not isinstance(raw, str):
+        return data
+
+    normalized = _SIGNATURE_CLASS_ALIASES.get(raw, raw)
+    if normalized in _SIGNATURE_CLASS_VALUES:
+        data["signature_class"] = normalized
+    else:
+        data["signature_class"] = "unknown"
+    return data
+
+
+def _coerce_corruption_mechanism(
+    data: Any,
+    *,
+    root_cause_field: str | None = None,
+) -> Any:
+    """对 corruption_mechanism 做有边界的容错归一化。"""
+    if not isinstance(data, dict):
+        return data
+
+    raw_value = data.get("corruption_mechanism")
+    if not isinstance(raw_value, str):
+        return data
+
+    normalized = _CORRUPTION_MECHANISM_ALIASES.get(raw_value, raw_value)
+
+    if normalized in _CORRUPTION_MECHANISM_VALUES:
+        data["corruption_mechanism"] = normalized
+        return data
+
+    if normalized in _ROOT_CAUSE_LIKE_MECHANISMS and root_cause_field:
+        current_root_cause = data.get(root_cause_field)
+        if current_root_cause in {
+            None,
+            "unknown",
+            "memory_corruption",
+            "pointer_corruption",
+        }:
+            data[root_cause_field] = normalized
+
+    data["corruption_mechanism"] = "unknown"
+    return data
+
 
 class ToolCall(BaseModel):
     command_name: str = Field(
@@ -115,8 +231,17 @@ class FinalDiagnosis(BaseModel):
         ]
     ] = Field(
         None,
-        description="Specific corruption mechanism once source-level field semantics are known",
+        description=(
+            "Specific corruption mechanism once source-level field semantics are known. "
+            "This field is narrower than root_cause_class; do not put out_of_bounds, "
+            "double_free, wild_pointer, or dma_corruption here."
+        ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_corruption_mechanism(cls, data: Any) -> Any:
+        return _coerce_corruption_mechanism(data)
 
 
 class VMCoreLLMAnalysisStep(BaseModel):
@@ -154,7 +279,8 @@ class VMCoreLLMAnalysisStep(BaseModel):
         description=(
             "Optional finer-grained mechanism beneath root_cause_class. "
             "Use this for distinctions such as field_type_misuse versus write_corruption. "
-            "Do not put these mechanism labels into root_cause_class."
+            "Do not put these mechanism labels into root_cause_class, and do not put "
+            "root-cause families such as out_of_bounds into corruption_mechanism."
         ),
     )
     partial_dump: "PartialDumpStatus" = Field("unknown")
@@ -180,54 +306,83 @@ class VMCoreLLMAnalysisStep(BaseModel):
             legacy_value = data.get("crash_class")
             if legacy_value is not None:
                 data["signature_class"] = legacy_value
-        return data
+        data = _coerce_signature_class(data)
+        return _coerce_corruption_mechanism(data, root_cause_field="root_cause_class")
 
 
+# =============================================================================
+# 崩溃分类系统 - 双层分类架构
+# =============================================================================
+
+# CrashSignatureClass: 崩溃签名类别（表层现象分类）
+#
+# 用途：
+# - 从 panic 字符串直接可观测的早期路由标签
+# - 用于快速确定分析路径和选择对应的分析剧本（playbook）
+# - 决定需要完成哪些验证检查点（gates）才能得出结论
+#
+# 特点：
+# - 基于直接可观测的现象（如 panic 消息、错误类型）
+# - 在分析早期阶段（通常第 2 步）就需要确定
+# - 主要用于分类和路由，而不是深入的根因分析
+# - 不得用于表达需要深度推理才能得出的根因（如 out_of_bounds、dma_corruption、race_condition）
 CrashSignatureClass = Literal[
-    "null_deref",
-    "use_after_free",
-    "pointer_corruption",
-    "bug_on",
-    "warn_on",
-    "soft_lockup",
-    "hard_lockup",
-    "rcu_stall",
-    "hung_task",
-    "atomic_sleep",
-    "divide_error",
-    "invalid_opcode",
-    "oom_panic",
-    "mce",
-    "general_protection_fault",
-    "unknown",
+    "null_deref",  # 空指针解引用 - unable to handle kernel NULL pointer dereference
+    "use_after_free",  # 使用已释放内存 - paging request at non-NULL address 或 KASAN 报告
+    "pointer_corruption",  # 指针损坏 - 通用指针损坏场景，需要进一步调查具体机制
+    "bug_on",  # 内核 BUG 断言 - BUG_ON 触发的崩溃
+    "warn_on",  # 内核 WARN 断言 - WARN_ON 触发的警告/崩溃
+    "soft_lockup",  # 软锁死 - soft lockup detected
+    "hard_lockup",  # 硬锁死 - NMI watchdog hard lockup
+    "rcu_stall",  # RCU 停滞 - rcu_sched self-detected stall
+    "hung_task",  # 任务挂起 - task blocked for more than 120 seconds
+    "atomic_sleep",  # 原子上下文中睡眠 - BUG: scheduling while atomic
+    "divide_error",  # 除零错误 - divide error
+    "invalid_opcode",  # 无效操作码 - invalid opcode
+    "oom_panic",  # 内存耗尽恐慌 - Out of memory panic
+    "mce",  # 机器检查异常 - Machine Check Exception / Hardware Error
+    "general_protection_fault",  # 通用保护故障 - x86 #13 或等效保护域故障
+    "stack_corruption",  # 栈损坏 - stack-protector / kernel stack is corrupted
+    "unknown",  # 未知类型 - 无法分类的崩溃类型
 ]
 
 
-# CrashSignatureClass: 从 panic 字符串直接可观测的早期路由标签。
-# 不得用于表达 out_of_bounds / dma_corruption / race_condition 等需要深度推理才能得出的根因。
+# RootCauseClass: 根本原因类别（深层机制分类）
+#
+# 用途：
+# - 表示经过深入调查后确定的根本原因机制
+# - 在分析结束时提供最终诊断依据
+# - 为生成修复建议提供基础
+#
+# 特点：
+# - 需要深度推理和工具验证才能确定
+# - 在分析后期阶段才逐步明确
+# - 反映真实的故障机制，而不仅仅是表面现象
+# - 包含所有 CrashSignatureClass 的类别（因为某些情况下签名就是根因）
+# - 额外包含需要深度分析才能确定的机制类别
 RootCauseClass = Literal[
-    "null_deref",
-    "use_after_free",
-    "out_of_bounds",
-    "double_free",
-    "wild_pointer",
-    "slab_corruption",
-    "memory_corruption",
-    "race_condition",
-    "deadlock",
-    "rcu_misuse",
-    "atomic_sleep",
-    "dma_corruption",
-    "iommu_fault",
-    "mce",
-    "bug_on",
-    "warn_on",
-    "divide_error",
-    "invalid_opcode",
-    "oom",
-    "oom_panic",
-    "pointer_corruption",
-    "unknown",
+    "null_deref",  # 空指针解引用 - 直接的 NULL 解引用或小偏移成员访问
+    "use_after_free",  # 使用已释放内存 - 典型的 UAF 场景
+    "out_of_bounds",  # 数组越界 - 堆/栈缓冲区越界写入
+    "double_free",  # 重复释放 - 同一内存被多次释放
+    "wild_pointer",  # 野指针 - 未初始化或已损坏的指针
+    "slab_corruption",  # Slab 内存池损坏 - slab metadata 或对象损坏
+    "memory_corruption",  # 内存损坏 - 通用内存损坏，机制不明
+    "race_condition",  # 竞态条件 - 多线程/多 CPU 竞争导致的状态不一致
+    "deadlock",  # 死锁 - 循环等待资源导致的阻塞
+    "rcu_misuse",  # RCU 误用 - RCU API 使用不当
+    "atomic_sleep",  # 原子上下文中睡眠 - 在不可调度上下文中调用睡眠函数
+    "dma_corruption",  # DMA 损坏 - 设备 DMA 操作导致的内存损坏
+    "iommu_fault",  # IOMMU 故障 - IOMMU 映射或权限错误
+    "mce",  # 机器检查异常 - 硬件错误导致的崩溃
+    "bug_on",  # 内核 BUG 断言 - BUG_ON 条件触发
+    "warn_on",  # 内核 WARN 断言 - WARN_ON 条件触发
+    "divide_error",  # 除零错误 - 除法操作中除数为零
+    "invalid_opcode",  # 无效操作码 - 执行了无效的 CPU 指令
+    "oom",  # 内存耗尽 - OOM killer 触发但未导致 panic
+    "oom_panic",  # 内存耗尽恐慌 - OOM 导致系统 panic
+    "pointer_corruption",  # 指针损坏 - 通用指针损坏，机制待确定
+    "unknown",  # 未知根因 - 证据不足以确定具体机制
 ]
 
 

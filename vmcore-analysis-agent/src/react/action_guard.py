@@ -278,6 +278,15 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
     if command == "bt" and "-a" in parts[1:] and not allow_bt_a:
         return "bt -a is forbidden unless the current signature_class is hard_lockup."
 
+    if command == "bt" and "-f" in parts[1:]:
+        flag_index = parts.index("-f")
+        if flag_index == len(parts) - 1:
+            return "bt -f requires a concrete pid or task argument."
+
+        target = parts[flag_index + 1]
+        if target.isdigit() and len(parts) == flag_index + 2:
+            return "bt -f must target a concrete pid or task context, not a frame number from bt output."
+
     # log 命令检查：必须配合 grep 使用，禁止单独使用
     if command == "log":
         if normalized == "log":
@@ -295,6 +304,10 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
             return "kmem -a <addr> is forbidden; use kmem -S <addr>."
         if parts[1] == "-S" and len(parts) == 2:
             return "bare kmem -S is forbidden; use kmem -S <addr>."
+        if parts[1] == "-S" and len(parts) >= 3:
+            candidate = parts[2].lower()
+            if candidate.startswith("ffff"):
+                return "kmem -S is only for slab or heap object addresses; do not use it on possible kernel stack addresses. Use task -R or vtop instead."
 
     # struct 命令检查：禁止裸用 struct -o
     if command == "struct":

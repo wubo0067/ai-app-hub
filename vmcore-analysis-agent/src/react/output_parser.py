@@ -145,6 +145,27 @@ def _is_quoted_shell_token(token: str) -> bool:
     return len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"}
 
 
+def _normalize_signature_class(content_str: str) -> str:
+    """在 JSON 解析前对 signature_class 做别名归一化，防止 LLM 输出未知值导致验证失败。"""
+    alias_mapping = {
+        "stack_protector": "stack_corruption",
+        "stack_smash": "stack_corruption",
+        "kernel_stack_corruption": "stack_corruption",
+        "gp_fault": "general_protection_fault",
+        "gpf": "general_protection_fault",
+        "null_pointer": "null_deref",
+        "nullptr": "null_deref",
+        "uaf": "use_after_free",
+        "machine_check": "mce",
+        "oom": "oom_panic",
+    }
+    for alias, canonical in alias_mapping.items():
+        pattern = r'("signature_class"\s*:\s*")' + re.escape(alias) + r'"'
+        replacement = r"\1" + canonical + r'"'
+        content_str = re.sub(pattern, replacement, content_str)
+    return content_str
+
+
 def _normalize_root_cause_class(content_str: str) -> str:
     """
     在 JSON 解析前对 root_cause_class / corruption_mechanism 做语义归一化。
@@ -222,6 +243,37 @@ def _normalize_root_cause_class(content_str: str) -> str:
         pattern = r'("corruption_mechanism"\s*:\s*")' + re.escape(alias) + r'"'
         replacement = r"\1" + canonical + r'"'
         content_str = re.sub(pattern, replacement, content_str)
+
+    # 某些 root-cause 标签会被 LLM 错塞进 corruption_mechanism。
+    # 对 out_of_bounds 这类值，保留现有 schema 语义：它属于 root_cause_class，
+    # corruption_mechanism 则降级为 unknown 以避免结构化输出失败。
+    misplaced_mechanism_to_root_cause = {
+        "out_of_bounds": "out_of_bounds",
+    }
+
+    for (
+        misplaced_value,
+        canonical_root_cause,
+    ) in misplaced_mechanism_to_root_cause.items():
+        content_str = re.sub(
+            r'("corruption_mechanism"\s*:\s*")' + re.escape(misplaced_value) + r'"',
+            r'\1unknown"',
+            content_str,
+        )
+
+        if re.search(r'"root_cause_class"\s*:', content_str):
+            content_str = re.sub(
+                r'("root_cause_class"\s*:\s*")(?P<value>memory_corruption|unknown)"',
+                r"\1" + canonical_root_cause + '"',
+                content_str,
+            )
+        else:
+            content_str = re.sub(
+                r'("signature_class"\s*:\s*"[^"]+"\s*,)',
+                r'\1\n  "root_cause_class": "' + canonical_root_cause + '",',
+                content_str,
+                count=1,
+            )
 
     # 警告检查：确保归一化后没有机制标签残留在 root_cause_class 中
     if re.search(rf'"root_cause_class"\s*:\s*"(?:{mechanism_pattern})"', content_str):
@@ -319,6 +371,7 @@ def repair_structured_output(
     repaired_prefix = f"{log_prefix}: " if log_prefix else ""
 
     # 在任何修复尝试之前，先进行语义归一化
+    content_str = _normalize_signature_class(content_str)
     content_str = _normalize_root_cause_class(content_str)
 
     try:
@@ -349,6 +402,7 @@ def repair_structured_output(
         fixed_content = _normalize_invalid_escapes(fixed_content)
         fixed_content = _inject_missing_arguments_field(fixed_content)
         # 再次应用语义归一化，确保手动修复后的内容也被处理
+        fixed_content = _normalize_signature_class(fixed_content)
         fixed_content = _normalize_root_cause_class(fixed_content)
         result = model_class.model_validate_json(fixed_content)
         logger.warning(

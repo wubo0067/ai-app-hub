@@ -79,7 +79,7 @@ Analysis:
 Pattern: paging request at a non-NULL address or a KASAN-style report.
 
 Analysis:
-1. Run kmem -S <address>; if it fails, fall back to kmem -p for page-level ownership.
+1. Run kmem -S <address> only when the candidate address is expected to be a slab object or heap allocation; if the address may belong to a kernel stack, text, or non-slab page, use vtop or kmem -p on the translated page instead.
 2. Recognize poison values such as 0x6b6b..., 0x5a5a..., and 0xdead....
 3. Distinguish UAF, heap OOB write, and double-free style symptoms.
 4. When KASAN is present, prioritize allocation and free stacks from dmesg.
@@ -102,7 +102,7 @@ Analysis:
 Pattern: paging request at a non-NULL address or a KASAN-style report.
 
 Analysis:
-1. Run kmem -S <address>; if it fails, fall back to kmem -p for page-level ownership.
+1. Run kmem -S <address> only when the candidate address is expected to be a slab object or heap allocation; if the address may belong to a kernel stack, text, or non-slab page, use vtop or kmem -p on the translated page instead.
 2. Recognize poison values such as 0x6b6b..., 0x5a5a..., and 0xdead....
 3. Distinguish UAF, heap OOB write, and double-free style symptoms.
 4. When KASAN is present, prioritize allocation and free stacks from dmesg.
@@ -174,4 +174,83 @@ Analysis:
 """.strip(),
     "bug_on": _BUG_WARN_PLAYBOOK,
     "warn_on": _BUG_WARN_PLAYBOOK,
+    "stack_corruption": """
+## Stack Corruption / Stack Protector Failure
+Pattern: stack-protector: Kernel stack is corrupted in: <function>.
+
+### CRITICAL: Stack Growth Direction and Causality Constraint (x86-64)
+
+On x86-64, the kernel stack grows from HIGH addresses toward LOW addresses.
+- A frame at a LOWER address was pushed LATER (called more recently).
+- A frame at a HIGHER address was pushed EARLIER (called first).
+- A local buffer overflow writes UPWARD (toward HIGHER addresses), so it can only corrupt
+  its own canary, saved RBP, return address, and frames of EARLIER callers (higher addresses).
+- A local buffer overflow CANNOT corrupt frames at LOWER addresses, because those frames
+  belong to functions called LATER and did not exist when the overflow occurred.
+
+**Mandatory causality check before attributing corruption source**:
+Given canary_frame_addr (address of the frame whose canary is corrupted) and
+suspect_frame_addr (address of the suspected overflow source):
+- If suspect_frame_addr > canary_frame_addr (suspect frame is at a higher address, i.e.,
+  an earlier/outer caller): the suspect's local overflow writes upward and CANNOT reach the
+  canary at a lower address. This attribution is PHYSICALLY IMPOSSIBLE. Reject it immediately.
+- If suspect_frame_addr < canary_frame_addr (suspect frame is at a lower address, i.e.,
+  a later/inner callee): the suspect's local overflow writes upward and CAN reach the canary
+  at a higher address. This attribution is physically plausible.
+- If suspect_frame_addr == canary_frame_addr: the function corrupted its own canary.
+
+Example of INVALID reasoning:
+  "link_path_walk (frame at 0x17c08) overflowed and corrupted the canary of
+   search_module_extables (frame at 0x17a10)"
+  → WRONG: 0x17c08 > 0x17a10, so link_path_walk's frame is at a higher address (earlier caller).
+  Its overflow writes toward even higher addresses and cannot reach 0x17a20.
+
+### Recognizing Exception/Interrupt Nested Frames
+
+When a page fault, interrupt, or exception occurs during a function's execution, the
+exception handler pushes NEW frames on the SAME kernel stack, extending it toward LOWER
+addresses. These nested frames appear in the backtrace BELOW the interrupted function.
+
+Key indicators of nested exception frames:
+- Frames prefixed with ? that belong to mm subsystem (handle_mm_fault, __do_page_fault)
+  or exception handling appearing below VFS/filesystem frames.
+- A function like search_module_extables appearing below inode_permission/link_path_walk
+  — this means the page fault handler called search_module_extables DURING link_path_walk's
+  execution, not that link_path_walk called it directly.
+
+When analyzing nested exception frames:
+- The corruption source must be sought WITHIN the exception handler call chain itself
+  (the frames between the interrupted function and the canary-checking function), not in
+  the interrupted function's callers.
+- Pay special attention to ? handle_mm_fault entries with large offsets (e.g., +0xbfd/0xfb0),
+  as these indicate deep execution within a complex function that has substantial local
+  state and is a prime candidate for the overflow source.
+
+Analysis:
+1. Identify the faulting function from the panic string and disassemble it with dis -rl <function>.
+2. Locate the stack canary check point (__stack_chk_fail call site) and determine the canary slot
+   from the disassembly (e.g., rbp-0x18 or similar). Compute the canary's absolute stack address.
+3. Read the task's kernel stack with rd <stack_base> <size> to examine the raw stack content;
+   look for overwritten canary or return address.
+4. **Perform the mandatory causality check**: list all frames with their addresses, identify
+   which frames are at lower addresses (later calls) vs higher addresses (earlier calls) relative
+   to the corrupted canary slot. Only frames at LOWER addresses (later calls whose overflow
+   writes upward toward the canary) are physically capable of causing the corruption.
+5. Frames prefixed with ? in the backtrace are stack-scan candidates, not reliable frame-pointer
+   links; do not treat them as proven callers. However, ? frames from exception handlers
+   (e.g., handle_mm_fault, __do_page_fault) are significant because they indicate nested
+   execution on the same stack.
+6. Compare the backtrace against the disassembly call chain to identify which frames are
+   plausible and which are residual from prior calls or exception handler nesting.
+7. For each candidate source function (only those passing the causality check in step 4),
+   check for local array variables that could overflow; inspect their sizes relative to stack
+   frame layout and the distance to the corrupted canary slot.
+8. Distinguish stack buffer overflow (local array overwrite) from external corruption
+   (another CPU or DMA corrupting the stack page).
+9. If the corrupted function is unrelated to the apparent call chain (e.g., zone_statistics
+   calling search_module_extables), suspect stack smearing from earlier activity or exception
+   handler nesting. Check whether an exception handler (page fault, interrupt) inserted
+   intermediate frames.
+10. Use vtop on the kernel stack address to verify the stack page is not shared or aliased.
+""".strip(),
 }

@@ -14,6 +14,45 @@ from .schema import CrashSignatureClass, GateEntry, Hypothesis, VMCoreLLMAnalysi
 
 
 def build_analysis_system_prompt(state: AgentState, *, is_last_step: bool) -> str:
+    """
+    构建 VMCore 分析 Agent 的系统提示词（System Prompt）。
+
+    该函数负责组装完整的系统提示词，为 LLM 提供分析 Linux 内核崩溃 (vmcore) 所需的上下文信息、
+    分析规则和输出约束。提示词采用分层架构设计，包含基础系统模板、当前执行状态、
+    针对性分析剧本和标准操作程序片段。
+
+    Args:
+        state (AgentState): 包含当前分析状态的字典对象，必须包含以下关键字段：
+            - current_signature_class: 当前崩溃签名类别，用于选择对应的分析剧本
+            - managed_active_hypotheses: 当前活跃的假设列表
+            - managed_gates: 当前门控验证状态
+            - messages: 历史消息记录
+            - step_count: 当前分析步骤计数
+            - 其他相关状态字段
+
+        is_last_step (bool): 标识是否为最后一步分析。当为 True 时，会添加关键警告信息，
+            强制 LLM 在此步骤提供最终诊断结论，不得再请求工具调用。
+
+    Returns:
+        str: 完整的系统提示词字符串，包含以下组成部分（按顺序）：
+            1. 基础系统提示模板（包含 VMCoreAnalysisStep 的 JSON Schema）
+            2. 当前执行器状态摘要（通过 build_executor_state_section 生成）
+            3. 针对当前崩溃签名的专用分析剧本（如果存在）
+            4. 相关的标准操作程序 (SOP) 片段（如果适用）
+            5. 结构化输出约束说明
+            6. 最后步骤的关键警告（仅当 is_last_step=True 时）
+
+    使用场景：
+        - 在每次 LLM 分析步骤开始前调用，为 DeepSeek-Reasoner 模型提供完整的分析上下文
+        - 支持 ReAct 模式的"思考 - 行动 - 观察"循环，确保 LLM 遵循预定义的分析流程
+        - 动态调整提示词内容，根据当前崩溃类型和分析阶段提供针对性指导
+
+    注意事项：
+        - 所有非空的提示词部分都会被连接，空字符串会被自动过滤
+        - 剧本 (playbook) 的选择严格基于 current_signature_class，确保分析路径的正确性
+        - SOP 片段的选择基于多种条件（签名类别、根本原因、步骤计数、门控状态、近期命令等）
+        - 必须明确告知 LLM 哪些字段由执行器管理，避免 LLM 尝试维护这些状态导致幻觉
+    """
     prompt_parts = [
         LAYER0_SYSTEM_PROMPT_TEMPLATE.format(
             VMCoreAnalysisStep_Schema=json.dumps(
@@ -50,6 +89,20 @@ def build_analysis_system_prompt(state: AgentState, *, is_last_step: bool) -> st
 
 
 def build_executor_state_section(state: AgentState) -> str:
+    """
+    构建执行器当前状态信息的格式化字符串。
+
+    该函数从 AgentState 中提取关键状态信息，包括签名类别、根本原因类别、部分转储信息、
+    步骤计数等，并结合假设、门控状态和最近执行的命令，生成一个结构化的状态摘要。
+    这个摘要用于在系统提示中向 LLM 提供当前调查的上下文信息。
+
+    Args:
+        state (AgentState): 包含当前代理状态信息的字典对象，包含各种调查相关的状态字段
+
+    Returns:
+        str: 格式化的状态信息字符串，包含步骤编号、签名类别、根本原因类别、部分转储、
+             当前阶段、活跃假设、门控状态和已执行命令等信息，每行以 Markdown 列表项格式呈现
+    """
     signature_class = state.get("current_signature_class") or "unknown"
     root_cause_class = state.get("current_root_cause_class") or "unknown"
     partial_dump = state.get("current_partial_dump") or "unknown"
@@ -76,12 +129,37 @@ def build_executor_state_section(state: AgentState) -> str:
 def _select_playbook(
     signature_class: Optional[CrashSignatureClass],
 ) -> str:
+    """
+    根据崩溃签名类别选择对应的剧本 (playbook) 内容。
+
+    该函数用于从预定义的 PLAYBOOKS 字典中获取与指定崩溃签名类别相关联的剧本内容。
+    如果传入的签名类别为空或为"unknown"，则返回空字符串。
+
+    Args:
+        signature_class (Optional[CrashSignatureClass]): 崩溃签名类别，可能为 None 或"unknown"
+
+    Returns:s
+        str: 对应的剧本内容字符串，如果找不到匹配项则返回空字符串
+    """
     if not signature_class or signature_class == "unknown":
         return ""
     return PLAYBOOKS.get(signature_class, "")
 
 
 def _select_sop_fragments(state: AgentState) -> list[str]:
+    """
+    根据当前调查状态选择应注入的 SOP 片段。
+
+    该函数会综合签名类别、根因类别、步骤进度、门控状态以及最近对话文本中的
+    关键词，动态拼装用于指导 LLM 的 SOP 提示片段。返回结果会在末尾去重并保持
+    首次出现顺序，以避免重复指令干扰模型决策。
+
+    Args:
+        state (AgentState): 当前分析状态，包含签名分类、步骤计数、门控信息与消息历史。
+
+    Returns:
+        list[str]: 需要追加到系统提示中的 SOP 片段列表（已去重，按触发顺序保留）。
+    """
     fragments: list[str] = []
     signature_class = state.get("current_signature_class")
     root_cause_class = state.get("current_root_cause_class")
@@ -101,6 +179,7 @@ def _select_sop_fragments(state: AgentState) -> list[str]:
         "n/a",
     }
 
+    # DMA 相关风险在中后期满足门控/关键词证据时优先提示。
     if (
         signature_class in {"pointer_corruption", "use_after_free"}
         and step_count >= 10
@@ -118,12 +197,14 @@ def _select_sop_fragments(state: AgentState) -> list[str]:
     ):
         fragments.append(SOP_FRAGMENTS["per_cpu_access"])
 
+    # 出现地址搜索相关操作时，补充地址空间与映射检查 SOP。
     if any(
         token in lowered_recent_text
         for token in ("search", "address", "ptov", "kmem -p")
     ):
         fragments.append(SOP_FRAGMENTS["address_search"])
 
+    # 指针/链表损坏线索出现后，增强驱动源码关联排查指导。
     if (
         signature_class in {"pointer_corruption", "use_after_free"}
         and step_count >= 8
@@ -153,6 +234,7 @@ def _select_sop_fragments(state: AgentState) -> list[str]:
     if "kasan" in lowered_recent_text or "ubsan" in lowered_recent_text:
         fragments.append(SOP_FRAGMENTS["kasan_ubsan"])
 
+    # 在后期收敛阶段，为高风险签名注入高级分析技巧。
     if step_count >= 18 and signature_class in {
         "pointer_corruption",
         "use_after_free",
@@ -164,24 +246,51 @@ def _select_sop_fragments(state: AgentState) -> list[str]:
 
 
 def _format_hypotheses(raw_hypotheses: object) -> str:
+    """
+    将活跃假设列表格式化为紧凑可读的摘要字符串。
+
+    输入可能为空或包含任意对象；函数会按 Hypothesis 模型进行校验，
+    最多展示前三条，输出形如 "#1 label (status); #2 label (status)"。
+
+    Args:
+        raw_hypotheses (object): 原始假设列表数据。
+
+    Returns:
+        str: 格式化后的假设摘要；无有效数据时返回 "none"。
+    """
     hypotheses = cast(Optional[Sequence[Hypothesis]], raw_hypotheses)
     if not hypotheses:
         return "none"
 
     formatted = []
+    # 仅展示前 3 条，避免状态摘要过长影响提示词预算。
     for hypothesis in hypotheses[:3]:
         item = Hypothesis.model_validate(hypothesis)
+        # 优先展示 rank；若缺失则回退到稳定 id。
         rank = f"#{item.rank}" if item.rank is not None else item.id
         formatted.append(f"{rank} {item.label} ({item.status})")
     return "; ".join(formatted)
 
 
 def _format_gates(raw_gates: object) -> str:
+    """
+    将门控状态字典格式化为简洁的键值对字符串。
+
+    每个门控条目会通过 GateEntry 模型校验，最多展示前五项，输出形如
+    "gate_a=open, gate_b=closed"，用于在系统提示中快速呈现当前门控进度。
+
+    Args:
+        raw_gates (object): 原始门控状态字典。
+
+    Returns:
+        str: 格式化后的门控状态摘要；无数据时返回 "none"。
+    """
     gates = cast(Optional[dict[str, GateEntry]], raw_gates)
     if not gates:
         return "none"
 
     formatted = []
+    # 仅展示前 5 个 gate，平衡可读性与信息密度。
     for gate_name, gate_entry in list(gates.items())[:5]:
         gate = GateEntry.model_validate(gate_entry)
         formatted.append(f"{gate_name}={gate.status}")

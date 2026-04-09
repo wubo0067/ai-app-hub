@@ -283,6 +283,44 @@ class OutputParserAuditTests(unittest.TestCase):
         self.assertEqual(llm_step.root_cause_class, "dma_corruption")
         self.assertEqual(llm_step.corruption_mechanism, "field_type_misuse")
 
+    def test_repair_structured_output_moves_out_of_bounds_to_root_cause_class(
+        self,
+    ) -> None:
+        repaired = repair_structured_output(
+            (
+                "{"
+                '"step_id": 24,'
+                '"reasoning": "stack text suggests an upward overwrite into older frames",'
+                '"action": null,'
+                '"is_conclusive": true,'
+                '"signature_class": "bug_on",'
+                '"root_cause_class": "memory_corruption",'
+                '"corruption_mechanism": "out_of_bounds",'
+                '"partial_dump": "partial",'
+                '"final_diagnosis": {'
+                '"crash_type": "stack protector",'
+                '"panic_string": "Kernel stack is corrupted",'
+                '"faulting_instruction": "search_module_extables+0x99",'
+                '"root_cause": "A stack overwrite is the most likely cause.",'
+                '"detailed_analysis": "The stack contains text-like payload and corrupted older frames.",'
+                '"suspect_code": {'
+                '"file": "fs/namei.c",'
+                '"function": "link_path_walk",'
+                '"line": "unknown"},'
+                '"evidence": ["ASCII text on stack"],'
+                '"corruption_mechanism": "out_of_bounds"'
+                "}"
+                "}"
+            ),
+            model_class=VMCoreLLMAnalysisStep,
+        )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(repaired.root_cause_class, "out_of_bounds")
+        self.assertEqual(repaired.corruption_mechanism, "unknown")
+        self.assertIsNotNone(repaired.final_diagnosis)
+        self.assertEqual(repaired.final_diagnosis.corruption_mechanism, "unknown")
+
     def test_downgrades_conclusion_when_write_fault_is_attributed_to_plain_read(
         self,
     ) -> None:
