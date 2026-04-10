@@ -178,6 +178,16 @@ Analysis:
 ## Stack Corruption / Stack Protector Failure
 Pattern: stack-protector: Kernel stack is corrupted in: <function>.
 
+### Mandatory Stack Corruption Analysis Checklist
+
+Before naming a local overflow source, complete this checklist in order:
+1. Reconstruct the canary-bearing frame from the real prologue and stack contents; do not equate a bt frame address with RBP.
+2. Prove the canary slot address from the disassembly-derived offset.
+3. Classify nearby frames as ordinary caller/callee frames versus interrupted-frame, pt_regs or exception-entry state, and exception-handler frames.
+4. Apply stack-growth direction only within a proven ordinary call segment; do not carry ordinary overflow causality across an exception boundary.
+5. If the suspected source and corrupted slot are separated by an exception-entry boundary, keep local-overflow attribution provisional until frame provenance and active-overlap arithmetic are proven.
+6. Evaluate at least these alternative mechanisms before final blame: active overwrite inside the exception path, stack-slot reuse from pre-fault returned frames, stale stack residue, and frame reconstruction error.
+
 ### CRITICAL: Stack Growth Direction and Causality Constraint (x86-64)
 
 On x86-64, the kernel stack grows from HIGH addresses toward LOW addresses.
@@ -205,6 +215,36 @@ Example of INVALID reasoning:
   → WRONG: 0x17c08 > 0x17a10, so link_path_walk's frame is at a higher address (earlier caller).
   Its overflow writes toward even higher addresses and cannot reach 0x17a20.
 
+### CRITICAL: Exception-Path Stack Is Not an Ordinary Call Nest
+
+Do NOT apply ordinary caller/callee stack-overflow arithmetic across an exception boundary
+until you have proved the exact provenance of each frame.
+
+For page fault, interrupt, NMI, and similar exception paths, the stack often contains:
+- an interrupted ordinary-function frame (for example, zone_statistics),
+- hardware-pushed exception state and/or pt_regs,
+- then exception-handler frames (for example, handle_mm_fault, search_module_extables).
+
+These are NOT equivalent to a simple uninterrupted nesting like:
+caller -> callee -> callee.
+
+Mandatory rule:
+- Relative address ordering alone does NOT prove that an interrupted pre-exception frame can
+   locally overflow into a post-exception handler frame, or vice versa.
+- Before using stack-direction arithmetic for causality, first classify each frame as one of:
+   interrupted normal-path frame, exception-entry state/pt_regs region, or exception-handler frame.
+- If the candidate source and the corrupted canary are on opposite sides of an exception-entry
+   boundary, you MUST mark ordinary local-overflow causality as unproven and avoid direct blame
+   based only on "lower address means later call".
+
+Example of INVALID reasoning:
+   "zone_statistics faulted, then handle_mm_fault and search_module_extables ran later at lower
+    addresses, therefore handle_mm_fault is the likely local overflow source because only later
+    frames can overwrite the canary"
+   → INSUFFICIENT: this treats the page-fault path as an ordinary contiguous call nest and ignores
+   the interrupted-frame / exception-entry / handler segmentation. The frame provenance must be
+   established first.
+
 ### Recognizing Exception/Interrupt Nested Frames
 
 When a page fault, interrupt, or exception occurs during a function's execution, the
@@ -222,9 +262,17 @@ When analyzing nested exception frames:
 - The corruption source must be sought WITHIN the exception handler call chain itself
   (the frames between the interrupted function and the canary-checking function), not in
   the interrupted function's callers.
-- Pay special attention to ? handle_mm_fault entries with large offsets (e.g., +0xbfd/0xfb0),
-  as these indicate deep execution within a complex function that has substantial local
-  state and is a prime candidate for the overflow source.
+- Do NOT upgrade an exception-handler frame to "likely overflow source" merely because it sits
+   at a lower address than the canary frame or than the interrupted frame. First prove that the
+   overwrite mechanism is an active local overwrite rather than reused stack residue, saved-state
+   confusion, or a misidentified frame link.
+- Treat deep offsets inside exception-path functions only as control-flow location evidence.
+   A non-trivial stack allocation such as sub rsp, 0x90, a large offset such as +0xbfd/0xfb0,
+   or generic function complexity does NOT by itself make handle_mm_fault or any similar frame
+   a likely overflow source.
+- Before naming a function as suspect, require at least one of: an overflow-capable local object,
+   a concrete copy or write primitive, overlap arithmetic that survives exception-boundary review,
+   or stack-byte provenance linking that frame's writes to the corrupted slot.
 
 Analysis:
 1. Identify the faulting function from the panic string and disassemble it with dis -rl <function>.
@@ -238,16 +286,19 @@ Analysis:
 5. **Perform the mandatory causality check**: list all frames with their addresses, identify
    which frames are at lower addresses (later calls) vs higher addresses (earlier calls) relative
    to the corrupted canary slot. Only frames at LOWER addresses (later calls whose overflow
-   writes upward toward the canary) are physically capable of causing the corruption.
+   writes upward toward the canary) are physically capable of causing the corruption WITHIN the
+   same proven stack segment. Do not apply this rule across an unproven exception-entry boundary.
 6. Frames prefixed with ? in the backtrace are stack-scan candidates, not reliable frame-pointer
    links; do not treat them as proven callers. However, ? frames from exception handlers
    (e.g., handle_mm_fault, __do_page_fault) are significant because they indicate nested
    execution on the same stack.
 7. Compare the backtrace against the disassembly call chain to identify which frames are
-   plausible and which are residual from prior calls or exception handler nesting.
+   plausible and which are residual from prior calls or exception handler nesting. Explicitly
+   annotate where the normal execution path was interrupted and where exception-handler frames begin.
 8. For each candidate source function (only those passing the causality check in step 5),
-   check for local array variables that could overflow; inspect their sizes relative to stack
-   frame layout and the distance to the corrupted canary slot.
+   check for an overflow-capable write mechanism such as a local array, structure copy,
+   memcpy-like primitive, negative-index store, alloca/VLA use, or proven direct write into
+   the corrupted region. Stack size alone is not a candidate-selection criterion.
 9. Distinguish stack buffer overflow (local array overwrite) from external corruption
    (another CPU or DMA corrupting the stack page).
 10. If the corrupted function is unrelated to the apparent call chain (e.g., zone_statistics
@@ -289,6 +340,14 @@ is a critical forensic clue. Pursue it aggressively:
        into adjacent stack slots.
     c. Cross-reference with the call chain: which functions in the active backtrace access
        task_struct fields that could spill onto the stack at the corrupted offset?
+    d. Treat a `current`-valued canary as a spill-location clue, not as proof by itself. Inspect
+       the disassembly for explicit stack-store instructions that save `current` or a
+       current-derived pointer into a local slot to free registers, including both rbp-relative
+       and rsp-relative forms (for example, `mov %rax, -0x40(%rbp)` or `mov %rax, 0x20(%rsp)`).
+    e. Only escalate this theory after proving slot adjacency: identify the exact saved slot for
+       `current`, identify a neighboring overflow-capable local object or write primitive in the
+       same frame, and show that the overwrite distance could reach that slot. Merely accessing
+       `current` or spilling it somewhere in the frame is insufficient.
 
 17. If the canary was overwritten with a kernel text address, use `sym <value>` and `dis -rl <value>`
     to identify the function. This may reveal a function pointer copy or vtable-style overwrite.
@@ -317,8 +376,12 @@ until another function call overwrites it. This creates a "ghost frame" effect:
        (e.g., walk_component → lookup_slow → various inode ops) that push frames to low addresses.
     b. Those deep helpers return — stack pointer moves back up, but their written data persists
        as stale residue in the low-address region.
-    c. Execution continues in link_path_walk, which eventually calls inode_permission →
-       security_inode_permission → zone_statistics. A page fault fires during zone_statistics.
+    c. Execution continues in the VFS permission or path-walk region, for example
+       inode_permission → __inode_permission → security_inode_permission and then into the
+       relevant LSM hook path. If a later corrupted bt appears to place an unrelated helper such as
+       zone_statistics directly adjacent to security_inode_permission, do NOT treat that edge as
+       proven ordinary control flow; first decide whether it is an exception splice, stack-scan
+       artifact, or corrupted saved return path.
     d. The page fault handler pushes new frames (handle_mm_fault → search_module_extables)
        into the SAME low-address region that was previously used by the returned deep helpers.
     e. search_module_extables's canary slot now occupies an address that was previously written

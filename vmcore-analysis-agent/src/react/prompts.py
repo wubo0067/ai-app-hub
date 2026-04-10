@@ -41,6 +41,35 @@ Q4 — Offset coverage:
 - Final diagnosis must either identify the most supported mechanism family or explicitly bound the remaining open set and explain why dump limitations prevent closure.
 - A conclusion that jumps directly from "task pointer in canary slot" to a broad subsystem blame without mechanism analysis is incomplete.
 
+### Exception-Boundary Provenance Guardrail
+
+- For page fault, interrupt, NMI, and similar nested paths, do NOT treat the visible backtrace as a single ordinary caller/callee chain for stack-overflow causality.
+- First separate: interrupted normal-path frames, hardware/pt_regs exception-entry state, and exception-handler frames.
+- Relative frame addresses alone are insufficient to claim that a handler frame is the overflow source for a canary found in another exception-path frame, or that an interrupted pre-exception frame overflowed into a handler frame.
+- If the suspected source and the corrupted slot are separated by an exception-entry boundary, local-overflow attribution remains provisional until frame provenance and active-overlap arithmetic are explicitly proven.
+- When reasoning is not proven, keep multiple mechanisms open: active overwrite inside the exception path, stack-slot reuse from pre-fault returned frames, or frame reconstruction error.
+
+### Review Red-Line Rule: Exception-Boundary Overflow Claims
+
+- Reject any conclusion that blames handle_mm_fault or another exception-path frame for canary corruption, or blames an interrupted pre-fault frame for a handler-frame canary, when the only support is relative stack position or ordinary downward-stack reasoning across a page-fault, interrupt, NMI, or similar exception boundary.
+- Such claims are invalid until the analysis explicitly proves frame provenance, exception-entry layout, and active overlap of the relevant stack regions.
+
+### Review Red-Line Rule: Evidence-Free Suspect Promotion
+
+- Reject any conclusion that names handle_mm_fault or any other function as the likely overflow source when the support is only a non-trivial stack allocation, a deep in-function offset, or vague statements such as "large stack frame" or "complex routine with substantial local state."
+- A suspect function must be tied to the corrupted slot by concrete write evidence: an overflow-capable local object, a copy or store primitive, validated overlap arithmetic, or stack-byte provenance. Otherwise the result must remain provisional.
+
+### Review Red-Line Rule: Current-Valued Canary Requires Spill Proof
+
+- Reject any conclusion that explains a current-valued canary by naming a specific function's local overflow unless the analysis identifies the exact stack spill slot for current or a current-derived pointer and proves that a neighboring overflow-capable local object or write primitive could reach that slot.
+- Mere access to current, generic task_struct usage, or an unspecified stack spill is not enough.
+
+### Review Red-Line Rule: Invalid Caller-Edge Narratives
+
+- Reject any conclusion that narrates two adjacent corrupted-backtrace frames as a proven ordinary caller-callee edge when static code structure does not support that edge, or when the edge crosses unrelated subsystems without a proven exception bridge.
+- Examples include treating a VFS permission helper as if it ordinarily called zone_statistics, or treating a scan-derived ? frame adjacency as a real call chain.
+- In such cases the analysis must first downgrade bt reliability and choose among bounded explanations such as exception-path splice, stack-scan artifact, stale-frame residue, or corrupted saved return path. It must not invent a normal call edge, and it must not promote a specific RIP-jump theory without validating saved return addresses or frame provenance.
+
 ### No-Op Command Hygiene
 
 - Do not use crash commands to print notes that are already present in reasoning or prior tool output.
