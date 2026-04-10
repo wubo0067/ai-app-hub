@@ -241,6 +241,25 @@ class FinalDiagnosis(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_corruption_mechanism(cls, data: Any) -> Any:
+        """
+        对 corruption_mechanism 字段进行标准化处理的验证器方法。
+        
+        该方法用于对 LLM 输出的 corruption_mechanism 字段进行容错归一化处理，
+        将可能存在的别名或不规范值转换为预定义的合法值之一，防止因 LLM
+        输出格式不一致而导致的模型验证失败。
+
+        处理逻辑:
+        1. 如果 corruption_mechanism 是已知的别名，则将其转换为标准值
+        2. 如果 corruption_mechanism 属于 root_cause 类型但不在允许值范围内，
+           则将其移动到合适的 root_cause_class 字段，并将 corruption_mechanism 设置为 "unknown"
+        3. 如果值完全未知且无法映射，则设置为 "unknown" 以确保流程继续运行
+
+        Args:
+            data: 输入的数据字典，应包含 corruption_mechanism 字段
+
+        Returns:
+            经过标准化处理的数据字典，确保 corruption_mechanism 字段符合预期的枚举值
+        """
         return _coerce_corruption_mechanism(data)
 
 

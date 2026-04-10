@@ -24,8 +24,29 @@ Q4 — Offset coverage:
 
 - this agent forbids emitting address arithmetic directly in crash actions.
 - This agent forbids emitting address arithmetic directly in crash actions.
-- Never emit rd -x <addr>+<offset> <count> or similar inline arithmetic as the final action.
+- Never emit rd -x <addr>+<offset> <count>, rd -x <addr>-<offset> <count>, or any similar inline arithmetic as the final action.
+- This prohibition applies to rd, struct, dis, ptov, vtop, search, kmem, and every other crash command that takes an address operand.
 - Pre-compute the final literal address first, then issue rd, struct, or related commands against that literal target.
+- Good example:
+    reasoning: "ffff8b817de17a10 - 0x40 = ffff8b817de179d0"
+    action: "rd -x ffff8b817de179d0 16"
+- Bad example:
+    action: "rd -x ffff8b817de17a10-0x40 16"
+- Before finalizing any action, perform a self-check: if the action string still contains +, -, parentheses, $-substitution, or register syntax inside an address operand, the action is invalid and must be rewritten with a literal address.
+
+### Stack-Corruption Mechanism Closure
+
+- If a stack canary is overwritten with a meaningful kernel value such as current task_struct, another recognizable object pointer, or a repeated non-random address, do not stop at reporting the overwritten value.
+- Before finalizing, explicitly evaluate three mechanism families: exception-path local overwrite, pre-fault residual-stack pollution later reused by the exception path, and current/current->field spill or copy overflow.
+- Final diagnosis must either identify the most supported mechanism family or explicitly bound the remaining open set and explain why dump limitations prevent closure.
+- A conclusion that jumps directly from "task pointer in canary slot" to a broad subsystem blame without mechanism analysis is incomplete.
+
+### No-Op Command Hygiene
+
+- Do not use crash commands to print notes that are already present in reasoning or prior tool output.
+- Never emit echo, printf, shell comments, separators, or breadcrumb text such as "Frame #4 address from bt is ..." inside action or run_script.
+- run_script is for bundling multiple diagnostic commands, not for narration.
+- Before finalizing an action, remove any command line that does not gather new evidence or change diagnostic state.
 """.strip()
 
 

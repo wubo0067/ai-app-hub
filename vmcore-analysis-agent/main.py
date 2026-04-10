@@ -159,7 +159,7 @@ async def health_check():
     """健康检查接口"""
     return {
         "status": "healthy",
-        "llm_ready": app_state["llm"] is not None,
+        "llm_ready": app_state["reasoning_llm"] is not None,
         "tools_ready": app_state["crash_tools"] is not None,
     }
 

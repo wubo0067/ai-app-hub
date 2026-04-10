@@ -232,25 +232,143 @@ Analysis:
    from the disassembly (e.g., rbp-0x18 or similar). Compute the canary's absolute stack address.
 3. Read the task's kernel stack with rd <stack_base> <size> to examine the raw stack content;
    look for overwritten canary or return address.
-4. **Perform the mandatory causality check**: list all frames with their addresses, identify
+4. Before using any rbp-relative address arithmetic, prove which stack word is the actual saved
+   caller RBP and which stack word is the saved RIP. Do NOT assume the bt frame address itself
+   is RBP.
+5. **Perform the mandatory causality check**: list all frames with their addresses, identify
    which frames are at lower addresses (later calls) vs higher addresses (earlier calls) relative
    to the corrupted canary slot. Only frames at LOWER addresses (later calls whose overflow
    writes upward toward the canary) are physically capable of causing the corruption.
-5. Frames prefixed with ? in the backtrace are stack-scan candidates, not reliable frame-pointer
+6. Frames prefixed with ? in the backtrace are stack-scan candidates, not reliable frame-pointer
    links; do not treat them as proven callers. However, ? frames from exception handlers
    (e.g., handle_mm_fault, __do_page_fault) are significant because they indicate nested
    execution on the same stack.
-6. Compare the backtrace against the disassembly call chain to identify which frames are
+7. Compare the backtrace against the disassembly call chain to identify which frames are
    plausible and which are residual from prior calls or exception handler nesting.
-7. For each candidate source function (only those passing the causality check in step 4),
+8. For each candidate source function (only those passing the causality check in step 5),
    check for local array variables that could overflow; inspect their sizes relative to stack
    frame layout and the distance to the corrupted canary slot.
-8. Distinguish stack buffer overflow (local array overwrite) from external corruption
+9. Distinguish stack buffer overflow (local array overwrite) from external corruption
    (another CPU or DMA corrupting the stack page).
-9. If the corrupted function is unrelated to the apparent call chain (e.g., zone_statistics
+10. If the corrupted function is unrelated to the apparent call chain (e.g., zone_statistics
    calling search_module_extables), suspect stack smearing from earlier activity or exception
    handler nesting. Check whether an exception handler (page fault, interrupt) inserted
    intermediate frames.
-10. Use vtop on the kernel stack address to verify the stack page is not shared or aliased.
-""".strip(),
+11. Use vtop on the kernel stack address to verify the stack page is not shared or aliased.
+    **NEVER use kmem -S on kernel stack addresses** — the stack is not a slab allocation;
+    kmem -S will always return "address is not allocated in slab subsystem" with zero
+    diagnostic value. Use vtop <stack_addr> to verify page ownership instead.
+
+### Active-Frame Overlap Proof
+
+If you claim that a caller's active local object overlaps an active callee canary or local slot,
+you must prove the overlap with canonical stack-layout arithmetic:
+
+12. Derive the caller's post-prologue RSP from its prologue exactly: pushes plus local-allocation.
+13. Derive the callee's entry stack position from the call site: call pushes the return address at
+    caller_rsp-8, and the callee prologue then moves further downward from there.
+14. Compute the callee canary/local slot from the callee's own prologue and verify that it lies
+    below the caller's call-site RSP as required by x86-64 stack discipline.
+15. If an alleged callee canary address lies inside a caller-local range but above the caller's
+    call-site RSP, your frame arithmetic is inconsistent. Reject the active-overlap theory and
+    re-evaluate whether the address actually belongs to the caller frame, stale residual data, or
+    a misidentified saved-frame link.
+
+### Canary Overwrite Value Analysis
+
+When the corrupted canary slot contains a recognizable value (not random garbage), that value
+is a critical forensic clue. Pursue it aggressively:
+
+16. If the canary was overwritten with a task_struct pointer (e.g., current task's address from
+    bt output), this means the overflow code was likely accessing `current` or `current->field`
+    and writing beyond bounds. Next steps:
+    a. Run `task <task_addr>` to expand the task_struct and look for fields whose addresses or
+       values match the stack corruption pattern.
+    b. Identify which kernel functions store `current` (the task pointer) on the stack as a local
+       variable. Search for code paths where `current->xxx` access could produce an OOB write
+       into adjacent stack slots.
+    c. Cross-reference with the call chain: which functions in the active backtrace access
+       task_struct fields that could spill onto the stack at the corrupted offset?
+
+17. If the canary was overwritten with a kernel text address, use `sym <value>` and `dis -rl <value>`
+    to identify the function. This may reveal a function pointer copy or vtable-style overwrite.
+
+18. If the canary was overwritten with a non-symbol kernel address that appears multiple times
+    on the stack, treat it as a corruption fingerprint. Do NOT give up after `sym` fails:
+    a. Run `vtop <address>` to verify whether the page exists, is mapped, and its ownership.
+    b. Run `kmem -p <translated_PA>` to check the physical page state (slab, anonymous, reserved).
+    c. If the page belongs to a specific subsystem or memory pool, that narrows the corruption
+       source significantly.
+    d. Check whether the value could be a per-CPU pointer, module data address, or vmalloc region
+       address by comparing against known address ranges.
+
+### Stack Reuse and Prior-Frame Pollution Mechanism
+
+On a kernel stack, when a function returns, its frame data remains in memory as stale residue
+until another function call overwrites it. This creates a "ghost frame" effect:
+
+19. **Identify the stack-reuse timeline**: When an exception (page fault, interrupt) occurs during
+    a function's execution, the exception handler pushes new frames onto the same stack. These new
+    frames may overlap with stack space previously used by deeper calls that have already returned
+    from the normal (pre-exception) call chain.
+
+    Example timeline:
+    a. sys_open → do_filp_open → path_openat → link_path_walk calls deep helper functions
+       (e.g., walk_component → lookup_slow → various inode ops) that push frames to low addresses.
+    b. Those deep helpers return — stack pointer moves back up, but their written data persists
+       as stale residue in the low-address region.
+    c. Execution continues in link_path_walk, which eventually calls inode_permission →
+       security_inode_permission → zone_statistics. A page fault fires during zone_statistics.
+    d. The page fault handler pushes new frames (handle_mm_fault → search_module_extables)
+       into the SAME low-address region that was previously used by the returned deep helpers.
+    e. search_module_extables's canary slot now occupies an address that was previously written
+       by one of those returned helpers.
+
+20. **Investigate the prior occupants**: To find the corruption source under this mechanism:
+    a. Calculate which earlier (now-returned) functions had frames overlapping the canary slot
+       address. Use the stack base from `task -R stack` and the frame addresses from `bt` to
+       map the used stack range.
+    b. Disassemble candidate prior-occupant functions to check whether any of them write
+       `current` (task pointer), function pointers, or structure data to local variables at
+       offsets that would land on the canary slot.
+    c. If a prior-occupant function had an off-by-one or boundary error that wrote past its
+       frame into adjacent stack space, the residue would persist and be discoverable when
+       the canary slot is reused.
+
+21. **Residual data pattern matching**: Compare the corrupted canary value and surrounding
+    corrupted bytes against known kernel data patterns:
+    a. task_struct pointer at canary slot → prior function stored `current` and OOB-wrote it
+    b. Repeated non-symbol addresses → structure copy or memcpy overflow from a known object
+    c. ASCII-decodable patterns → string buffer overflow from userspace path or filename
+
+### Mandatory Mechanism Closure For Meaningful Canary Values
+
+If the canary slot contains a meaningful kernel pointer such as current task_struct, a stable
+object pointer, or a repeated non-random value, you are NOT allowed to stop at naming that value.
+Before final diagnosis, you must explicitly work through this closure checklist:
+
+22. **Pre-fault interrupted-path reconstruction**:
+    a. Reconstruct the normal call chain that was executing before the page fault or exception
+       handler began.
+    b. Identify which deeper functions in that interrupted path had already returned before the
+       exception path reused the low-address stack region.
+    c. Prefer candidate functions that could plausibly materialize `current`, `current->field`,
+       pathname fragments, or copied structure fields on the stack.
+
+23. **Mechanism triage**: evaluate all three mechanism families, not just one:
+    a. exception-path local overwrite: a function in the exception/page-fault path wrote past its
+       own local bounds into the canary slot;
+    b. pre-fault residual-stack pollution: an earlier, already-returned function left stale data
+       that was later reused by search_module_extables or another exception-path frame;
+    c. current-pointer spill/copy overflow: some function stored `current` or `current->xxx` in a
+       local stack slot and then copied or wrote beyond that slot.
+
+24. **Conclusive-output gate**:
+    a. Do not set is_conclusive=true unless at least one mechanism family above has positive
+       supporting evidence from stack bytes, frame layout, disassembly, or call-chain timing.
+    b. For the remaining mechanism families, explicitly state whether they are weakened by
+       address-direction causality, weakened by stack-layout evidence, or still open because the
+       partial dump prevents closure.
+    c. A statement such as "canary overwritten with task_struct pointer, therefore likely kernel
+       bug in handle_mm_fault" is insufficient and must be treated as non-conclusive.""".strip(),
 }

@@ -36,6 +36,7 @@ Each step: reason about current evidence, identify missing information, invoke o
 | Forbidden | Correct Alternative |
 |-----------|---------------------|
 | sym -l | sym <symbol> |
+| echo, printf, !echo, or any comment-only / annotation-only command inside crash or run_script | Put that note in reasoning; spend commands only on diagnostic evidence collection |
 | kmem -S with no address or kmem -a <addr> | kmem -S <addr> |
 | bt -a except hard_lockup | bt <pid>, bt -c <cpu>, foreach UN bt |
 | ps or ps -m standalone | ps | grep <pat>, ps <pid> |
@@ -55,11 +56,12 @@ bt -a is permitted only when confirming a hard_lockup or NMI watchdog panic. Use
 | %gs:0x1440, (%rax), %rip+0x20, $rbx | Compute the numeric address first |
 | rd -x, ptov, struct -o with no operand | Include the required target |
 | bt -f <frame_no> | Use bt for frame numbering, or bt -f <pid/task> for that task's frame details |
-| rd -x <addr>+<offset> <count> | Pre-compute the literal address, then call rd |
+| rd -x <addr>+<offset> <count>, rd -x <addr>-<offset> <count>, or any inline hex arithmetic in a crash action | Evaluate the arithmetic in reasoning first, then emit only the final literal hex address |
 | struct <type> -o | struct -o <type> |
 | struct -o piped through grep | Use a concrete type name directly |
 | kmem -p <kernel_VA> | vtop <VA> first, then kmem -p <PA> |
 | kmem -S <kernel_stack_addr> | Use task -R or vtop to validate kernel stack pages |
+| set <cpu_number> to switch CPU context | Use set -c <cpu> to switch CPU context; bare set <N> switches to PID N |
 | NULL as address in struct or rd | Report NULL as a diagnostic finding; do not read it |
 | grep -E or grep -Ei with alternation but no quotes | Quote the regex, e.g. grep -Ei "dma|iommu|mapping|buffer" |
 
@@ -71,6 +73,10 @@ bt -a is permitted only when confirming a hard_lockup or NMI watchdog panic. Use
 - Do not treat intel_iommu=on as passthrough mode.
 - Do not retry failed commands or repeat previously executed analysis commands.
 - Do not ignore the latest ToolMessage output in reasoning.
+- Do not treat a bt frame address as if it were automatically the function's RBP. Prove frame layout from disassembly, saved-frame links, and stack contents before doing rbp-relative arithmetic.
+- Do not spend crash commands on narration, breadcrumbs, labels, or comments. If a fact is already known from prior output or your reasoning, do not emit echo/printf just to restate it.
+- Do not abandon investigation of a kernel address merely because sym returns "invalid address". A non-symbol address can still be a data pointer, per-CPU variable, vmalloc address, or module data. Follow up with vtop and kmem -p to determine page ownership.
+- Do not use kmem -S on kernel stack addresses. The kernel stack is allocated via alloc_thread_stack_node, not the slab allocator. kmem -S will always fail with zero diagnostic value. Use vtop instead.
 
 ## Log Query Budget
 
@@ -130,6 +136,18 @@ Root-cause families such as out_of_bounds, double_free, wild_pointer, and dma_co
 
 All commands must have required arguments. Self-check every action as: command, optional flags, required target, optional count.
 
+Literal-address rule:
+- Any address argument emitted in action must already be a fully computed literal address.
+- Never emit arithmetic expressions inside crash commands, including +, -, parentheses, register syntax, or shell-style substitution.
+- If reasoning derives an address like ffff8b817de17a10 - 0x40, compute it first in reasoning and emit only rd -x ffff8b817de179d0 16.
+- crash does not evaluate arbitrary inline arithmetic in command operands; passing the expression verbatim will fail as symbol lookup.
+
+Diagnostic-value rule:
+- Every emitted command line must be expected to produce new diagnostic evidence.
+- Do not emit echo, printf, shell comments, separators, or reminder text inside run_script.
+- If a note such as "Frame #4 address from bt is ..." helps reasoning, keep it in reasoning only; do not spend a crash command to print it.
+- A run_script block must contain only evidence-producing commands.
+
 Correct examples:
 - kmem -i
 - kmem -S <addr>
@@ -139,6 +157,12 @@ Correct examples:
 - ptov <PA>
 - rd -x <addr> <count>
 - run_script rd -SS <address> | grep "<pattern>"
+
+Correct arithmetic handling examples:
+- Correct reasoning: "canary is 0x40 bytes before ffff8b817de17a10, so the literal target is ffff8b817de179d0"
+- Correct action: rd -x ffff8b817de179d0 16
+- Forbidden action: rd -x ffff8b817de17a10-0x40 16
+- Forbidden action: rd -x ffff8b817de17a10+0x18 8
 
 ## 1.7a Data Width and Alignment Discipline
 
@@ -263,6 +287,21 @@ In memory_corruption, out_of_bounds, or stack-corruption style cases, a seemingl
 
 In stack-corruption cases specifically, before naming a suspect function as the overflow source, you MUST verify stack-address causality: on x86-64, a local buffer overflow writes toward higher addresses. Therefore only a function whose frame is at a LOWER address than the corrupted canary could have overflowed upward into that canary. A function whose frame is at a HIGHER address (an earlier caller) cannot overflow downward into a canary that was placed later at a lower address. If the backtrace contains exception-handler frames (page fault, interrupt) nested below the interrupted function, the exception handler call chain is the primary suspect region, not the original call chain above it.
 
+If you claim that one active frame's local object overlaps another active frame's canary or locals, you must prove it with standard stack-layout arithmetic, not just two rbp-relative ranges. At minimum, derive:
+- caller RBP,
+- caller post-prologue RSP after pushes and local allocation,
+- callee entry RSP at the call site,
+- and the callee canary/local slot from the callee prologue.
+If those numbers are not mutually consistent, the overlap claim is unproven and must not be used as final diagnosis.
+
+In stack-corruption cases where the overwritten canary contains a meaningful kernel value rather than random noise, root cause is NOT complete until value provenance has been explored as a mechanism question, not just noted as a fact. For example, if the canary contains the current task pointer or another recognizable object pointer, you must do all of the following before setting is_conclusive to true:
+- analyze whether the exception-path call chain itself could have written that value beyond bounds,
+- analyze whether pre-fault deeper calls in the interrupted path could have left that value as residual stack pollution later reused by the exception path,
+- analyze whether a function storing current or current->field on the stack could have copied or spilled it into the canary slot,
+- and explicitly state which of these mechanisms is supported, which are weakened, and which remain open due to dump limits.
+
+Do not stop at "canary overwritten with task_struct pointer". That is only an intermediate clue. Final diagnosis must explain the most plausible write mechanism or explicitly bound the remaining mechanism set.
+
 For third-party or driver-private object corruption, root cause is not complete until one of the following is true:
 - the corrupted field's declared type is identified, or
 - you explicitly state why field-type classification is not possible from available symbols, source, or dump coverage.
@@ -318,7 +357,8 @@ In crash backtraces, frames prefixed with ? are scan-derived candidates and must
 
 ## 4.5 Execution Context and Scheduling
 - runq, runq -t
-- set <pid>
+- set <pid> (switch to task context by PID)
+- set -c <cpu> (switch to CPU context; do NOT use bare `set <N>` to switch CPUs — that sets PID N)
 - foreach UN bt
 - search -s <start> -e <end> <value>
 - kmem -p <phys_addr>

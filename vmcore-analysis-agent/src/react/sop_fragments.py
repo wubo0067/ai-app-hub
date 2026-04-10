@@ -54,12 +54,15 @@ Analysis:
 3. Use bt -f only with a concrete pid or task when you need per-frame details for that task; never use bt -f with a frame number.
 4. On x86_64 with a frame-pointer prologue, saved caller RBP is at [RBP] and the return address is at [RBP+8]; compute the canary slot from the disassembly-derived offset such as rbp-0x18 instead of guessing from older frames.
 5. On x86-64, the stack grows downward (high → low). A buffer overflow in function F writes UPWARD and can only corrupt F's own canary and frames of F's callers (at higher addresses). It CANNOT corrupt frames pushed after F (at lower addresses). Always verify overflow direction vs victim frame address before attributing a corruption source.
-6. When an exception (page fault, interrupt) fires during a function's execution, the exception handler pushes new frames at even lower addresses on the same stack. Identify these nested exception frames (often prefixed with ?) and consider the exception handler call chain as a candidate corruption source — not the interrupted function's callers.
-7. Inspect task_struct and thread_info fields with task -R when you need stack boundaries or execution-context validation.
-8. Inspect STACK_END_MAGIC and the raw stack contents with rd -x when needed.
-9. For kernel-stack pages, use vtop or task-derived stack boundaries when page validation is required; do not use kmem -S on stack addresses.
-10. In panic backtraces, frames prefixed with ? are stack-scan candidates rather than trusted frame-pointer links; treat them as hints only, not proven caller-callee relationships. However, ? frames from exception handlers are diagnostically significant.
-11. Look for recursive call patterns, overwritten return-address regions, and frames that jump into unrelated subsystems.
+6. Do not equate a bt frame address with RBP. When proving a canary address or overlap claim, reconstruct frame layout from the actual prologue, saved-frame links, and current stack contents.
+7. For any claim that caller locals overlap an active callee frame, compute caller post-prologue RSP first. Since the callee frame is allocated below the caller's call-site RSP, an alleged callee canary above that boundary is a proof error.
+8. When an exception (page fault, interrupt) fires during a function's execution, the exception handler pushes new frames at even lower addresses on the same stack. Identify these nested exception frames (often prefixed with ?) and consider the exception handler call chain as a candidate corruption source — not the interrupted function's callers.
+9. Inspect task_struct and thread_info fields with task -R when you need stack boundaries or execution-context validation.
+10. Inspect STACK_END_MAGIC and the raw stack contents with rd -x when needed.
+11. For kernel-stack pages, use vtop or task-derived stack boundaries when page validation is required; do NOT use kmem -S on stack addresses — the kernel stack is not a slab allocation and kmem -S will always return a useless "not allocated in slab subsystem" error.
+12. In panic backtraces, frames prefixed with ? are stack-scan candidates rather than trusted frame-pointer links; treat them as hints only, not proven caller-callee relationships. However, ? frames from exception handlers are diagnostically significant.
+13. Look for recursive call patterns, overwritten return-address regions, and frames that jump into unrelated subsystems.
+14. When sym fails on a non-symbol kernel address found repeatedly on the stack, do NOT abandon the address. Instead run vtop <address> to validate the page, then kmem -p <PA> to check page state. The address may be a per-CPU pointer, vmalloc object, or module data address that reveals the corruption source.
 """.strip(),
     "kasan_ubsan": """
 ## 3.11 KASAN / UBSAN Reports
