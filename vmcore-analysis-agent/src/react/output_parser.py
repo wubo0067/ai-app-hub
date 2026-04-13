@@ -506,6 +506,10 @@ def apply_executor_consistency_audit(
         state,
         log_prefix=log_prefix,
     )
+    analysis_step = _reconcile_explicit_action_hint(
+        analysis_step,
+        log_prefix=log_prefix,
+    )
     mismatch = _detect_page_fault_access_mismatch(state)
     if mismatch is None:
         return analysis_step
@@ -546,6 +550,93 @@ def apply_executor_consistency_audit(
         analysis_step.confidence = "low"
 
     return analysis_step
+
+
+def _reconcile_explicit_action_hint(
+    analysis_step: VMCoreLLMAnalysisStep,
+    *,
+    log_prefix: str = "",
+) -> VMCoreLLMAnalysisStep:
+    """对齐 reasoning 中的显式 Action 提示与结构化 action。"""
+    if analysis_step.action is None or not analysis_step.reasoning:
+        return analysis_step
+
+    explicit_action = _extract_explicit_action_hint(analysis_step.reasoning)
+    if not explicit_action:
+        return analysis_step
+
+    structured_action = _render_structured_action_text(analysis_step)
+    if not structured_action:
+        return analysis_step
+
+    if "|" not in explicit_action:
+        return analysis_step
+
+    if "|" in structured_action:
+        return analysis_step
+
+    if not explicit_action.startswith(f"{analysis_step.action.command_name} "):
+        return analysis_step
+
+    prefix = f"{log_prefix}: " if log_prefix else ""
+    audit_note = (
+        "Executor audit: reasoning contained an explicit piped action, but the "
+        "structured action dropped the pipeline. The structured action was rebuilt "
+        f"from the explicit hint: {explicit_action}"
+    )
+    logger.warning("%s%s", prefix, audit_note)
+
+    analysis_step.action.command_name = "run_script"
+    analysis_step.action.arguments = [explicit_action]
+
+    if audit_note not in analysis_step.reasoning:
+        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
+
+    if analysis_step.additional_notes:
+        if audit_note not in analysis_step.additional_notes:
+            analysis_step.additional_notes = (
+                f"{analysis_step.additional_notes} {audit_note}"
+            ).strip()
+    else:
+        analysis_step.additional_notes = audit_note
+
+    return analysis_step
+
+
+def _extract_explicit_action_hint(reasoning: str) -> str | None:
+    """从 reasoning 文本中提取显式声明的 Action 命令。"""
+    if not reasoning:
+        return None
+
+    patterns = [
+        r"(?:^|\n)Action:\s*(?P<command>.+?)(?:\n|$)",
+        r"(?:^|\n)Next action:\s*(?P<command>.+?)(?:\n|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, reasoning, flags=re.IGNORECASE)
+        if match is None:
+            continue
+
+        command = match.group("command").strip()
+        command = command.rstrip(".。")
+        if not command:
+            continue
+        return command
+    return None
+
+
+def _render_structured_action_text(analysis_step: VMCoreLLMAnalysisStep) -> str:
+    """将当前结构化 action 渲染为可比较的文本形式。"""
+    action = analysis_step.action
+    if action is None:
+        return ""
+
+    rendered_args = render_action_arguments(action.arguments)
+    if action.command_name == "run_script":
+        return "\n".join(action.arguments).strip()
+    if rendered_args:
+        return f"{action.command_name} {rendered_args}".strip()
+    return action.command_name
 
 
 def _normalize_signature_class_from_fault_context(

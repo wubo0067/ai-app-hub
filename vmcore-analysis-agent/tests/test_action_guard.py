@@ -9,6 +9,27 @@ from src.react.action_guard import (
 
 
 class ActionGuardTests(unittest.TestCase):
+    def test_rejects_standalone_log_m(self) -> None:
+        error = validate_tool_call_request(
+            "log",
+            {"command": "log -m"},
+        )
+        self.assertIn("standalone log -m is forbidden", error)
+
+    def test_rejects_log_m_without_grep_after_pipe(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": "log -m | sed -n '1,20p'"},
+        )
+        self.assertIn("must be piped to grep", error)
+
+    def test_allows_log_m_with_grep(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": 'log -m | grep -Ei "BUG|page fault|kernel BUG"'},
+        )
+        self.assertIsNone(error)
+
     def test_rejects_unfiltered_sym_list_in_run_script(self) -> None:
         error = validate_tool_call_request(
             "run_script",

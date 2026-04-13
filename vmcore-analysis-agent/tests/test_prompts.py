@@ -74,6 +74,18 @@ class PromptContractTests(unittest.TestCase):
             "If the first grep returns repetitive info or heartbeat lines", prompt
         )
 
+    def test_analysis_prompt_forbids_standalone_log_actions(self) -> None:
+        prompt = analysis_crash_prompt()
+
+        self.assertIn(
+            "the emitted action itself MUST literally contain `| grep`", prompt
+        )
+        self.assertIn("NEVER emit `log -m`, `log -t`, or `log -a` standalone", prompt)
+        self.assertIn(
+            "do not pipe them to `head`, `tail`, `sed`, or other commands before grep",
+            prompt,
+        )
+
     def test_analysis_prompt_requires_alignment_aware_subword_reasoning(self) -> None:
         prompt = analysis_crash_prompt()
 
@@ -154,6 +166,34 @@ class PromptContractTests(unittest.TestCase):
             prompt,
         )
         self.assertIn("treat that output as a schema error", prompt)
+
+    def test_analysis_prompt_rejects_stack_resident_code_pointer_as_writer_proof(
+        self,
+    ) -> None:
+        prompt = analysis_crash_prompt()
+
+        self.assertIn(
+            'Reject any conclusion that infers "function X caused the overflow" merely because an address inside function X appears on the stack',
+            prompt,
+        )
+        self.assertIn(
+            "A kernel text address found on the stack is first evidence about the value that was written",
+            prompt,
+        )
+
+    def test_analysis_prompt_requires_active_call_chain_before_exception_blame(
+        self,
+    ) -> None:
+        prompt = analysis_crash_prompt()
+
+        self.assertIn(
+            "if the active path is sys_open -> do_filp_open -> path_openat -> do_last -> link_path_walk -> inode_permission",
+            prompt,
+        )
+        self.assertIn(
+            "those VFS/open-path frames must be audited with disassembly and stack-layout reasoning before any blame shifts to handle_mm_fault or fault.c",
+            prompt,
+        )
 
 
 if __name__ == "__main__":

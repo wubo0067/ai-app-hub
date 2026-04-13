@@ -350,7 +350,14 @@ is a critical forensic clue. Pursue it aggressively:
        `current` or spilling it somewhere in the frame is insufficient.
 
 17. If the canary was overwritten with a kernel text address, use `sym <value>` and `dis -rl <value>`
-    to identify the function. This may reveal a function pointer copy or vtable-style overwrite.
+    to identify the function. This may reveal a function pointer copy, callback table, or residual
+    stack payload, but it is NOT proof that the named function was the overflow source.
+    a. First classify the address as a written value: saved return site, copied function pointer,
+       callback table entry, or stale residual stack content.
+    b. Only after establishing how that code pointer could have been materialized on the stack may
+       you use it in writer-provenance reasoning.
+    c. Reject any jump from "handle_mm_fault+0xbfd is on the stack" to "handle_mm_fault caused
+       the overflow" unless a concrete write path, local object, and slot-overlap proof are shown.
 
 18. If the canary was overwritten with a non-symbol kernel address that appears multiple times
     on the stack, treat it as a corruption fingerprint. Do NOT give up after `sym` fails:
@@ -398,11 +405,44 @@ until another function call overwrites it. This creates a "ghost frame" effect:
        frame into adjacent stack space, the residue would persist and be discoverable when
        the canary slot is reused.
 
+20a. **Analyze the active call chain before exception-path blame**:
+    a. If the panic task is still on a coherent syscall path such as sys_open -> do_filp_open ->
+       path_openat -> do_last -> link_path_walk -> inode_permission, inspect those active frames
+       first with `dis -rl <func>` before promoting an exception handler as the source.
+    b. Prioritize functions on the live non-exception path that perform pathname handling,
+       structure copies, or substantial local-stack bookkeeping.
+    c. A final recommendation that jumps from a stack-resident exception-path address directly to
+       fault.c or handle_mm_fault, without first auditing the active VFS/open-path frames, is
+       incomplete and must remain non-conclusive.
+
 21. **Residual data pattern matching**: Compare the corrupted canary value and surrounding
     corrupted bytes against known kernel data patterns:
     a. task_struct pointer at canary slot → prior function stored `current` and OOB-wrote it
     b. Repeated non-symbol addresses → structure copy or memcpy overflow from a known object
-    c. ASCII-decodable patterns → string buffer overflow from userspace path or filename
+    c. Contiguous validated string object → only then consider string-copy style overflow; an
+       isolated ASCII-decodable 8-byte word is only a weak clue and cannot establish pathname,
+       filename, or userspace-string provenance by itself
+
+### Mandatory String-Evidence Gate
+
+If stack bytes look printable, do NOT jump from "ASCII-decodable" to "pathname" or
+"filename fragment". Before using a string hypothesis in final diagnosis, verify all of the
+following:
+
+22. **String object validation**:
+    a. There is a contiguous multi-byte region, not just one 8-byte machine word.
+    b. The region has either a NULL terminator, an explicit length field, or a surrounding
+       object layout that proves string semantics.
+    c. The neighboring bytes are consistent with a real copied string rather than unrelated
+       printable residue from pointers, flags, or packed values.
+
+23. **Copy-path validation**:
+    a. Identify a plausible code path that could have copied that exact string class onto the
+       stack, such as copy_from_user, strncpy, strscpy, getname, or pathname handling.
+    b. If no such copy primitive or pathname-handling path is visible in the active or prior
+       call chain, keep the string hypothesis low confidence.
+    c. If the evidence is only "these 8 bytes decode as ASCII", explicitly reject pathname
+       attribution as unproven.
 
 ### Mandatory Mechanism Closure For Meaningful Canary Values
 
@@ -410,15 +450,15 @@ If the canary slot contains a meaningful kernel pointer such as current task_str
 object pointer, or a repeated non-random value, you are NOT allowed to stop at naming that value.
 Before final diagnosis, you must explicitly work through this closure checklist:
 
-22. **Pre-fault interrupted-path reconstruction**:
+24. **Pre-fault interrupted-path reconstruction**:
     a. Reconstruct the normal call chain that was executing before the page fault or exception
        handler began.
     b. Identify which deeper functions in that interrupted path had already returned before the
        exception path reused the low-address stack region.
     c. Prefer candidate functions that could plausibly materialize `current`, `current->field`,
-       pathname fragments, or copied structure fields on the stack.
+       validated string objects, or copied structure fields on the stack.
 
-23. **Mechanism triage**: evaluate all three mechanism families, not just one:
+25. **Mechanism triage**: evaluate all three mechanism families, not just one:
     a. exception-path local overwrite: a function in the exception/page-fault path wrote past its
        own local bounds into the canary slot;
     b. pre-fault residual-stack pollution: an earlier, already-returned function left stale data
@@ -426,7 +466,7 @@ Before final diagnosis, you must explicitly work through this closure checklist:
     c. current-pointer spill/copy overflow: some function stored `current` or `current->xxx` in a
        local stack slot and then copied or wrote beyond that slot.
 
-24. **Conclusive-output gate**:
+26. **Conclusive-output gate**:
     a. Do not set is_conclusive=true unless at least one mechanism family above has positive
        supporting evidence from stack bytes, frame layout, disassembly, or call-chain timing.
     b. For the remaining mechanism families, explicitly state whether they are weakened by

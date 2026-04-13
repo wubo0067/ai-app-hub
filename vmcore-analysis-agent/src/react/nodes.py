@@ -250,9 +250,10 @@ async def collect_crash_init_data(state: AgentState) -> dict:
                 # 逐行扫描，找到匹配行后提取上下文窗口
                 for i, line in enumerate(dmesg_lines):
                     if pattern.search(line):
-                        # 向前取 50 行（崩溃前的上下文），向后取 50 行（崩溃后的调用栈/日志）
+                        # 向前取 50 行（崩溃前的上下文），不提取 dmesg 中的 Call Trace 部分
+                        # Call Trace 以 bt 为准，因为发生 Kernel stack is corrupted，还是以 bt 的为准
                         start = max(0, i - 50)
-                        end = min(len(dmesg_lines), i + 50)
+                        end = min(len(dmesg_lines), i)
                         return (
                             f"$ vmcore-dmesg (extracted around CPU:{t_cpu} PID:{t_pid} Comm:{t_comm})\n"
                             + "".join(dmesg_lines[start:end])

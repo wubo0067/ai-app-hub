@@ -293,8 +293,18 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
             return "standalone log is forbidden; pipe it with grep."
         if normalized.startswith("log |"):
             return "log must use log -m | grep <pattern>, not log | grep."
-        if len(parts) >= 2 and parts[1] in {"-m", "-t", "-a"} and "|" not in normalized:
-            return f"standalone {parts[0]} {parts[1]} is forbidden; pipe it with grep."
+        if len(parts) >= 2 and parts[1] in {"-m", "-t", "-a"}:
+            if "|" not in normalized:
+                return (
+                    f"standalone {parts[0]} {parts[1]} is forbidden; pipe it with grep."
+                )
+
+            pipe_index = parts.index("|") if "|" in parts else -1
+            if pipe_index == -1 or "grep" not in parts[pipe_index + 1 :]:
+                return (
+                    f"{parts[0]} {parts[1]} must be piped to grep with a concrete pattern; "
+                    "do not pipe log output to other commands first."
+                )
 
     # kmem 命令检查：必须带有效选项
     if command == "kmem":

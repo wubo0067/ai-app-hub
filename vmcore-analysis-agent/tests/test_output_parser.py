@@ -420,6 +420,37 @@ class OutputParserAuditTests(unittest.TestCase):
         )
         self.assertIsNone(audited.additional_notes)
 
+    def test_rebuilds_structured_action_from_explicit_piped_action_hint(self) -> None:
+        state = {"messages": [HumanMessage(content="BUG: stack protector triggered\n")]}
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 16,
+                "reasoning": (
+                    "The next diagnostic step should search the kernel log for BUG markers.\n"
+                    'Action: log -m | grep -Ei "BUG|page fault|kernel BUG" | head -30'
+                ),
+                "action": {
+                    "command_name": "log",
+                    "arguments": ["-m"],
+                },
+                "is_conclusive": False,
+                "signature_class": "stack_corruption",
+                "root_cause_class": None,
+                "partial_dump": "partial",
+            }
+        )
+
+        audited = apply_executor_consistency_audit(llm_step, state)
+
+        self.assertEqual(audited.action.command_name, "run_script")
+        self.assertEqual(
+            audited.action.arguments,
+            ['log -m | grep -Ei "BUG|page fault|kernel BUG" | head -30'],
+        )
+        self.assertIn(
+            "structured action dropped the pipeline", audited.additional_notes
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

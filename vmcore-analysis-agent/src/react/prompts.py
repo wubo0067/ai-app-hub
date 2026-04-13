@@ -59,6 +59,18 @@ Q4 — Offset coverage:
 - Reject any conclusion that names handle_mm_fault or any other function as the likely overflow source when the support is only a non-trivial stack allocation, a deep in-function offset, or vague statements such as "large stack frame" or "complex routine with substantial local state."
 - A suspect function must be tied to the corrupted slot by concrete write evidence: an overflow-capable local object, a copy or store primitive, validated overlap arithmetic, or stack-byte provenance. Otherwise the result must remain provisional.
 
+### Review Red-Line Rule: Stack-Resident Code Pointer Is Not Writer Proof
+
+- Reject any conclusion that infers "function X caused the overflow" merely because an address inside function X appears on the stack.
+- A kernel text address found on the stack is first evidence about the value that was written, copied, spilled, or left as residue. It is not yet evidence about which function performed the overwrite.
+- Before using a stack-resident code pointer in root-cause attribution, the analysis must distinguish saved return site, copied function pointer, callback-table payload, stale stack residue, and dump artifact.
+
+### Review Red-Line Rule: Active Call Chain First
+
+- When the panic task remains on a coherent non-exception path, inspect that live chain before promoting exception handlers to suspects.
+- Example: if the active path is sys_open -> do_filp_open -> path_openat -> do_last -> link_path_walk -> inode_permission, those VFS/open-path frames must be audited with disassembly and stack-layout reasoning before any blame shifts to handle_mm_fault or fault.c.
+- A final recommendation that jumps directly from a stack-resident handle_mm_fault return site to arch/x86/mm/fault.c is incomplete unless the active syscall-path frames have already been checked and ruled down.
+
 ### Review Red-Line Rule: Current-Valued Canary Requires Spill Proof
 
 - Reject any conclusion that explains a current-valued canary by naming a specific function's local overflow unless the analysis identifies the exact stack spill slot for current or a current-derived pointer and proves that a neighboring overflow-capable local object or write primitive could reach that slot.
@@ -134,7 +146,7 @@ The following is the User-Provided Initial Context for this Linux kernel crash a
   2. If the crash path enters a third-party module or directly adjacent callback path, promote that module family in the hypothesis ranking and account for symbol/debug-info limitations.
   3. If no third-party module appears on the active path, keep them as environmental risk factors rather than the default root cause.
 - **Integration**: You MUST integrate your reasoning over the critical kernel error alongside the `bt` (backtrace) evaluation. Do not analyze them in isolation.
-- **Log Searching**: If you need to search for specific patterns in the kernel log AFTER initial analysis, you MUST pipe the log command with grep, and for noisy subsystems you MUST narrow the query with an additional grep stage or a specific error regex. Example: `log -m | grep -i nouveau | grep -Ei "fail|error|timeout|fault|xid|mmu|fifo"`. **NEVER use `log -m`, `log -t`, or `log -a` standalone** — they dump the entire log and cause token overflow. Do NOT attempt to use `grep` on vmcore-dmesg.
+- **Log Searching**: If you need to search for specific patterns in the kernel log AFTER initial analysis, the emitted action itself MUST literally contain `| grep`. Example: `log -m | grep -i nouveau | grep -Ei "fail|error|timeout|fault|xid|mmu|fifo"`. **NEVER emit `log -m`, `log -t`, or `log -a` standalone in the action field**, and do not pipe them to `head`, `tail`, `sed`, or other commands before grep. These forms dump the entire log, cause token overflow, and are invalid even if your reasoning mentions a filtered query. Do NOT attempt to use `grep` on vmcore-dmesg.
 
 <initial_data>
 {init_info}
