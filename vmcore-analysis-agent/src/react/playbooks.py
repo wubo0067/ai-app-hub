@@ -178,6 +178,17 @@ Analysis:
 ## Stack Corruption / Stack Protector Failure
 Pattern: stack-protector: Kernel stack is corrupted in: <function>.
 
+### ⛔ FIRST ACTION RULE
+
+When this playbook is triggered, your VERY FIRST analysis actions (before ANY disassembly of
+non-canary functions, before ANY hypothesis about overflow sources) MUST be:
+1. Disassemble the canary-bearing function (from the panic string) to identify the canary slot.
+2. Execute Phase 1 of the Stack Frame Forensics SOP (3.8a): frame-by-frame saved-RIP validation.
+3. Produce the Phase 1 Required Output identifying the first phantom frame.
+
+You are FORBIDDEN from disassembling handle_mm_fault, __do_page_fault, or any other non-canary
+function until Phase 1-3 of the SOP are complete with their required outputs.
+
 ### Mandatory Stack Corruption Analysis Checklist
 
 Before naming a local overflow source, complete this checklist in order:

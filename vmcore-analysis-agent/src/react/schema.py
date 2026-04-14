@@ -4,18 +4,9 @@
 # Author: CalmWU
 # Created: 2026-03-23
 
-from typing import Any, ClassVar, Dict, List, Literal, Optional, cast
+from typing import Any, ClassVar, Dict, List, Literal, Optional, cast, get_args
 
 from pydantic import BaseModel, Field, model_validator
-
-_CORRUPTION_MECHANISM_VALUES = {
-    "field_type_misuse",
-    "write_corruption",
-    "race_condition",
-    "missing_conversion",
-    "reinit_path_bug",
-    "unknown",
-}
 
 _CORRUPTION_MECHANISM_ALIASES = {
     "type_misuse": "field_type_misuse",
@@ -35,30 +26,98 @@ _ROOT_CAUSE_LIKE_MECHANISMS = {
     "use_after_free",
     "null_deref",
     "dma_corruption",
+    "stack_corruption",
 }
 
-# ---------------------------------------------------------------------------
-# signature_class 容错归一化
-# ---------------------------------------------------------------------------
-_SIGNATURE_CLASS_VALUES = {
-    "null_deref",
-    "use_after_free",
-    "pointer_corruption",
-    "bug_on",
-    "warn_on",
-    "soft_lockup",
-    "hard_lockup",
-    "rcu_stall",
-    "hung_task",
-    "atomic_sleep",
-    "divide_error",
-    "invalid_opcode",
-    "oom_panic",
-    "mce",
-    "general_protection_fault",
-    "stack_corruption",
-    "unknown",
+_ROOT_CAUSE_CLASS_ALIASES = {
+    "corruption": "memory_corruption",
+    "memory_error": "memory_corruption",
+    "address_corruption": "wild_pointer",
+    "invalid_pointer": "wild_pointer",
+    "stack_protector": "stack_corruption",
+    "stack_smash": "stack_corruption",
+    "kernel_stack_corruption": "stack_corruption",
 }
+
+_ROOT_CAUSE_FROM_MECHANISM = {
+    "field_type_misuse": "dma_corruption",
+    "missing_conversion": "dma_corruption",
+    "write_corruption": "memory_corruption",
+    "reinit_path_bug": "race_condition",
+    "race_condition": "race_condition",
+    "unknown": "unknown",
+}
+
+
+CorruptionMechanism = Literal[
+    "field_type_misuse",
+    "write_corruption",
+    "race_condition",
+    "missing_conversion",
+    "reinit_path_bug",
+    "unknown",
+]
+
+
+def get_signature_class_aliases() -> dict[str, str]:
+    """返回 signature_class 的兼容别名映射。"""
+    return dict(_SIGNATURE_CLASS_ALIASES)
+
+
+def get_root_cause_class_aliases() -> dict[str, str]:
+    """返回 root_cause_class 的兼容别名映射。"""
+    return dict(_ROOT_CAUSE_CLASS_ALIASES)
+
+
+def get_corruption_mechanism_aliases() -> dict[str, str]:
+    """返回 corruption_mechanism 的兼容别名映射。"""
+    return dict(_CORRUPTION_MECHANISM_ALIASES)
+
+
+def get_root_cause_from_mechanism_mapping() -> dict[str, str]:
+    """返回 mechanism 到 root_cause_class 的标准映射。"""
+    return dict(_ROOT_CAUSE_FROM_MECHANISM)
+
+
+def get_root_cause_like_mechanisms() -> set[str]:
+    """返回若误填到 corruption_mechanism 中应回灌到 root_cause_class 的值集合。"""
+    return set(_ROOT_CAUSE_LIKE_MECHANISMS)
+
+
+def get_signature_class_values() -> tuple[str, ...]:
+    """返回 signature_class 的 canonical 枚举值。"""
+    return cast(tuple[str, ...], get_args(CrashSignatureClass))
+
+
+def get_signature_class_value_set() -> set[str]:
+    """返回 signature_class 的 canonical 枚举值集合。"""
+    return set(get_signature_class_values())
+
+
+def get_root_cause_class_values() -> tuple[str, ...]:
+    """返回 root_cause_class 的 canonical 枚举值。"""
+    return cast(tuple[str, ...], get_args(RootCauseClass))
+
+
+def get_root_cause_class_value_set() -> set[str]:
+    """返回 root_cause_class 的 canonical 枚举值集合。"""
+    return set(get_root_cause_class_values())
+
+
+def get_corruption_mechanism_values() -> tuple[str, ...]:
+    """返回 corruption_mechanism 的 canonical 枚举值。"""
+    return cast(tuple[str, ...], get_args(CorruptionMechanism))
+
+
+def get_corruption_mechanism_value_set() -> set[str]:
+    """返回 corruption_mechanism 的 canonical 枚举值集合。"""
+    return set(get_corruption_mechanism_values())
+
+
+def get_partial_dump_values() -> tuple[str, ...]:
+    """返回 partial_dump 的 canonical 枚举值。"""
+    return cast(tuple[str, ...], get_args(PartialDumpStatus))
+
 
 _SIGNATURE_CLASS_ALIASES: dict[str, str] = {
     "stack_protector": "stack_corruption",
@@ -85,10 +144,35 @@ def _coerce_signature_class(data: Any) -> Any:
         return data
 
     normalized = _SIGNATURE_CLASS_ALIASES.get(raw, raw)
-    if normalized in _SIGNATURE_CLASS_VALUES:
+    if normalized in get_signature_class_value_set():
         data["signature_class"] = normalized
     else:
         data["signature_class"] = "unknown"
+    return data
+
+
+def _coerce_root_cause_class(data: Any) -> Any:
+    """对 root_cause_class 做有边界的容错归一化，避免近似标签中断管线。"""
+    if not isinstance(data, dict):
+        return data
+
+    raw = data.get("root_cause_class")
+    if not isinstance(raw, str):
+        return data
+
+    normalized = _ROOT_CAUSE_CLASS_ALIASES.get(raw, raw)
+
+    if normalized in _ROOT_CAUSE_FROM_MECHANISM:
+        if data.get("corruption_mechanism") in {None, "unknown"}:
+            data["corruption_mechanism"] = normalized
+        data["root_cause_class"] = _ROOT_CAUSE_FROM_MECHANISM[normalized]
+        return data
+
+    if normalized in get_root_cause_class_value_set():
+        data["root_cause_class"] = normalized
+    else:
+        data["root_cause_class"] = "unknown"
+
     return data
 
 
@@ -107,7 +191,7 @@ def _coerce_corruption_mechanism(
 
     normalized = _CORRUPTION_MECHANISM_ALIASES.get(raw_value, raw_value)
 
-    if normalized in _CORRUPTION_MECHANISM_VALUES:
+    if normalized in get_corruption_mechanism_value_set():
         data["corruption_mechanism"] = normalized
         return data
 
@@ -220,16 +304,7 @@ class FinalDiagnosis(BaseModel):
         None,
         description="Source-level structural inference for third-party or driver-private crash objects",
     )
-    corruption_mechanism: Optional[
-        Literal[
-            "field_type_misuse",
-            "write_corruption",
-            "race_condition",
-            "missing_conversion",
-            "reinit_path_bug",
-            "unknown",
-        ]
-    ] = Field(
+    corruption_mechanism: Optional[CorruptionMechanism] = Field(
         None,
         description=(
             "Specific corruption mechanism once source-level field semantics are known. "
@@ -243,7 +318,7 @@ class FinalDiagnosis(BaseModel):
     def normalize_corruption_mechanism(cls, data: Any) -> Any:
         """
         对 corruption_mechanism 字段进行标准化处理的验证器方法。
-        
+
         该方法用于对 LLM 输出的 corruption_mechanism 字段进行容错归一化处理，
         将可能存在的别名或不规范值转换为预定义的合法值之一，防止因 LLM
         输出格式不一致而导致的模型验证失败。
@@ -284,16 +359,7 @@ class VMCoreLLMAnalysisStep(BaseModel):
     is_conclusive: bool = Field(False)
     signature_class: Optional["CrashSignatureClass"] = Field(None)
     root_cause_class: Optional["RootCauseClass"] = Field(None)
-    corruption_mechanism: Optional[
-        Literal[
-            "field_type_misuse",
-            "write_corruption",
-            "race_condition",
-            "missing_conversion",
-            "reinit_path_bug",
-            "unknown",
-        ]
-    ] = Field(
+    corruption_mechanism: Optional[CorruptionMechanism] = Field(
         None,
         description=(
             "Optional finer-grained mechanism beneath root_cause_class. "
@@ -326,6 +392,7 @@ class VMCoreLLMAnalysisStep(BaseModel):
             if legacy_value is not None:
                 data["signature_class"] = legacy_value
         data = _coerce_signature_class(data)
+        data = _coerce_root_cause_class(data)
         return _coerce_corruption_mechanism(data, root_cause_field="root_cause_class")
 
 
@@ -401,6 +468,7 @@ RootCauseClass = Literal[
     "oom",  # 内存耗尽 - OOM killer 触发但未导致 panic
     "oom_panic",  # 内存耗尽恐慌 - OOM 导致系统 panic
     "pointer_corruption",  # 指针损坏 - 通用指针损坏，机制待确定
+    "stack_corruption",  # 栈损坏 - 已能确认栈被破坏，但尚未定位更深层机制
     "unknown",  # 未知根因 - 证据不足以确定具体机制
 ]
 
@@ -557,16 +625,7 @@ class VMCoreAnalysisStep(BaseModel):
         ),
     )
 
-    corruption_mechanism: Optional[
-        Literal[
-            "field_type_misuse",
-            "write_corruption",
-            "race_condition",
-            "missing_conversion",
-            "reinit_path_bug",
-            "unknown",
-        ]
-    ] = Field(
+    corruption_mechanism: Optional[CorruptionMechanism] = Field(
         None,
         description=(
             "Optional finer-grained corruption mechanism nested under root_cause_class. "

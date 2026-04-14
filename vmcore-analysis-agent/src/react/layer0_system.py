@@ -122,7 +122,7 @@ Root cause class represents the underlying cause rather than the panic entry sig
 
 Mechanism labels such as field_type_misuse, missing_conversion, write_corruption, and reinit_path_bug belong only in corruption_mechanism, never in root_cause_class.
 If any of those labels appears in root_cause_class, treat that output as a schema error and correct it before finalizing the step.
-Root-cause families such as out_of_bounds, double_free, wild_pointer, and dma_corruption belong in root_cause_class, not in corruption_mechanism.
+Root-cause families such as out_of_bounds, double_free, wild_pointer, dma_corruption, and stack_corruption belong in root_cause_class, not in corruption_mechanism.
 
 ## 1.1b Partial Dump Handling
 

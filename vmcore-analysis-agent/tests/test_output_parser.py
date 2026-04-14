@@ -266,6 +266,29 @@ class OutputParserAuditTests(unittest.TestCase):
         self.assertEqual(repaired.root_cause_class, "dma_corruption")
         self.assertEqual(repaired.corruption_mechanism, "field_type_misuse")
 
+    def test_repair_structured_output_lifts_stack_corruption_from_mechanism(
+        self,
+    ) -> None:
+        repaired = repair_structured_output(
+            (
+                "{"
+                '"step_id": 23,'
+                '"reasoning": "stack canary overwrite is confirmed",'
+                '"action": null,'
+                '"is_conclusive": false,'
+                '"signature_class": "stack_corruption",'
+                '"root_cause_class": "memory_corruption",'
+                '"corruption_mechanism": "stack_corruption",'
+                '"partial_dump": "partial"'
+                "}"
+            ),
+            model_class=VMCoreLLMAnalysisStep,
+        )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(repaired.root_cause_class, "stack_corruption")
+        self.assertEqual(repaired.corruption_mechanism, "unknown")
+
     def test_top_level_step_accepts_explicit_corruption_mechanism(self) -> None:
         llm_step = VMCoreLLMAnalysisStep.model_validate(
             {
@@ -320,6 +343,48 @@ class OutputParserAuditTests(unittest.TestCase):
         self.assertEqual(repaired.corruption_mechanism, "unknown")
         self.assertIsNotNone(repaired.final_diagnosis)
         self.assertEqual(repaired.final_diagnosis.corruption_mechanism, "unknown")
+
+    def test_repair_structured_output_accepts_stack_corruption_root_cause(
+        self,
+    ) -> None:
+        repaired = repair_structured_output(
+            (
+                "{"
+                '"step_id": 24,'
+                '"reasoning": "stack canary overwrite confirms stack damage but not the exact overwrite primitive",'
+                '"action": null,'
+                '"is_conclusive": false,'
+                '"signature_class": "stack_corruption",'
+                '"root_cause_class": "stack_corruption",'
+                '"partial_dump": "partial"'
+                "}"
+            ),
+            model_class=VMCoreLLMAnalysisStep,
+        )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(repaired.root_cause_class, "stack_corruption")
+
+    def test_repair_structured_output_maps_stack_protector_root_cause_alias(
+        self,
+    ) -> None:
+        repaired = repair_structured_output(
+            (
+                "{"
+                '"step_id": 24,'
+                '"reasoning": "legacy stack-protector wording should not break structured output",'
+                '"action": null,'
+                '"is_conclusive": false,'
+                '"signature_class": "stack_corruption",'
+                '"root_cause_class": "stack_protector",'
+                '"partial_dump": "partial"'
+                "}"
+            ),
+            model_class=VMCoreLLMAnalysisStep,
+        )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(repaired.root_cause_class, "stack_corruption")
 
     def test_downgrades_conclusion_when_write_fault_is_attributed_to_plain_read(
         self,

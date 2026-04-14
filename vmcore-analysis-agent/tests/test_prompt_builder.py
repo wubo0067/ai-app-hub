@@ -179,6 +179,24 @@ class PromptBuilderTests(unittest.TestCase):
         self.assertIn("Function-pointer anchor", layered_prompt)
         self.assertIn("Open-source cross-reference", layered_prompt)
 
+    def test_layered_prompt_injects_dynamic_enum_contract(self) -> None:
+        state = {
+            "step_count": 6,
+            "current_signature_class": "stack_corruption",
+            "current_root_cause_class": "unknown",
+            "current_partial_dump": "partial",
+            "managed_active_hypotheses": None,
+            "managed_gates": None,
+            "messages": [HumanMessage(content="Initial Context")],
+        }
+
+        layered_prompt = build_analysis_system_prompt(state, is_last_step=False)
+
+        self.assertIn("[ENUM CONTRACT]", layered_prompt)
+        self.assertIn("'stack_corruption'", layered_prompt)
+        self.assertIn("'stack_protector' -> 'stack_corruption'", layered_prompt)
+        self.assertIn("'type_misuse' -> 'field_type_misuse'", layered_prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

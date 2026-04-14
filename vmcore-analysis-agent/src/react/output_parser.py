@@ -13,7 +13,15 @@ from pydantic import BaseModel
 
 from src.utils.logging import logger
 
-from .schema import VMCoreAnalysisStep, VMCoreLLMAnalysisStep
+from .schema import (
+    VMCoreAnalysisStep,
+    VMCoreLLMAnalysisStep,
+    get_corruption_mechanism_aliases,
+    get_root_cause_class_aliases,
+    get_root_cause_from_mechanism_mapping,
+    get_root_cause_like_mechanisms,
+    get_signature_class_aliases,
+)
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
@@ -147,18 +155,7 @@ def _is_quoted_shell_token(token: str) -> bool:
 
 def _normalize_signature_class(content_str: str) -> str:
     """在 JSON 解析前对 signature_class 做别名归一化，防止 LLM 输出未知值导致验证失败。"""
-    alias_mapping = {
-        "stack_protector": "stack_corruption",
-        "stack_smash": "stack_corruption",
-        "kernel_stack_corruption": "stack_corruption",
-        "gp_fault": "general_protection_fault",
-        "gpf": "general_protection_fault",
-        "null_pointer": "null_deref",
-        "nullptr": "null_deref",
-        "uaf": "use_after_free",
-        "machine_check": "mce",
-        "oom": "oom_panic",
-    }
+    alias_mapping = get_signature_class_aliases()
     for alias, canonical in alias_mapping.items():
         pattern = r'("signature_class"\s*:\s*")' + re.escape(alias) + r'"'
         replacement = r"\1" + canonical + r'"'
@@ -186,24 +183,8 @@ def _normalize_root_cause_class(content_str: str) -> str:
     注意事项：
         维护映射表的完整性，避免遗漏新的别名变体
     """
-    # root_cause_class 的别名映射表
-    root_cause_alias_mapping = {
-        "pointer_corruption": "wild_pointer",
-        "corruption": "memory_corruption",
-        "memory_error": "memory_corruption",
-        "address_corruption": "wild_pointer",
-        "invalid_pointer": "wild_pointer",
-    }
-
-    # corruption_mechanism 到 root_cause 的映射表
-    mechanism_to_root_cause_mapping = {
-        "field_type_misuse": "dma_corruption",
-        "missing_conversion": "dma_corruption",
-        "write_corruption": "memory_corruption",
-        "reinit_path_bug": "race_condition",
-        "race_condition": "race_condition",
-        "unknown": "unknown",
-    }
+    root_cause_alias_mapping = get_root_cause_class_aliases()
+    mechanism_to_root_cause_mapping = get_root_cause_from_mechanism_mapping()
 
     mechanism_pattern = "|".join(
         re.escape(value) for value in mechanism_to_root_cause_mapping
@@ -231,35 +212,31 @@ def _normalize_root_cause_class(content_str: str) -> str:
     )
     content_str = root_cause_pattern.sub(_replace_root_cause, content_str)
 
-    # corruption_mechanism 的别名映射
-    corruption_mechanism_alias_mapping = {
-        "type_misuse": "field_type_misuse",
-        "dma_type_misuse": "field_type_misuse",
-        "overwrite": "write_corruption",
-        "write_overwrite": "write_corruption",
-        "reinit_bug": "reinit_path_bug",
-    }
+    corruption_mechanism_alias_mapping = get_corruption_mechanism_aliases()
     for alias, canonical in corruption_mechanism_alias_mapping.items():
         pattern = r'("corruption_mechanism"\s*:\s*")' + re.escape(alias) + r'"'
         replacement = r"\1" + canonical + r'"'
         content_str = re.sub(pattern, replacement, content_str)
 
     # 某些 root-cause 标签会被 LLM 错塞进 corruption_mechanism。
-    # 对 out_of_bounds 这类值，保留现有 schema 语义：它属于 root_cause_class，
+    # 对这类值，保留现有 schema 语义：它属于 root_cause_class，
     # corruption_mechanism 则降级为 unknown 以避免结构化输出失败。
     misplaced_mechanism_to_root_cause = {
-        "out_of_bounds": "out_of_bounds",
+        value: value for value in sorted(get_root_cause_like_mechanisms())
     }
 
     for (
         misplaced_value,
         canonical_root_cause,
     ) in misplaced_mechanism_to_root_cause.items():
-        content_str = re.sub(
+        content_str, replaced_count = re.subn(
             r'("corruption_mechanism"\s*:\s*")' + re.escape(misplaced_value) + r'"',
             r'\1unknown"',
             content_str,
         )
+
+        if replaced_count == 0:
+            continue
 
         if re.search(r'"root_cause_class"\s*:', content_str):
             content_str = re.sub(

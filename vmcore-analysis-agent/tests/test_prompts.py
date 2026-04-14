@@ -2,7 +2,14 @@ import unittest
 
 from src.react.prompts import (
     analysis_crash_prompt,
+    build_minimal_schema_enum_contract,
     simplified_structure_reasoning_prompt,
+)
+from src.react.schema import (
+    get_corruption_mechanism_values,
+    get_partial_dump_values,
+    get_root_cause_class_values,
+    get_signature_class_values,
 )
 
 
@@ -155,6 +162,33 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("NEVER in root_cause_class", prompt)
         self.assertIn("that is a schema error and must be corrected", prompt)
         self.assertIn('"corruption_mechanism": null', prompt)
+
+    def test_simplified_prompt_includes_current_schema_enum_contract(self) -> None:
+        prompt = simplified_structure_reasoning_prompt()
+
+        self.assertIn("Allowed enum values in final JSON:", prompt)
+        for value in get_signature_class_values():
+            self.assertIn(f"'{value}'", prompt)
+        for value in get_root_cause_class_values():
+            self.assertIn(f"'{value}'", prompt)
+        for value in get_corruption_mechanism_values():
+            self.assertIn(f"'{value}'", prompt)
+        for value in get_partial_dump_values():
+            self.assertIn(f"'{value}'", prompt)
+
+    def test_simplified_prompt_requires_action_object_not_string(self) -> None:
+        prompt = simplified_structure_reasoning_prompt()
+
+        self.assertIn("Do NOT return action as a string", prompt)
+        self.assertIn('"command_name": "rd"', prompt)
+        self.assertIn('"arguments": ["-x", "ffff...", "16"]', prompt)
+
+    def test_minimal_schema_enum_contract_requires_canonical_values(self) -> None:
+        contract = build_minimal_schema_enum_contract()
+
+        self.assertIn("Do not emit aliases or shorthand in final JSON", contract)
+        self.assertIn("'stack_protector' -> 'stack_corruption'", contract)
+        self.assertIn("'type_misuse' -> 'field_type_misuse'", contract)
 
     def test_analysis_prompt_treats_mechanism_in_root_cause_class_as_schema_error(
         self,

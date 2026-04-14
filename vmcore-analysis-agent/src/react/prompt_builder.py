@@ -10,6 +10,7 @@ from langchain_core.messages import AIMessage, BaseMessage
 
 from .graph_state import AgentState
 from .prompt_layers import LAYER0_SYSTEM_PROMPT_TEMPLATE, PLAYBOOKS, SOP_FRAGMENTS
+from .prompts import build_minimal_schema_enum_contract
 from .schema import CrashSignatureClass, GateEntry, Hypothesis, VMCoreLLMAnalysisStep
 
 
@@ -60,6 +61,7 @@ def build_analysis_system_prompt(state: AgentState, *, is_last_step: bool) -> st
                 indent=2,
             ),
         ),
+        "[ENUM CONTRACT]\n" + build_minimal_schema_enum_contract(),
         build_executor_state_section(state),
     ]
 

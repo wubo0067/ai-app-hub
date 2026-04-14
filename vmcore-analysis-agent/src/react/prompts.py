@@ -5,6 +5,51 @@
 # Created: 2026-01-09
 
 from .prompt_layers import LAYER0_SYSTEM_PROMPT_TEMPLATE, PLAYBOOKS, SOP_FRAGMENTS
+from .schema import (
+    get_corruption_mechanism_aliases,
+    get_corruption_mechanism_values,
+    get_partial_dump_values,
+    get_root_cause_class_aliases,
+    get_root_cause_class_values,
+    get_signature_class_aliases,
+    get_signature_class_values,
+)
+
+
+def _quote_values(values: tuple[str, ...]) -> str:
+    return ", ".join(f"'{value}'" for value in values)
+
+
+def _invalid_aliases_text() -> str:
+    aliases = sorted(
+        {
+            *get_signature_class_aliases().keys(),
+            *get_root_cause_class_aliases().keys(),
+            *get_corruption_mechanism_aliases().keys(),
+        }
+    )
+    return _quote_values(tuple(aliases))
+
+
+def _quote_alias_map(alias_map: dict[str, str]) -> str:
+    items = [f"'{alias}' -> '{canonical}'" for alias, canonical in alias_map.items()]
+    return ", ".join(items)
+
+
+def build_minimal_schema_enum_contract() -> str:
+    """构造与 schema 同步的最小结构化输出枚举约束。"""
+    return (
+        "Allowed enum values in final JSON:\n"
+        f"- signature_class: {_quote_values(get_signature_class_values())}\n"
+        f"- root_cause_class: {_quote_values(get_root_cause_class_values())}\n"
+        f"- corruption_mechanism: {_quote_values(get_corruption_mechanism_values())}\n"
+        f"- partial_dump: {_quote_values(get_partial_dump_values())}\n"
+        "Do not emit aliases or shorthand in final JSON. Normalize them to canonical schema values first.\n"
+        f"- signature_class aliases to normalize: {_quote_alias_map(get_signature_class_aliases())}\n"
+        f"- root_cause_class aliases to normalize: {_quote_alias_map(get_root_cause_class_aliases())}\n"
+        f"- corruption_mechanism aliases to normalize: {_quote_alias_map(get_corruption_mechanism_aliases())}"
+    )
+
 
 _ANALYSIS_PROMPT_COMPATIBILITY_APPENDIX = """
 ## Compatibility Appendix
@@ -88,6 +133,11 @@ Q4 — Offset coverage:
 - Never emit echo, printf, shell comments, separators, or breadcrumb text such as "Frame #4 address from bt is ..." inside action or run_script.
 - run_script is for bundling multiple diagnostic commands, not for narration.
 - Before finalizing an action, remove any command line that does not gather new evidence or change diagnostic state.
+
+### Log Filtering Contract
+
+- If you need to search kernel logs after initial analysis, the emitted action itself MUST literally contain `| grep`.
+- NEVER emit `log -m`, `log -t`, or `log -a` standalone in the action field, and do not pipe them to `head`, `tail`, `sed`, or other commands before grep.
 """.strip()
 
 
@@ -159,26 +209,31 @@ def simplified_structure_reasoning_prompt() -> str:
     简化版结构化推理提示词，仅要求模型输出核心字段，降低输出负担。
     复杂字段（如 gates、active_hypotheses）将在后处理阶段自动补齐。
     """
+    signature_values = get_signature_class_values()
+    root_cause_values = get_root_cause_class_values()
+    mechanism_values = get_corruption_mechanism_values()
+    partial_dump_values = get_partial_dump_values()
+    invalid_aliases = _invalid_aliases_text()
+
     return (
         "You are a helper that extracts CORE information from unstructured vmcore crash analysis reasoning "
         "into a minimal structured JSON format.\n\n"
         "The analysis reasoning text will be provided in the next user message. Extract ONLY the following core fields from that text:\n\n"
         "Current analysis step number: {current_step}\n\n"
-        "{force_conclusion}"
+        "{force_conclusion}" + build_minimal_schema_enum_contract() + "\n\n"
         "REQUIRED FIELDS TO EXTRACT:\n"
         "1. 'reasoning': Summarize the key reasoning points (3-6 sentences)\n"
         "2. 'step_id': Set to {current_step}\n"
-        "3. 'action': If the reasoning suggests a specific crash command, provide the COMPLETE command with all arguments. "
-        "Otherwise set to null.\n"
+        "3. 'action': If the reasoning suggests a specific crash command, return an object with exactly two fields: 'command_name' and 'arguments'. "
+        'Example: {"command_name": "rd", "arguments": ["-x", "ffff...", "16"]}. Otherwise set it to null. Do NOT return action as a string.\n'
         "4. 'is_conclusive': Set to true ONLY if the reasoning explicitly states a final conclusion with root cause. "
         "Otherwise set to false.\n"
-        "5. 'signature_class': Extract the crash signature class from panic string analysis (e.g., 'null_deref', "
-        "'use_after_free', 'pointer_corruption', etc.)\n"
-        "6. 'root_cause_class': Extract the underlying root cause if mentioned (can be null during exploration)\n"
-        "7. 'corruption_mechanism': Extract a finer-grained mechanism only when the reasoning supports it "
-        "(e.g., 'field_type_misuse', 'missing_conversion', 'write_corruption', 'reinit_path_bug'). "
-        "If absent or unsupported, set to null.\n"
-        "8. 'partial_dump': Set this only if dump completeness is explicitly mentioned; otherwise use 'unknown'\n\n"
+        f"5. 'signature_class': Extract the crash signature class from panic string analysis. Allowed values: {_quote_values(signature_values)}.\n"
+        "6. 'root_cause_class': Extract the underlying root cause if the reasoning narrows it. Use null when it is not stated yet. "
+        f"Allowed values: {_quote_values(root_cause_values)}.\n"
+        "7. 'corruption_mechanism': Extract a finer-grained mechanism only when the reasoning supports it. "
+        f"Allowed values: {_quote_values(mechanism_values)}. If absent or unsupported, set to null.\n"
+        f"8. 'partial_dump': Use only these values: {_quote_values(partial_dump_values)}. If dump completeness is not explicitly mentioned, use 'unknown'.\n\n"
         "FIELDS TO SKIP (will be auto-filled later):\n"
         "- active_hypotheses\n"
         "- gates\n"
@@ -189,8 +244,10 @@ def simplified_structure_reasoning_prompt() -> str:
         "RULES:\n"
         "- Focus ONLY on extracting the required fields above\n"
         "- Keep reasoning concise and focused on what was learned from tool output\n"
-        "- For root_cause_class, use values like 'null_deref', 'use_after_free', 'wild_pointer', 'memory_corruption', "
-        "'dma_corruption', etc. If uncertain, use 'unknown'\n"
+        "- The schema definition below is the source of truth for field names and enum values. Follow it exactly even if the reasoning uses synonyms or old labels\n"
+        "- Do not emit aliases or near-miss labels in final JSON. Invalid examples include "
+        f"{invalid_aliases}. Convert them to the canonical values allowed by the schema\n"
+        "- For root_cause_class, use 'stack_corruption' when stack damage is confirmed but the deeper mechanism is not yet proven. Use 'unknown' only when the reasoning bounds the failure family but still cannot isolate a canonical root-cause value\n"
         "- corruption_mechanism is narrower than root_cause_class. Put labels like 'field_type_misuse' or "
         "'missing_conversion' there, NEVER in root_cause_class\n"
         "- If labels like 'field_type_misuse', 'missing_conversion', 'write_corruption', or 'reinit_path_bug' appear "
@@ -210,6 +267,7 @@ def simplified_structure_reasoning_prompt() -> str:
         '  "partial_dump": "unknown"\n'
         "}}\n"
         "```\n\n"
-        "If a follow-up command is needed, replace action=null with a complete command object.\n\n"
+        "If a follow-up command is needed, replace action=null with a complete command object such as "
+        '{"command_name": "dis", "arguments": ["-rl", "ffffffff81000000"]}.\n\n'
         "REMEMBER: Skip complex fields! They will be handled automatically after your response.\n"
     )

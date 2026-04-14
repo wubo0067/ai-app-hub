@@ -41,6 +41,40 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(step.root_cause_class, "out_of_bounds")
         self.assertEqual(step.corruption_mechanism, "unknown")
 
+    def test_vmcore_llm_analysis_step_accepts_stack_corruption_root_cause(
+        self,
+    ) -> None:
+        step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 24,
+                "reasoning": "Stack canary overwrite is confirmed, but the precise overwrite primitive is still unknown.",
+                "action": None,
+                "is_conclusive": False,
+                "signature_class": "stack_corruption",
+                "root_cause_class": "stack_corruption",
+                "partial_dump": "partial",
+            }
+        )
+
+        self.assertEqual(step.root_cause_class, "stack_corruption")
+
+    def test_vmcore_llm_analysis_step_maps_stack_protector_root_cause_alias(
+        self,
+    ) -> None:
+        step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 24,
+                "reasoning": "The model used a legacy stack-protector label for the root cause.",
+                "action": None,
+                "is_conclusive": False,
+                "signature_class": "stack_corruption",
+                "root_cause_class": "stack_protector",
+                "partial_dump": "partial",
+            }
+        )
+
+        self.assertEqual(step.root_cause_class, "stack_corruption")
+
     def test_final_diagnosis_accepts_driver_source_evidence(self) -> None:
         diagnosis = FinalDiagnosis.model_validate(
             {
