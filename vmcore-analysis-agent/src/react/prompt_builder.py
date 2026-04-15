@@ -233,6 +233,9 @@ def _select_sop_fragments(state: AgentState) -> list[str]:
     ):
         fragments.append(SOP_FRAGMENTS["stack_overflow"])
 
+    if signature_class == "stack_corruption":
+        fragments.append(SOP_FRAGMENTS["stack_frame_forensics"])
+
     if "kasan" in lowered_recent_text or "ubsan" in lowered_recent_text:
         fragments.append(SOP_FRAGMENTS["kasan_ubsan"])
 

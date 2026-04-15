@@ -197,6 +197,49 @@ class PromptBuilderTests(unittest.TestCase):
         self.assertIn("'stack_protector' -> 'stack_corruption'", layered_prompt)
         self.assertIn("'type_misuse' -> 'field_type_misuse'", layered_prompt)
 
+    def test_stack_corruption_runtime_prompt_injects_frame_forensics_and_avoids_handler_default(
+        self,
+    ) -> None:
+        state = {
+            "step_count": 8,
+            "current_signature_class": "stack_corruption",
+            "current_root_cause_class": "unknown",
+            "current_partial_dump": "partial",
+            "managed_active_hypotheses": None,
+            "managed_gates": None,
+            "messages": [
+                HumanMessage(
+                    content=(
+                        "Kernel panic - not syncing: stack-protector: Kernel stack is corrupted in: "
+                        "search_module_extables\n"
+                        "stack corruption\n"
+                        "zone_statistics\n"
+                        "link_path_walk"
+                    )
+                )
+            ],
+        }
+
+        layered_prompt = build_analysis_system_prompt(state, is_last_step=False)
+
+        self.assertIn("## 3.8a Stack Frame Forensics SOP", layered_prompt)
+        self.assertIn(
+            "Do NOT derive RBP_absolute from the bt frame address by formula alone",
+            layered_prompt,
+        )
+        self.assertIn(
+            "strong unwind or exception-boundary hint",
+            layered_prompt,
+        )
+        self.assertIn(
+            "The exception-handler call chain is additional provenance context, not a default cross-frame",
+            layered_prompt,
+        )
+        self.assertNotIn(
+            "The corruption source must be sought WITHIN the exception handler call chain itself",
+            layered_prompt,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

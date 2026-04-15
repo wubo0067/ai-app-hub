@@ -221,11 +221,59 @@ class PromptContractTests(unittest.TestCase):
         prompt = analysis_crash_prompt()
 
         self.assertIn(
-            "if the active path is sys_open -> do_filp_open -> path_openat -> do_last -> link_path_walk -> inode_permission",
+            "do not automatically pivot to that interrupted non-exception chain in every stack-protector case",
             prompt,
         )
         self.assertIn(
-            "those VFS/open-path frames must be audited with disassembly and stack-layout reasoning before any blame shifts to handle_mm_fault or fault.c",
+            "First explain why the canary-bearing function's own frame is not the primary suspect",
+            prompt,
+        )
+
+    def test_analysis_prompt_defaults_stack_protector_to_own_frame(self) -> None:
+        prompt = analysis_crash_prompt()
+
+        self.assertIn(
+            "When the panic string explicitly says stack-protector failure in function F, the default hypothesis is corruption of F's own frame during F's execution",
+            prompt,
+        )
+        self.assertIn(
+            "Do not name an unrelated interrupted-path function unless you can prove a concrete write primitive or proven cross-frame overlap into F's canary slot",
+            prompt,
+        )
+
+    def test_analysis_prompt_prioritizes_self_frame_for_canary_owner(self) -> None:
+        prompt = analysis_crash_prompt()
+
+        self.assertIn(
+            "If suspect_frame_addr == canary_frame_addr, prioritize self-frame overflow, inline expansion,",
+            prompt,
+        )
+        self.assertIn(
+            "or unprotected leaf-callee overwrite before investigating any other frame",
+            prompt,
+        )
+
+    def test_analysis_prompt_treats_duplicate_frames_as_hint_not_proof(self) -> None:
+        prompt = analysis_crash_prompt()
+
+        self.assertIn(
+            "treat this as a strong unwind or exception-boundary hint, not an automatic",
+            prompt,
+        )
+        self.assertIn(
+            "proof of stack smearing",
+            prompt,
+        )
+
+    def test_analysis_prompt_rejects_formula_only_rbp_derivation(self) -> None:
+        prompt = analysis_crash_prompt()
+
+        self.assertIn(
+            "Do NOT derive RBP_absolute from the bt frame address by formula alone",
+            prompt,
+        )
+        self.assertIn(
+            "only after RBP_absolute has been established by an independently closed proof",
             prompt,
         )
 

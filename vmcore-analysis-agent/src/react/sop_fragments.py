@@ -235,15 +235,19 @@ Goal: identify the FIRST unreliable (phantom) frame in the backtrace.
       mark this frame as the **first suspect phantom frame**.
 
 2. Check for **duplicate saved RIPs**: if two or more consecutive frames share the exact same
-   saved RIP value, this is a definitive stack smearing signal. In any normal call chain, two
-   consecutive frames cannot have identical return addresses. The first frame with the duplicated
-   saved RIP is the first phantom frame.
+    saved RIP value, treat this as a strong unwind or exception-boundary hint, not an automatic
+    proof of stack smearing.
+    - In an ordinary uninterrupted call chain, duplicated consecutive return addresses are highly
+       suspicious and must be explained.
+    - However, before labeling the pattern as phantom-frame corruption, rule in or rule out
+       exception nesting, pt_regs boundaries, unwinder residue, or stack-scan artifacts.
+    - Only after that context check may you classify the first duplicated frame as phantom.
 
 3. Record and report:
    - The last trusted frame (highest frame number with valid saved RIP and plausible caller edge).
    - The first phantom frame (frame number, address, and the anomalous saved RIP value).
-   - All subsequent frames between the first phantom frame and the canary-bearing frame are
-     also unreliable and should be treated as smeared stack data.
+    - Whether subsequent frames are truly phantom, exception-nested, or merely unwind-adjacent.
+       Do not collapse these categories into generic stack smearing without supporting evidence.
 
 **Phase 1 Required Output** (you MUST produce this before proceeding to Phase 2):
 ```
@@ -297,40 +301,42 @@ Goal: compute the exact canary slot address from disassembly, not from bt frame 
    c. Subsequent pushes (push %r12, push %rbx, etc.) and `sub $N, %rsp` extend the frame
       below RBP.
 
-3. Identify the canary store instruction (e.g., `mov %rax, -0x18(%rbp)`) and compute:
-   canary_slot_addr = RBP_absolute - offset
+3. Identify the canary store instruction (e.g., `mov %rax, -0x18(%rbp)`) and compute the slot
+   only after RBP_absolute has been established by an independently closed proof.
 
-4. To compute RBP_absolute from the bt frame address:
-   a. The bt frame address for the canary-bearing function is the RSP at the point where it
-      called __stack_chk_fail (or the deepest callee).
-   b. Count the total frame size below RBP: each push after `mov %rsp, %rbp` uses 8 bytes,
-      plus the `sub $N, %rsp` value, plus 8 bytes for the __stack_chk_fail return address.
-   c. RBP_absolute = bt_frame_address + total_size_below_rbp
-   d. Verify by checking that the value at [RBP_absolute] in the raw stack dump looks like
-      a valid saved RBP (a stack address within the task's stack range).
+4. Accept an RBP_absolute candidate only if all of the following are true:
+   a. The candidate is consistent with the real function prologue and any pushes or local-space
+      allocation below RBP.
+   b. The value at [RBP_absolute] validates as a plausible saved RBP or frame link for that task.
+   c. The value at [RBP_absolute+8] validates as a plausible saved RIP or return site.
+   d. The resulting canary slot address matches the raw stack layout without contradiction.
 
-5. Read the canary slot contents and evaluate:
+5. If that proof does not close, stop the arithmetic and report the canary slot as unproven.
+   Do NOT derive RBP_absolute from the bt frame address by formula alone, and do NOT continue
+   writer-provenance reasoning on top of an unverified canary slot.
+
+6. Read the canary slot contents and evaluate only after the slot address is independently
+   validated:
    a. If the value is a valid gs:0x28 canary (high-entropy random), canary is intact — the
       __stack_chk_fail was triggered by something else (rare).
    b. If the value is a non-random recognizable pattern (e.g., a kernel code address, a small
       integer like 0x2, a task_struct pointer, or a stack address), the canary was overwritten.
    c. Record both the slot address and its contents as primary forensic evidence.
 
-**Phase 3 Required Output** (you MUST show the RBP computation steps):
+**Phase 3 Required Output** (you MUST show the independent verification steps):
 ```
 PHASE 3 RESULT:
   Function: <canary_bearing_function>
-  Prologue pushes after mov %rsp,%rbp: <list registers> = <N*8> bytes
-  sub $<M>, %rsp
-  __stack_chk_fail return address: 8 bytes
-  Total below RBP: <N*8 + M + 8> bytes
-  bt frame address (RSP at call): <address>
-  RBP_absolute = <bt_frame_addr> + <total> = <computed_value>
-  Verification: [RBP_absolute] = <value from rd> (valid stack addr? <yes/no>)
+  Prologue evidence: <push/mov/sub sequence>
+  Candidate RBP_absolute: <value or unproven>
+  Independent checks:
+    [RBP_absolute] = <value> (saved RBP plausible? <yes/no>)
+    [RBP_absolute+8] = <value> (saved RIP plausible? <yes/no>)
+    slot-layout consistency = <yes/no>
   Canary offset from disassembly: rbp-<offset>
-  Canary slot address: <RBP_absolute - offset>
-  Canary slot contents: <value> (expected canary from gs:0x28: <value>)
-  Canary status: <intact | overwritten with <description>>
+  Canary slot address: <value or unproven>
+  Canary slot contents: <value or unread / unproven>
+  Canary status: <intact | overwritten | unproven>
 ```
 
 ### Phase 4: Corruption Region Delineation

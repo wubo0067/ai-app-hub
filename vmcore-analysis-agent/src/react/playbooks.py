@@ -189,6 +189,13 @@ non-canary functions, before ANY hypothesis about overflow sources) MUST be:
 You are FORBIDDEN from disassembling handle_mm_fault, __do_page_fault, or any other non-canary
 function until Phase 1-3 of the SOP are complete with their required outputs.
 
+### Stack-Protector Red-Line
+
+When the panic string explicitly says stack-protector failure in function F, the default
+hypothesis is corruption of F's own frame during F's execution. Do not name an unrelated
+interrupted-path function unless you can prove a concrete write primitive or proven
+cross-frame overlap into F's canary slot.
+
 ### Mandatory Stack Corruption Analysis Checklist
 
 Before naming a local overflow source, complete this checklist in order:
@@ -219,6 +226,12 @@ suspect_frame_addr (address of the suspected overflow source):
   a later/inner callee): the suspect's local overflow writes upward and CAN reach the canary
   at a higher address. This attribution is physically plausible.
 - If suspect_frame_addr == canary_frame_addr: the function corrupted its own canary.
+
+**Self-frame priority rule**:
+- If suspect_frame_addr == canary_frame_addr, prioritize self-frame overflow, inline expansion,
+   or unprotected leaf-callee overwrite before investigating any other frame.
+- Do not pivot to interrupted-path or unrelated caller frames until you can explain why the
+   canary-bearing frame itself is not the primary suspect.
 
 Example of INVALID reasoning:
   "link_path_walk (frame at 0x17c08) overflowed and corrupted the canary of
@@ -270,9 +283,11 @@ Key indicators of nested exception frames:
   execution, not that link_path_walk called it directly.
 
 When analyzing nested exception frames:
-- The corruption source must be sought WITHIN the exception handler call chain itself
-  (the frames between the interrupted function and the canary-checking function), not in
-  the interrupted function's callers.
+- Treat the canary-bearing function's own frame as the primary investigation target first.
+- The exception-handler call chain is additional provenance context, not a default cross-frame
+   overflow source.
+- Do not pivot to unrelated interrupted-path callers unless you can prove a concrete write
+   primitive or proven overlap into the canary-bearing function's slot.
 - Do NOT upgrade an exception-handler frame to "likely overflow source" merely because it sits
    at a lower address than the canary frame or than the interrupted frame. First prove that the
    overwrite mechanism is an active local overwrite rather than reused stack residue, saved-state
