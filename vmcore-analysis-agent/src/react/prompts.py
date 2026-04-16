@@ -82,7 +82,10 @@ Q4 — Offset coverage:
 ### Stack-Corruption Mechanism Closure
 
 - If a stack canary is overwritten with a meaningful kernel value such as current task_struct, another recognizable object pointer, or a repeated non-random address, do not stop at reporting the overwritten value.
-- Before finalizing, explicitly evaluate three mechanism families: exception-path local overwrite, pre-fault residual-stack pollution later reused by the exception path, and current/current->field spill or copy overflow.
+- ⛔ CANARY INVARIANT: The stack protector prologue unconditionally writes the canary at function entry. Therefore "pre-fault residual-stack pollution" is NOT a valid canary corruption mechanism. Only writes occurring DURING the canary-bearing function's execution can corrupt the canary.
+- Before finalizing, explicitly evaluate these mechanism families: self-frame local overflow (the canary-bearing function's own code or its unprotected leaf callees), exception-path local overwrite, and current/current->field spill or copy overflow.
+- Prefer `resolve_stack_canary_slot` for canary-slot and frame-pointer-chain closure. Only if the tool is unavailable or unproven may you fall back to verified RBP arithmetic; never scan the stack for recognizable values and reverse-justify the address.
+- Prefer `classify_saved_rip_frames_tool` for phantom-frame and saved-RIP classification. Only if the tool is unavailable or unproven may you fall back to manual frame-by-frame saved-RIP validation.
 - Final diagnosis must either identify the most supported mechanism family or explicitly bound the remaining open set and explain why dump limitations prevent closure.
 - A conclusion that jumps directly from "task pointer in canary slot" to a broad subsystem blame without mechanism analysis is incomplete.
 
@@ -225,7 +228,7 @@ def simplified_structure_reasoning_prompt() -> str:
         "1. 'reasoning': Summarize the key reasoning points (3-6 sentences)\n"
         "2. 'step_id': Set to {current_step}\n"
         "3. 'action': If the reasoning suggests a specific crash command, return an object with exactly two fields: 'command_name' and 'arguments'. "
-        'Example: {"command_name": "rd", "arguments": ["-x", "ffff...", "16"]}. Otherwise set it to null. Do NOT return action as a string.\n'
+        'Example: {{"command_name": "rd", "arguments": ["-x", "ffff...", "16"]}}. Otherwise set it to null. Do NOT return action as a string.\n'
         "4. 'is_conclusive': Set to true ONLY if the reasoning explicitly states a final conclusion with root cause. "
         "Otherwise set to false.\n"
         f"5. 'signature_class': Extract the crash signature class from panic string analysis. Allowed values: {_quote_values(signature_values)}.\n"
@@ -268,6 +271,6 @@ def simplified_structure_reasoning_prompt() -> str:
         "}}\n"
         "```\n\n"
         "If a follow-up command is needed, replace action=null with a complete command object such as "
-        '{"command_name": "dis", "arguments": ["-rl", "ffffffff81000000"]}.\n\n'
+        '{{"command_name": "dis", "arguments": ["-rl", "ffffffff81000000"]}}.\n\n'
         "REMEMBER: Skip complex fields! They will be handled automatically after your response.\n"
     )

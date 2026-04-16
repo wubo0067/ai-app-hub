@@ -10,16 +10,19 @@ from typing import List, Optional
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from src.utils.logging import logger
 
+MCP_SERVER_NAME = "crash"
+
 # 初始化 MCP 客户端
 crash_client = MultiServerMCPClient(
     {
-        "crash": {
+        MCP_SERVER_NAME: {
             "command": sys.executable,
             "args": ["-m", "src.mcp_tools.crash.server"],
             "transport": "stdio",
         }
     }
 )
+MCP_CLIENT = crash_client
 
 # 全局工具列表（延迟初始化）
 _crash_tools: Optional[List] = None
@@ -34,11 +37,10 @@ async def _initialize_tools():
     try:
         logger.info("Initializing crash MCP tools...")
         _crash_tools = await crash_client.get_tools()
-        # 详细打印 tool 信息
-        logger.debug(
-            "\n".join(f"{tool.name}: {tool.description}" for tool in _crash_tools)
+        logger.info(
+            f"Successfully initialized {len(_crash_tools)} crash tools.\n\t%s",
+            "\n\t".join(f"{tool.name}: {tool.description}" for tool in _crash_tools),
         )
-        logger.info(f"Successfully initialized {len(_crash_tools)} crash tools.")
         return _crash_tools
     except Exception as e:
         logger.error(f"Failed to get tools from MCP client: {e}")
@@ -88,6 +90,32 @@ async def initialize_crash_tools() -> List:
         List: crash 工具列表
     """
     return await _initialize_tools()
+
+
+async def initialize_tools() -> List:
+    return await initialize_crash_tools()
+
+
+def build_tool_payload(
+    tool_name: str, raw_args, state: dict[str, object]
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "vmcore_path": state["vmcore_path"],
+        "vmlinux_path": state["vmlinux_path"],
+    }
+
+    if tool_name == "run_script":
+        script = (
+            raw_args.get("script", "") if isinstance(raw_args, dict) else str(raw_args)
+        )
+        payload["script"] = script
+        return payload
+
+    command = (
+        raw_args.get("command", "") if isinstance(raw_args, dict) else str(raw_args)
+    )
+    payload["command"] = command
+    return payload
 
 
 # 模块级别的工具列表（可能为空，需要在运行时初始化）

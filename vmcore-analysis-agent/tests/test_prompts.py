@@ -183,6 +183,16 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn('"command_name": "rd"', prompt)
         self.assertIn('"arguments": ["-x", "ffff...", "16"]', prompt)
 
+    def test_simplified_prompt_can_be_formatted_without_key_errors(self) -> None:
+        prompt = simplified_structure_reasoning_prompt().format(
+            current_step=4,
+            force_conclusion="",
+        )
+
+        self.assertIn('"command_name": "rd"', prompt)
+        self.assertIn('"command_name": "dis"', prompt)
+        self.assertIn('"step_id": 4', prompt)
+
     def test_minimal_schema_enum_contract_requires_canonical_values(self) -> None:
         contract = build_minimal_schema_enum_contract()
 

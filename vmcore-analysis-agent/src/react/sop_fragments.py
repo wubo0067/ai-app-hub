@@ -78,6 +78,96 @@ Analysis:
 14. If a bt segment implies an unexpected edge such as a VFS permission helper apparently calling an mm or vmstat helper directly, do not treat that adjacency as proof of normal execution. First decide whether it is a corrupted saved RIP, a stack-scan artifact, or an exception-nested splice.
 15. When sym fails on a non-symbol kernel address found repeatedly on the stack, do NOT abandon the address. Instead run vtop <address> to validate the page, then kmem -p <PA> to check page state. The address may be a per-CPU pointer, vmalloc object, or module data address that reveals the corruption source.
 """.strip(),
+    "stack_protector_fast_path": """
+## 3.8b Stack Protector Fast Path
+
+Use this SOP only when the panic string explicitly says stack-protector or the active frame is
+__stack_chk_fail.
+
+### Context Pruning
+
+- Skip generic ghost-frame hunting, residual-stack narratives, and prior-occupant reconstruction
+   until the canary slot has been closed by `resolve_stack_canary_slot` or a proven manual
+   fallback.
+- For __stack_chk_fail, the current bt is provisionally trustworthy for the active call path.
+   Do NOT make phantom-frame detection the first mandatory task.
+- Do not use stack-resident code addresses such as zone_statistics or link_path_walk as overflow-
+   source evidence before the canary slot has been proven and the mechanism family has been narrowed.
+
+### Phase 1: Canary Slot Closure (MANDATORY)
+
+1. Call `resolve_stack_canary_slot <function>` as the DEFAULT and PREFERRED action.
+2. Read the tool output and copy forward: return-address location, __stack_chk_fail_RBP,
+   canary-bearing function RBP, canary offset, canary slot address, canary slot contents,
+   and live gs:0x28 canary.
+3. Only if the tool is unavailable or returns unproven may you fall back to manual disassembly,
+   frame-pointer-chain arithmetic, and raw stack validation.
+4. If both the tool path and the manual fallback fail to close, report the canary slot as
+   unproven and STOP. Do NOT pivot to narrative-driven suspects or recognizable-value guessing.
+
+**Phase 1 Required Output**:
+```
+PHASE 1 RESULT:
+   Function: <canary_bearing_function>
+   Source: <resolve_stack_canary_slot | manual fallback>
+   Canary summary: <slot addr/value vs live gs:0x28 canary>
+   Key chain: <return-address location, __stack_chk_fail_RBP, caller RBP>
+   Status: <intact | overwritten | unproven>
+   Manual notes: <only if the tool was unavailable or unproven>
+```
+
+### Phase 2: Allowed Mechanism Triage (MANDATORY)
+
+Evaluate ONLY these mechanism families, in this order:
+1. Self-frame local overflow in the canary-bearing function.
+2. Active callee upward overwrite from a lower-address active callee.
+3. Active exception-path overwrite during the same execution window.
+
+For each candidate, require at least one of the following positive evidence items:
+- an overflow-capable local object;
+- a concrete write primitive;
+- proven overlap arithmetic into the canary slot;
+- verified active-call-chain membership during the canary-bearing window.
+
+The following are NOT candidate mechanisms for canary corruption and must not be listed:
+- residual stack pollution
+- pre-fault stack reuse
+- stale task pointer from a prior function
+- generic stack smearing
+- any theory derived only from a recognizable value found on the stack
+
+**Phase 2 Required Output**:
+```
+PHASE 2 RESULT:
+   Candidate mechanisms evaluated:
+      1. Self-frame local overflow: <evidence for/against>
+      2. Active callee upward overwrite: <evidence for/against>
+      3. Active exception-path overwrite: <evidence for/against>
+   Leading hypothesis: <mechanism or indeterminate>
+   Evidence: <concrete items>
+   Unresolved: <blocked verification>
+```
+
+### Phase 3: Conditional Provenance Check (ONLY IF NEEDED)
+
+Run a limited frame-provenance / phantom-frame check only if one of these is true:
+1. the bt contains a statically impossible caller-callee edge;
+2. duplicated saved RIPs remain unexplained after Phase 1 slot closure;
+3. you are explaining corruption of saved RIP/RBP or another NON-CANARY slot.
+
+If you run this phase:
+- call `classify_saved_rip_frames_tool [--start-frame N] [--end-frame M]` as the PRIMARY path;
+- use manual saved-RIP reading and `sym` only if the tool is unavailable or returns unproven;
+- use it only to classify frame reliability;
+- do not let it override verified canary-slot arithmetic;
+- do not use it to invent interrupted-path blame for link_path_walk, zone_statistics,
+   handle_mm_fault, or other stack-resident functions without a concrete write primitive.
+
+### Final Output Constraint
+
+If Phase 1 slot closure is unproven, or if none of the allowed mechanism families has positive
+evidence, the final suspect code location MUST remain indeterminate.
+""".strip(),
     "kasan_ubsan": """
 ## 3.11 KASAN / UBSAN Reports
 
@@ -180,11 +270,10 @@ Use this SOP when the crash path is inside a driver, struct -o cannot validate t
     "stack_frame_forensics": """
 ## 3.8a Stack Frame Forensics SOP
 
-Use this SOP when stack-protector fires (__stack_chk_fail) or when the backtrace contains
-subsystem-inconsistent frames (e.g., an mm/vmstat helper appearing inside a VFS/security
-call chain). This SOP provides the positive step-by-step procedure for frame-level validation,
-phantom frame detection, and overflow source tracing that complements the defensive rules in
-the stack_corruption playbook.
+Use this SOP for generic stack-smearing / phantom-frame forensics when the main problem is
+frame reliability, subsystem-inconsistent backtraces, or corruption of NON-CANARY stack data.
+Do NOT use this as the first-line SOP for explicit stack-protector / __stack_chk_fail cases;
+those cases must use the dedicated Stack Protector Fast Path first.
 
 ### ⛔ MANDATORY EXECUTION ORDER — NON-NEGOTIABLE
 
@@ -194,14 +283,15 @@ pursuing side investigations (such as disassembling non-canary-bearing functions
 completing Phase 3 is FORBIDDEN.
 
 **Phase Gate Rules**:
-- Phase 1 GATE: You must have identified and explicitly stated the FIRST phantom frame and
+- Phase 1 GATE: You must have called `classify_saved_rip_frames_tool` or an equivalent manual
+   fallback, then explicitly stated the FIRST phantom frame and
   the LAST trusted frame before proceeding to Phase 2. If you cannot identify phantom frames,
   state "no phantom frames detected" with evidence.
 - Phase 2 GATE: You must have classified the phantom frame mechanism (smearing / exception
   splice / corrupted saved RIP) before proceeding to Phase 3.
-- Phase 3 GATE: You must have computed RBP_absolute using the prologue-counting method
-  (step 4a-4d below) and verified the canary slot contents before proceeding to Phase 4.
-  Do NOT compute RBP by guessing from raw stack values.
+- Phase 3 GATE: You must have called `resolve_stack_canary_slot` or completed an equivalent
+   manual fallback and verified the canary slot contents before proceeding to Phase 4.
+   Do NOT compute RBP by guessing from raw stack values.
 - Phase 5 GATE: Before naming ANY suspect function, you must have completed the causality
   check with concrete evidence. If no mechanism has positive evidence, the conclusion MUST
   be "indeterminate — partial dump prevents closure" and the suspect code location MUST be
@@ -223,7 +313,12 @@ next candidate mechanism in Phase 5.
 
 Goal: identify the FIRST unreliable (phantom) frame in the backtrace.
 
-1. Starting from the outermost trusted frame (e.g., system_call_fastpath → sys_open → ...),
+1. Call `classify_saved_rip_frames_tool [--start-frame N] [--end-frame M]` as the DEFAULT path.
+   The tool deterministically reads saved RIP values from raw stack data, resolves them with
+   `sym`, and reports the last trusted frame plus the first unreliable phantom-frame candidate.
+
+2. Only if that tool is unavailable or returns unproven, perform the manual fallback:
+   starting from the outermost trusted frame (e.g., system_call_fastpath → sys_open → ...),
    walk inward (toward lower addresses / higher frame numbers in bt) and validate each frame's
    saved RIP:
    a. Read the saved RIP at [frame_addr] from the raw stack dump (bt -f output).
@@ -234,7 +329,7 @@ Goal: identify the FIRST unreliable (phantom) frame in the backtrace.
    d. If the resolved function is from an unrelated subsystem (e.g., mm/vmstat in a VFS path),
       mark this frame as the **first suspect phantom frame**.
 
-2. Check for **duplicate saved RIPs**: if two or more consecutive frames share the exact same
+3. Check for **duplicate saved RIPs**: if two or more consecutive frames share the exact same
     saved RIP value, treat this as a strong unwind or exception-boundary hint, not an automatic
     proof of stack smearing.
     - In an ordinary uninterrupted call chain, duplicated consecutive return addresses are highly
@@ -243,7 +338,7 @@ Goal: identify the FIRST unreliable (phantom) frame in the backtrace.
        exception nesting, pt_regs boundaries, unwinder residue, or stack-scan artifacts.
     - Only after that context check may you classify the first duplicated frame as phantom.
 
-3. Record and report:
+4. Record and report:
    - The last trusted frame (highest frame number with valid saved RIP and plausible caller edge).
    - The first phantom frame (frame number, address, and the anomalous saved RIP value).
     - Whether subsequent frames are truly phantom, exception-nested, or merely unwind-adjacent.
@@ -252,10 +347,12 @@ Goal: identify the FIRST unreliable (phantom) frame in the backtrace.
 **Phase 1 Required Output** (you MUST produce this before proceeding to Phase 2):
 ```
 PHASE 1 RESULT:
-  Last trusted frame: #<N> <function> at <address> (saved RIP <value> → <resolved_sym> ✓)
-  First phantom frame: #<N> <function> at <address> (saved RIP <value> → <resolved_sym> ✗ reason: <why implausible>)
-  Smearing signal: <duplicate saved RIPs? / subsystem mismatch? / other>
-  Frames #<X> through #<Y> are UNRELIABLE.
+   Source: <classify_saved_rip_frames_tool | manual fallback>
+   Last trusted frame: #<N> <function> at <address>
+   First unreliable frame: #<N> <function> at <address> (<reason>)
+   Reliability summary: <duplicate RIPs / caller mismatch / exception-adjacent / none>
+   Unreliable range: #<X>-#<Y> or <none>
+   Manual notes: <only if the tool was unavailable or unproven>
 ```
 
 ### Phase 2: Phantom Frame Mechanism Classification
@@ -293,29 +390,44 @@ PHASE 2 RESULT:
 
 Goal: compute the exact canary slot address from disassembly, not from bt frame addresses.
 
-1. Disassemble the canary-bearing function with `dis -rl <function>`.
+1. Call `resolve_stack_canary_slot <function>` as the DEFAULT path.
 
-2. Identify the prologue sequence and compute RBP:
+2. Only if that tool is unavailable or returns unproven, perform the manual fallback:
+   disassemble the canary-bearing function with `dis -rl <function>`.
+
+3. In the manual fallback, identify the prologue sequence and compute RBP:
    a. The standard x86-64 frame-pointer prologue is: push %rbp; mov %rsp, %rbp.
    b. After `mov %rsp, %rbp`, RBP equals the address where old RBP was saved.
    c. Subsequent pushes (push %r12, push %rbx, etc.) and `sub $N, %rsp` extend the frame
       below RBP.
 
-3. Identify the canary store instruction (e.g., `mov %rax, -0x18(%rbp)`) and compute the slot
+3a. **Recommended manual RBP derivation method — frame-pointer chain**:
+   a. If __stack_chk_fail has a standard frame-pointer prologue (push %rbp; mov %rsp, %rbp),
+      then [__stack_chk_fail_RBP + 8] = return address to search_module_extables.
+   b. Locate the return address (e.g., search_module_extables+153) in the raw stack dump.
+      The address where this return address is stored is __stack_chk_fail_RBP + 8.
+   c. Therefore __stack_chk_fail_RBP = (that address) - 8.
+   d. [__stack_chk_fail_RBP] = saved old RBP = the canary-bearing function's RBP.
+   e. This derivation is more reliable than guessing from bt frame addresses.
+
+4. Identify the canary store instruction (e.g., `mov %rax, -0x18(%rbp)`) and compute the slot
    only after RBP_absolute has been established by an independently closed proof.
 
-4. Accept an RBP_absolute candidate only if all of the following are true:
+5. Accept an RBP_absolute candidate only if all of the following are true:
    a. The candidate is consistent with the real function prologue and any pushes or local-space
       allocation below RBP.
    b. The value at [RBP_absolute] validates as a plausible saved RBP or frame link for that task.
    c. The value at [RBP_absolute+8] validates as a plausible saved RIP or return site.
    d. The resulting canary slot address matches the raw stack layout without contradiction.
 
-5. If that proof does not close, stop the arithmetic and report the canary slot as unproven.
+6. If that proof does not close, stop the arithmetic and report the canary slot as unproven.
    Do NOT derive RBP_absolute from the bt frame address by formula alone, and do NOT continue
    writer-provenance reasoning on top of an unverified canary slot.
+   Do NOT scan the stack for a "recognizable" value (like a task pointer) and reverse-justify
+   that address as the canary slot. The canary slot address must be derived from RBP arithmetic,
+   not from the value found at an address.
 
-6. Read the canary slot contents and evaluate only after the slot address is independently
+7. Read the canary slot contents and evaluate only after the slot address is independently
    validated:
    a. If the value is a valid gs:0x28 canary (high-entropy random), canary is intact — the
       __stack_chk_fail was triggered by something else (rare).
@@ -327,16 +439,11 @@ Goal: compute the exact canary slot address from disassembly, not from bt frame 
 ```
 PHASE 3 RESULT:
   Function: <canary_bearing_function>
-  Prologue evidence: <push/mov/sub sequence>
-  Candidate RBP_absolute: <value or unproven>
-  Independent checks:
-    [RBP_absolute] = <value> (saved RBP plausible? <yes/no>)
-    [RBP_absolute+8] = <value> (saved RIP plausible? <yes/no>)
-    slot-layout consistency = <yes/no>
-  Canary offset from disassembly: rbp-<offset>
-  Canary slot address: <value or unproven>
-  Canary slot contents: <value or unread / unproven>
-  Canary status: <intact | overwritten | unproven>
+   Source: <resolve_stack_canary_slot | manual fallback>
+   Canary summary: <slot addr/value vs live canary>
+   Verification: <tool closed the chain | manual checks passed | unproven>
+   Key chain: <caller RBP / saved RIP plausibility / slot-layout consistency>
+   Manual notes: <only if the tool was unavailable or unproven>
 ```
 
 ### Phase 4: Corruption Region Delineation
@@ -374,19 +481,19 @@ Procedure:
 
 1. **Identify candidate source mechanisms** (evaluate ALL before final attribution):
 
-   a. **Pre-fault residual-stack pollution**: The most common mechanism in VFS-path stack
-      corruption cases.
-      - During the active syscall path (e.g., path_openat → do_last → link_path_walk →
-        walk_component → lookup_slow → ... → page allocator → zone_statistics), deep callees
-        push frames into low-address stack regions.
-      - When those deep callees return, their frame data persists as stale residue.
-      - If a later exception (page fault, interrupt) causes new handler frames to be allocated
-        in that same low-address region, the canary slot of the handler function may coincide
-        with an address previously written by a returned callee.
-      - To investigate: identify which earlier (now-returned) functions had frames overlapping
-        the canary slot address. Disassemble candidate prior-occupant functions to check whether
-        any write `current`, function pointers, or structure data to local variables at offsets
-        that would land on the canary slot.
+   ⛔ **CRITICAL REMINDER**: The stack protector prologue (mov %gs:0x28, %rax; mov %rax, <canary_slot>)
+   UNCONDITIONALLY writes the canary at function entry. Therefore, residual or stale data that existed
+   at the canary slot address BEFORE the canary-bearing function was entered CANNOT be the cause of
+   __stack_chk_fail. Only writes that occur DURING the function's execution (after prologue, before
+   epilogue) can corrupt the canary.
+
+   a. **Self-frame local overflow (HIGHEST PRIORITY)**: The canary-bearing function itself, or an
+      inlined/unprotected leaf callee it invokes, performed an out-of-bounds write that reached
+      the canary slot.
+      - To investigate: audit the canary-bearing function's C source and disassembly for local
+        buffer operations, array accesses, structure copies, memcpy/memmove targets, or
+        inline-expanded callees with overflow-capable objects.
+      - This is the DEFAULT and MOST COMMON mechanism for stack-protector failures.
 
    b. **Active callee upward overflow**: A function at a LOWER address than the canary slot
       overflowed a local buffer upward, corrupting the canary at a higher address.
@@ -423,7 +530,7 @@ Procedure:
 ```
 PHASE 5 RESULT:
   Candidate mechanisms evaluated:
-    1. Pre-fault residual-stack pollution: <evidence for/against>
+    1. Self-frame local overflow (canary-bearing function or its unprotected leaf callees): <evidence for/against>
     2. Active callee upward overflow: <evidence for/against>
     3. Exception-path active overwrite: <evidence for/against>
     4. Stack reuse from struct copy/memcpy: <evidence for/against>
@@ -432,6 +539,11 @@ PHASE 5 RESULT:
   Unresolved: <what the partial dump prevents from verifying>
   Suspect code location: <function or "indeterminate"> (ONLY if concrete evidence exists)
 ```
+
+⛔ **REMINDER**: "Pre-fault residual-stack pollution" is NOT a valid canary corruption mechanism
+because the prologue unconditionally writes the canary. Do not list it as a candidate for canary
+corruption. It may be relevant for corruption of saved RBP, saved RIP, or non-canary locals, but
+NEVER for the canary slot itself.
 
 **FINAL OUTPUT CONSTRAINT**: If your Phase 5 leading hypothesis has confidence "low" or
 "indeterminate", you MUST set the final "可疑代码位置" to "indeterminate — insufficient

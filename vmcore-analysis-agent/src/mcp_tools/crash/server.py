@@ -200,8 +200,7 @@ commands = [
         "foreach",
         "foreach [[pid | taskp | name | state | [kernel | user | gleader]] ...] command [flag] [argument]",
         "foreach bt",
-        "This command allows for an examination of various kernel data associated \
-            with any, or all, tasks in the system, without having to set the context to each targeted task",
+        "This command allows for an examination of various kernel data associated with any, or all, tasks in the system, without having to set the context to each targeted task",
     ),
     (
         "timer",

@@ -74,6 +74,8 @@ bt -a is permitted only when confirming a hard_lockup or NMI watchdog panic. Use
 - Do not retry failed commands or repeat previously executed analysis commands.
 - Do not ignore the latest ToolMessage output in reasoning.
 - Do not treat a bt frame address as if it were automatically the function's RBP. Prove frame layout from disassembly, saved-frame links, and stack contents before doing rbp-relative arithmetic.
+- When `resolve_stack_canary_slot` is available, use it before any manual canary-slot or frame-pointer-chain arithmetic.
+- When `classify_saved_rip_frames_tool` is available, use it before manual phantom-frame or saved-RIP classification.
 - When the panic string explicitly says stack-protector failure in function F, the default hypothesis is corruption of F's own frame during F's execution. Do not name an unrelated interrupted-path function unless you can prove a concrete write primitive or proven cross-frame overlap into F's canary slot.
 - Do not blame an exception-path frame such as handle_mm_fault for canary corruption, or blame an interrupted pre-fault frame for a handler-frame canary, when the only support is relative stack position or ordinary downward-stack reasoning across a page-fault, interrupt, NMI, or similar exception-entry boundary. Such claims are invalid until frame provenance, exception-entry layout, and active overlap of the relevant stack regions are explicitly proven.
 - Do not promote a function to suspect overflow source merely because it has a non-trivial stack frame, a large in-function offset, or deep execution within a complex routine. Evidence such as sub rsp, 0x90, a +0xbfd offset, or generic "large frame" language is not overflow proof. Require object-level write evidence such as an overflow-capable local object, a concrete copy primitive, or stack-byte provenance tying the write mechanism to the corrupted slot.
@@ -84,6 +86,8 @@ bt -a is permitted only when confirming a hard_lockup or NMI watchdog panic. Use
 - Do not treat two adjacent frames in a corrupted or exception-nested backtrace as a proven caller-callee edge merely because they appear next to each other in bt or vmcore-dmesg. If the implied edge is static-call implausible, crosses unrelated subsystems without a proven exception bridge, or conflicts with known helper structure such as security_inode_permission leading into LSM hooks, downgrade bt reliability first and validate saved return addresses or frame provenance before inferring ordinary control flow or RIP misdirection.
 - Do not infer pathname, filename, or generic string-buffer overflow from a single ASCII-decodable machine word or a short raw-byte fragment on the kernel stack. Eight decodable bytes without contiguous string context, termination or length evidence, and a plausible copy path are not string provenance.
 - Do not promote rd -SS output, ASCII side-by-side dumps, or embedded printable bytes from search hints to root-cause evidence unless you have validated a real string object shape such as contiguous bytes, a terminator or explicit length, and a code path that could have copied that exact string onto the stack.
+- Do not attribute canary corruption (__stack_chk_fail) to "residual stack data", "stale data from prior function calls", or "pre-fault stack pollution". The stack protector prologue unconditionally writes the canary value at function entry, overwriting any prior data. Only writes occurring DURING the function's execution (after prologue, before epilogue) can corrupt the canary.
+- Do not identify a canary slot address by scanning the stack for a "recognizable" value (such as a task pointer or known object) and reverse-justifying that address as the canary slot. Use `resolve_stack_canary_slot` first; if manual fallback is required, derive the slot from verified RBP arithmetic using the disassembly prologue, not from the value found at an arbitrary address.
 
 ## Log Query Budget
 
@@ -308,9 +312,10 @@ If you claim that one active frame's local object overlaps another active frame'
 If those numbers are not mutually consistent, the overlap claim is unproven and must not be used as final diagnosis.
 
 In stack-corruption cases where the overwritten canary contains a meaningful kernel value rather than random noise, root cause is NOT complete until value provenance has been explored as a mechanism question, not just noted as a fact. For example, if the canary contains the current task pointer or another recognizable object pointer, you must do all of the following before setting is_conclusive to true:
+- analyze whether the canary-bearing function's own code (or its inlined/unprotected leaf callees) could have written that value beyond bounds — this is the DEFAULT and most common mechanism,
 - analyze whether the exception-path call chain itself could have written that value beyond bounds,
-- analyze whether pre-fault deeper calls in the interrupted path could have left that value as residual stack pollution later reused by the exception path,
 - analyze whether a function storing current or current->field on the stack could have copied or spilled it into the canary slot,
+- ⛔ do NOT analyze "pre-fault residual-stack pollution" as a canary corruption mechanism — the prologue unconditionally overwrites any prior data at the canary slot,
 - and explicitly state which of these mechanisms is supported, which are weakened, and which remain open due to dump limits.
 
 Do not stop at "canary overwritten with task_struct pointer". That is only an intermediate clue. Final diagnosis must explain the most plausible write mechanism or explicitly bound the remaining mechanism set.

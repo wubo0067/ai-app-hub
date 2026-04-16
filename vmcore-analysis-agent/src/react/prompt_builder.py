@@ -65,7 +65,7 @@ def build_analysis_system_prompt(state: AgentState, *, is_last_step: bool) -> st
         build_executor_state_section(state),
     ]
 
-    playbook = _select_playbook(state.get("current_signature_class"))
+    playbook = _select_playbook(state)
     if playbook:
         prompt_parts.append(playbook)
 
@@ -128,23 +128,27 @@ def build_executor_state_section(state: AgentState) -> str:
     return "\n".join(lines)
 
 
-def _select_playbook(
-    signature_class: Optional[CrashSignatureClass],
-) -> str:
+def _select_playbook(state: AgentState) -> str:
     """
-    根据崩溃签名类别选择对应的剧本 (playbook) 内容。
+    根据崩溃签名类别和上下文选择对应的剧本 (playbook) 内容。
 
     该函数用于从预定义的 PLAYBOOKS 字典中获取与指定崩溃签名类别相关联的剧本内容。
     如果传入的签名类别为空或为"unknown"，则返回空字符串。
 
     Args:
-        signature_class (Optional[CrashSignatureClass]): 崩溃签名类别，可能为 None 或"unknown"
+        state (AgentState): 当前分析状态。
 
     Returns:s
         str: 对应的剧本内容字符串，如果找不到匹配项则返回空字符串
     """
+    signature_class = state.get("current_signature_class")
     if not signature_class or signature_class == "unknown":
         return ""
+
+    recent_text = _recent_text_blob(state.get("messages", []))
+    if _is_stack_protector_case(signature_class, recent_text):
+        return PLAYBOOKS.get("stack_protector_canary", "")
+
     return PLAYBOOKS.get(signature_class, "")
 
 
@@ -169,6 +173,7 @@ def _select_sop_fragments(state: AgentState) -> list[str]:
     gates = cast(Optional[dict[str, GateEntry]], state.get("managed_gates")) or {}
     recent_text = _recent_text_blob(state.get("messages", []))
     lowered_recent_text = recent_text.lower()
+    stack_protector_case = _is_stack_protector_case(signature_class, recent_text)
 
     external_gate = gates.get("external_corruption_gate")
     local_gate = gates.get("local_corruption_exclusion")
@@ -230,10 +235,12 @@ def _select_sop_fragments(state: AgentState) -> list[str]:
     if (
         "stack overflow" in lowered_recent_text
         or "stack corruption" in lowered_recent_text
-    ):
+    ) and not stack_protector_case:
         fragments.append(SOP_FRAGMENTS["stack_overflow"])
 
-    if signature_class == "stack_corruption":
+    if stack_protector_case:
+        fragments.append(SOP_FRAGMENTS["stack_protector_fast_path"])
+    elif signature_class == "stack_corruption":
         fragments.append(SOP_FRAGMENTS["stack_frame_forensics"])
 
     if "kasan" in lowered_recent_text or "ubsan" in lowered_recent_text:
@@ -248,6 +255,29 @@ def _select_sop_fragments(state: AgentState) -> list[str]:
         fragments.append(SOP_FRAGMENTS["advanced_techniques"])
 
     return _dedupe_preserve_order(fragments)
+
+
+def _is_stack_protector_case(
+    signature_class: Optional[CrashSignatureClass], recent_text: str
+) -> bool:
+    """
+    判断当前 stack_corruption 是否为显式的 stack-protector / __stack_chk_fail 场景。
+
+    这类 case 需要使用经过上下文裁剪的 canary 专用 playbook/SOP，避免将
+    generic stack smearing、residual pollution 等叙事与 canary 规则同时注入。
+    """
+    if signature_class != "stack_corruption":
+        return False
+
+    lowered_recent_text = recent_text.lower()
+    return any(
+        marker in lowered_recent_text
+        for marker in (
+            "stack-protector",
+            "__stack_chk_fail",
+            "kernel stack is corrupted in",
+        )
+    )
 
 
 def _format_hypotheses(raw_hypotheses: object) -> str:

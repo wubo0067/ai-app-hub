@@ -174,6 +174,84 @@ Analysis:
 """.strip(),
     "bug_on": _BUG_WARN_PLAYBOOK,
     "warn_on": _BUG_WARN_PLAYBOOK,
+    "stack_protector_canary": """
+## Stack Protector / Canary Failure
+Pattern: stack-protector: Kernel stack is corrupted in: <function>, or active frame is __stack_chk_fail.
+
+### Context-Pruning Rule
+
+When this playbook is selected, IGNORE generic residual-stack, prior-occupant, ghost-frame,
+or stack-smearing narratives unless you have already proved that a NON-CANARY target
+(saved RIP, saved RBP, or other local slot) is the object that was corrupted.
+
+For the canary slot itself, the ONLY admissible time window is AFTER the canary-bearing
+function's prologue store and BEFORE its epilogue check.
+
+### ⛔ COMPILER-LEVEL CANARY INVARIANT (NON-NEGOTIABLE)
+
+The GCC/Clang stack protector prologue unconditionally writes the canary value into the slot:
+```
+mov %gs:0x28, %rax
+mov %rax, -0x18(%rbp)
+```
+
+Therefore:
+1. Residual stack data CANNOT explain __stack_chk_fail.
+2. Pre-fault stack reuse CANNOT explain __stack_chk_fail.
+3. A stale task pointer from an earlier function CANNOT explain __stack_chk_fail.
+4. Only a write that occurs DURING the canary-bearing function's execution can corrupt the canary.
+
+### Mandatory Fast Path
+
+Your first actions MUST be:
+1. Call `resolve_stack_canary_slot <function>` as the PRIMARY path to derive the
+   __stack_chk_fail frame-pointer chain, canary-bearing RBP, canary slot address, and live
+   gs:0x28 comparison.
+2. Only if that tool is unavailable or returns unproven, fall back to manual disassembly and
+   frame-pointer arithmetic.
+3. After the canary slot has been closed, audit only the allowed mechanism families listed below.
+
+Do NOT begin with phantom-frame hunting, prior-occupant reconstruction, or interrupted-path
+story building. Those are conditional fallback investigations, not the primary path.
+
+### ONLY Allowed Mechanism Families
+
+You MUST keep the candidate set restricted to:
+1. Self-frame local overflow in the canary-bearing function.
+2. Active callee upward overwrite from a lower-address active callee.
+3. Active exception-path overwrite by code executing during the same canary-bearing window.
+
+The following are FORBIDDEN as canary mechanisms:
+- residual stack pollution
+- stale data from prior function calls
+- prior-frame reuse
+- generic stack smearing
+- a mere recognizable value found on the stack
+
+### Blame Guardrails
+
+- Do not blame link_path_walk, zone_statistics, handle_mm_fault, or any interrupted-path frame
+   merely because its address appears on the stack.
+- Do not identify the canary slot by scanning for a task pointer, code address, or other
+   recognizable value and reverse-justifying the address.
+- Do not use stack direction across an exception boundary unless frame provenance and active
+   overlap have been explicitly proven.
+
+### Conditional Provenance Fallback
+
+Only after the canary slot has been closed by `resolve_stack_canary_slot` (or a proven manual
+fallback) may you perform limited frame
+provenance checks, and only for one of these reasons:
+1. bt contains a statically impossible caller-callee edge.
+2. duplicated saved RIPs remain unexplained after canary-slot closure.
+3. you are now explaining corruption of a non-canary slot rather than the canary itself.
+
+When one of those conditions is met, call `classify_saved_rip_frames_tool` before attempting
+manual phantom-frame or saved-RIP classification.
+
+If none of the allowed mechanism families has positive evidence, the conclusion MUST remain
+indeterminate and no specific function may be named as the overflow source.
+""".strip(),
     "stack_corruption": """
 ## Stack Corruption / Stack Protector Failure
 Pattern: stack-protector: Kernel stack is corrupted in: <function>.
@@ -196,6 +274,34 @@ hypothesis is corruption of F's own frame during F's execution. Do not name an u
 interrupted-path function unless you can prove a concrete write primitive or proven
 cross-frame overlap into F's canary slot.
 
+### ⛔ COMPILER-LEVEL CANARY INVARIANT (NON-NEGOTIABLE)
+
+The GCC/Clang stack protector prologue **unconditionally** writes the canary value into the
+canary slot at function entry:
+```
+mov %gs:0x28, %rax       ; load random canary from per-CPU area
+mov %rax, -0x18(%rbp)    ; store canary into slot (overwrites ANY prior data)
+```
+This means:
+1. **Residual stack data CANNOT cause __stack_chk_fail.** The prologue store overwrites whatever
+   value was at the canary slot before the function was entered. Pre-existing "stale" or
+   "residual" data from prior function calls, returned helpers, or pre-exception frames is
+   irrelevant to canary integrity.
+2. **The ONLY way __stack_chk_fail triggers** is if code executing AFTER the prologue store and
+   BEFORE the epilogue check overwrites the canary slot. This means: a buffer overflow, an
+   out-of-bounds write, a wild pointer store, a memcpy/structure-copy overrun, or similar
+   write primitive that occurs DURING the canary-bearing function's execution (including its
+   callees that share the same stack frame region below RSP).
+3. **Reject any theory** that attributes canary corruption to "residual stack pollution",
+   "pre-fault data reuse", "stale task pointer left by a prior function", or any mechanism
+   that operates BEFORE the canary-bearing function's prologue. Such theories violate this
+   compiler invariant and are ALWAYS wrong.
+4. **Correct investigation direction**: audit the canary-bearing function's C source code for
+   local buffer operations, array accesses, structure copies, or inline-expanded callees that
+   could write past their bounds into the canary slot. Also check unprotected leaf callees
+   (functions without their own canary) that the canary-bearing function calls, as those
+   callees' stack frames overlap the caller's sub-RSP region.
+
 ### Mandatory Stack Corruption Analysis Checklist
 
 Before naming a local overflow source, complete this checklist in order:
@@ -204,7 +310,10 @@ Before naming a local overflow source, complete this checklist in order:
 3. Classify nearby frames as ordinary caller/callee frames versus interrupted-frame, pt_regs or exception-entry state, and exception-handler frames.
 4. Apply stack-growth direction only within a proven ordinary call segment; do not carry ordinary overflow causality across an exception boundary.
 5. If the suspected source and corrupted slot are separated by an exception-entry boundary, keep local-overflow attribution provisional until frame provenance and active-overlap arithmetic are proven.
-6. Evaluate at least these alternative mechanisms before final blame: active overwrite inside the exception path, stack-slot reuse from pre-fault returned frames, stale stack residue, and frame reconstruction error.
+6. Evaluate at least these alternative mechanisms before final blame: self-frame local overflow
+   (canary-bearing function's own code or unprotected leaf callees), active overwrite inside the
+   exception path, stack-slot reuse from pre-fault returned frames (valid for saved RBP/RIP/locals
+   but NOT for the canary slot — see CANARY INVARIANT above), and frame reconstruction error.
 
 ### CRITICAL: Stack Growth Direction and Causality Constraint (x86-64)
 
@@ -396,8 +505,15 @@ is a critical forensic clue. Pursue it aggressively:
 
 ### Stack Reuse and Prior-Frame Pollution Mechanism
 
+⛔ **CANARY INVARIANT REMINDER**: The following discussion of residual stack data applies to
+corruption of saved RBP, saved RIP, and non-canary local variables. It does NOT apply to canary
+corruption. The stack protector prologue unconditionally writes the canary at function entry,
+overwriting any residual data. For __stack_chk_fail cases, the canary was corrupted DURING the
+function's execution, not before it.
+
 On a kernel stack, when a function returns, its frame data remains in memory as stale residue
-until another function call overwrites it. This creates a "ghost frame" effect:
+until another function call overwrites it. This creates a "ghost frame" effect that can corrupt
+non-canary frame data:
 
 19. **Identify the stack-reuse timeline**: When an exception (page fault, interrupt) occurs during
     a function's execution, the exception handler pushes new frames onto the same stack. These new
@@ -417,19 +533,25 @@ until another function call overwrites it. This creates a "ghost frame" effect:
        artifact, or corrupted saved return path.
     d. The page fault handler pushes new frames (handle_mm_fault → search_module_extables)
        into the SAME low-address region that was previously used by the returned deep helpers.
-    e. search_module_extables's canary slot now occupies an address that was previously written
-       by one of those returned helpers.
+    e. search_module_extables's saved RBP, saved RIP, or non-canary local variables may now
+       occupy addresses that were previously written by those returned helpers. However, the
+       CANARY SLOT is immune to this effect because the prologue unconditionally overwrites it.
+       Residual data can explain corrupted frame links or spurious unwinder output, but it
+       CANNOT explain __stack_chk_fail.
 
-20. **Investigate the prior occupants**: To find the corruption source under this mechanism:
-    a. Calculate which earlier (now-returned) functions had frames overlapping the canary slot
+20. **Investigate the prior occupants**: To find non-canary corruption under this mechanism:
+    a. Calculate which earlier (now-returned) functions had frames overlapping the affected
        address. Use the stack base from `task -R stack` and the frame addresses from `bt` to
        map the used stack range.
     b. Disassemble candidate prior-occupant functions to check whether any of them write
        `current` (task pointer), function pointers, or structure data to local variables at
-       offsets that would land on the canary slot.
+       offsets that would land on the corrupted slot.
     c. If a prior-occupant function had an off-by-one or boundary error that wrote past its
        frame into adjacent stack space, the residue would persist and be discoverable when
-       the canary slot is reused.
+       the slot is reused.
+    d. ⛔ Do NOT use this mechanism to explain canary corruption. The canary prologue
+       overwrites any residual data. For __stack_chk_fail cases, focus on self-frame overflow
+       (mechanism 25a) instead.
 
 20a. **Analyze the active call chain before exception-path blame**:
     a. If the panic task is still on a coherent syscall path such as sys_open -> do_filp_open ->
@@ -441,11 +563,17 @@ until another function call overwrites it. This creates a "ghost frame" effect:
        fault.c or handle_mm_fault, without first auditing the active VFS/open-path frames, is
        incomplete and must remain non-conclusive.
 
-21. **Residual data pattern matching**: Compare the corrupted canary value and surrounding
-    corrupted bytes against known kernel data patterns:
-    a. task_struct pointer at canary slot → prior function stored `current` and OOB-wrote it
-    b. Repeated non-symbol addresses → structure copy or memcpy overflow from a known object
-    c. Contiguous validated string object → only then consider string-copy style overflow; an
+21. **Residual data pattern matching**: Compare corrupted stack data and surrounding bytes
+    against known kernel data patterns. For NON-CANARY slots (saved RBP, saved RIP, locals),
+    residual data from prior functions is a valid corruption source. For the CANARY SLOT,
+    residual data is irrelevant — the prologue overwrites it; only in-execution writes matter.
+    a. task_struct pointer at canary slot → the canary-bearing function (or its active callee)
+       accessed `current` and an OOB write during execution spilled it into the canary slot;
+       NOT residual data from a prior function
+    b. task_struct pointer at non-canary slot → prior function may have stored `current` as
+       residual, or active function spilled it
+    c. Repeated non-symbol addresses → structure copy or memcpy overflow from a known object
+    d. Contiguous validated string object → only then consider string-copy style overflow; an
        isolated ASCII-decodable 8-byte word is only a weak clue and cannot establish pathname,
        filename, or userspace-string provenance by itself
 
@@ -484,13 +612,17 @@ Before final diagnosis, you must explicitly work through this closure checklist:
     c. Prefer candidate functions that could plausibly materialize `current`, `current->field`,
        validated string objects, or copied structure fields on the stack.
 
-25. **Mechanism triage**: evaluate all three mechanism families, not just one:
-    a. exception-path local overwrite: a function in the exception/page-fault path wrote past its
+25. **Mechanism triage**: evaluate the following mechanism families, not just one:
+    a. self-frame local overflow: the canary-bearing function itself (or an inlined/unprotected
+       leaf callee) performed an out-of-bounds write that reached the canary slot. THIS IS THE
+       DEFAULT AND MOST COMMON MECHANISM and must be evaluated FIRST;
+    b. exception-path local overwrite: a function in the exception/page-fault path wrote past its
        own local bounds into the canary slot;
-    b. pre-fault residual-stack pollution: an earlier, already-returned function left stale data
-       that was later reused by search_module_extables or another exception-path frame;
     c. current-pointer spill/copy overflow: some function stored `current` or `current->xxx` in a
-       local stack slot and then copied or wrote beyond that slot.
+       local stack slot and then copied or wrote beyond that slot;
+    d. ⛔ Do NOT list "pre-fault residual-stack pollution" as a canary corruption mechanism. The
+       prologue unconditionally writes the canary, overwriting any residual data. Residual data
+       can only corrupt saved RBP, saved RIP, or non-canary locals.
 
 26. **Conclusive-output gate**:
     a. Do not set is_conclusive=true unless at least one mechanism family above has positive

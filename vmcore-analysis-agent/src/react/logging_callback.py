@@ -49,6 +49,13 @@ class GraphLoggingCallback(BaseCallbackHandler):
             return
         self._logged_error_ids.add(err_id)
 
+        if self._is_recoverable_output_parsing_error(error):
+            logger.warning(
+                "Structured output parsing failed during LLM invocation; fallback logic may recover. Error: %s",
+                error,
+            )
+            return
+
         # logger.error("=" * 80)
         logger.error(f"❌ Graph execution failed with error: {error}")
         # logger.error("=" * 80)
@@ -88,6 +95,13 @@ class GraphLoggingCallback(BaseCallbackHandler):
 
     def on_llm_error(self, error: BaseException, **kwargs: Any) -> None:
         """当 LLM 调用出错时"""
+        if self._is_recoverable_output_parsing_error(error):
+            logger.warning(
+                "  ⚠ Structured output parsing failed; fallback logic may recover: %s",
+                error,
+            )
+            return
+
         logger.error(f"  ✗ LLM invocation failed: {error}")
 
     def on_agent_action(self, action: Any, **kwargs: Any) -> None:
@@ -127,6 +141,11 @@ class GraphLoggingCallback(BaseCallbackHandler):
             else:
                 formatted[k] = str(v)[:100] + "..." if len(str(v)) > 100 else v
         return formatted
+
+    @staticmethod
+    def _is_recoverable_output_parsing_error(error: BaseException) -> bool:
+        message = str(error)
+        return "Invalid json output" in message or "OUTPUT_PARSING_FAILURE" in message
 
 
 # 全局回调处理器实例

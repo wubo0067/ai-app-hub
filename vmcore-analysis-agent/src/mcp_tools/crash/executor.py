@@ -5,10 +5,19 @@
 # Created: 2026-01-09
 
 import subprocess
-from src.utils.logging import logger
-from src.utils.os import get_linux_distro_version
 
-distro, version = get_linux_distro_version()
+
+def _get_logger():
+    from src.utils.logging import logger
+
+    return logger
+
+
+def _get_linux_distro_version() -> tuple[str, str]:
+    from src.utils.os import get_linux_distro_version
+
+    return get_linux_distro_version()
+
 
 # crash 命令单次执行的最长等待时间（秒）。
 # log | grep 等大输出命令可能导致无限期阻塞，超时后强制终止进程并返回截断结果。
@@ -51,6 +60,7 @@ def run_crash_command_rhel9(command, vmcore_path, vmlinux_path, verbose=False):
     Returns:
         str: The output of the crash command.
     """
+    logger = _get_logger()
     full_cmd = ["crash", vmlinux_path, vmcore_path]
     process = subprocess.Popen(
         full_cmd,
@@ -136,6 +146,7 @@ def run_crash_script_rhel9(script_content, vmcore_path, vmlinux_path, verbose=Fa
     Returns:
         str: The filtered output of the crash session.
     """
+    logger = _get_logger()
     full_cmd = ["crash", vmlinux_path, vmcore_path]
 
     # 执行 crash 命令，通过 stdin 传入脚本内容
@@ -240,6 +251,7 @@ def run_crash_command(full_subcmd, vmcore_path, vmlinux_path, verbose=False):
     """
 
     # 工具运行的 OS 环境和版本
+    distro, version = _get_linux_distro_version()
     if distro == "rhel" and int(version) == 9:
         return run_crash_command_rhel9(full_subcmd, vmcore_path, vmlinux_path, verbose)
     else:
@@ -255,6 +267,7 @@ def run_crash_script(script_content, vmcore_path, vmlinux_path, verbose=False):
     Returns:
         str: The output of the crash script.
     """
+    distro, version = _get_linux_distro_version()
     if distro == "rhel" and int(version) == 9:
         return run_crash_script_rhel9(
             script_content, vmcore_path, vmlinux_path, verbose

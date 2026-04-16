@@ -17,11 +17,13 @@ VMCore 分析 Agent 节点实现
 import asyncio
 import json
 import re
+from contextlib import AsyncExitStack
 from typing import List, Tuple, Any
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_mcp_adapters.tools import load_mcp_tools
 from src.utils.logging import logger
+from src.mcp_tools import get_registered_tool_provider
 from .graph_state import AgentState
 from .prompts import crash_init_data_prompt
 from .action_guard import (
@@ -32,7 +34,6 @@ from .action_guard import (
     extract_command_lines,
     validate_tool_call_request,
 )
-from src.mcp_tools.crash.client import crash_client
 
 # =========================================================================
 # 节点名称常量定义
@@ -61,64 +62,82 @@ DEFAULT_CRASH_COMMANDS: list[str] = [
 ]
 
 
-async def dispatch_crash_commands(
-    commands: List[str], state: AgentState
+async def dispatch_mcp_requests(
+    requests: List[dict[str, Any]], state: AgentState
 ) -> List[Tuple[str, Any]]:
     """
-    匹配工具并并发执行 crash 命令。
-    此函数会管理 MCP 会话的生命周期。
+    匹配工具并并发执行 MCP 工具调用。
+    此函数会按工具所属 provider 管理 MCP 会话生命周期。
 
     Args:
-        commands: 待执行的命令列表
+        requests: 待执行的 MCP 请求列表。每项至少包含 display/tool_name/args。
         state: 当前 Agent 状态
 
     Returns:
         List[Tuple[str, Any]]: [(命令，结果)]
     """
     tasks: List[Tuple[str, asyncio.Task]] = []
+    tools_by_provider: dict[str, dict[str, Any]] = {}
+    providers_in_use = {}
 
-    # 创建 MCP 会话并获取工具列表
-    async with crash_client.session("crash") as session:
-        tools = await load_mcp_tools(session)
-        logger.info(f"Retrieved {len(tools)} tools from MCP client.")
+    for request in requests:
+        tool_name = request["tool_name"]
+        provider = get_registered_tool_provider(tool_name)
+        if provider is None:
+            logger.warning("No registered MCP provider found for tool: %s", tool_name)
+            continue
+        providers_in_use[provider.package_name] = provider
 
-        for cmd in commands:
-            # 命令分解：工具名 + 参数。例如 "run_script mod -s ..." -> tool_name="run_script"
-            parts = cmd.split(" ", 1)
-            tool_name = parts[0]
-            # 注意：实际传递给 invoke 的 command 并不只是剩余参数，
-            # 需要根据工具定义的 schema 构造 payload。
-            # 这里目前的 dispatch_crash_commands 假设所有工具只有一个参数 'command'，值为完整命令行。
-            # 但 run_script 的参数名是 'script'。这就需要差异化处理。
-
-            # 使用精准匹配而不是 startswith，防止 "sys" 匹配到 "systemd" 等（如果有的话）
-            tool = next(
-                (t for t in tools if t.name == tool_name),
-                None,
+    async with AsyncExitStack() as stack:
+        for provider in providers_in_use.values():
+            session = await stack.enter_async_context(
+                provider.client.session(provider.server_name)
             )
+            tools = await load_mcp_tools(session)
+            logger.info(
+                "Retrieved %d tools from MCP provider %s.",
+                len(tools),
+                provider.package_name,
+            )
+            tools_by_provider[provider.package_name] = {
+                tool.name: tool for tool in tools
+            }
 
-            if tool:
-                # 构造调用载荷
-                payload = {
-                    "vmcore_path": state["vmcore_path"],
-                    "vmlinux_path": state["vmlinux_path"],
-                }
+        for request in requests:
+            display = request["display"]
+            tool_name = request["tool_name"]
+            args = request["args"]
 
-                if tool_name == "run_script":
-                    # run_script 工具需要的参数是 'script'
-                    # 其内容应该是除了工具名之外的所有部分
-                    script_content = parts[1] if len(parts) > 1 else ""
-                    # 之前的 cmd 构造逻辑已经处理了 join，这里直接透传内容即可
-                    # 但需要注意，cmd 是 "run_script line1\nline2..."
-                    payload["script"] = script_content
-                else:
-                    # 其他标准 crash 工具，需要的参数是 'command'，值为完整命令行
-                    payload["command"] = cmd
+            provider = get_registered_tool_provider(tool_name)
+            if provider is None:
+                logger.warning("No provider available for tool call: %s", display)
+                continue
 
-                tasks.append((cmd, asyncio.create_task(tool.ainvoke(payload))))
-                logger.debug(f"Matched tool '{tool_name}' for input: {cmd[:50]}...")
-            else:
-                logger.warning(f"No tool found for command: {cmd}")
+            tool = tools_by_provider.get(provider.package_name, {}).get(tool_name)
+            if tool is None:
+                logger.warning(
+                    "Provider %s did not expose tool %s",
+                    provider.package_name,
+                    tool_name,
+                )
+                continue
+
+            try:
+                payload = provider.build_tool_payload(tool_name, args, state)
+            except Exception as exc:
+                logger.error("Failed to build payload for tool %s: %s", tool_name, exc)
+                tasks.append(
+                    (display, asyncio.create_task(asyncio.sleep(0, result=exc)))
+                )
+                continue
+
+            tasks.append((display, asyncio.create_task(tool.ainvoke(payload))))
+            logger.debug(
+                "Matched provider '%s' tool '%s' for request: %s",
+                provider.package_name,
+                tool_name,
+                display[:80],
+            )
 
         results = []
         if tasks:
@@ -146,7 +165,22 @@ async def dispatch_crash_commands(
                 else:
                     results.append(str(res).strip())
 
-    return list(zip([cmd for cmd, _ in tasks], results))
+    return list(zip([display for display, _ in tasks], results))
+
+
+async def dispatch_crash_commands(
+    commands: List[str], state: AgentState
+) -> List[Tuple[str, Any]]:
+    requests = []
+    for cmd in commands:
+        parts = cmd.split(" ", 1)
+        tool_name = parts[0]
+        if tool_name == "run_script":
+            args = {"script": parts[1] if len(parts) > 1 else ""}
+        else:
+            args = {"command": cmd}
+        requests.append({"display": cmd, "tool_name": tool_name, "args": args})
+    return await dispatch_mcp_requests(requests, state)
 
 
 async def collect_crash_init_data(state: AgentState) -> dict:
@@ -453,9 +487,11 @@ async def call_crash_tool(state: AgentState) -> dict:
                 )
 
                 tool_calls_data.append(
-                    (tool_call_id, name, full_cmd, current_fingerprint)
+                    (tool_call_id, name, full_cmd, current_fingerprint, args)
                 )
-                commands_to_run.append(full_cmd)
+                commands_to_run.append(
+                    {"display": full_cmd, "tool_name": name, "args": args}
+                )
 
                 logger.debug(
                     f"Processing tool call: {name} (ID: {tool_call_id}) -> Cmd: {full_cmd}"
@@ -463,7 +499,7 @@ async def call_crash_tool(state: AgentState) -> dict:
 
             # 使用公共函数批量执行命令
             if commands_to_run:
-                matched_results = await dispatch_crash_commands(commands_to_run, state)
+                matched_results = await dispatch_mcp_requests(commands_to_run, state)
                 # matched_results 是 List[(cmd, output)]，只包含成功匹配并执行的结果
 
                 # 将结果映射回 ToolMessage
@@ -472,6 +508,7 @@ async def call_crash_tool(state: AgentState) -> dict:
                     tool_name,
                     original_cmd,
                     fingerprint,
+                    _raw_args,
                 ) in tool_calls_data:
                     found_result = False
 
