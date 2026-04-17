@@ -5,6 +5,12 @@
 # Created: 2026-01-09
 
 from .prompt_layers import LAYER0_SYSTEM_PROMPT_TEMPLATE, PLAYBOOKS, SOP_FRAGMENTS
+from .prompt_overlays import DRIVER_OBJECT_OVERLAY, STACK_CORRUPTION_OVERLAY
+from .prompt_phrases import (
+    CANARY_POINTER_VALUE_PARTIAL_DUMP_RULE,
+    CANARY_POINTER_VALUE_RULE,
+    STACK_CAUSALITY_RED_LINE_RULE,
+)
 from .schema import (
     get_corruption_mechanism_aliases,
     get_corruption_mechanism_values,
@@ -51,7 +57,7 @@ def build_minimal_schema_enum_contract() -> str:
     )
 
 
-_ANALYSIS_PROMPT_COMPATIBILITY_APPENDIX = """
+_ANALYSIS_PROMPT_COMPATIBILITY_APPENDIX = f"""
 ## Compatibility Appendix
 
 ### Minimal-Output Contract Reminder
@@ -81,11 +87,11 @@ Q4 — Offset coverage:
 
 ### Stack-Corruption Mechanism Closure
 
-- If a stack canary is overwritten with a meaningful kernel value such as current task_struct, another recognizable object pointer, or a repeated non-random address, do not stop at reporting the overwritten value.
+- {CANARY_POINTER_VALUE_RULE}
+- {CANARY_POINTER_VALUE_PARTIAL_DUMP_RULE}
 - ⛔ CANARY INVARIANT: The stack protector prologue unconditionally writes the canary at function entry. Therefore "pre-fault residual-stack pollution" is NOT a valid canary corruption mechanism. Only writes occurring DURING the canary-bearing function's execution can corrupt the canary.
 - Before finalizing, explicitly evaluate these mechanism families: self-frame local overflow (the canary-bearing function's own code or its unprotected leaf callees), exception-path local overwrite, and current/current->field spill or copy overflow.
 - Prefer `resolve_stack_canary_slot` for canary-slot and frame-pointer-chain closure. Only if the tool is unavailable or unproven may you fall back to verified RBP arithmetic; never scan the stack for recognizable values and reverse-justify the address.
-- Prefer `classify_saved_rip_frames_tool` for phantom-frame and saved-RIP classification. Only if the tool is unavailable or unproven may you fall back to manual frame-by-frame saved-RIP validation.
 - Final diagnosis must either identify the most supported mechanism family or explicitly bound the remaining open set and explain why dump limitations prevent closure.
 - A conclusion that jumps directly from "task pointer in canary slot" to a broad subsystem blame without mechanism analysis is incomplete.
 
@@ -124,6 +130,10 @@ Q4 — Offset coverage:
 - Reject any conclusion that explains a current-valued canary by naming a specific function's local overflow unless the analysis identifies the exact stack spill slot for current or a current-derived pointer and proves that a neighboring overflow-capable local object or write primitive could reach that slot.
 - Mere access to current, generic task_struct usage, or an unspecified stack spill is not enough.
 
+### Review Red-Line Rule: Causality-Eliminated Frames
+
+- {STACK_CAUSALITY_RED_LINE_RULE}
+
 ### Review Red-Line Rule: Invalid Caller-Edge Narratives
 
 - Reject any conclusion that narrates two adjacent corrupted-backtrace frames as a proven ordinary caller-callee edge when static code structure does not support that edge, or when the edge crosses unrelated subsystems without a proven exception bridge.
@@ -141,6 +151,12 @@ Q4 — Offset coverage:
 
 - If you need to search kernel logs after initial analysis, the emitted action itself MUST literally contain `| grep`.
 - NEVER emit `log -m`, `log -t`, or `log -a` standalone in the action field, and do not pipe them to `head`, `tail`, `sed`, or other commands before grep.
+
+### Memory Sweep Contract
+
+- If you use `rd -SS`, the action MUST include an explicit small count and a concrete grep anchor.
+- NEVER emit large-range `rd -SS` sweeps paired with broad printable-character filters such as `grep -E '[ -~]{{8,}}'`, `[[:print:]]`, or equivalent "show me arbitrary ASCII" patterns.
+- Prefer a narrow window plus a symbol name, device tag, validated string fragment, or other specific anchor that is already motivated by the evidence.
 """.strip()
 
 
@@ -156,12 +172,193 @@ def _unique_prompt_sections(sections: list[str]) -> list[str]:
     return unique_sections
 
 
-def analysis_crash_prompt() -> str:
+def _is_stack_protector_prompt_case(
+    signature_class: str | None,
+    recent_text: str,
+) -> bool:
+    if signature_class != "stack_corruption":
+        return False
+
+    lowered_recent_text = recent_text.lower()
+    return any(
+        marker in lowered_recent_text
+        for marker in (
+            "stack-protector",
+            "__stack_chk_fail",
+            "kernel stack is corrupted in",
+        )
+    )
+
+
+def _select_prompt_playbook(
+    signature_class: str | None,
+    recent_text: str,
+) -> str:
+    if not signature_class or signature_class == "unknown":
+        return ""
+
+    if _is_stack_protector_prompt_case(signature_class, recent_text):
+        return PLAYBOOKS.get("stack_protector_canary", "")
+
+    return PLAYBOOKS.get(signature_class, "")
+
+
+def _select_prompt_sop_fragments(
+    *,
+    signature_class: str | None,
+    recent_text: str,
+    root_cause_class: str | None,
+    step_count: int,
+    enabled_gates: set[str],
+) -> list[str]:
+    fragments: list[str] = []
+    lowered_recent_text = recent_text.lower()
+    stack_protector_case = _is_stack_protector_prompt_case(
+        signature_class,
+        recent_text,
+    )
+
+    if "dma_corruption" in enabled_gates or (
+        signature_class in {"pointer_corruption", "use_after_free"}
+        and step_count >= 10
+        and (
+            root_cause_class == "dma_corruption"
+            or "dma" in lowered_recent_text
+            or "iommu" in lowered_recent_text
+        )
+    ):
+        fragments.append(SOP_FRAGMENTS["dma_corruption"])
+
+    if "per_cpu_access" in enabled_gates or any(
+        token in lowered_recent_text for token in ("%gs", "per-cpu", "per_cpu", "gs:")
+    ):
+        fragments.append(SOP_FRAGMENTS["per_cpu_access"])
+
+    if "address_search" in enabled_gates or any(
+        token in lowered_recent_text
+        for token in ("search", "address", "ptov", "kmem -p")
+    ):
+        fragments.append(SOP_FRAGMENTS["address_search"])
+
+    if "driver_source_correlation" in enabled_gates or (
+        signature_class in {"pointer_corruption", "use_after_free"}
+        and step_count >= 8
+        and any(
+            token in lowered_recent_text
+            for token in (
+                "function pointer",
+                "_base_",
+                "mod -s",
+                "sym ",
+                "apic",
+                "fee0",
+                "list_head",
+                "self-referential",
+                "self reference",
+            )
+        )
+    ):
+        fragments.append(SOP_FRAGMENTS["driver_source_correlation"])
+
+    if "stack_overflow" in enabled_gates or (
+        (
+            "stack overflow" in lowered_recent_text
+            or "stack corruption" in lowered_recent_text
+        )
+        and not stack_protector_case
+    ):
+        fragments.append(SOP_FRAGMENTS["stack_overflow"])
+
+    if "stack_protector_fast_path" in enabled_gates or stack_protector_case:
+        fragments.append(SOP_FRAGMENTS["stack_protector_fast_path"])
+    elif signature_class == "stack_corruption":
+        fragments.append(SOP_FRAGMENTS["stack_frame_forensics"])
+
+    if "kasan_ubsan" in enabled_gates or any(
+        token in lowered_recent_text for token in ("kasan", "ubsan")
+    ):
+        fragments.append(SOP_FRAGMENTS["kasan_ubsan"])
+
+    if "advanced_techniques" in enabled_gates or (
+        step_count >= 18
+        and signature_class
+        in {"pointer_corruption", "use_after_free", "general_protection_fault"}
+    ):
+        fragments.append(SOP_FRAGMENTS["advanced_techniques"])
+
+    return fragments
+
+
+def _select_prompt_overlays(
+    *,
+    signature_class: str | None,
+    recent_text: str,
+    root_cause_class: str | None,
+    step_count: int,
+    enabled_gates: set[str],
+) -> list[str]:
+    overlays: list[str] = []
+    lowered_recent_text = recent_text.lower()
+
+    if signature_class == "stack_corruption":
+        overlays.append(STACK_CORRUPTION_OVERLAY)
+
+    if "driver_object_overlay" in enabled_gates or (
+        signature_class in {"pointer_corruption", "use_after_free"}
+        and (
+            root_cause_class == "dma_corruption"
+            or step_count >= 8
+            or any(
+                token in lowered_recent_text
+                for token in (
+                    "function pointer",
+                    "_base_",
+                    "mod -s",
+                    "sym ",
+                    "apic",
+                    "fee0",
+                    "list_head",
+                    "self-referential",
+                    "self reference",
+                    "third-party",
+                    "out-of-tree",
+                )
+            )
+        )
+    ):
+        overlays.append(DRIVER_OBJECT_OVERLAY)
+
+    return overlays
+
+
+def analysis_crash_prompt(
+    *,
+    signature_class: str | None = None,
+    recent_text: str = "",
+    root_cause_class: str | None = None,
+    step_count: int = 0,
+    enabled_gates: set[str] | None = None,
+) -> str:
+    gates = {gate.strip().lower() for gate in (enabled_gates or set()) if gate.strip()}
+
     sections = _unique_prompt_sections(
         [
             LAYER0_SYSTEM_PROMPT_TEMPLATE,
-            *PLAYBOOKS.values(),
-            *SOP_FRAGMENTS.values(),
+            _select_prompt_playbook(signature_class, recent_text),
+            *_select_prompt_overlays(
+                signature_class=signature_class,
+                recent_text=recent_text,
+                root_cause_class=root_cause_class,
+                step_count=step_count,
+                enabled_gates=gates,
+            ),
+            *_select_prompt_sop_fragments(
+                signature_class=signature_class,
+                recent_text=recent_text,
+                root_cause_class=root_cause_class,
+                step_count=step_count,
+                enabled_gates=gates,
+            ),
             _ANALYSIS_PROMPT_COMPATIBILITY_APPENDIX,
         ]
     )
@@ -227,8 +424,8 @@ def simplified_structure_reasoning_prompt() -> str:
         "REQUIRED FIELDS TO EXTRACT:\n"
         "1. 'reasoning': Summarize the key reasoning points (3-6 sentences)\n"
         "2. 'step_id': Set to {current_step}\n"
-        "3. 'action': If the reasoning suggests a specific crash command, return an object with exactly two fields: 'command_name' and 'arguments'. "
-        'Example: {{"command_name": "rd", "arguments": ["-x", "ffff...", "16"]}}. Otherwise set it to null. Do NOT return action as a string.\n'
+        "3. 'action': If the reasoning suggests a specific MCP tool call, return an object with exactly two fields: 'command_name' and 'arguments'. "
+        'Example: {{"command_name": "rd", "arguments": ["-x", "ffff...", "16"]}} or {{"command_name": "resolve_stack_canary_slot", "arguments": ["search_module_extables"]}}. Otherwise set it to null. Do NOT return action as a string.\n'
         "4. 'is_conclusive': Set to true ONLY if the reasoning explicitly states a final conclusion with root cause. "
         "Otherwise set to false.\n"
         f"5. 'signature_class': Extract the crash signature class from panic string analysis. Allowed values: {_quote_values(signature_values)}.\n"
@@ -270,7 +467,7 @@ def simplified_structure_reasoning_prompt() -> str:
         '  "partial_dump": "unknown"\n'
         "}}\n"
         "```\n\n"
-        "If a follow-up command is needed, replace action=null with a complete command object such as "
-        '{{"command_name": "dis", "arguments": ["-rl", "ffffffff81000000"]}}.\n\n'
+        "If a follow-up tool call is needed, replace action=null with a complete command object such as "
+        '{{"command_name": "dis", "arguments": ["-rl", "ffffffff81000000"]}} or {{"command_name": "resolve_stack_canary_slot", "arguments": ["search_module_extables"]}}.\n\n'
         "REMEMBER: Skip complex fields! They will be handled automatically after your response.\n"
     )

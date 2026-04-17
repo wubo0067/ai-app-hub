@@ -3,7 +3,7 @@ import unittest
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from src.react.llm_runtime import compress_messages_for_llm
+from src.react.llm_runtime import compute_adaptive_max_tokens, compress_messages_for_llm
 
 
 class LLMRuntimeCompressionTests(unittest.TestCase):
@@ -114,6 +114,46 @@ class LLMRuntimeCompressionTests(unittest.TestCase):
         self.assertLess(len(compressed_old_tool.content), len(old_tool_output))
         self.assertIn("have been pruned", compressed_old_tool.content)
         self.assertEqual(compressed_recent_tool.content, recent_tool_output)
+
+    def test_compress_messages_bounds_oversized_recent_tool_messages(self) -> None:
+        old_tool_output = "OLD-TOOL-OUTPUT-" * 50
+        recent_tool_output = "RECENT-TOOL-OUTPUT-" * 600
+
+        messages = [
+            HumanMessage(content="Initial Context"),
+            ToolMessage(content=old_tool_output, tool_call_id="tool-old"),
+            ToolMessage(content=recent_tool_output, tool_call_id="tool-recent"),
+        ]
+
+        compressed = compress_messages_for_llm(
+            messages,
+            max_tool_output_chars=240,
+            recent_tool_messages_to_keep=1,
+            max_recent_tool_output_chars=360,
+        )
+
+        compressed_recent_tool = compressed[2]
+
+        self.assertLess(len(compressed_recent_tool.content), len(recent_tool_output))
+        self.assertIn("have been pruned", compressed_recent_tool.content)
+
+    def test_compute_adaptive_max_tokens_shrinks_for_large_context(self) -> None:
+        huge_reasoning = "reasoning-block-" * 6000
+        huge_tool_output = "tool-output-line\n" * 9000
+
+        messages = [
+            HumanMessage(content="Initial Context"),
+            AIMessage(
+                content=json.dumps({"step_id": 8, "reasoning": "need more evidence"}),
+                additional_kwargs={"reasoning_content": huge_reasoning},
+            ),
+            ToolMessage(content=huge_tool_output, tool_call_id="tool-huge"),
+        ]
+
+        adaptive = compute_adaptive_max_tokens(messages)
+
+        self.assertLess(adaptive, 48000)
+        self.assertGreaterEqual(adaptive, 4096)
 
 
 if __name__ == "__main__":

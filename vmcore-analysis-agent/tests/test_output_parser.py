@@ -1,4 +1,6 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from langchain_core.messages import HumanMessage, ToolMessage
 
@@ -12,6 +14,59 @@ from src.react.schema import FinalDiagnosis, SuspectCode, VMCoreLLMAnalysisStep
 
 
 class OutputParserAuditTests(unittest.TestCase):
+    def test_promotes_standalone_mcp_tool_out_of_run_script(self) -> None:
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 3,
+                "reasoning": "The next diagnostic action is to resolve the canary slot using the tool.",
+                "action": {
+                    "command_name": "run_script",
+                    "arguments": ["resolve_stack_canary_slot search_module_extables"],
+                },
+                "is_conclusive": False,
+                "signature_class": "stack_corruption",
+                "root_cause_class": None,
+                "partial_dump": "partial",
+            }
+        )
+
+        with patch(
+            "src.react.output_parser.get_registered_tool_provider",
+            return_value=SimpleNamespace(package_name="stack_canary"),
+        ):
+            audited = apply_executor_consistency_audit(llm_step, state={})
+
+        self.assertEqual(audited.action.command_name, "resolve_stack_canary_slot")
+        self.assertEqual(audited.action.arguments, ["search_module_extables"])
+        self.assertIn(
+            "run_script wrapped a standalone MCP tool call",
+            audited.additional_notes,
+        )
+
+    def test_keeps_real_crash_run_script_unchanged(self) -> None:
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 4,
+                "reasoning": "Bundle two crash commands in one session.",
+                "action": {
+                    "command_name": "run_script",
+                    "arguments": ["sym ffffffffb4b1f419\ndis -rl ffffffffb4b1f419"],
+                },
+                "is_conclusive": False,
+                "signature_class": "stack_corruption",
+                "root_cause_class": None,
+                "partial_dump": "partial",
+            }
+        )
+
+        audited = apply_executor_consistency_audit(llm_step, state={})
+
+        self.assertEqual(audited.action.command_name, "run_script")
+        self.assertEqual(
+            audited.action.arguments,
+            ["sym ffffffffb4b1f419\ndis -rl ffffffffb4b1f419"],
+        )
+
     def test_corrects_gpf_signature_for_oops_0000_kernel_paging_request(self) -> None:
         state = {
             "messages": [

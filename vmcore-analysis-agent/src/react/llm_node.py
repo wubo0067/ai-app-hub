@@ -17,6 +17,7 @@ from .output_parser import (
     select_analysis_content,
 )
 from .llm_runtime import ainvoke_with_retry, compress_messages_for_llm
+from .llm_runtime import compute_adaptive_max_tokens
 from .prompt_builder import build_analysis_system_prompt, build_executor_state_section
 from .prompts import (
     crash_init_data_prompt,
@@ -65,9 +66,10 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
     # 压缩消息历史后再发送给 LLM，避免 reasoning_content 累积和大工具输出导致 token 暴增
     compressed_messages = compress_messages_for_llm(state["messages"])
     messages_to_send = [SystemMessage(content=system_message), *compressed_messages]
+    adaptive_max_tokens = compute_adaptive_max_tokens(messages_to_send)
 
     logger.info(
-        f"Prepared messages for LLM analysis (step {current_step}): {[type(m).__name__ for m in messages_to_send]} with system prompt length {len(system_message)}"
+        f"Prepared messages for LLM analysis (step {current_step}): {[type(m).__name__ for m in messages_to_send]} with system prompt length {len(system_message)} and adaptive max_tokens {adaptive_max_tokens}"
     )
 
     # 如果上一条消息是 AIMessage 且没有工具调用，说明在此之前发生过 fallback（如 LLM 返回了无效的动作或未提供结论）
@@ -88,7 +90,9 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         )
 
     # 结构化输出，设置 include_raw=True 以获取 token 消耗等元数据
-    llm_analysis = llm_with_tools.with_structured_output(
+    llm_analysis = llm_with_tools.bind(
+        max_tokens=adaptive_max_tokens
+    ).with_structured_output(
         VMCoreLLMAnalysisStep, method="json_mode", include_raw=True
     )
     try:
@@ -266,8 +270,16 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
         SystemMessage(content=system_prompt),
         HumanMessage(content=reasoning),
     ]
+    adaptive_max_tokens = compute_adaptive_max_tokens(
+        messages_to_send,
+        default_max_tokens=8192,
+        min_max_tokens=2048,
+        safety_margin_tokens=2048,
+    )
 
-    chat_with_structured = structured_llm.with_structured_output(
+    chat_with_structured = structured_llm.bind(
+        max_tokens=adaptive_max_tokens
+    ).with_structured_output(
         VMCoreLLMAnalysisStep, method="json_mode", include_raw=True
     )
 

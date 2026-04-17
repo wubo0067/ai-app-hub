@@ -24,7 +24,7 @@ def _get_linux_distro_version() -> tuple[str, str]:
 COMMAND_TIMEOUT = 180
 
 # 单次命令返回的最大字符数。超出部分将被截断以防止 LLM token 溢出。
-MAX_OUTPUT_CHARS = 100_000
+MAX_OUTPUT_CHARS = 40_000
 
 CRASH_IGNORE_MARKERS = [
     "crash ",

@@ -6,11 +6,13 @@
 
 import json
 import re
+import shlex
 from typing import Any, TypeVar
 
 from json_repair import repair_json
 from pydantic import BaseModel
 
+from src.mcp_tools import get_registered_tool_provider
 from src.utils.logging import logger
 
 from .schema import (
@@ -483,6 +485,10 @@ def apply_executor_consistency_audit(
         state,
         log_prefix=log_prefix,
     )
+    analysis_step = _lift_standalone_mcp_tool_out_of_run_script(
+        analysis_step,
+        log_prefix=log_prefix,
+    )
     analysis_step = _reconcile_explicit_action_hint(
         analysis_step,
         log_prefix=log_prefix,
@@ -525,6 +531,60 @@ def apply_executor_consistency_audit(
 
     if analysis_step.confidence not in {None, "low"}:
         analysis_step.confidence = "low"
+
+    return analysis_step
+
+
+def _lift_standalone_mcp_tool_out_of_run_script(
+    analysis_step: VMCoreLLMAnalysisStep,
+    *,
+    log_prefix: str = "",
+) -> VMCoreLLMAnalysisStep:
+    """将被误包裹进 run_script 的独立 MCP 工具提升为真实工具调用。"""
+    action = analysis_step.action
+    if action is None or action.command_name != "run_script":
+        return analysis_step
+
+    if len(action.arguments) != 1:
+        return analysis_step
+
+    script_line = action.arguments[0].strip()
+    if not script_line or "\n" in script_line:
+        return analysis_step
+
+    try:
+        tokens = shlex.split(script_line)
+    except ValueError:
+        return analysis_step
+
+    if not tokens:
+        return analysis_step
+
+    tool_name = tokens[0]
+    provider = get_registered_tool_provider(tool_name)
+    if provider is None or provider.package_name == "crash":
+        return analysis_step
+
+    prefix = f"{log_prefix}: " if log_prefix else ""
+    audit_note = (
+        "Executor audit: run_script wrapped a standalone MCP tool call. "
+        f"Promoted '{script_line}' to direct tool '{tool_name}'."
+    )
+    logger.warning("%s%s", prefix, audit_note)
+
+    action.command_name = tool_name
+    action.arguments = tokens[1:]
+
+    if audit_note not in analysis_step.reasoning:
+        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
+
+    if analysis_step.additional_notes:
+        if audit_note not in analysis_step.additional_notes:
+            analysis_step.additional_notes = (
+                f"{analysis_step.additional_notes} {audit_note}"
+            ).strip()
+    else:
+        analysis_step.additional_notes = audit_note
 
     return analysis_step
 

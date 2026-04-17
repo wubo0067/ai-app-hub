@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+from .prompt_phrases import (
+    CANARY_POINTER_VALUE_PARTIAL_DUMP_RULE,
+    CANARY_POINTER_VALUE_RULE,
+    STACK_CAUSALITY_RED_LINE_RULE,
+)
+
 SOP_FRAGMENTS: dict[str, str] = {
     "address_search": """
 ## 1.6 Address Search SOP
@@ -13,9 +19,10 @@ Strategy 1: targeted region search.
 - search -s <start> -e <end> <address> for bounded VA ranges.
 
 Strategy 1a: symbol-oriented raw region sweep.
-- When you need to inspect a suspicious kernel memory region deeply and reinterpret raw bytes as likely kernel symbol addresses, prefer run_script with rd -SS <address> | grep "<pattern>".
+- When you need to inspect a suspicious kernel memory region deeply and reinterpret raw bytes as likely kernel symbol addresses, prefer run_script with rd -SS <address> <small_count> | grep "<concrete_anchor>".
 - Use this when page-fault, pointer-corruption, or object-shape analysis has already identified a bounded suspect region and you need candidate function-pointer or embedded-string anchors.
-- If a wider bounded region is required, add an explicit count to rd instead of switching to an unbounded search.
+- Keep the rd window explicit and small. Do not use broad printable-character grep patterns such as grep -E '[ -~]{8,}' to mine arbitrary ASCII across a large range.
+- If a wider bounded region is required, add an explicit count to rd gradually instead of switching to a large sweep.
 - Treat grep hits only as candidate anchors. Validate each hit with sym, dis, struct, or neighboring rd output before concluding pointer provenance or root cause.
 
 Strategy 2: reverse physical-address resolution.
@@ -41,9 +48,9 @@ Procedure:
 3. Read the literal address base plus offset with rd.
 4. Optionally identify the symbol relative to __per_cpu_start.
 
-Do not emit rd against percent-gs syntax, registers, or shell-like expressions.
+Do not emit rd against percent-gs syntax, registers, or shell-like expres  sions.
 """.strip(),
-    "stack_overflow": """
+    "stack_overflow": f"""
 ## 3.8 Stack Overflow / Stack Corruption
 
 Pattern: kernel stack overflow, corrupted stack end detected, or crash in random-looking code with RSP near a stack boundary.
@@ -56,10 +63,11 @@ Pattern: kernel stack overflow, corrupted stack end detected, or crash in random
 5. If the candidate source and corrupted canary sit on opposite sides of an exception-entry boundary, ordinary local-overflow causality is unproven until frame provenance and active-overlap arithmetic are explicitly established.
 6. Before blaming a handler frame such as handle_mm_fault, evaluate competing mechanisms: active overwrite inside the exception path, stack-slot reuse from pre-fault returned frames, stale stack residue, or misidentified frame links.
 7. Do not promote any function to direct suspect based only on stack-frame size, deep offset, or generic routine complexity. Require an overflow-capable object or write primitive, or concrete stack-byte provenance.
-8. If the overwritten canary value matches current or a task_struct-derived pointer, treat it as a spill-location clue only. Find the exact disassembly stack-store that spilled current or the derived pointer, then prove that an adjacent overflow-capable local object or concrete write primitive in the same frame could reach that saved slot.
-9. If adjacent frames imply an ordinary call edge that static code structure does not support, or splice unrelated subsystems without a proven exception bridge, treat that bt edge as unreliable until saved return addresses, frame links, or exception-entry provenance validate it.
-10. If printable bytes appear near the canary or in a suspect stack slot, treat them as undecoded payload until proven otherwise. Do not call them pathname or filename evidence unless you validate contiguous string structure plus a plausible copy primitive.
-11. If any checklist item remains unproven, keep the final mechanism bounded and provisional instead of naming a direct overflow source.
+8. {CANARY_POINTER_VALUE_RULE}
+9. {CANARY_POINTER_VALUE_PARTIAL_DUMP_RULE}
+10. If adjacent frames imply an ordinary call edge that static code structure does not support, or splice unrelated subsystems without a proven exception bridge, treat that bt edge as unreliable until saved return addresses, frame links, or exception-entry provenance validate it.
+11. If printable bytes appear near the canary or in a suspect stack slot, treat them as undecoded payload until proven otherwise. Do not call them pathname or filename evidence unless you validate contiguous string structure plus a plausible copy primitive.
+12. If any checklist item remains unproven, keep the final mechanism bounded and provisional instead of naming a direct overflow source.
 
 Analysis:
 1. Distinguish process, IRQ, and exception stack overflows.
@@ -78,7 +86,7 @@ Analysis:
 14. If a bt segment implies an unexpected edge such as a VFS permission helper apparently calling an mm or vmstat helper directly, do not treat that adjacency as proof of normal execution. First decide whether it is a corrupted saved RIP, a stack-scan artifact, or an exception-nested splice.
 15. When sym fails on a non-symbol kernel address found repeatedly on the stack, do NOT abandon the address. Instead run vtop <address> to validate the page, then kmem -p <PA> to check page state. The address may be a per-CPU pointer, vmalloc object, or module data address that reveals the corruption source.
 """.strip(),
-    "stack_protector_fast_path": """
+    "stack_protector_fast_path": f"""
 ## 3.8b Stack Protector Fast Path
 
 Use this SOP only when the panic string explicitly says stack-protector or the active frame is
@@ -100,9 +108,11 @@ __stack_chk_fail.
 2. Read the tool output and copy forward: return-address location, __stack_chk_fail_RBP,
    canary-bearing function RBP, canary offset, canary slot address, canary slot contents,
    and live gs:0x28 canary.
-3. Only if the tool is unavailable or returns unproven may you fall back to manual disassembly,
+3. {CANARY_POINTER_VALUE_RULE}
+4. {CANARY_POINTER_VALUE_PARTIAL_DUMP_RULE}
+5. Only if the tool is unavailable or returns unproven may you fall back to manual disassembly,
    frame-pointer-chain arithmetic, and raw stack validation.
-4. If both the tool path and the manual fallback fail to close, report the canary slot as
+6. If both the tool path and the manual fallback fail to close, report the canary slot as
    unproven and STOP. Do NOT pivot to narrative-driven suspects or recognizable-value guessing.
 
 **Phase 1 Required Output**:
@@ -167,6 +177,10 @@ If you run this phase:
 
 If Phase 1 slot closure is unproven, or if none of the allowed mechanism families has positive
 evidence, the final suspect code location MUST remain indeterminate.
+
+### Action Execution Red-Line
+
+{STACK_CAUSALITY_RED_LINE_RULE}
 """.strip(),
     "kasan_ubsan": """
 ## 3.11 KASAN / UBSAN Reports
@@ -525,6 +539,9 @@ Procedure:
       and keep the conclusion provisional.
    d. NEVER name a final overflow source based solely on frame size, function complexity, or
       "stack-heavy" reputation without concrete write-path evidence.
+
+4. **Action execution red-line after mathematical elimination**:
+   a. {STACK_CAUSALITY_RED_LINE_RULE}
 
 **Phase 5 Required Output**:
 ```

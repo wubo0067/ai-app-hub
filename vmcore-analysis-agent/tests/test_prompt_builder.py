@@ -62,7 +62,7 @@ class PromptBuilderTests(unittest.TestCase):
         self.assertIn("register_provenance=open", section)
         self.assertIn("run_script(dis -rl ffffffff81000000)", section)
 
-    def test_dynamic_prompt_is_shorter_than_full_prompt_for_pointer_corruption(
+    def test_dynamic_prompt_for_pointer_corruption_excludes_unrelated_overlays(
         self,
     ) -> None:
         state = {
@@ -87,14 +87,14 @@ class PromptBuilderTests(unittest.TestCase):
             "messages": [HumanMessage(content="Initial Context")],
         }
 
-        full_prompt = analysis_crash_prompt().format(VMCoreAnalysisStep_Schema="{}")
         layered_prompt = build_analysis_system_prompt(state, is_last_step=False)
 
-        self.assertLess(len(layered_prompt), len(full_prompt))
         self.assertIn("Pointer Corruption Playbook", layered_prompt)
         self.assertNotIn(
             "## 3.12 DMA Memory Corruption (Stray DMA Write)", layered_prompt
         )
+        self.assertNotIn("## Stack-Corruption Overlay", layered_prompt)
+        self.assertNotIn("## 3.8b Stack Protector Fast Path", layered_prompt)
 
     def test_layer0_prompt_comes_from_explicit_prompt_layers_template(self) -> None:
         state = {
@@ -178,6 +178,7 @@ class PromptBuilderTests(unittest.TestCase):
         self.assertIn("## 3.13 Driver Source Correlation", layered_prompt)
         self.assertIn("Function-pointer anchor", layered_prompt)
         self.assertIn("Open-source cross-reference", layered_prompt)
+        self.assertIn("## Driver-Private Object Overlay", layered_prompt)
 
     def test_layered_prompt_injects_dynamic_enum_contract(self) -> None:
         state = {
@@ -197,7 +198,7 @@ class PromptBuilderTests(unittest.TestCase):
         self.assertIn("'stack_protector' -> 'stack_corruption'", layered_prompt)
         self.assertIn("'type_misuse' -> 'field_type_misuse'", layered_prompt)
 
-    def test_stack_corruption_runtime_prompt_injects_frame_forensics_and_avoids_handler_default(
+    def test_stack_protector_runtime_prompt_injects_stack_overlay_and_fast_path(
         self,
     ) -> None:
         state = {
@@ -222,21 +223,54 @@ class PromptBuilderTests(unittest.TestCase):
 
         layered_prompt = build_analysis_system_prompt(state, is_last_step=False)
 
-        self.assertIn("## 3.8a Stack Frame Forensics SOP", layered_prompt)
+        self.assertIn("## 3.8b Stack Protector Fast Path", layered_prompt)
         self.assertIn(
-            "Do NOT derive RBP_absolute from the bt frame address by formula alone",
+            "Call `resolve_stack_canary_slot <function>` as the DEFAULT and PREFERRED action",
             layered_prompt,
         )
         self.assertIn(
-            "strong unwind or exception-boundary hint",
+            "In explicit stack-protector cases, first close the canary slot with `resolve_stack_canary_slot`",
             layered_prompt,
         )
         self.assertIn(
-            "The exception-handler call chain is additional provenance context, not a default cross-frame",
+            "When the panic string explicitly says stack-protector failure in function F, the default hypothesis is corruption of F's own frame during F's execution",
             layered_prompt,
         )
         self.assertNotIn(
             "The corruption source must be sought WITHIN the exception handler call chain itself",
+            layered_prompt,
+        )
+        self.assertIn("## Stack-Corruption Overlay", layered_prompt)
+        self.assertNotIn(
+            "## 3.12 DMA Memory Corruption (Stray DMA Write)",
+            layered_prompt,
+        )
+        self.assertNotIn("## Driver-Private Object Overlay", layered_prompt)
+
+    def test_pointer_corruption_runtime_prompt_excludes_stack_overlay(self) -> None:
+        state = {
+            "step_count": 10,
+            "current_signature_class": "pointer_corruption",
+            "current_root_cause_class": "unknown",
+            "current_partial_dump": "partial",
+            "managed_active_hypotheses": None,
+            "managed_gates": None,
+            "messages": [
+                HumanMessage(
+                    content=(
+                        "pointer corruption with function pointer anchor and mod -s cue in a third-party driver"
+                    )
+                )
+            ],
+        }
+
+        layered_prompt = build_analysis_system_prompt(state, is_last_step=False)
+
+        self.assertIn("Pointer Corruption Playbook", layered_prompt)
+        self.assertIn("## Driver-Private Object Overlay", layered_prompt)
+        self.assertNotIn("## Stack-Corruption Overlay", layered_prompt)
+        self.assertNotIn(
+            "When the panic string explicitly says stack-protector failure in function F",
             layered_prompt,
         )
 

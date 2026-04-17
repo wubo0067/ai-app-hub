@@ -5,11 +5,18 @@
 # Created: 2026-03-23
 
 import asyncio
+import math
 
 import openai
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from src.utils.logging import logger
+
+REASONER_CONTEXT_LIMIT_TOKENS = 131_072
+DEFAULT_REASONER_MAX_TOKENS = 48_000
+MIN_REASONER_MAX_TOKENS = 4_096
+REASONER_TOKEN_SAFETY_MARGIN = 8_192
+APPROX_CHARS_PER_TOKEN = 3.0
 
 
 async def ainvoke_with_retry(
@@ -48,14 +55,15 @@ def compress_messages_for_llm(
     messages: list,
     max_tool_output_chars: int = 4000,
     recent_tool_messages_to_keep: int = 2,
+    max_recent_tool_output_chars: int = 12_000,
 ) -> list:
     """
     在发送给 LLM 前对消息历史进行保守压缩，降低 token 消耗。
 
      策略：
      1. 所有 AIMessage 一律原样保留，尤其禁止改写 reasoning_content。
-     2. 保留最近几条 ToolMessage 的完整内容。
-     3. 对更早的 ToolMessage，当其返回内容超过 max_tool_output_chars 时，截断其中间部分。
+    2. 最近几条 ToolMessage 默认保留更多内容，但若单条过大仍会压缩到上限。
+    3. 对更早的 ToolMessage，当其返回内容超过 max_tool_output_chars 时，截断其中间部分。
 
     此函数不修改 AgentState，仅返回压缩后的副本用于当次 LLM 调用。
     """
@@ -63,8 +71,7 @@ def compress_messages_for_llm(
         i for i, msg in enumerate(messages) if isinstance(msg, ToolMessage)
     ]
     recent_tool_indices = _recent_index_set(
-        tool_msg_indices,
-        recent_tool_messages_to_keep,
+        tool_msg_indices, recent_tool_messages_to_keep
     )
 
     def truncate_middle(text: str, head_chars: int, tail_chars: int) -> str:
@@ -81,19 +88,25 @@ def compress_messages_for_llm(
 
     compressed = []
     truncated_tool_count = 0
+    truncated_recent_tool_count = 0
     tool_chars_before = 0
     tool_chars_after = 0
 
     for index, msg in enumerate(messages):
-        if (
-            isinstance(msg, ToolMessage)
-            and index not in recent_tool_indices
-            and isinstance(msg.content, str)
-            and len(msg.content) > max_tool_output_chars
-        ):
-            tool_chars_before += len(msg.content)
-            tool_head_chars = max_tool_output_chars * 3 // 5
-            tool_tail_chars = max_tool_output_chars - tool_head_chars
+        if not isinstance(msg, ToolMessage) or not isinstance(msg.content, str):
+            compressed.append(msg)
+            continue
+
+        tool_chars_before += len(msg.content)
+
+        tool_limit = (
+            max_recent_tool_output_chars
+            if index in recent_tool_indices
+            else max_tool_output_chars
+        )
+        if len(msg.content) > tool_limit:
+            tool_head_chars = tool_limit * 3 // 5
+            tool_tail_chars = tool_limit - tool_head_chars
             truncated_content = truncate_middle(
                 msg.content,
                 tool_head_chars,
@@ -101,23 +114,66 @@ def compress_messages_for_llm(
             )
             msg = msg.model_copy(update={"content": truncated_content})
             truncated_tool_count += 1
-            tool_chars_after += len(msg.content)
-            compressed.append(msg)
-        elif isinstance(msg, ToolMessage) and isinstance(msg.content, str):
-            tool_chars_before += len(msg.content)
+            if index in recent_tool_indices:
+                truncated_recent_tool_count += 1
             tool_chars_after += len(msg.content)
             compressed.append(msg)
         else:
+            tool_chars_after += len(msg.content)
             compressed.append(msg)
 
     if truncated_tool_count:
         tool_saved = tool_chars_before - tool_chars_after
         logger.info(
-            f"[compress] truncated {truncated_tool_count} old ToolMessages (limit={max_tool_output_chars}, "
+            f"[compress] truncated {truncated_tool_count} ToolMessages (older_limit={max_tool_output_chars}, "
             f"before={tool_chars_before}, after={tool_chars_after}, saved={tool_saved}, "
-            f"kept recent tool messages full: {recent_tool_messages_to_keep})"
+            f"kept recent tool messages full: {recent_tool_messages_to_keep - truncated_recent_tool_count}, "
+            f"bounded recent tool messages: {truncated_recent_tool_count}, recent_limit={max_recent_tool_output_chars})"
         )
     return compressed
+
+
+def estimate_message_char_budget(messages: list) -> int:
+    total_chars = 0
+
+    for message in messages:
+        content = getattr(message, "content", "")
+        if isinstance(content, str):
+            total_chars += len(content)
+        else:
+            total_chars += len(str(content))
+
+        if isinstance(message, AIMessage):
+            reasoning = message.additional_kwargs.get("reasoning_content")
+            if isinstance(reasoning, str):
+                total_chars += len(reasoning)
+
+        if isinstance(message, (SystemMessage, HumanMessage, ToolMessage)):
+            continue
+
+    return total_chars
+
+
+def compute_adaptive_max_tokens(
+    messages: list,
+    *,
+    default_max_tokens: int = DEFAULT_REASONER_MAX_TOKENS,
+    context_limit_tokens: int = REASONER_CONTEXT_LIMIT_TOKENS,
+    min_max_tokens: int = MIN_REASONER_MAX_TOKENS,
+    safety_margin_tokens: int = REASONER_TOKEN_SAFETY_MARGIN,
+    approx_chars_per_token: float = APPROX_CHARS_PER_TOKEN,
+) -> int:
+    approx_message_tokens = math.ceil(
+        estimate_message_char_budget(messages) / approx_chars_per_token
+    )
+    available_completion_tokens = (
+        context_limit_tokens - approx_message_tokens - safety_margin_tokens
+    )
+
+    if available_completion_tokens <= min_max_tokens:
+        return min_max_tokens
+
+    return min(default_max_tokens, available_completion_tokens)
 
 
 def _recent_index_set(indices: list[int], keep_count: int) -> set[int]:

@@ -46,6 +46,27 @@ class ActionGuardTests(unittest.TestCase):
         )
         self.assertIsNone(error)
 
+    def test_rejects_large_rd_ss_printable_sweep(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": "rd -SS 0xffff8b817de14000 8192 | grep -E '[ -~]{8,}'"},
+        )
+        self.assertIn("broad printable-character grep", error)
+
+    def test_rejects_oversized_rd_ss_even_with_specific_grep(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": 'rd -SS 0xffff8b817de14000 1024 | grep -i "task_struct"'},
+        )
+        self.assertIn("rd -SS count 1024 is too large", error)
+
+    def test_allows_bounded_rd_ss_with_specific_anchor(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": 'rd -SS 0xffff8b817de17b40 64 | grep -i "task_struct"'},
+        )
+        self.assertIsNone(error)
+
     def test_rejects_bt_a_without_hard_lockup_context(self) -> None:
         error = validate_tool_call_request("bt", {"command": "bt -a"})
         self.assertIn("bt -a is forbidden", error)

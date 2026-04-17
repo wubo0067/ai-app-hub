@@ -14,6 +14,27 @@ from src.react.schema import (
 
 
 class PromptContractTests(unittest.TestCase):
+    def _stack_frame_prompt(self) -> str:
+        return analysis_crash_prompt(
+            signature_class="stack_corruption",
+            recent_text="stack corruption duplicate saved RIP phantom frame unreliable bt",
+        )
+
+    def _stack_protector_prompt(self) -> str:
+        return analysis_crash_prompt(
+            signature_class="stack_corruption",
+            recent_text="stack-protector __stack_chk_fail kernel stack is corrupted in",
+        )
+
+    def _driver_dma_prompt(self) -> str:
+        return analysis_crash_prompt(
+            signature_class="pointer_corruption",
+            recent_text="dma iommu function pointer mod -s fee0 list_head self-referential",
+            root_cause_class="dma_corruption",
+            step_count=18,
+            enabled_gates={"dma_corruption", "driver_source_correlation"},
+        )
+
     def test_analysis_prompt_uses_minimal_output_contract(self) -> None:
         prompt = analysis_crash_prompt()
 
@@ -63,7 +84,7 @@ class PromptContractTests(unittest.TestCase):
     def test_analysis_prompt_requires_quoted_grep_regex_and_module_symbol_loading(
         self,
     ) -> None:
-        prompt = analysis_crash_prompt()
+        prompt = self._driver_dma_prompt()
 
         self.assertIn('grep -Ei "dma|iommu|mapping|buffer"', prompt)
         self.assertIn(
@@ -93,6 +114,16 @@ class PromptContractTests(unittest.TestCase):
             prompt,
         )
 
+    def test_analysis_prompt_forbids_broad_rd_ss_ascii_sweeps(self) -> None:
+        prompt = analysis_crash_prompt()
+
+        self.assertIn(
+            "If you use `rd -SS`, the action MUST include an explicit small count",
+            prompt,
+        )
+        self.assertIn("grep -E '[ -~]{8,}'", prompt)
+        self.assertIn("Prefer a narrow window plus a symbol name", prompt)
+
     def test_analysis_prompt_requires_alignment_aware_subword_reasoning(self) -> None:
         prompt = analysis_crash_prompt()
 
@@ -113,7 +144,7 @@ class PromptContractTests(unittest.TestCase):
     def test_analysis_prompt_requires_dma_address_validation_before_labeling(
         self,
     ) -> None:
-        prompt = analysis_crash_prompt()
+        prompt = self._driver_dma_prompt()
 
         self.assertIn("Do not call a value a DMA physical address until", prompt)
         self.assertIn("validate it against sys -m or kmem -i", prompt)
@@ -125,7 +156,7 @@ class PromptContractTests(unittest.TestCase):
     def test_analysis_prompt_requires_mod_s_fallback_after_guessed_type_failure(
         self,
     ) -> None:
-        prompt = analysis_crash_prompt()
+        prompt = self._driver_dma_prompt()
 
         self.assertIn(
             "If struct -o <guessed_type> fails on a module crash path", prompt
@@ -133,17 +164,17 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("sym -l <module> | grep -i <keyword>", prompt)
 
     def test_analysis_prompt_adds_driver_source_correlation_rules(self) -> None:
-        prompt = analysis_crash_prompt()
+        prompt = self._driver_dma_prompt()
 
-        self.assertIn("## 2.3b Driver Source Correlation", prompt)
-        self.assertIn("Function Pointer Anchoring", prompt)
-        self.assertIn("Open Source Cross-Reference", prompt)
+        self.assertIn("## Driver-Private Object Overlay", prompt)
+        self.assertIn("### Step A: Function Pointer Anchoring", prompt)
+        self.assertIn("### Step D: Open Source Cross-Reference", prompt)
         self.assertIn(
             "field type must drive the corruption-mechanism classification", prompt
         )
 
     def test_analysis_prompt_requires_field_type_disambiguation(self) -> None:
-        prompt = analysis_crash_prompt()
+        prompt = self._driver_dma_prompt()
 
         self.assertIn(
             "Sub-step D: field-type disambiguation before naming the root cause", prompt
@@ -228,7 +259,7 @@ class PromptContractTests(unittest.TestCase):
     def test_analysis_prompt_requires_active_call_chain_before_exception_blame(
         self,
     ) -> None:
-        prompt = analysis_crash_prompt()
+        prompt = self._stack_protector_prompt()
 
         self.assertIn(
             "do not automatically pivot to that interrupted non-exception chain in every stack-protector case",
@@ -240,7 +271,7 @@ class PromptContractTests(unittest.TestCase):
         )
 
     def test_analysis_prompt_defaults_stack_protector_to_own_frame(self) -> None:
-        prompt = analysis_crash_prompt()
+        prompt = self._stack_protector_prompt()
 
         self.assertIn(
             "When the panic string explicitly says stack-protector failure in function F, the default hypothesis is corruption of F's own frame during F's execution",
@@ -251,8 +282,68 @@ class PromptContractTests(unittest.TestCase):
             prompt,
         )
 
-    def test_analysis_prompt_prioritizes_self_frame_for_canary_owner(self) -> None:
+    def test_analysis_prompt_forces_pointer_valued_canary_provenance_read(self) -> None:
         prompt = analysis_crash_prompt()
+
+        self.assertIn(
+            "treat it as a high-priority provenance clue rather than a completed diagnosis",
+            prompt,
+        )
+        self.assertIn(
+            "You are FORBIDDEN from invoking `partial dump` as an excuse to skip that provenance read before attempting it",
+            prompt,
+        )
+        self.assertIn(
+            "saved RBP, saved RIP, spilled local pointer, or nearby object reference",
+            prompt,
+        )
+
+    def test_analysis_prompt_blocks_local_buffer_hunting_after_causality_elimination(
+        self,
+    ) -> None:
+        prompt = analysis_crash_prompt()
+
+        self.assertIn(
+            "strictly FORBIDDEN from spending `dis` or `rd` on that function merely to hunt for local buffers",
+            prompt,
+        )
+        self.assertIn(
+            "instead, immediately move to the canary-bearing function itself, lower-address active callees, or overwritten-canary-value provenance",
+            prompt,
+        )
+
+    def test_analysis_prompt_conditions_saved_rip_tool_for_stack_protector_cases(
+        self,
+    ) -> None:
+        prompt = self._stack_protector_prompt()
+
+        self.assertIn(
+            "In explicit stack-protector cases, first close the canary slot with `resolve_stack_canary_slot`",
+            prompt,
+        )
+        self.assertIn(
+            "only then use `classify_saved_rip_frames_tool` for NON-CANARY provenance checks",
+            prompt,
+        )
+        self.assertNotIn(
+            "Prefer `classify_saved_rip_frames_tool` for phantom-frame and saved-RIP classification. Only if the tool is unavailable or unproven may you fall back to manual frame-by-frame saved-RIP validation.",
+            prompt,
+        )
+        self.assertEqual(
+            prompt.count(
+                "In explicit stack-protector cases, first close the canary slot with `resolve_stack_canary_slot`"
+            ),
+            1,
+        )
+        self.assertEqual(
+            prompt.count(
+                "only then use `classify_saved_rip_frames_tool` for NON-CANARY provenance checks"
+            ),
+            1,
+        )
+
+    def test_analysis_prompt_prioritizes_self_frame_for_canary_owner(self) -> None:
+        prompt = self._stack_frame_prompt()
 
         self.assertIn(
             "If suspect_frame_addr == canary_frame_addr, prioritize self-frame overflow, inline expansion,",
@@ -264,7 +355,7 @@ class PromptContractTests(unittest.TestCase):
         )
 
     def test_analysis_prompt_treats_duplicate_frames_as_hint_not_proof(self) -> None:
-        prompt = analysis_crash_prompt()
+        prompt = self._stack_frame_prompt()
 
         self.assertIn(
             "treat this as a strong unwind or exception-boundary hint, not an automatic",
@@ -276,7 +367,7 @@ class PromptContractTests(unittest.TestCase):
         )
 
     def test_analysis_prompt_rejects_formula_only_rbp_derivation(self) -> None:
-        prompt = analysis_crash_prompt()
+        prompt = self._stack_frame_prompt()
 
         self.assertIn(
             "Do NOT derive RBP_absolute from the bt frame address by formula alone",

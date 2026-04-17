@@ -211,11 +211,19 @@ def _coerce_corruption_mechanism(
 
 class ToolCall(BaseModel):
     command_name: str = Field(
-        ..., description="The crash command (e.g., 'dis', 'rd') or 'run_script'."
+        ...,
+        description=(
+            "The MCP tool name to invoke, such as a crash command tool ('dis', 'rd'), "
+            "'run_script', or a standalone analysis tool like 'resolve_stack_canary_slot'."
+        ),
     )
     arguments: List[str] = Field(
         default_factory=list,
-        description="Command arguments. For 'run_script', each string is a separate command line.",
+        description=(
+            "Tool arguments as a token list. For crash command tools, the tokens are rendered "
+            "back into one crash command. For 'run_script', each string is a separate crash command line. "
+            "Do not wrap standalone MCP tools inside 'run_script'."
+        ),
     )
 
     @model_validator(mode="before")

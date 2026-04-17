@@ -6,7 +6,7 @@
 
 # src/mcp_tools/crash/client.py
 import sys
-from typing import List, Optional
+from typing import Any, List, Optional
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from src.utils.logging import logger
 
@@ -96,6 +96,32 @@ async def initialize_tools() -> List:
     return await initialize_crash_tools()
 
 
+def _build_full_crash_command(tool_name: str, raw_args: Any) -> str:
+    if isinstance(raw_args, dict):
+        if "command" in raw_args:
+            command = str(raw_args.get("command", "")).strip()
+        elif "arguments" in raw_args:
+            command = " ".join(
+                str(part).strip()
+                for part in raw_args.get("arguments", [])
+                if str(part).strip()
+            )
+        else:
+            command = ""
+    elif isinstance(raw_args, (list, tuple)):
+        command = " ".join(str(part).strip() for part in raw_args if str(part).strip())
+    else:
+        command = str(raw_args).strip()
+
+    if not command:
+        return tool_name
+
+    if command == tool_name or command.startswith(f"{tool_name} "):
+        return command
+
+    return f"{tool_name} {command}"
+
+
 def build_tool_payload(
     tool_name: str, raw_args, state: dict[str, object]
 ) -> dict[str, object]:
@@ -111,10 +137,7 @@ def build_tool_payload(
         payload["script"] = script
         return payload
 
-    command = (
-        raw_args.get("command", "") if isinstance(raw_args, dict) else str(raw_args)
-    )
-    payload["command"] = command
+    payload["command"] = _build_full_crash_command(tool_name, raw_args)
     return payload
 
 

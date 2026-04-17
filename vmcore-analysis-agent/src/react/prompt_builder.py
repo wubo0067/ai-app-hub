@@ -9,6 +9,7 @@ from typing import Iterable, Optional, Sequence, cast
 from langchain_core.messages import AIMessage, BaseMessage
 
 from .graph_state import AgentState
+from .prompt_overlays import DRIVER_OBJECT_OVERLAY, STACK_CORRUPTION_OVERLAY
 from .prompt_layers import LAYER0_SYSTEM_PROMPT_TEMPLATE, PLAYBOOKS, SOP_FRAGMENTS
 from .prompts import build_minimal_schema_enum_contract
 from .schema import CrashSignatureClass, GateEntry, Hypothesis, VMCoreLLMAnalysisStep
@@ -68,6 +69,10 @@ def build_analysis_system_prompt(state: AgentState, *, is_last_step: bool) -> st
     playbook = _select_playbook(state)
     if playbook:
         prompt_parts.append(playbook)
+
+    context_overlays = _select_context_overlays(state)
+    if context_overlays:
+        prompt_parts.extend(context_overlays)
 
     sop_fragments = _select_sop_fragments(state)
     if sop_fragments:
@@ -255,6 +260,47 @@ def _select_sop_fragments(state: AgentState) -> list[str]:
         fragments.append(SOP_FRAGMENTS["advanced_techniques"])
 
     return _dedupe_preserve_order(fragments)
+
+
+def _select_context_overlays(state: AgentState) -> list[str]:
+    overlays: list[str] = []
+    signature_class = state.get("current_signature_class")
+    root_cause_class = state.get("current_root_cause_class")
+    step_count = state.get("step_count", 0)
+    recent_text = _recent_text_blob(state.get("messages", []))
+    lowered_recent_text = recent_text.lower()
+    stack_protector_case = _is_stack_protector_case(signature_class, recent_text)
+
+    if signature_class == "stack_corruption":
+        overlays.append(STACK_CORRUPTION_OVERLAY)
+
+    if (
+        signature_class in {"pointer_corruption", "use_after_free"}
+        and (
+            root_cause_class == "dma_corruption"
+            or step_count >= 8
+            or any(
+                token in lowered_recent_text
+                for token in (
+                    "function pointer",
+                    "_base_",
+                    "mod -s",
+                    "sym ",
+                    "apic",
+                    "fee0",
+                    "list_head",
+                    "self-referential",
+                    "self reference",
+                    "third-party",
+                    "out-of-tree",
+                )
+            )
+        )
+        and not stack_protector_case
+    ):
+        overlays.append(DRIVER_OBJECT_OVERLAY)
+
+    return _dedupe_preserve_order(overlays)
 
 
 def _is_stack_protector_case(
