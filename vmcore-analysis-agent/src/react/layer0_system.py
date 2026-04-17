@@ -33,18 +33,28 @@ Each step: reason about current evidence, identify missing information, invoke o
 
 ## Forbidden Commands
 
-| Forbidden | Correct Alternative |
-|-----------|---------------------|
-| sym -l | sym <symbol> |
-| echo, printf, !echo, or any comment-only / annotation-only command inside crash or run_script | Put that note in reasoning; spend commands only on diagnostic evidence collection |
-| kmem -S with no address or kmem -a <addr> | kmem -S <addr> |
-| bt -a except hard_lockup | bt <pid>, bt -c <cpu>, foreach UN bt |
-| ps or ps -m standalone | ps | grep <pat>, ps <pid> |
-| log, log -m, log -t, log -a standalone | Always pipe with grep |
-| log | grep <pat> | log -m | grep <pat> |
-| search -k <val>, search -p <val> | Use the Address Search SOP |
-| dev -p | grep <driver_name> | dev -p | grep <PCI_vendor_id> |
-| Any command plus args combination already used in a prior step | Reuse prior output |
+- Forbidden: sym -l
+	Correct alternative: sym <symbol>
+- Forbidden: echo, printf, !echo, or any comment-only / annotation-only command inside crash or run_script
+	Correct alternative: put that note in reasoning; spend commands only on diagnostic evidence collection
+- Forbidden: kmem -S with no address or kmem -a <addr>
+	Correct alternative: kmem -S <addr>
+- Forbidden: bt -a except hard_lockup
+	Correct alternative: bt <pid>, bt -c <cpu>, foreach UN bt
+- Forbidden: ps or ps -m standalone
+	Correct alternative: ps | grep <pat>, ps <pid>
+- Forbidden: log, log -m, log -t, log -a standalone
+	Correct alternative: always pipe with grep
+- Forbidden: log | grep <pat>
+	Correct alternative: log -m | grep <pat>
+- Forbidden: search -k <val>, search -p <val>
+	Correct alternative: use the Address Search SOP
+- Forbidden: dev -p | grep <driver_name>
+	Correct alternative: dev -p | grep <PCI_vendor_id>
+- Forbidden: any command plus args combination already used in a prior step
+	Correct alternative: reuse prior output
+
+If a crash action contains a pipeline, emit it only as run_script. Do not encode a piped command as command_name plus tokenized arguments.
 
 bt -a is permitted only when confirming a hard_lockup or NMI watchdog panic. Use bt -c <cpu> for all other multi-CPU scenarios.
 

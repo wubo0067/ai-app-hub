@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from src.mcp_tools import get_registered_tool_provider
 from src.utils.logging import logger
 
+from .action_guard import validate_tool_call_request
 from .schema import (
     VMCoreAnalysisStep,
     VMCoreLLMAnalysisStep,
@@ -493,6 +494,11 @@ def apply_executor_consistency_audit(
         analysis_step,
         log_prefix=log_prefix,
     )
+    analysis_step = _preflight_action_with_guard(
+        analysis_step,
+        state,
+        log_prefix=log_prefix,
+    )
     mismatch = _detect_page_fault_access_mismatch(state)
     if mismatch is None:
         return analysis_step
@@ -636,6 +642,89 @@ def _reconcile_explicit_action_hint(
             ).strip()
     else:
         analysis_step.additional_notes = audit_note
+
+    return analysis_step
+
+
+def _preflight_action_with_guard(
+    analysis_step: VMCoreLLMAnalysisStep,
+    state: dict[str, Any],
+    *,
+    log_prefix: str = "",
+) -> VMCoreLLMAnalysisStep:
+    """在构造 tool_calls 前执行一次动作预检与归一化。"""
+    action = analysis_step.action
+    if action is None:
+        return analysis_step
+
+    prefix = f"{log_prefix}: " if log_prefix else ""
+    rendered_action = _render_structured_action_text(analysis_step)
+
+    if action.command_name != "run_script" and "|" in rendered_action:
+        audit_note = (
+            "Executor audit: piped crash actions must use run_script. "
+            f"Re-encoded structured action as run_script: {rendered_action}"
+        )
+        logger.warning("%s%s", prefix, audit_note)
+        action.command_name = "run_script"
+        action.arguments = [rendered_action]
+
+        if audit_note not in analysis_step.reasoning:
+            analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
+
+        if analysis_step.additional_notes:
+            if audit_note not in analysis_step.additional_notes:
+                analysis_step.additional_notes = (
+                    f"{analysis_step.additional_notes} {audit_note}"
+                ).strip()
+        else:
+            analysis_step.additional_notes = audit_note
+
+    action = analysis_step.action
+    if action is None:
+        return analysis_step
+
+    tool_args = (
+        {"script": "\n".join(action.arguments)}
+        if action.command_name == "run_script"
+        else {"command": render_action_arguments(action.arguments)}
+    )
+    validation_error = validate_tool_call_request(
+        action.command_name,
+        tool_args,
+        allow_bt_a=analysis_step.signature_class == "hard_lockup",
+        observed_struct_offsets=state.get("crash_path_struct_offsets"),
+        struct_layout_cache=dict(state.get("struct_layout_cache", {})),
+    )
+    if validation_error is None:
+        return analysis_step
+
+    rejected_action = _render_structured_action_text(analysis_step)
+    audit_note = (
+        "Executor preflight rejected the proposed action before tool dispatch: "
+        f"{validation_error}. Replan with a compliant command. Rejected action: {rejected_action}"
+    )
+    logger.warning("%s%s", prefix, audit_note)
+    analysis_step.action = None
+
+    if audit_note not in analysis_step.reasoning:
+        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
+
+    if analysis_step.additional_notes:
+        if audit_note not in analysis_step.additional_notes:
+            analysis_step.additional_notes = (
+                f"{analysis_step.additional_notes} {audit_note}"
+            ).strip()
+    else:
+        analysis_step.additional_notes = audit_note
+
+    if analysis_step.is_conclusive:
+        analysis_step.is_conclusive = False
+        analysis_step.final_diagnosis = None
+        analysis_step.fix_suggestion = None
+
+    if analysis_step.confidence not in {None, "low"}:
+        analysis_step.confidence = "low"
 
     return analysis_step
 
