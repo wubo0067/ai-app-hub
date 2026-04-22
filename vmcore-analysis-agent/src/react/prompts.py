@@ -396,7 +396,7 @@ The following is the User-Provided Initial Context for this Linux kernel crash a
   2. If the crash path enters a third-party module or directly adjacent callback path, promote that module family in the hypothesis ranking and account for symbol/debug-info limitations.
   3. If no third-party module appears on the active path, keep them as environmental risk factors rather than the default root cause.
 - **Integration**: You MUST integrate your reasoning over the critical kernel error alongside the `bt` (backtrace) evaluation. Do not analyze them in isolation.
-- **Log Searching**: If you need to search for specific patterns in the kernel log AFTER initial analysis, the emitted action itself MUST literally contain `| grep`. Example: `log -m | grep -i nouveau | grep -Ei "fail|error|timeout|fault|xid|mmu|fifo"`. **NEVER emit `log -m`, `log -t`, or `log -a` standalone in the action field**, and do not pipe them to `head`, `tail`, `sed`, or other commands before grep. These forms dump the entire log, cause token overflow, and are invalid even if your reasoning mentions a filtered query. Do NOT attempt to use `grep` on vmcore-dmesg.
+- **Log Searching**: If you need to search for specific patterns in the kernel log AFTER initial analysis, the emitted action itself MUST literally contain `| grep`, and any action containing a pipeline must be encoded as `{"command_name": "run_script", "arguments": ["..."]}`. Example: `log -m | grep -i nouveau | grep -Ei "fail|error|timeout|fault|xid|mmu|fifo"`. **NEVER emit `log -m`, `log -t`, or `log -a` standalone in the action field**, and do not pipe them to `head`, `tail`, `sed`, or other commands before grep. These forms dump the entire log, cause token overflow, and are invalid even if your reasoning mentions a filtered query. Do NOT attempt to use `grep` on vmcore-dmesg.
 
 <initial_data>
 {init_info}
@@ -425,7 +425,7 @@ def simplified_structure_reasoning_prompt() -> str:
         "1. 'reasoning': Summarize the key reasoning points (3-6 sentences)\n"
         "2. 'step_id': Set to {current_step}\n"
         "3. 'action': If the reasoning suggests a specific MCP tool call, return an object with exactly two fields: 'command_name' and 'arguments'. "
-        'Example: {{"command_name": "rd", "arguments": ["-x", "ffff...", "16"]}} or {{"command_name": "resolve_stack_canary_slot", "arguments": ["search_module_extables"]}}. Otherwise set it to null. Do NOT return action as a string.\n'
+        'Example: {{"command_name": "rd", "arguments": ["-x", "ffff...", "16"]}}, {{"command_name": "run_script", "arguments": ["log -m | grep -i \\"mpt3sas\\" | grep -Ei \\"error|timeout|reset\\""]}}, or {{"command_name": "resolve_stack_canary_slot", "arguments": ["search_module_extables"]}}. Otherwise set it to null. Do NOT return action as a string.\n'
         "4. 'is_conclusive': Set to true ONLY if the reasoning explicitly states a final conclusion with root cause. "
         "Otherwise set to false.\n"
         f"5. 'signature_class': Extract the crash signature class from panic string analysis. Allowed values: {_quote_values(signature_values)}.\n"
@@ -452,6 +452,7 @@ def simplified_structure_reasoning_prompt() -> str:
         "'missing_conversion' there, NEVER in root_cause_class\n"
         "- If labels like 'field_type_misuse', 'missing_conversion', 'write_corruption', or 'reinit_path_bug' appear "
         "in root_cause_class, that is a schema error and must be corrected before you answer\n"
+        "- Any action containing a pipeline character '|' MUST use command_name='run_script' and store the full command line as a single string in arguments\n"
         "- DO NOT attempt to reconstruct complex hypothesis lists or gate statuses\n"
         "- Output MUST be valid JSON with ONLY the required fields above\n\n"
         "Schema for required fields only:\n"
@@ -468,6 +469,6 @@ def simplified_structure_reasoning_prompt() -> str:
         "}}\n"
         "```\n\n"
         "If a follow-up tool call is needed, replace action=null with a complete command object such as "
-        '{{"command_name": "dis", "arguments": ["-rl", "ffffffff81000000"]}} or {{"command_name": "resolve_stack_canary_slot", "arguments": ["search_module_extables"]}}.\n\n'
+        '{{"command_name": "dis", "arguments": ["-rl", "ffffffff81000000"]}}, {{"command_name": "run_script", "arguments": ["log -m | grep -i \\"nouveau\\" | grep -Ei \\"fail|error|timeout|fault|xid|mmu|fifo\\""]}}, or {{"command_name": "resolve_stack_canary_slot", "arguments": ["search_module_extables"]}}.\n\n'
         "REMEMBER: Skip complex fields! They will be handled automatically after your response.\n"
     )

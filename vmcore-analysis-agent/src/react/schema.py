@@ -214,7 +214,8 @@ class ToolCall(BaseModel):
         ...,
         description=(
             "The MCP tool name to invoke, such as a crash command tool ('dis', 'rd'), "
-            "'run_script', or a standalone analysis tool like 'resolve_stack_canary_slot'."
+            "'run_script', or a standalone analysis tool like 'resolve_stack_canary_slot'. "
+            "Any crash action that contains a pipeline ('|') must use command_name='run_script'."
         ),
     )
     arguments: List[str] = Field(
@@ -222,7 +223,9 @@ class ToolCall(BaseModel):
         description=(
             "Tool arguments as a token list. For crash command tools, the tokens are rendered "
             "back into one crash command. For 'run_script', each string is a separate crash command line. "
-            "Do not wrap standalone MCP tools inside 'run_script'."
+            "Do not wrap standalone MCP tools inside 'run_script'. Piped crash commands such as "
+            "'log -m | grep -i <pattern>' or 'rd -SS <addr> 64 | grep <anchor>' must be encoded "
+            "as a single run_script line instead of tokenized arguments."
         ),
     )
 
