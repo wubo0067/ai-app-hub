@@ -96,17 +96,36 @@ def resolve_stack_canary(
             f"Failed to locate canary-bearing function '{function_name}' in bt output."
         )
 
+    canary_function_addr = _resolve_function_address(
+        function_name,
+        frames,
+        vmcore_path,
+        vmlinux_path,
+    )
+    stack_chk_fail_addr = _resolve_function_address(
+        "__stack_chk_fail",
+        frames,
+        vmcore_path,
+        vmlinux_path,
+    )
+
     stack_chk_fail_frame_addr = (
         stack_chk_fail_frame_override
         if stack_chk_fail_frame_override is not None
         else stack_chk_frame.frame_addr
     )
 
-    canary_disassembly = run_crash_command(
-        f"dis -rl {function_name}", vmcore_path, vmlinux_path, True
+    canary_disassembly = _get_function_disassembly(
+        function_name,
+        canary_function_addr,
+        vmcore_path,
+        vmlinux_path,
     )
-    stack_chk_disassembly = run_crash_command(
-        "dis -rl __stack_chk_fail", vmcore_path, vmlinux_path, True
+    stack_chk_disassembly = _get_function_disassembly(
+        "__stack_chk_fail",
+        stack_chk_fail_addr,
+        vmcore_path,
+        vmlinux_path,
     )
 
     canary_offset = _extract_canary_offset(canary_disassembly)
@@ -425,6 +444,53 @@ def _extract_canary_offset(disassembly: str) -> Optional[int]:
     return None
 
 
+def _resolve_function_address(
+    function_name: str,
+    frames: list[BtFrame],
+    vmcore_path: str,
+    vmlinux_path: str,
+) -> Optional[int]:
+    frame = next((item for item in frames if item.function == function_name), None)
+    if frame is not None:
+        return frame.rip
+
+    symbol_output = run_crash_command(
+        f"sym {function_name}", vmcore_path, vmlinux_path, True
+    )
+    return _parse_symbol_address(symbol_output)
+
+
+def _get_function_disassembly(
+    function_name: str,
+    resolved_address: Optional[int],
+    vmcore_path: str,
+    vmlinux_path: str,
+) -> str:
+    address_disassembly: Optional[str] = None
+    if resolved_address is not None:
+        address_disassembly = run_crash_command(
+            f"dis -rl {resolved_address:x}",
+            vmcore_path,
+            vmlinux_path,
+            True,
+        )
+        if _has_complete_disassembly(address_disassembly):
+            return address_disassembly
+
+    name_disassembly = run_crash_command(
+        f"dis -rl {function_name}",
+        vmcore_path,
+        vmlinux_path,
+        True,
+    )
+    if _has_complete_disassembly(name_disassembly):
+        return name_disassembly
+
+    if resolved_address is not None and address_disassembly is not None:
+        return address_disassembly
+    return name_disassembly
+
+
 def _extract_stack_chk_fail_return_address(disassembly: str) -> Optional[int]:
     instructions: list[tuple[int, str]] = []
     for line in disassembly.splitlines():
@@ -450,6 +516,16 @@ def _has_standard_frame_pointer_prologue(disassembly: str) -> bool:
     has_push = any(_RBP_PROLOGUE_PUSH_RE.search(inst) for inst in instructions)
     has_mov = any(_RBP_PROLOGUE_MOV_RE.search(inst) for inst in instructions)
     return has_push and has_mov
+
+
+def _has_complete_disassembly(disassembly: str) -> bool:
+    instruction_count = 0
+    for line in disassembly.splitlines():
+        if _DISASM_RE.match(line):
+            instruction_count += 1
+            if instruction_count >= 2:
+                return True
+    return False
 
 
 def _parse_rd_words(output: str) -> dict[int, int]:
@@ -488,6 +564,14 @@ def _resolve_symbol_name(output: str) -> Optional[str]:
         match = _SYM_FUNC_RE.match(line.strip())
         if match:
             return match.group("symbol")
+    return None
+
+
+def _parse_symbol_address(output: str) -> Optional[int]:
+    for line in output.splitlines():
+        match = _SYM_FUNC_RE.match(line.strip())
+        if match:
+            return int(match.group("addr"), 16)
     return None
 
 

@@ -196,11 +196,12 @@ Analysis:
 ## 3.12 DMA Memory Corruption (Stray DMA Write)
 
 Preconditions before suspecting DMA:
-1. Exclude use-after-free with kmem -S and poison-pattern checks.
-2. Exclude race or double-free style explanations.
-3. Confirm the corrupted memory is DMA-reachable.
-4. Check whether corruption correlates with I/O pressure.
-5. Prioritize dma_map or unmap violations if DMA API debug evidence exists.
+Treat these preconditions as the DMA-side realization of S1-S5 exclusion reasoning from the system layer. Do not promote DMA unless the stronger non-DMA explanations have been explicitly closed first and the device-side evidence threshold is met.
+1. Exclude use-after-free with kmem -S and poison-pattern checks. This is part of S4.
+2. Exclude race or double-free style explanations. This is part of S4.
+3. Confirm the corrupted memory is DMA-reachable. This is part of S5.
+4. Check whether corruption correlates with I/O pressure. This is part of S5.
+5. Prioritize dma_map or unmap violations if DMA API debug evidence exists. This is part of S5.
 
 Non-indicators:
 - intel_iommu=on by itself is not passthrough.
@@ -208,6 +209,8 @@ Non-indicators:
 - Mere module presence or generic dmesg errors are not device attribution.
 - A bus-address-like value is not enough by itself. First prove whether the exact source field really contains that value.
 - Do not call a value a DMA physical address until you have checked whether it fits the actual system physical-memory range and stated the current IOMMU context.
+
+Before or alongside this DMA fragment, ensure the other S1-S4 gates are already closed: instruction-level provenance (S1), ordinary object-state validation (S2), and stack or snapshot artifact exclusion where applicable (S3), plus stronger software corruption-source exclusion (S4).
 
 ### Step 1: Confirm IOMMU Mode
 - Check vmcore-dmesg first for iommu, dmar, passthrough, translation, smmu patterns.

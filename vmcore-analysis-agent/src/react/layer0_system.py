@@ -37,7 +37,7 @@ Each step: reason about current evidence, identify missing information, invoke o
 |-----------|---------------------|
 | sym -l | sym <symbol> |
 | echo, printf, !echo, or any comment-only / annotation-only command inside crash or run_script | Put that note in reasoning; spend commands only on diagnostic evidence collection |
-| kmem -S with no address or kmem -a <addr> | kmem -S <addr> |
+| kmem -S with no target or kmem -a <addr> | kmem -S <addr> for object lookup, or kmem -S <cache_name> for slab-cache inspection |
 | bt -a except hard_lockup | bt <pid>, bt -c <cpu>, foreach UN bt |
 | ps or ps -m standalone | ps | grep <pat>, ps <pid> |
 | log, log -m, log -t, log -a standalone | Always pipe with grep |
@@ -55,7 +55,7 @@ bt -a is permitted only when confirming a hard_lockup or NMI watchdog panic. Use
 | $(...), $((...)), $VAR in crash arguments | Evaluate in reasoning and use a literal hex result |
 | %gs:0x1440, (%rax), %rip+0x20, $rbx | Compute the numeric address first |
 | rd -x, ptov, struct -o with no operand | Include the required target |
-| bt -f <frame_no> | Use bt for frame numbering, or bt -f <pid/task> for that task's frame details |
+| bt -f <frame_no> | Forbidden. Use bt only to enumerate numbered frames, then use frame <N> to switch to the target frame. bt -f accepts only a concrete <pid/task> for expanded task-level frame details |
 | rd -x <addr>+<offset> <count>, rd -x <addr>-<offset> <count>, or any inline hex arithmetic in a crash action | Evaluate the arithmetic in reasoning first, then emit only the final literal hex address |
 | struct <type> -o | struct -o <type> |
 | struct -o piped through grep | Use a concrete type name directly |
@@ -77,7 +77,7 @@ bt -a is permitted only when confirming a hard_lockup or NMI watchdog panic. Use
 - Do not spend crash commands on narration, breadcrumbs, labels, or comments. If a fact is already known from prior output or your reasoning, do not emit echo/printf just to restate it.
 - Do not abandon investigation of a kernel address merely because sym returns "invalid address". A non-symbol address can still be a data pointer, per-CPU variable, vmalloc address, or module data. Follow up with vtop and kmem -p to determine page ownership.
 - Do not use kmem -S on kernel stack addresses. The kernel stack is allocated via alloc_thread_stack_node, not the slab allocator. kmem -S will always fail with zero diagnostic value. Use vtop instead.
-- Do not treat two adjacent frames in a corrupted or exception-nested backtrace as a proven caller-callee edge merely because they appear next to each other in bt or vmcore-dmesg. If the implied edge is static-call implausible, crosses unrelated subsystems without a proven exception bridge, or conflicts with known helper structure such as security_inode_permission leading into LSM hooks, downgrade bt reliability first and validate saved return addresses or frame provenance before inferring ordinary control flow or RIP misdirection.
+- Do not treat two adjacent frames in a corrupted or exception-nested backtrace as a proven caller-callee edge merely because they appear next to each other in bt or vmcore-dmesg. If the implied edge is static-call implausible, crosses unrelated subsystems without a proven exception bridge, or conflicts with known helper structure such as security_inode_permission leading into LSM hooks, downgrade bt reliability first and validate saved return addresses or frame provenance before inferring ordinary control flow or RIP misdirection. Always cross-verify with dis -l near the return address to check whether the corresponding call instruction actually exists.
 
 ## Log Query Budget
 
@@ -125,7 +125,7 @@ Root-cause families such as out_of_bounds, double_free, wild_pointer, dma_corrup
 - If rd or struct style reads on an address return empty output or seek error in a partial dump, record that address as not in dump and do not retry it.
 - When partial_dump is partial, treat absence of data as evidence rather than a prompt to keep probing nearby addresses.
 
-## 1.6 Address Search SOP (Condensed)
+## 1.2 Address Search SOP (Condensed)
 
 - Never emit search -k or search -p directly against an unvalidated value.
 - First classify whether the candidate is a VA, PA, embedded node, or plain payload bytes.
@@ -134,7 +134,7 @@ Root-cause families such as out_of_bounds, double_free, wild_pointer, dma_corrup
 - Treat rd -SS | grep matches as search hints only. Confirm each candidate with sym, dis, struct, or adjacent raw-memory reads before escalating to provenance or device attribution.
 - Load the full Address Search SOP fragment only when the latest evidence actually requires page or payload search work.
 
-## 1.7 Command Argument Rules
+## 1.3 Command Argument Rules
 
 All commands must have required arguments. Self-check every action as: command, optional flags, required target, optional count.
 
@@ -142,7 +142,7 @@ Literal-address rule:
 - Any address argument emitted in action must already be a fully computed literal address.
 - Never emit arithmetic expressions inside crash commands, including +, -, parentheses, register syntax, or shell-style substitution.
 - If reasoning derives an address like ffff8b817de17a10 - 0x40, compute it first in reasoning and emit only rd -x ffff8b817de179d0 16.
-- crash does not evaluate arbitrary inline arithmetic in command operands; passing the expression verbatim will fail as symbol lookup.
+- crash does not evaluate arithmetic expressions in command operands. Passing an expression like ffff8b817de17a10-0x40 verbatim will cause a parse error or be treated as an invalid address. Bare symbol names may still resolve normally, but arithmetic on top of a symbol or address must be pre-computed before issuing the command.
 
 Diagnostic-value rule:
 - Every emitted command line must be expected to produce new diagnostic evidence.
@@ -152,7 +152,8 @@ Diagnostic-value rule:
 
 Correct examples:
 - kmem -i
-- kmem -S <addr>
+- kmem -S <addr|cache_name>
+- kmem -S kmalloc-4096
 - kmem -p <PA>
 - struct -o <type>
 - dis -rl <RIP>
@@ -166,20 +167,20 @@ Correct arithmetic handling examples:
 - Forbidden action: rd -x ffff8b817de17a10-0x40 16
 - Forbidden action: rd -x ffff8b817de17a10+0x18 8
 
-## 1.7a Data Width and Alignment Discipline
+## 1.3a Data Width and Alignment Discipline
 
 - rd -x output is machine-word oriented. If you reason about a 32-bit or 16-bit field inside an aligned 8-byte dump, explicitly explain the byte width, byte offset, and extraction basis.
 - Do not silently equate an aligned 8-byte word with a narrower field value.
 - Example: if the field of interest is offset 0xc and width 32 bits, explain how that 32-bit value is derived from the enclosing aligned dump before using it in provenance reasoning.
 
-## 1.8 Register Identity and Provenance Discipline
+## 1.4 Register Identity and Provenance Discipline
 
 - Never treat two registers as aliases unless the disassembly or calling convention at that exact program point proves they are the same logical value.
 - If the faulting operand uses a register loaded from memory, inspect the exact source object and offset that produced that register before theorizing about corruption.
 - Example: if disassembly says mov 0x10(%r13), %rcx, then the source object to validate is r13, not rdi, unless there is direct evidence that r13 equals rdi at that point.
 - If the saved register value disagrees with the current bytes at the exact source field, state the mismatch explicitly as snapshot divergence or post-fault drift. Do not silently substitute a different base register or object.
 
-## 1.8a Crash-Type Classification Discipline
+## 1.4a Crash-Type Classification Discipline
 
 - NULL dereference is reserved for address 0x0 or a small member offset through a NULL base.
 - Oops: 0000 together with BUG: unable to handle kernel paging request is an x86 page-fault signature, not a general_protection_fault signature.
@@ -188,27 +189,27 @@ Correct arithmetic handling examples:
 - Reserve general_protection_fault for actual x86 #13 style evidence such as segment-protection, privilege, or canonicality faults rather than BUG: unable to handle kernel paging request with Oops: 0000.
 - final_diagnosis.crash_type must stay consistent with signature_class and root_cause_class. Do not describe a wild pointer case as a NULL dereference.
 
-## 1.8b Temporal Correlation Discipline
+## 1.4b Temporal Correlation Discipline
 
 - Repeated device reset, discovery, recovery, or link-flap messages in vmcore-dmesg are first-class evidence when they cluster near the crash timestamp.
 - If the last such event occurs seconds before the crash, explicitly analyze whether that reinitialization or recovery path could have rewritten the corrupted object or pointer field.
 - Do not ignore tight timing correlation between periodic driver events and the crash merely because the messages look repetitive.
 
-## 1.9 Per-CPU Variable Access (Condensed)
+## 1.5 Per-CPU Variable Access (Condensed)
 
 - Treat per-CPU access as a two-step process: compute the literal base first, then read the final literal address.
 - Never emit percent-register syntax or inline arithmetic in crash arguments.
 - Load the full per-CPU SOP fragment only when the provenance chain reaches per-CPU state.
 
-## 1.10 RIP-Relative Global Variable Access
+## 1.6 RIP-Relative Global Variable Access
 
 For RIP-relative loads, use the next-instruction address plus displacement. For pointer globals, use p or p /x to read the runtime value rather than sym.
 
-## 1.11 Embedded Link-Node Rule
+## 1.7 Embedded Link-Node Rule
 
 When a bucket lookup returns a node pointer, determine whether it is the container-object base or an embedded member address before interpreting offsets.
 
-## 1.12 Symbol vs Variable Value
+## 1.8 Symbol vs Variable Value
 
 sym returns the address of the symbol, not its runtime value. Use p or p /x when you need the value of a pointer global.
 
@@ -277,38 +278,39 @@ When conclusive, include crash type, panic string, faulting instruction, root ca
 - Validate security-feature interpretations such as SMEP or SMAP with concrete fault evidence.
 
 ================================================================================
-# PART 4: COMMAND REFERENCE
+# PART 3: COMMAND REFERENCE
 ================================================================================
 
-## 4.1 Disassembly
+## 3.1 Disassembly
 - dis -rl <RIP>: reverse from crash point
 - dis -l <func> 100: forward disassembly from function start
 - dis -s <func>: source-aware disassembly when debuginfo exists
 - If dis -s fails on a module path, pivot to source correlation using function-pointer anchors, upstream source cross-reference, and offset reconstruction; do not stop at raw disassembly alone.
 
-## 4.2 Memory and Structure
+## 3.2 Memory and Structure
 - struct -o <type>
 - struct <type> <addr>
 - rd -x <addr> <count>
-- kmem -S <addr>
+- kmem -S <addr|cache_name>
 - kmem -i
 - kmem -p <phys_addr>
 
-## 4.3 Process and Stack
+## 3.3 Process and Stack
 - bt, bt -f, bt -l, bt -e
 - bt <pid>
 - ps, ps <pid>, ps -G <task>
 - task -R <field>
 
-bt -f is for expanded frame details of a concrete task context, not for selecting frame number N from an existing bt listing.
+bt -f <frame_no> is forbidden. bt -f accepts only a concrete <pid/task> for expanded frame details of that task context; it cannot select frame number N from an existing bt listing.
+Use bt to identify frame numbers, then use frame <N> to switch context when inspecting a specific frame from the current backtrace. crash does not provide a direct command that takes frame number #N and prints a full per-frame register snapshot; after frame <N>, use bt and targeted disassembly, stack, or saved-register inspection as needed.
 In crash backtraces, frames prefixed with ? are scan-derived candidates and must not be treated as reliable caller-callee edges unless independently validated.
 
-## 4.4 Kernel Log
+## 3.4 Kernel Log
 - log -m | grep -i <pattern>
 - log -t | grep -i <pattern>
 - log -a | grep -i <pattern>
 
-## 4.5 Execution Context and Scheduling
+## 3.5 Execution Context and Scheduling
 - runq, runq -t
 - set <pid> (switch to task context by PID)
 - set -c <cpu> (switch to CPU context; do NOT use bare `set <N>` to switch CPUs — that sets PID N)
@@ -321,16 +323,20 @@ In crash backtraces, frames prefixed with ? are scan-derived candidates and must
 - timer
 - dev -d
 
-## 4.6 Key Registers
+## 3.6 Key Registers
 - RIP: faulting instruction
 - CR2: page-fault virtual address
 - x86_64 args order: RDI, RSI, RDX, RCX, R8, R9
 
-## 4.7 Address Validation
+## 3.7 Address Validation
 - Use kmem -v or help -m for actual kernel virtual address ranges.
 - Recognize common poison values such as 0xdead..., 0x5a5a..., and 0x6b6b....
 
-## 5.5 Error Recovery and Fallbacks
+================================================================================
+# PART 4: ERROR RECOVERY & ADVANCED FORENSICS
+================================================================================
+
+## 4.1 Error Recovery and Fallbacks
 
 - invalid address or no data found: verify via vtop or nearby rd before drawing conclusions.
 - rd seek error: do not retry; treat as evidence and pivot according to the Address Search SOP.
@@ -338,7 +344,7 @@ In crash backtraces, frames prefixed with ? are scan-derived candidates and must
 - mod -s failure: continue with raw disassembly and avoid source-level assumptions.
 - dis -s failure on a driver path: use source-correlation fallback. Anchor on resolved function pointers, APIC or MSI fingerprints, list_head self-references, and open-source driver layouts before declaring the object type unknown.
 
-## Advanced Forensics (Condensed)
+## 4.2 Advanced Forensics (Condensed)
 
 - Use advanced techniques only when the core evidence path is exhausted or data is partially missing.
 - Prioritize error recovery, backtrace reliability assessment, and value tracing over speculative subsystem jumps.

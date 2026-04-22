@@ -16,6 +16,8 @@ Analysis:
 _PROVENANCE_AND_CORRUPTION_SOURCE_GUIDE = """
 ## Provenance and Corruption-Source Guide
 
+Use this guide as part of the S1-S5 exclusion reasoning required before promoting DMA or hardware. In this file, S1 mainly covers instruction-level provenance closure, S2 covers ordinary object-state validation, S3 covers snapshot or unwind artifact exclusion, and S4 covers stronger software corruption sources.
+
 - Trace the last writer of every suspect register before classifying the overwrite mechanism.
 - If crash-time register values differ from current vmcore bytes, treat the mismatch as a snapshot observation, not proof of DMA or overwrite source.
 - When a faulting register was loaded from a concrete memory operand such as 0x10(%r13), you must read that exact source object before inferring corruption from a different object or argument register.
@@ -91,7 +93,7 @@ Analysis:
 ## Pointer Corruption Playbook
 
 - Treat pointer corruption as a provenance-first workflow, not a device-attribution workflow.
-- Before considering DMA or hardware, close register provenance, object lifetime, and local corruption exclusion in that order.
+- Before considering DMA or hardware, explicitly close S1-S5 exclusion reasoning. At minimum in this playbook: close register provenance first (S1), object lifetime and ordinary object-state validation next (S2), stack or snapshot artifact exclusion when relevant (S3), local corruption exclusion after that (S4), and only then assess whether any affirmative device-side evidence exists (S5).
 - A snapshot mismatch between crash-time registers and current vmcore memory is diagnostic context only; it does not prove overwrite mechanism.
 - If a driver or third-party module is on the crash path, validate the full driver object shape before escalating to external corruption.
 - If the bad value came from a concrete load like mov 0x10(%r13), %rcx, the next validation target is the r13-based object, not a different argument register.

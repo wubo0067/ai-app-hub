@@ -130,6 +130,19 @@ async def lifespan(app: FastAPI):
     )
     logger.info("Agent graph created successfully.")
 
+    # 这里的 yield 出现在 asynccontextmanager 修饰的 lifespan 函数里，
+    # 它不是“返回结果给调用方继续用”的普通生成器用法，而是把这个函数一分为二：
+    # yield 之前：应用启动阶段执行
+    # yield 之后：应用关闭阶段执行
+    # 它等价于“异步上下文管理器”的中间分界点。FastAPI 在启动时进入这个上下文，在关闭时退出这个上下文。
+
+    # 放到这段代码里，语义基本就是：
+    # 启动时：
+    #   初始化 reasonining_llm、structured_llm、mcp_tools、agent_graph
+    # 服务运行中：
+    #   应用开始接收 /health、/analyze、/analyze/stream 请求
+    # 关闭时：
+    #   执行清理资源、打印 shutdown 日志，后续如果你要关闭 MCP 连接、释放客户端、停止后台任务，也应该写在 yield 后面
     yield
 
     # 清理资源
