@@ -48,7 +48,7 @@ Procedure:
 3. Read the literal address base plus offset with rd.
 4. Optionally identify the symbol relative to __per_cpu_start.
 
-Do not emit rd against percent-gs syntax, registers, or shell-like expres  sions.
+"Do not emit rd against percent-gs syntax, registers, or shell-like expressions."
 """.strip(),
     "stack_overflow": f"""
 ## 3.8 Stack Overflow / Stack Corruption
@@ -92,28 +92,44 @@ Analysis:
 Use this SOP only when the panic string explicitly says stack-protector or the active frame is
 __stack_chk_fail.
 
-### Context Pruning
-
-- Skip generic ghost-frame hunting, residual-stack narratives, and prior-occupant reconstruction
-   until the canary slot has been closed by `resolve_stack_canary_slot` or a proven manual
-   fallback.
-- For __stack_chk_fail, the current bt is provisionally trustworthy for the active call path.
-   Do NOT make phantom-frame detection the first mandatory task.
-- Do not use stack-resident code addresses such as zone_statistics or link_path_walk as overflow-
-   source evidence before the canary slot has been proven and the mechanism family has been narrowed.
-
 ### Phase 1: Canary Slot Closure (MANDATORY)
 
 1. Call `resolve_stack_canary_slot <function>` as the DEFAULT and PREFERRED action.
 2. Read the tool output and copy forward: return-address location, __stack_chk_fail_RBP,
    canary-bearing function RBP, canary offset, canary slot address, canary slot contents,
    and live gs:0x28 canary.
-3. {CANARY_POINTER_VALUE_RULE}
-4. {CANARY_POINTER_VALUE_PARTIAL_DUMP_RULE}
-5. Only if the tool is unavailable or returns unproven may you fall back to manual disassembly,
-   frame-pointer-chain arithmetic, and raw stack validation.
-6. If both the tool path and the manual fallback fail to close, report the canary slot as
+3. Only if the tool is unavailable or returns unproven, perform the manual fallback:
+   a. Disassemble the canary-bearing function with `dis -rl <function>` to identify the
+      standard prologue (push %rbp; mov %rsp, %rbp) and the canary store instruction
+      (e.g., `mov %rax, -0x18(%rbp)` → canary offset is -0x18).
+   b. **Recommended RBP derivation — frame-pointer chain (preferred over bt address formulas)**:
+      - If `__stack_chk_fail` has a standard prologue (push %rbp; mov %rsp, %rbp), then
+        [__stack_chk_fail_RBP + 8] holds the return address back to the canary-bearing function.
+      - Locate that exact return-address value in the raw stack dump (e.g., via `bt -f` or
+        `rd -x` around the suspected frame region). The stack address that contains this value
+        equals __stack_chk_fail_RBP + 8.
+      - Therefore __stack_chk_fail_RBP = (that address) − 8.
+      - [__stack_chk_fail_RBP] = saved old RBP = the canary-bearing function's RBP_absolute.
+      - This derivation is more reliable than computing RBP from the `bt` frame address alone.
+   c. Accept RBP_absolute only if ALL of the following are independently verified:
+      - Consistent with the function prologue, push instructions, and `sub $N, %rsp` layout.
+      - [RBP_absolute] is a plausible saved RBP (a stack-range address for this task).
+      - [RBP_absolute + 8] is a plausible saved RIP (a valid kernel text address).
+      - The resulting canary slot address is consistent with the raw stack layout without
+        contradiction.
+   d. Compute the canary slot address as RBP_absolute + <canary_offset from prologue>.
+      Read the slot with `rd -x <slot_addr> 1` and compare to the live gs:0x28 canary value.
+      - High-entropy value matching gs:0x28 → canary intact (rare; re-examine the crash path).
+      - Non-random / recognizable value (task pointer, small integer, code address) → overwritten.
+      - Record both the slot address and its contents as primary forensic evidence.
+   e. Do NOT derive RBP_absolute from the bt frame address by formula alone without independent
+      validation of steps (c). Do NOT scan the stack for a "recognizable" value and
+      reverse-justify that address as the canary slot. The slot address MUST come from RBP
+      arithmetic, not from the value found at a stack location.
+4. If both the tool path and the manual fallback fail to close, report the canary slot as
    unproven and STOP. Do NOT pivot to narrative-driven suspects or recognizable-value guessing.
+5. {CANARY_POINTER_VALUE_RULE}
+6. {CANARY_POINTER_VALUE_PARTIAL_DUMP_RULE}
 
 **Phase 1 Required Output**:
 ```
@@ -181,6 +197,16 @@ evidence, the final suspect code location MUST remain indeterminate.
 ### Action Execution Red-Line
 
 {STACK_CAUSALITY_RED_LINE_RULE}
+
+### Context Guardrails (Reference)
+
+- Skip generic ghost-frame hunting, residual-stack narratives, and prior-occupant reconstruction
+   until the canary slot has been closed by `resolve_stack_canary_slot` or a proven manual
+   fallback.
+- For __stack_chk_fail, the current bt is provisionally trustworthy for the active call path.
+   Do NOT make phantom-frame detection the first mandatory task.
+- Do not use stack-resident code addresses such as zone_statistics or link_path_walk as overflow-
+   source evidence before the canary slot has been proven and the mechanism family has been narrowed.
 """.strip(),
     "kasan_ubsan": """
 ## 3.11 KASAN / UBSAN Reports

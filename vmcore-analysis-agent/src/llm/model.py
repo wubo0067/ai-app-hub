@@ -58,16 +58,22 @@ class ChatDeepSeekReasoner(ChatDeepSeek):
 def create_reasoning_llm():
     """Create and return the reasoning LLM instance."""
     api_key = os.environ.get("DEEPSEEK_API_KEY")
-    base_url = config_manager.get("BASE_URL")
-    model_name = config_manager.get("LLM_MODEL")
-    temperature = float(config_manager.get("TEMPERATURE"))
+    base_url = str(
+        config_manager.get("base_url")
+    ).lower()  # DeepSeek API 的 base_url 配置项
+    # 是否是 think 模式
+    thinking = str(config_manager.get("thinking", "disabled")).lower()
+    # 模型名称
+    model_name = str(config_manager.get("llm_model")).lower()
+    temperature = float(config_manager.get("temperature"))
+    reasoning_effort = str(config_manager.get("reasoning_effort", "max")).lower()
 
     if not all([api_key, base_url, model_name]):
         logger.error("Missing required LLM configuration parameters")
         raise ValueError("Missing required LLM configuration parameters")
 
     # 配置 LangSmith 追踪
-    if config_manager.get("LANGSMITH_TRACING"):
+    if config_manager.get("langsmith_tracing"):
         os.environ["LANGSMITH_TRACING"] = "true"
 
     # top_p 值      采样集合大小    随机性        确定性        适合场景
@@ -77,27 +83,33 @@ def create_reasoning_llm():
     # top_p=1.0     全部词汇       最高          最低          开放式创作
 
     try:
-        if model_name == "deepseek-reasoner":
+        if thinking == "enabled":
+            # 使用的是思考模式
             llm_class = ChatDeepSeekReasoner
             max_tokens = 48000  # Reasoner 模型的 max_tokens 同时包含 reasoning_tokens + content_tokens，需要足够大
-        elif model_name == "deepseek-chat":
+            llm_kwargs = {
+                "reasoning_effort": reasoning_effort,
+                "extra_body": {"thinking": {"type": "enabled"}},
+            }
+        else:
+            # 普通对话模式
             llm_class = ChatDeepSeek
             max_tokens = 8192
-        else:
-            error_msg = f"Unsupported reasoning model: {model_name}"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
+            llm_kwargs = {
+                "top_p": 0.1,  # 使用低随机性设置，适合代码生成和事实回答
+                "presence_penalty": 0,  # 保持输出更贴近原始符号和事实
+                "temperature": temperature,  # https://api-docs.deepseek.com/zh-cn/quick_start/parameter_settings
+                "extra_body": {"thinking": {"type": "disabled"}},
+            }
 
         llm = llm_class(
             api_key=SecretStr(str(api_key)),
-            base_url=str(base_url),
-            model=str(model_name),
+            base_url=base_url,
+            model=model_name,
             max_tokens=max_tokens,
-            top_p=0.1,  # 使用低随机性设置，适合代码生成和事实回答
-            presence_penalty=0,  # 不需要模型通过增加多样性来“换个说法”，我们需要的是精确的原始符号
-            temperature=temperature,  # https://api-docs.deepseek.com/zh-cn/quick_start/parameter_settings
             timeout=300,  # 5 分钟超时，后期步骤对话历史很长，LLM 推理耗时较久
             max_retries=3,  # 遇到连接超时等瞬态错误时自动重试
+            **llm_kwargs,
         )
         logger.info(f"Successfully created LLM instance, model: {llm}")
         return llm
@@ -114,7 +126,12 @@ def create_structured_llm():
     使用此 Chat 模型将推理内容转换为 VMCoreAnalysisStep 结构化输出。
     """
     api_key = os.environ.get("DEEPSEEK_API_KEY")
-    base_url = config_manager.get("BASE_URL")
+    base_url = str(
+        config_manager.get("base_url")
+    ).lower()  # DeepSeek API 的 base_url 配置项
+
+    # 模型名称
+    model_name = str(config_manager.get("llm_model")).lower()
 
     if not api_key or not base_url:
         logger.error("Missing DEEPSEEK_API_KEY env var or BASE_URL for chat LLM")
@@ -123,13 +140,14 @@ def create_structured_llm():
     try:
         llm = ChatDeepSeek(
             api_key=SecretStr(str(api_key)),
-            base_url=str(base_url),
-            model="deepseek-chat",
+            base_url=base_url,
+            model=model_name,
             max_tokens=8192,
             top_p=0.1,
             temperature=0.0,
             timeout=120,
             max_retries=3,
+            extra_body={"thinking": {"type": "disabled"}},
         )
         logger.info(f"Successfully created chat LLM instance: {llm}")
         return llm

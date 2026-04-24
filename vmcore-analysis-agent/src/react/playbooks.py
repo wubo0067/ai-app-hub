@@ -180,29 +180,6 @@ Analysis:
 ## Stack Protector / Canary Failure
 Pattern: stack-protector: Kernel stack is corrupted in: <function>, or active frame is __stack_chk_fail.
 
-### Context-Pruning Rule
-
-When this playbook is selected, IGNORE generic residual-stack, prior-occupant, ghost-frame,
-or stack-smearing narratives unless you have already proved that a NON-CANARY target
-(saved RIP, saved RBP, or other local slot) is the object that was corrupted.
-
-For the canary slot itself, the ONLY admissible time window is AFTER the canary-bearing
-function's prologue store and BEFORE its epilogue check.
-
-### ⛔ COMPILER-LEVEL CANARY INVARIANT (NON-NEGOTIABLE)
-
-The GCC/Clang stack protector prologue unconditionally writes the canary value into the slot:
-```
-mov %gs:0x28, %rax
-mov %rax, -0x18(%rbp)
-```
-
-Therefore:
-1. Residual stack data CANNOT explain __stack_chk_fail.
-2. Pre-fault stack reuse CANNOT explain __stack_chk_fail.
-3. A stale task pointer from an earlier function CANNOT explain __stack_chk_fail.
-4. Only a write that occurs DURING the canary-bearing function's execution can corrupt the canary.
-
 ### Mandatory Fast Path
 
 Your first actions MUST be:
@@ -223,22 +200,6 @@ You MUST keep the candidate set restricted to:
 2. Active callee upward overwrite from a lower-address active callee.
 3. Active exception-path overwrite by code executing during the same canary-bearing window.
 
-The following are FORBIDDEN as canary mechanisms:
-- residual stack pollution
-- stale data from prior function calls
-- prior-frame reuse
-- generic stack smearing
-- a mere recognizable value found on the stack
-
-### Blame Guardrails
-
-- Do not blame link_path_walk, zone_statistics, handle_mm_fault, or any interrupted-path frame
-   merely because its address appears on the stack.
-- Do not identify the canary slot by scanning for a task pointer, code address, or other
-   recognizable value and reverse-justifying the address.
-- Do not use stack direction across an exception boundary unless frame provenance and active
-   overlap have been explicitly proven.
-
 ### Conditional Provenance Fallback
 
 Only after the canary slot has been closed by `resolve_stack_canary_slot` (or a proven manual
@@ -253,62 +214,49 @@ manual phantom-frame or saved-RIP classification.
 
 If none of the allowed mechanism families has positive evidence, the conclusion MUST remain
 indeterminate and no specific function may be named as the overflow source.
+
+---
+
+### Appendix: Guardrails and Invariants (Reference)
+
+**⛔ COMPILER-LEVEL CANARY INVARIANT**: The stack protector prologue unconditionally writes
+the canary at function entry (`mov %gs:0x28,%rax; mov %rax,<slot>(%rbp)`). Residual stack
+data, pre-fault stack reuse, and stale task pointers CANNOT explain __stack_chk_fail. Only
+a write DURING the function's execution (after prologue, before epilogue) can corrupt the canary.
+
+**Forbidden canary mechanisms**: residual stack pollution, stale data from prior function
+calls, prior-frame reuse, generic stack smearing, a mere recognizable value found on the stack.
+
+**Context pruning**: IGNORE generic residual-stack, prior-occupant, ghost-frame, or
+stack-smearing narratives unless you have already proved that a NON-CANARY target (saved RIP,
+saved RBP, or other local slot) was corrupted. For the canary slot, the ONLY admissible time
+window is AFTER the prologue store and BEFORE the epilogue check.
+
+**Blame guardrails**: Do not blame link_path_walk, zone_statistics, handle_mm_fault, or any interrupted-path frame merely because its address appears on the stack. Do not identify the canary slot by scanning for a recognizable value and reverse-justifying the address. Do not use stack direction across an exception boundary unless frame provenance and active overlap have been explicitly proven.
 """.strip(),
     "stack_corruption": """
-## Stack Corruption / Stack Protector Failure
-Pattern: stack-protector: Kernel stack is corrupted in: <function>.
+## Stack Corruption (Generic — Non-Canary)
+Pattern: Kernel stack overflow, stack smashing detected, or frame-pointer corruption where the
+panic did NOT contain stack-protector or __stack_chk_fail.
 
 ### ⛔ FIRST ACTION RULE
 
-When this playbook is triggered, your VERY FIRST analysis actions (before ANY disassembly of
-non-canary functions, before ANY hypothesis about overflow sources) MUST be:
-1. Disassemble the canary-bearing function (from the panic string) to identify the canary slot.
-2. Execute Phase 1 of the Stack Frame Forensics SOP (3.8a): frame-by-frame saved-RIP validation.
-3. Produce the Phase 1 Required Output identifying the first phantom frame.
+Your VERY FIRST analysis actions (before any hypothesis about overflow sources) MUST be:
+1. Execute Phase 1 of the Stack Frame Forensics SOP (3.8a): frame-by-frame saved-RIP and
+   saved-RBP validation.
+2. Produce the Phase 1 Required Output identifying the first phantom frame.
+3. Then proceed to Phase 2 (overflow window reconstruction) and Phase 3 (blame triage).
 
-You are FORBIDDEN from disassembling handle_mm_fault, __do_page_fault, or any other non-canary
-function until Phase 1-3 of the SOP are complete with their required outputs.
-
-### Stack-Protector Red-Line
-
-When the panic string explicitly says stack-protector failure in function F, the default
-hypothesis is corruption of F's own frame during F's execution. Do not name an unrelated
-interrupted-path function unless you can prove a concrete write primitive or proven
-cross-frame overlap into F's canary slot.
-
-### ⛔ COMPILER-LEVEL CANARY INVARIANT (NON-NEGOTIABLE)
-
-The GCC/Clang stack protector prologue **unconditionally** writes the canary value into the
-canary slot at function entry:
-```
-mov %gs:0x28, %rax       ; load random canary from per-CPU area
-mov %rax, -0x18(%rbp)    ; store canary into slot (overwrites ANY prior data)
-```
-This means:
-1. **Residual stack data CANNOT cause __stack_chk_fail.** The prologue store overwrites whatever
-   value was at the canary slot before the function was entered. Pre-existing "stale" or
-   "residual" data from prior function calls, returned helpers, or pre-exception frames is
-   irrelevant to canary integrity.
-2. **The ONLY way __stack_chk_fail triggers** is if code executing AFTER the prologue store and
-   BEFORE the epilogue check overwrites the canary slot. This means: a buffer overflow, an
-   out-of-bounds write, a wild pointer store, a memcpy/structure-copy overrun, or similar
-   write primitive that occurs DURING the canary-bearing function's execution (including its
-   callees that share the same stack frame region below RSP).
-3. **Reject any theory** that attributes canary corruption to "residual stack pollution",
-   "pre-fault data reuse", "stale task pointer left by a prior function", or any mechanism
-   that operates BEFORE the canary-bearing function's prologue. Such theories violate this
-   compiler invariant and are ALWAYS wrong.
-4. **Correct investigation direction**: audit the canary-bearing function's C source code for
-   local buffer operations, array accesses, structure copies, or inline-expanded callees that
-   could write past their bounds into the canary slot. Also check unprotected leaf callees
-   (functions without their own canary) that the canary-bearing function calls, as those
-   callees' stack frames overlap the caller's sub-RSP region.
+You are FORBIDDEN from naming a specific overflow source or disassembling suspected callers
+until Phase 1–3 of the SOP are complete with their required outputs.
 
 ### Mandatory Stack Corruption Analysis Checklist
 
 Before naming a local overflow source, complete this checklist in order:
-1. Reconstruct the canary-bearing frame from the real prologue and stack contents; do not equate a bt frame address with RBP.
-2. Prove the canary slot address from the disassembly-derived offset.
+1. Validate the frame-pointer chain: confirm each saved RBP is a stack-range address and each
+   saved RIP is a valid kernel text address.
+2. Identify the first phantom frame (corrupted saved RIP or saved RBP): this is the primary
+   forensic evidence for where corruption entered the call chain.
 3. Classify nearby frames as ordinary caller/callee frames versus interrupted-frame, pt_regs or exception-entry state, and exception-handler frames.
 4. Apply stack-growth direction only within a proven ordinary call segment; do not carry ordinary overflow causality across an exception boundary.
 5. If the suspected source and corrupted slot are separated by an exception-entry boundary, keep local-overflow attribution provisional until frame provenance and active-overlap arithmetic are proven.
@@ -349,6 +297,35 @@ Example of INVALID reasoning:
    search_module_extables (frame at 0x17a10)"
   → WRONG: 0x17c08 > 0x17a10, so link_path_walk's frame is at a higher address (earlier caller).
   Its overflow writes toward even higher addresses and cannot reach 0x17a20.
+
+### ⛔ MANDATORY PRE-CONCLUSION GATE (stack_protector_canary)
+
+You MUST execute this gate explicitly and in writing BEFORE stating any final diagnosis or
+naming any overflow source. Failure to complete this gate makes the conclusion invalid.
+
+**Gate Checklist** — fill in ALL items:
+
+```
+Canary-bearing function    : <name>
+Canary frame address       : 0x<addr>          ← from bt output
+Canary slot address        : 0x<addr>          ← RBP - <offset> from disassembly
+
+For each candidate function you intend to blame:
+  Candidate                : <name>
+  Candidate frame address  : 0x<addr>          ← from bt output
+  Comparison               : candidate (0x<X>) vs canary_slot (0x<Y>)
+  candidate > canary_slot? : YES → ❌ EXCLUDED (PHYSICALLY IMPOSSIBLE, reject immediately)
+                             NO  → ✅ Plausible, continue investigation
+```
+
+**Gate Rule**: If candidate frame address > canary frame address → the candidate is an earlier
+(outer) caller. Its local overflow writes toward higher addresses. It CANNOT reach the canary at
+a lower address. You MUST mark this candidate as EXCLUDED and MUST NOT name it as the overflow
+source in the final diagnosis.
+
+**If all candidates are excluded**: the conclusion MUST state the corruption source as
+indeterminate. Name only the remaining allowed mechanism families (self-frame or callee) as
+the investigation direction. Do NOT default to the most recently disassembled function.
 
 ### CRITICAL: Exception-Path Stack Is Not an Ordinary Call Nest
 

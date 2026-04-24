@@ -66,15 +66,16 @@ def build_analysis_system_prompt(state: AgentState, *, is_last_step: bool) -> st
         build_executor_state_section(state),
     ]
 
-    playbook = _select_playbook(state)
+    recent_text = _recent_text_blob(state.get("messages", []))
+    playbook = _select_playbook(state, recent_text)
     if playbook:
         prompt_parts.append(playbook)
 
-    context_overlays = _select_context_overlays(state)
+    context_overlays = _select_context_overlays(state, recent_text)
     if context_overlays:
         prompt_parts.extend(context_overlays)
 
-    sop_fragments = _select_sop_fragments(state)
+    sop_fragments = _select_sop_fragments(state, recent_text)
     if sop_fragments:
         prompt_parts.extend(sop_fragments)
 
@@ -133,7 +134,7 @@ def build_executor_state_section(state: AgentState) -> str:
     return "\n".join(lines)
 
 
-def _select_playbook(state: AgentState) -> str:
+def _select_playbook(state: AgentState, recent_text: str) -> str:
     """
     根据崩溃签名类别和上下文选择对应的剧本 (playbook) 内容。
 
@@ -142,6 +143,7 @@ def _select_playbook(state: AgentState) -> str:
 
     Args:
         state (AgentState): 当前分析状态。
+        recent_text (str): 最近消息的合并文本，由调用方预先计算并传入。
 
     Returns:s
         str: 对应的剧本内容字符串，如果找不到匹配项则返回空字符串
@@ -150,14 +152,13 @@ def _select_playbook(state: AgentState) -> str:
     if not signature_class or signature_class == "unknown":
         return ""
 
-    recent_text = _recent_text_blob(state.get("messages", []))
     if _is_stack_protector_case(signature_class, recent_text):
         return PLAYBOOKS.get("stack_protector_canary", "")
 
     return PLAYBOOKS.get(signature_class, "")
 
 
-def _select_sop_fragments(state: AgentState) -> list[str]:
+def _select_sop_fragments(state: AgentState, recent_text: str) -> list[str]:
     """
     根据当前调查状态选择应注入的 SOP 片段。
 
@@ -167,6 +168,7 @@ def _select_sop_fragments(state: AgentState) -> list[str]:
 
     Args:
         state (AgentState): 当前分析状态，包含签名分类、步骤计数、门控信息与消息历史。
+        recent_text (str): 最近消息的合并文本，由调用方预先计算并传入。
 
     Returns:
         list[str]: 需要追加到系统提示中的 SOP 片段列表（已去重，按触发顺序保留）。
@@ -176,7 +178,6 @@ def _select_sop_fragments(state: AgentState) -> list[str]:
     root_cause_class = state.get("current_root_cause_class")
     step_count = state.get("step_count", 0)
     gates = cast(Optional[dict[str, GateEntry]], state.get("managed_gates")) or {}
-    recent_text = _recent_text_blob(state.get("messages", []))
     lowered_recent_text = recent_text.lower()
     stack_protector_case = _is_stack_protector_case(signature_class, recent_text)
 
@@ -210,16 +211,16 @@ def _select_sop_fragments(state: AgentState) -> list[str]:
         fragments.append(SOP_FRAGMENTS["per_cpu_access"])
 
     # 出现地址搜索相关操作时，补充地址空间与映射检查 SOP。
-    if any(
-        token in lowered_recent_text
-        for token in ("search", "address", "ptov", "kmem -p")
-    ):
+    if any(token in lowered_recent_text for token in ("search", "ptov", "kmem -p")):
         fragments.append(SOP_FRAGMENTS["address_search"])
 
     # 指针/链表损坏线索出现后，增强驱动源码关联排查指导。
     if (
         signature_class in {"pointer_corruption", "use_after_free"}
         and step_count >= 8
+        # any() 函数：接收一个可迭代对象，如果其中任一元素为 True 则返回 True，全部为 False 则返回 False
+        # 遍历元组中的每个关键词，检查每个关键词是否存在于 lowered_recent_text 文本中
+        # 如果有任何一个关键词存在，整个表达式返回 True，否则返回 False
         and any(
             token in lowered_recent_text
             for token in (
@@ -262,23 +263,52 @@ def _select_sop_fragments(state: AgentState) -> list[str]:
     return _dedupe_preserve_order(fragments)
 
 
-def _select_context_overlays(state: AgentState) -> list[str]:
+def _select_context_overlays(state: AgentState, recent_text: str) -> list[str]:
+    """
+    根据当前分析状态选择上下文覆盖层（context overlays）。
+
+    该函数根据崩溃签名类别、根本原因类别、步骤计数以及最近的消息内容，
+    动态决定是否需要添加特定的上下文覆盖层，如栈损坏覆盖层或驱动对象覆盖层。
+
+    Args:
+        state (AgentState): 包含当前分析状态的字典对象，包括崩溃签名类别、
+                           根本原因类别、步骤计数和消息历史等关键信息
+        recent_text (str): 最近消息的合并文本，由调用方预先计算并传入。
+
+    Returns:
+        list[str]: 上下文覆盖层标识符列表，可能包含 STACK_CORRUPTION_OVERLAY、
+                   DRIVER_OBJECT_OVERLAY 或空列表
+    """
+    # 初始化覆盖层数组
     overlays: list[str] = []
+    # 获取当前崩溃签名类别
     signature_class = state.get("current_signature_class")
+    # 获取当前根本原因类别
     root_cause_class = state.get("current_root_cause_class")
+    # 获取当前步骤计数，默认为 0
     step_count = state.get("step_count", 0)
-    recent_text = _recent_text_blob(state.get("messages", []))
+    # 将最近文本转换为小写，便于关键词匹配
     lowered_recent_text = recent_text.lower()
+    # 检查是否为栈保护案例
     stack_protector_case = _is_stack_protector_case(signature_class, recent_text)
 
-    if signature_class == "stack_corruption":
+    # 如果崩溃签名是栈损坏，添加栈损坏覆盖层。
+    # 注意：stack_protector_case 时跳过，因为 stack_protector_canary playbook +
+    # stack_protector_fast_path SOP 已完整覆盖所有规则；同时注入 STACK_CORRUPTION_OVERLAY
+    # 会引入 S1-S5 generic 方法论与 stack_protector_canary 快速路径的隐性优先级矛盾。
+    if signature_class == "stack_corruption" and not stack_protector_case:
         overlays.append(STACK_CORRUPTION_OVERLAY)
 
+    # 如果崩溃签名是指针损坏或使用后释放，且满足特定条件，添加驱动对象覆盖层
     if (
+        # 检查签名类别是否为指针损坏或使用后释放
         signature_class in {"pointer_corruption", "use_after_free"}
         and (
+            # 根本原因是 DMA 损坏
             root_cause_class == "dma_corruption"
+            # 或者步骤计数大于等于 8
             or step_count >= 8
+            # 或者最近文本中包含特定关键词
             or any(
                 token in lowered_recent_text
                 for token in (
@@ -296,10 +326,13 @@ def _select_context_overlays(state: AgentState) -> list[str]:
                 )
             )
         )
+        # 并且不是栈保护案例
         and not stack_protector_case
     ):
+        # 添加驱动对象覆盖层
         overlays.append(DRIVER_OBJECT_OVERLAY)
 
+    # 去除重复项并保持顺序后返回覆盖层数组
     return _dedupe_preserve_order(overlays)
 
 
@@ -379,20 +412,93 @@ def _format_gates(raw_gates: object) -> str:
 
 
 def _recent_command_summaries(messages: Sequence[BaseMessage]) -> str:
-    commands: list[str] = []
+    command_counts: dict[str, int] = {}
+    command_order: list[str] = []
+
     for message in reversed(messages):
         if not isinstance(message, AIMessage):
             continue
 
-        commands.extend(_extract_commands_from_ai_message(message))
-        if len(commands) >= 8:
-            break
+        for command_type in _extract_command_types_from_ai_message(message):
+            command_counts[command_type] = command_counts.get(command_type, 0) + 1
+            if command_type not in command_order:
+                command_order.append(command_type)
 
-    if not commands:
+    if not command_counts:
         return "none"
 
-    unique_commands = _dedupe_preserve_order(reversed(commands))
-    return "; ".join(unique_commands[-8:])
+    summaries = []
+    for command_type in command_order[:8]:
+        count = command_counts[command_type]
+        suffix = "call" if count == 1 else "calls"
+        summaries.append(f"{command_type}: {count} {suffix}")
+    return "; ".join(summaries)
+
+
+def _extract_command_types_from_ai_message(message: AIMessage) -> list[str]:
+    command_types: list[str] = []
+
+    for tool_call in message.tool_calls or []:
+        name = tool_call.get("name") or tool_call.get("command_name")
+        args = tool_call.get("args") or tool_call.get("arguments") or {}
+        if isinstance(args, dict):
+            if "command_name" in args:
+                command_types.extend(
+                    _command_types_from_action(
+                        str(args["command_name"]),
+                        args.get("arguments") or [],
+                    )
+                )
+            elif "script" in args:
+                command_types.extend(
+                    _command_types_from_action("run_script", args["script"])
+                )
+            elif "command" in args:
+                command_types.extend(
+                    _command_types_from_action("run_script", args["command"])
+                )
+            elif name:
+                command_types.append(str(name))
+        elif name:
+            command_types.extend(_command_types_from_action(str(name), args))
+
+    if command_types:
+        return command_types
+
+    try:
+        parsed_content = json.loads(message.content)
+    except (TypeError, json.JSONDecodeError):
+        return []
+
+    action = parsed_content.get("action")
+    if not action:
+        return []
+
+    return _command_types_from_action(
+        action.get("command_name", "unknown"),
+        action.get("arguments") or [],
+    )
+
+
+def _command_types_from_action(command_name: str, arguments: object) -> list[str]:
+    if command_name != "run_script":
+        return [command_name]
+
+    if isinstance(arguments, str):
+        lines = [arguments]
+    elif isinstance(arguments, Iterable) and not isinstance(arguments, (bytes, dict)):
+        lines = [str(argument) for argument in arguments]
+    else:
+        lines = [str(arguments)]
+
+    command_types = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        command_types.append(stripped.split()[0])
+
+    return command_types or ["run_script"]
 
 
 def _extract_commands_from_ai_message(message: AIMessage) -> list[str]:
@@ -445,8 +551,12 @@ def _render_command(command_name: str, arguments: object) -> str:
 
 
 def _recent_text_blob(messages: Sequence[BaseMessage]) -> str:
+    # Scan ALL messages for keyword detection used by SOP/overlay/playbook injection.
+    # This function's output is never inserted into the prompt; it is only used for
+    # `in` keyword checks. Capping at 6 messages caused SOP injection to silently fail
+    # when critical signals (e.g., "gs:0x28", "address") had scrolled out of the window.
     parts: list[str] = []
-    for message in messages[-6:]:
+    for message in messages:
         content = getattr(message, "content", "")
         if isinstance(content, str):
             parts.append(content[:800])
@@ -457,18 +567,35 @@ def _infer_stage_name(
     step_count: int,
     gates: Optional[dict[str, GateEntry]],
 ) -> str:
+    pending_gate = None
+    if gates:
+        open_gates = [
+            name
+            for name, gate in gates.items()
+            if GateEntry.model_validate(gate).status in {"open", "blocked"}
+        ]
+        if open_gates:
+            pending_gate = open_gates[0]
+
     if step_count <= 3:
         return "Stage 0-1: panic classification and fault identification"
 
-    if gates:
-        open_gates = [
-            name for name, gate in gates.items() if gate.status in {"open", "blocked"}
-        ]
-        if open_gates:
-            return f"Stage 2-5: evidence collection ({open_gates[0]} pending)"
-
-    if step_count >= 20:
+    if step_count >= 18:
+        if pending_gate:
+            return (
+                "Stage 6: convergence and bounded conclusion "
+                f"({pending_gate} still pending)"
+            )
         return "Stage 6: convergence and bounded conclusion"
+
+    if step_count <= 9 and pending_gate:
+        return f"Stage 2-5: evidence collection ({pending_gate} pending)"
+
+    if pending_gate:
+        return (
+            "Stage 4-5: object validation and source exclusion "
+            f"({pending_gate} still pending)"
+        )
 
     return "Stage 4-5: object validation and source exclusion"
 
