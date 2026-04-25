@@ -15,6 +15,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, System
 from .graph_state import AgentState
 from .output_parser import render_action_arguments
 from .schema import VMCoreAnalysisStep
+from src.utils.config import config_manager
 from src.utils.logging import logger
 
 
@@ -32,6 +33,9 @@ def generate_markdown_report(state: AgentState) -> str:
 
     lines = []
 
+    # 直接从配置中获取模型名称
+    model_name = str(config_manager.get("llm_model", "unknown")).lower()
+
     # 标题和基本信息
     lines.append("# VMCore 分析报告")
     lines.append("")
@@ -42,6 +46,8 @@ def generate_markdown_report(state: AgentState) -> str:
     lines.append(f"- **vmcore 路径**: `{state['vmcore_path']}`")
     lines.append(f"- **vmlinux 路径**: `{state['vmlinux_path']}`")
     lines.append(f"- **vmcore-dmesg 路径**: `{state['vmcore_dmesg_path']}`")
+
+    lines.append(f"- **分析模型**: `{model_name}`")
 
     if state.get("debug_symbol_paths"):
         lines.append(f"- **调试符号路径**:")
@@ -223,12 +229,9 @@ def generate_markdown_report(state: AgentState) -> str:
     lines.append("")
     lines.append("## 总结")
     lines.append("")
-    lines.append(
-        f"本次分析共执行 {step_number} 个步骤，使用了 {state.get('token_usage', 0)} 个 Token"
-    )
-    if state.get("model_name"):
-        lines.append(f"，使用的模型：{state.get('model_name')}")
-    lines.append("。")
+    summary_text = f"本次分析共执行 {step_number} 个步骤，使用了 {state.get('token_usage', 0)} 个 Token"
+    summary_text += f"，使用的模型：{model_name}。"
+    lines.append(summary_text)
 
     # 检查是否有最终诊断
     has_diagnosis = False
