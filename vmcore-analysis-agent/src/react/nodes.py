@@ -171,15 +171,39 @@ async def dispatch_mcp_requests(
 async def dispatch_crash_commands(
     commands: List[str], state: AgentState
 ) -> List[Tuple[str, Any]]:
+    """
+    解析并分发崩溃分析相关的指令列表。
+
+    该函数负责将输入的字符串指令字符串解析为 MCP (Model Context Protocol)
+    可理解的工具调用请求格式。它能够识别特定的 'run_script' 指令并对其进行
+    参数提取，对于其他指令则将其视为通用的工具命令。
+
+    Args:
+        commands (List[str]): 待执行的指令字符串列表。
+            例如：["run_script path/to/script.py", "get_logs"]
+        state (AgentState): 当前代理的状态对象，用于上下文传递。
+
+    Returns:
+        List[Tuple[str, Any]]: 返回执行结果列表。每个元素是一个元组，
+            包含 (原始指令字符串，工具执行后的响应内容)。
+    """
     requests = []
     for cmd in commands:
+        # 将指令按第一个空格分隔，从而分离工具名称和参数
         parts = cmd.split(" ", 1)
         tool_name = parts[0]
+
         if tool_name == "run_script":
+            # 如果是 run_script 指令，将剩余部分作为 'script' 参数
             args = {"script": parts[1] if len(parts) > 1 else ""}
         else:
+            # 对于其他所有指令，将其整个字符串作为 'command' 参数
             args = {"command": cmd}
+
+        # 构建符合 dispatch_mcp_requests 要求的请求结构
         requests.append({"display": cmd, "tool_name": tool_name, "args": args})
+
+    # 异步分发所有解析后的请求并等待结果返回
     return await dispatch_mcp_requests(requests, state)
 
 
