@@ -161,6 +161,7 @@ def _build_managed_gates(
             managed[gate_name] = GateEntry(
                 required_for=[signature_class],
                 status="open",
+                prerequisite=None,
                 evidence=(
                     "Managed by executor state: awaiting source-level field typing via "
                     "function-pointer anchoring, source cross-reference, or defensible offset inference."
@@ -170,6 +171,7 @@ def _build_managed_gates(
             managed[gate_name] = GateEntry(
                 required_for=[signature_class],
                 status="open",
+                prerequisite=None,
                 evidence="Managed by executor state: awaiting deterministic evidence.",
             )
 
