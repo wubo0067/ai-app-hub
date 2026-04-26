@@ -131,6 +131,15 @@ _SIGNATURE_CLASS_ALIASES: dict[str, str] = {
     "oob": "pointer_corruption",
     "machine_check": "mce",
     "oom": "oom_panic",
+    "wprotect": "write_protection_violation",
+    "write_protect": "write_protection_violation",
+    "ro_fault": "write_protection_violation",
+    "smep": "smap_smep_violation",
+    "smap": "smap_smep_violation",
+    "privilege_violation": "smap_smep_violation",
+    "invalid_addr": "invalid_address_access",
+    "page_not_found": "page_not_present",
+    "vmalloc_fault": "page_not_present",
 }
 
 
@@ -440,6 +449,10 @@ CrashSignatureClass = Literal[
     "mce",  # 机器检查异常 - Machine Check Exception / Hardware Error
     "general_protection_fault",  # 通用保护故障 - x86 #13 或等效保护域故障
     "stack_corruption",  # 栈损坏 - stack-protector / kernel stack is corrupted
+    "invalid_address_access",  # 非法地址访问 - canonical 但垃圾值地址的 page fault（指针溢出/位翻转/偏移错误）
+    "write_protection_violation",  # 写保护违例 - 向只读页（.text/.rodata/__ro_after_init）发起写入
+    "page_not_present",  # 映射缺失 - vmalloc/vmap/模块地址空间中 PTE 无效的 page fault
+    "smap_smep_violation",  # SMAP/SMEP 违例 - 内核态越权访问/执行用户态页面
     "unknown",  # 未知类型 - 无法分类的崩溃类型
 ]
 
@@ -480,6 +493,8 @@ RootCauseClass = Literal[
     "oom_panic",  # 内存耗尽恐慌 - OOM 导致系统 panic
     "pointer_corruption",  # 指针损坏 - 通用指针损坏，机制待确定
     "stack_corruption",  # 栈损坏 - 已能确认栈被破坏，但尚未定位更深层机制
+    "write_protection_violation",  # 写保护违例 - 内核只读内存被写入（漏洞利用/驱动错误/内存破坏）
+    "smap_smep_violation",  # SMAP/SMEP 违例 - 内核越权执行或访问用户态页面
     "unknown",  # 未知根因 - 证据不足以确定具体机制
 ]
 
@@ -574,6 +589,10 @@ class VMCoreAnalysisStep(BaseModel):
         "oom_panic": ["oom_context", "memory_pressure"],
         "general_protection_fault": ["register_provenance"],
         "bug_on": ["stack_integrity"],
+        "invalid_address_access": ["register_provenance"],
+        "write_protection_violation": ["register_provenance"],
+        "page_not_present": ["register_provenance", "object_lifetime"],
+        "smap_smep_violation": ["register_provenance"],
     }
 
     _DEFAULT_ROOT_CAUSE_FROM_SIGNATURE: ClassVar[Dict[str, str]] = {
@@ -586,6 +605,8 @@ class VMCoreAnalysisStep(BaseModel):
         "divide_error": "divide_error",
         "invalid_opcode": "invalid_opcode",
         "oom_panic": "oom_panic",
+        "write_protection_violation": "write_protection_violation",
+        "smap_smep_violation": "smap_smep_violation",
     }
 
     @model_validator(mode="before")

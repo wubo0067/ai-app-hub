@@ -176,6 +176,197 @@ Analysis:
 """.strip(),
     "bug_on": _BUG_WARN_PLAYBOOK,
     "warn_on": _BUG_WARN_PLAYBOOK,
+    "invalid_address_access": """
+## 3.11 Invalid Address Access (Canonical but Garbage-Valued Fault Address)
+Pattern: unable to handle kernel paging request at <address> where the fault address is
+non-zero, non-trivial, and does not match any expected kernel object layout; the address
+appears random, offset-shifted, or clearly outside any kernel-mapped region, yet is
+architecturally canonical.
+
+Triage — classify the address BEFORE proceeding:
+- If the address is TRULY NON-CANONICAL (bits 63:48 are not all 0 or all 1 on x86-64):
+  this is a General Protection Fault (#GP, x86 vector 13). Route to general_protection_fault.
+- If the address is near zero (< 0x1000 or a small struct-member offset from zero):
+  route to null_deref.
+- If the address is in the vmalloc/vmap range but the PTE is absent: route to page_not_present.
+- Otherwise (canonical, non-null, non-vmalloc, PTE-absent, garbage-looking): use this playbook.
+
+Analysis:
+1. Confirm the address is canonical: verify that bits 63:48 sign-extend bit 47.
+   If not canonical, stop — this is a #GP; switch to general_protection_fault playbook.
+2. Use sym <RIP> and dis -rl <RIP> to identify the faulting instruction and the register
+   holding the bad address.
+3. Identify the producer: which register carries the bad value, and where was it last
+   loaded? Trace back through the register chain — was this a memory load, the result of
+   arithmetic, a function return value, or a struct-member dereference?
+4. Evaluate likely root causes in order:
+   a. Pointer overflow / underflow: iterating a pointer past the end of an allocation, or
+      subtracting past the start. The bad address will be a small or large delta from a
+      valid kernel symbol or slab address.
+   b. Struct member offset error: wrong struct type cast, incorrect field offset constant,
+      or API mismatch producing an address that is valid-looking except for a small shift.
+   c. Bit flip (hardware): a single-bit change in a valid kernel pointer produces an address
+      in an unmapped region. Look for corroborating MCE or EDAC evidence.
+   d. Stale/wild pointer from UAF: the object holding the pointer was freed and its memory
+      reclaimed; the stored pointer now refers to reclaimed or remapped address space.
+5. Run vtop <fault_addr> to confirm the page is absent.  If vtop succeeds and a valid
+   page is found, the access may be a protection fault — re-evaluate the Oops error code.
+6. If the bad address has a recognizable bit pattern (e.g., a valid address shifted by one
+   byte, a bus address stored in a kernel virtual pointer slot, or a value matching a known
+   struct field), treat that pattern as a corruption fingerprint and trace it aggressively.
+7. For unaligned-access symptoms on non-x86 architectures: verify whether the fault is an
+   alignment exception. On x86, unaligned data accesses are handled in hardware; if an
+   alignment-related path is reported, the address itself is more likely wrong, not merely
+   misaligned.
+""".strip(),
+    "write_protection_violation": """
+## 3.12 Write Protection Violation (Read-Only Page Fault)
+Pattern: BUG: unable to handle kernel paging request at <address>; Oops error code with
+bit 0 (protection fault, page IS present) and bit 1 (write access) both set — e.g.,
+Oops: 0003; or "kernel BUG at ... write to read-only memory"; or dmesg explicitly states
+"Write protect fault" or "kernel attempted to write to read-only page".
+
+Oops error code quick decode (relevant bits):
+  bit 0 = 1 → protection fault (page present, access denied)
+  bit 1 = 1 → write fault
+  bit 4 = 1 → instruction-fetch fault (SMEP) → use smap_smep_violation instead
+
+Analysis:
+1. Confirm the error code: bits 0 and 1 both set, bit 4 clear.
+   If bit 4 is also set, this is a SMEP violation — route to smap_smep_violation.
+2. Identify the fault address. Use sym <fault_addr> to classify the write target:
+   a. Kernel .text section → kernel code segment is being modified. Highest-priority
+      security concern; treat as potential exploit (inline hook, code patch, ret2dir).
+   b. .rodata or __ro_after_init data → attempt to modify data sealed after init;
+      likely a driver lifecycle bug or post-init write to a configuration constant.
+   c. Module .text or .rodata → faulty module self-modifying its own code or constants.
+   d. Kernel page table or credential struct pages → memory corruption reaching
+      write-protected structural pages; may indicate heap OOB or DMA overwrite.
+3. Use dis -rl <RIP> to locate the exact store instruction that triggered the fault.
+4. Trace the write source: identify the object being written and the value being stored.
+   Determine whether this is a direct store, a memcpy, a copy_from_user overrun, or an
+   indirect write through a corrupted function pointer or struct field.
+5. Assess the write mechanism:
+   a. Direct store to a known kernel text or RO symbol from a driver path → driver bug
+      directly writing a constant or code address (e.g., self-patching, miscounted offset).
+   b. memcpy or bulk copy overrunning into a read-only region adjacent to a writable one →
+      OOB write; investigate source buffer bounds and copy length.
+   c. Attempt to modify __ro_after_init config data long after init completed →
+      driver lifecycle bug; check whether the init vs. runtime paths are correctly split.
+   d. Corrupted pointer directing a store to a protected region → route the pointer
+      provenance investigation to pointer_corruption or use_after_free as appropriate.
+6. Cross-check dmesg for preceding events: module loads, setuid/setcap syscalls, mprotect
+   calls on kernel memory, or prior BUG/WARN lines indicating pre-existing corruption.
+7. If exploit activity is suspected (write targeting function pointer tables, system call
+   table, IDT, or credential structures), record all register values and the full backtrace
+   as forensic evidence before drawing conclusions.
+""".strip(),
+    "page_not_present": """
+## 3.13 Page Not Present (Missing Mapping — VMalloc / VMap / Module Space)
+Pattern: unable to handle kernel paging request at <address>; Oops error code 0x0000
+(neither protection fault nor write fault — the page is simply absent); fault address is
+in the vmalloc region, the module address range, a driver vmap area, or another
+dynamically-mapped kernel virtual range — not the slab/kmalloc heap and not near NULL.
+
+Key distinction from use_after_free (slab):
+  use_after_free  → physical page is typically still present; kmem -S finds a freed slab
+                    object; poison markers (0x6b6b...) are visible in the slab data.
+  page_not_present → vtop <fault_addr> FAILS or returns an invalid/absent PTE;
+                    the physical page backing that virtual address does not exist.
+
+Analysis:
+1. Run vtop <fault_addr> immediately to confirm the PTE is absent or invalid.
+   If vtop succeeds and the page IS present, re-evaluate: this may be a use_after_free
+   with slab reuse, or a protection fault with wrong error code interpretation.
+2. Identify the address range of the fault address:
+   a. vmalloc range (typically 0xffffc90000000000–0xffffe8ffffffffff on x86-64):
+      likely vmalloc UAF — the region was vfree'd while a stale pointer remained live.
+   b. Module text/data range (0xffffffffc0000000–0xffffffffff000000):
+      module was unloaded (or partially initialized) while still referenced; check whether
+      module_put or module unload raced with in-flight callers.
+   c. Driver vmap or ioremap region: driver unmapped its own I/O or buffer window while a
+      pending interrupt, DMA completion, or work-queue entry still held a reference.
+3. Check dmesg for vfree, free_vm_area, vunmap, iounmap, module_put, or __free_pages
+   activity immediately before the crash. Correlate freed addresses with the fault address.
+4. Inspect the call stack for the access path: is the stale reference being dereferenced
+   from an interrupt handler, a work-queue callback, a timer, or an RCU callback that
+   outlived the allocation?
+5. For vmalloc UAF: identify (a) the vmalloc/vmap call that allocated the region, and
+   (b) the vfree/vunmap call that freed it. Determine which reference — pointer stored in
+   a struct, argument passed to a callback, cached in a per-CPU variable — was not cleared
+   before the free.
+6. For module-range faults: use mod -s <module> to inspect module state. Verify whether
+   the module is in MODULE_STATE_UNFORMED or MODULE_STATE_GOING at crash time.
+7. Distinguish from vmalloc_fault (normal TLB sync): the kernel vmalloc_fault handler
+   propagates page-table entries from init_mm for legitimate vmalloc mappings. If
+   vmalloc_fault appears in the call stack and the crash still occurred, the mapping truly
+   no longer exists — this confirms the vmalloc region was freed before the access.
+8. If the fault is in a DMA-mapped region, consider whether the DMA mapping was torn down
+   (dma_unmap_*) while device-side DMA was still in flight. Check IOMMU fault logs.
+""".strip(),
+    "smap_smep_violation": """
+## 3.14 SMAP / SMEP Violation (Privilege Boundary Fault)
+Pattern: unable to handle kernel paging request at <user-space address>; fault address is
+in user-space range (typically < 0x00007fffffffffff); Oops error code with bit 2 (user-mode
+page accessed from CPL=0) set, and/or bit 4 (instruction-fetch fault) set.
+
+Triage — distinguish SMEP from SMAP before proceeding:
+  SMEP violation: kernel attempted to EXECUTE a user-space page.
+    Oops error code bit 4 (instruction-fetch) is set (e.g., 0x0011, 0x0015).
+    RIP is at a valid kernel address; the faulting instruction is an indirect call/jmp
+    that resolved to a user-space target.
+  SMAP violation: kernel accessed (read/write) a user-space DATA page without stac/clac.
+    Oops error code bit 2 set, bit 4 clear (e.g., 0x0004, 0x0005, 0x0006, 0x0007).
+    The fault address is a user-space data address; RIP is inside kernel code.
+
+Analysis:
+1. Confirm the fault address is in user-space range (below the user-kernel split,
+   typically < 0x00007fffffffffff on x86-64). If the fault address is in kernel range,
+   this is not a SMAP/SMEP violation — re-evaluate using a different playbook.
+2. Decode the Oops error code to classify the violation (SMEP vs. SMAP) as above.
+3. Use sym <RIP> and dis -rl <RIP> to identify the exact instruction that faulted.
+   - SMEP: locate the indirect call or jmp in kernel code whose target resolved to the
+     user-space address. Inspect the function pointer register and its source object.
+   - SMAP: locate the memory load or store accessing the user-space address. Verify whether
+     it falls inside a copy_from_user / copy_to_user / get_user / put_user guard. These
+     wrappers temporarily re-enable user-space access via stac/clac; a plain dereference
+     outside them triggers SMAP.
+
+4. For SMEP violations:
+   a. This is a strong indicator of kernel exploit activity (ret2usr, JOP/ROP pivoting to
+      user-space shellcode, function-pointer overwrite).
+   b. Identify which kernel struct or callback table contains the corrupted function pointer
+      that resolved to the user address. Trace the pointer provenance using the register
+      chain and the object at which the indirect call/jmp was issued.
+   c. If the function pointer was corrupted by a prior memory error, route the corruption
+      source investigation to pointer_corruption or use_after_free as appropriate.
+   d. If no corruption source is found and the pointer appears to have been deliberately
+      set to a user-space address, treat as an active exploit attempt and document all
+      register values and the full backtrace.
+
+5. For SMAP violations:
+   a. Check whether the kernel code path has a legitimate reason to access user-space
+      memory at that point. If yes, verify whether copy_from_user / get_user is missing
+      and a __user-annotated pointer is being dereferenced directly instead.
+   b. Common legitimate-bug pattern: an ioctl handler, read/write callback, or mmap fault
+      handler receives a user-supplied pointer and dereferences it without the proper guard.
+      Inspect the call chain for such patterns in the active frames.
+   c. If no direct user-pointer dereference is found in the active call chain, consider
+      whether a kernel object was corrupted (UAF, OOB write) to contain a user-space
+      address that the kernel then inadvertently dereferenced.
+   d. Check for missing access_ok() validation upstream: a user address that was never
+      range-checked may pass into a kernel subsystem that expects it to have been
+      validated earlier in the call chain.
+
+6. Assess security context:
+   a. SMEP violations in production kernels are nearly always exploit-related. Treat as
+      highest-priority and preserve all forensic evidence.
+   b. SMAP violations may be legitimate driver bugs (missing copy_from_user wrapper) or
+      exploit attempts (corrupted data structures directing the kernel toward user memory).
+      Pursue both angles until one is definitively ruled out.
+7. Check dmesg for preceding suspicious events: unusual setuid / setreuid / setcap syscalls,
+   mmap calls by the crash task mapping executable user pages, or prior BUG/WARN/GPF lines.
+""".strip(),
     "stack_protector_canary": """
 ## Stack Protector / Canary Failure
 Pattern: stack-protector: Kernel stack is corrupted in: <function>, or active frame is __stack_chk_fail.
