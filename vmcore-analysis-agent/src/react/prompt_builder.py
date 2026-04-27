@@ -540,13 +540,23 @@ def _extract_commands_from_ai_message(message: AIMessage) -> list[str]:
 
 
 def _render_command(command_name: str, arguments: object) -> str:
+    """
+    将命令名称和参数渲染为字符串表示。
+
+    根据参数类型不同，生成格式为 "命令名 (参数列表)" 或仅 "命令名" 的字符串。
+    支持字符串参数直接使用，可迭代对象参数用逗号连接，其他类型忽略参数。
+    """
     if isinstance(arguments, str):
+        # 字符串参数直接作为参数内容
         rendered_args = arguments
     elif isinstance(arguments, Iterable):
+        # 可迭代对象参数转换为逗号分隔的字符串
         rendered_args = ", ".join(str(arg) for arg in arguments)
     else:
+        # 其他类型不显示参数
         rendered_args = ""
 
+    # 如果有参数内容，返回 "命令名 (参数)"，否则只返回命令名
     return f"{command_name}({rendered_args})" if rendered_args else command_name
 
 
@@ -567,6 +577,21 @@ def _infer_stage_name(
     step_count: int,
     gates: Optional[dict[str, GateEntry]],
 ) -> str:
+    """根据当前推理步数和待处理的门控（gate）状态，推断所处的分析阶段的中文描述。
+
+    参数：
+        step_count: 当前已执行的推理步数。
+        gates: 门控定义字典，键为门名称，值为 GateEntry 格式的原始数据（将进行解析）。
+
+    返回：
+        描述当前阶段的字符串。阶段划分逻辑：
+        - 步数 ≤ 3 时，处于“阶段 0-1：panic 分类与故障识别”；
+        - 步数 ≥ 18 时，处于“阶段 6：收敛与有限结论”，如果存在未完成的门控则附加提示；
+        - 步数 ≤ 9 且存在待处理门控时，处于“阶段 2-5：证据收集”；
+        - 其余情况根据是否有待处理门控，决定返回“阶段 4-5：对象验证与来源排除”，并附加门控信息；
+        - 若无待处理门控且步数在中间范围，仍返回阶段 4-5 的默认描述。
+    """
+    # 找出第一个状态为 open 或 blocked 的门控，作为当前待处理门控
     pending_gate = None
     if gates:
         open_gates = [
@@ -577,9 +602,11 @@ def _infer_stage_name(
         if open_gates:
             pending_gate = open_gates[0]
 
+    # 早期步骤：回归阶段 0-1
     if step_count <= 3:
         return "Stage 0-1: panic classification and fault identification"
 
+    # 后期步骤：收敛阶段，可能附带仍在处理的门控提示
     if step_count >= 18:
         if pending_gate:
             return (
@@ -588,15 +615,18 @@ def _infer_stage_name(
             )
         return "Stage 6: convergence and bounded conclusion"
 
+    # 中期且存在未完成的门控：证据收集阶段
     if step_count <= 9 and pending_gate:
         return f"Stage 2-5: evidence collection ({pending_gate} pending)"
 
+    # 存在待处理门控但步数偏后：对象验证与来源排除阶段，并注明门控
     if pending_gate:
         return (
             "Stage 4-5: object validation and source exclusion "
             f"({pending_gate} still pending)"
         )
 
+    # 默认返回阶段 4-5（无门控提示）
     return "Stage 4-5: object validation and source exclusion"
 
 

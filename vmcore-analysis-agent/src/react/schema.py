@@ -532,11 +532,16 @@ class Hypothesis(BaseModel):
 class GateEntry(BaseModel):
     """
     is_conclusive=True 前必须完成的验证检查点。
+
+    每个 gate 代表一个必须完成的验证步骤，用于确认崩溃根因的特定假设。
+    在将分析结论标记为“最终结论”（is_conclusive=True）之前，所有相关的 gate
+    必须处于 closed 或 n/a 状态，且 evidence 字段必须填写具体的工具输出。
+
     status 含义：
-      open    — 尚未调查
-      closed  — 已验证（evidence 字段必须填写具体工具输出，不得是泛泛总结）
-      blocked — 前置 gate 尚未关闭（仅 external_corruption_gate 使用）
-      n/a     — 确实不适用（evidence 字段必须说明原因）
+      open    — 尚未调查，或调查尚未完成
+      closed  — 已验证通过（evidence 字段必须填写具体工具输出，不得使用泛泛总结）
+      blocked — 前置 gate 尚未关闭，当前 gate 无法开始验证（通常仅 external_corruption_gate 使用）
+      n/a     — 确实不适用（evidence 字段必须解释为何不适用，如特定硬件环境未触发）
     """
 
     required_for: List[CrashSignatureClass] = Field(
@@ -565,6 +570,39 @@ PartialDumpStatus = Literal[
 
 
 class VMCoreAnalysisStep(BaseModel):
+    """
+    A single reasoning step in the vmcore analysis state machine.
+
+    该模型描述代理在一次崩溃调查中所进行的结构化推理、所选择的下一步动作，以及不断演化的证据状态。
+    它强制执行依赖于崩溃特征（signature_class）的必需证据门（evidence gates），并管理假设与诊断结论的生命周期。
+
+    **Fields Overview:**
+    - **step_id**: 当前步骤的唯一序列号。
+    - **reasoning**:3–6 句的分析性总结，遵循规定格式（学到了什么、对假设的影响、下一步最具诊断价值的行动）。
+    - **action**: 下一步要执行的工具调用。当 is_conclusive=True 时必须为 None。
+    - **is_conclusive**: 调查是否已达到最终诊断。
+    - **signature_class**: 从 panic/warning 字符串中提取的早期崩溃特征。步骤 1 时为 null；从步骤 2 开始为必填。
+      参见 §1.1a 崩溃特征决策表。必须是允许的 `CrashSignatureClass` 值之一——不是根本原因标签。
+    - **root_cause_class**: 根本原因类别（不同于 `signature_class`）。
+      在早期调查阶段可能为 null。当 `is_conclusive=True` 时，必须为具体值（或 `"unknown"`）。
+    - **corruption_mechanism**: 可选的更细粒度的破坏子类别，嵌套在 `root_cause_class` 下。
+    - **partial_dump**: Vmcore 完整性状态。在步骤 2 从 `sys` 输出中设置一次，并保持不变。当为 `"partial"` 时，代理不得重试返回空输出或 seek 错误的地址。
+    - **active_hypotheses**: 假设的有序列表。从步骤 2 开始，每一步都会更新。只有一个假设可以有 `status='leading'`。
+      被排除的假设仍保留在列表中，状态为 `status='ruled_out'`，并填写证据。
+    - **gates**: 必须完成的验证检查点的门控。仅包含 `required_for` 列表中包含当前 `signature_class` 的门控。
+      所有必需的门控必须达到 `'closed'` 或 `'n/a'` 状态，才能将 `is_conclusive` 设置为 `true`。
+    - **final_diagnosis**: 仅在 `is_conclusive=True` 时填充。
+    - **fix_suggestion**: 推荐的修复或解决方法。
+    - **confidence**: 诊断的置信水平（`high`、`medium` 或 `low`）。
+    - **additional_notes**: 注意事项、未解决的备选项或建议的后续行动。
+
+    **Validators:**
+    - `migrate_legacy_crash_class`: 将旧字段 crash_class 映射到 signature_class，用于向后兼容。
+    - `validate_and_patch`: 当分析在没有明确确定根本原因的情况下结束时，自动分配默认的 `root_cause_class`，基于 `_DEFAULT_ROOT_CAUSE_FROM_SIGNATURE` 中的映射。
+
+    系统提示（system prompt）中包含更详细的 gate 关闭标准与假设更新规则。
+    """
+
     step_id: int = Field(..., description="Current step sequence number.")
 
     _REQUIRED_GATES: ClassVar[Dict[str, List[str]]] = {
