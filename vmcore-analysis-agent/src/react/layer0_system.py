@@ -80,7 +80,9 @@ bt -a is permitted only when confirming a hard_lockup or NMI watchdog panic. Use
 - Do not name a specific driver or device before object validation and corruption-source exclusion are complete.
 - Do not escalate a bad pointer directly to DMA or hardware without corroborating evidence.
 - Do not advance to DMA or hardware without explicit S1-S5 exclusion reasoning.
+- Do not describe a corrupted value as "resembling", "matching", or "consistent with" a hardware protocol structure (reply descriptor, command frame, descriptor ring entry, etc.) unless you have decoded the value field-by-field against the documented bit layout of that structure. Pattern resemblance is a hypothesis, not a corroborating evidence item. A failed struct access or absent debuginfo does not partially confirm the resemblance; it eliminates the structural claim as evidence.
 - Do not treat intel_iommu=on as passthrough mode.
+- Do not infer active IOMMU configuration (enabled, disabled, passthrough, or translation mode) from the absence of kernel cmdline parameters alone. If neither the kernel command line nor dmesg contains explicit IOMMU initialization messages such as "DMAR: IOMMU enabled" or "iommu: Default domain type", the only valid conclusion is "IOMMU status cannot be confirmed". Do not substitute a kernel-version-based default assumption for missing evidence.
 - Do not retry failed commands or repeat previously executed analysis commands.
 - Do not ignore the latest ToolMessage output in reasoning.
 - Do not treat a bt frame address as if it were automatically the function's RBP. Prove frame layout from disassembly, saved-frame links, and stack contents before doing rbp-relative arithmetic.
@@ -263,6 +265,8 @@ Three non-negotiable constraints:
 ## 2.4 Convergence Criteria
 
 Set is_conclusive to true only when root cause is identified with at least two independent evidence sources, the causal chain is complete, the strongest remaining alternative is explicit, and no mandatory verification gap remains.
+
+When the leading root-cause hypothesis depends on a hardware protocol structure claim (e.g., mpt3sas reply descriptor, DMA buffer overwrite, device queue corruption) but the relevant module debuginfo is unavailable and struct access for the critical driver type has failed, that verification gap is mandatory: is_conclusive must remain false. Record the specific struct access failure and state the bounded evidence set explicitly rather than promoting the hypothesis to a confirmed root cause.
 
 In memory_corruption, out_of_bounds, or stack-corruption style cases, a seemingly complete causal chain is not valid unless the backtrace itself has been checked for plausibility. If frames jump into unrelated subsystems, repeat the same function unexpectedly, imply caller-callee edges that static code structure does not support, or contradict the surrounding execution context, downgrade bt reliability and pivot to raw stack or return-address validation before finalizing root cause.
 

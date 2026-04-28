@@ -87,6 +87,15 @@ When struct -o fails for a third-party or out-of-tree module, reconstruct the ru
 - Once the driver and function are known, look for known upstream fixes, stable backports, or CVEs touching the same queue, reset, or reinitialization path.
 - If you cannot verify an exact patch, state the bounded pattern only. Do not invent commit IDs.
 
+### Step G: Protocol-Level Value Claims Require Bit Layout Verification
+- If a corrupted value is described as "resembling", "matching", or "consistent with" a hardware protocol structure (e.g., mpt3sas reply descriptor, NVMe command frame, SCSI CDB, descriptor ring entry), that description is a hypothesis, NOT evidence-quality correlation, until the bit layout is explicitly verified.
+- Required verification before elevating a resemblance claim to evidence:
+  - Map the raw 64-bit (or N-bit) value to the named structure's documented bit field layout, field by field.
+  - Confirm that each decoded sub-field (type, flags, payload, address) individually holds a value consistent with valid protocol state for the claimed structure type.
+  - Prove that the physical page or DMA buffer containing the value is actually mapped to the device's DMA ring, reply queue, or command queue — not merely that the address range "could be" a DMA target.
+- If module debuginfo is unavailable and struct access for the candidate type fails, any structural resemblance claims MUST be explicitly labeled "unverified hypothesis" in the analysis. Do NOT carry forward a failed struct attempt as partial confirmation of the structural claim.
+- Confidence labels such as "high confidence" or "root cause confirmed" are incompatible with an unverified protocol-structure resemblance claim. When bit layout verification cannot be completed, the DMA or hardware attribution must remain explicitly provisional, and is_conclusive must not be set to true on that basis alone.
+
 For third-party or driver-private object corruption, root cause is not complete until one of the following is true:
 - the corrupted field's declared type is identified, or
 - you explicitly state why field-type classification is not possible from available symbols, source, or dump coverage.
