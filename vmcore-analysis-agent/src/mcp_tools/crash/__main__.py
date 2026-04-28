@@ -9,7 +9,6 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from src.utils.logging import logger
 from .client import crash_client
 
-
 # def test_rhel9_crash():
 #     command = "sys -i"
 #     vmcore_path = "/var/crash/127.0.0.1-2026-01-07-16:46:03/vmcore"
@@ -91,9 +90,39 @@ bt"""
         raise
 
 
+async def test_scsishow_tool():
+    logger.info("Starting scsishow tool test")
+
+    vmcore_path = "/home/calmwu/Downloads/crash_case/Case_04419769/vmcore"
+    vmlinux_path = "/usr/lib/debug/lib/modules/4.18.0-553.22.1.el8_10.x86_64/vmlinux"
+
+    try:
+        async with crash_client.session("crash") as session:
+            logger.info("Session established")
+            tools = await load_mcp_tools(session)
+            scsishow_tool = next((t for t in tools if t.name == "scsishow"), None)
+            if scsishow_tool:
+                logger.info("Executing 'scsishow' tool with kver='4.18.0'")
+                result = await scsishow_tool.ainvoke(
+                    {
+                        "vmcore_path": vmcore_path,
+                        "vmlinux_path": vmlinux_path,
+                        "kver": "4.18.0",
+                    }
+                )
+                logger.info(f"'scsishow' result:\n{result}")
+            else:
+                logger.error("Tool 'scsishow' not found")
+
+    except Exception as e:
+        logger.error(f"Error testing scsishow: {e}")
+        raise
+
+
 async def main():
     # await test_crash_mcp()
-    await test_run_script_tool()
+    # await test_run_script_tool()
+    await test_scsishow_tool()
 
 
 if __name__ == "__main__":

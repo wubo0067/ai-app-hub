@@ -16,11 +16,33 @@ from typing import Annotated
 from pydantic import Field
 from fastmcp import FastMCP
 from .executor import run_crash_command, run_crash_script
+from .scsishow import run_scsishow
 
 crash_server = FastMCP(
     "crash_server",
     instructions="This server provides crash analysis tools for Linux vmcore files.",
 )
+
+
+@crash_server.tool()
+def scsishow(
+    vmcore_path: Annotated[
+        str, Field(description="The absolute path to the vmcore file.")
+    ],
+    vmlinux_path: Annotated[
+        str, Field(description="The absolute path to the vmlinux file.")
+    ],
+    kver: Annotated[
+        str, Field(description="The target kernel version (e.g., 4.18.0).")
+    ],
+) -> str:
+    """
+    Run scsishow crash subcommand to extract SCSI subsystem properties across 3.10, 4.18, 5.14.
+    """
+    try:
+        return run_scsishow(vmcore_path, vmlinux_path, kver)
+    except Exception as e:
+        return f"Failed to execute scsishow: {str(e)}"
 
 
 @crash_server.tool()
