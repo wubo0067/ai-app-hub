@@ -253,7 +253,7 @@ class GateEntry(BaseModel):
 _REQUIRED_GATES: ClassVar[Dict[str, List[str]]] = {
     "pointer_corruption": [
         "register_provenance",         # Register provenance validation
-        "object_lifetime",             # Object lifetime validation  
+        "object_lifetime",             # Object lifetime validation
         "local_corruption_exclusion",  # Exclude local corruption
         "external_corruption_gate",    # External corruption gate
         "field_type_classification",   # Field type classification
@@ -376,6 +376,8 @@ vmcore-analysis-agent/
 │   │   ├── playbooks.py               # Analysis playbook definitions
 │   │   ├── prompt_builder.py          # Prompt builder
 │   │   ├── prompt_layers.py           # Prompt layer management
+│   │   ├── prompt_overlays.py         # Prompt overlay definitions
+│   │   ├── prompt_phrases.py          # Prompt phrase templates
 │   │   ├── prompts.py                 # Professional analysis prompts
 │   │   ├── report_generator.py        # Markdown report generation
 │   │   ├── schema.py                  # Data schema definitions (VMCoreAnalysisStep)
@@ -386,11 +388,19 @@ vmcore-analysis-agent/
 │   │   │   ├── server.py              # crash MCP server
 │   │   │   ├── client.py              # crash MCP client
 │   │   │   ├── executor.py            # crash command executor
+│   │   │   ├── scsishow.py            # SCSI show utility
 │   │   │   └── __init__.py            # crash tools package initialization
-│   │   └── source_patch/              # source_patch MCP Server implementation
-│   │       ├── server.py              # Source patch MCP server
-│   │       ├── client.py              # Source patch MCP client
-│   │       └── __init__.py            # Source patch tools package initialization
+│   │   ├── source_patch/              # source_patch MCP Server implementation
+│   │   │   ├── server.py              # Source patch MCP server
+│   │   │   ├── client.py              # Source patch MCP client
+│   │   │   └── __init__.py            # Source patch tools package initialization
+│   │   ├── stack_canary/              # Stack canary analysis tools
+│   │   │   ├── server.py              # Stack canary MCP server
+│   │   │   ├── client.py              # Stack canary MCP client
+│   │   │   ├── analyzer.py            # Stack canary analyzer
+│   │   │   └── __init__.py            # Stack canary tools package initialization
+│   │   ├── __init__.py                # MCP tools package initialization
+│   │   └── registry.py                # MCP tool registry
 │   └── utils/                         # Utility functions
 │       ├── config.py                  # Configuration management
 │       ├── logging.py                 # Logging configuration
@@ -401,15 +411,22 @@ vmcore-analysis-agent/
 │   ├── soft_lockup/                   # Soft lockup reproduction scenarios
 │   └── dma_memory_corruption/         # DMA memory corruption reproduction scenarios
 ├── reports/                           # Analysis report output directory
-├── logs/                              # Runtime log directory
 ├── tests/                             # Test suite
 │   ├── test_action_guard.py           # Action guard tests
+│   ├── test_crash_client.py           # Crash client tests
+│   ├── test_llm_runtime.py            # LLM runtime tests
 │   ├── test_output_parser.py          # Output parser tests
+│   ├── test_prompt_builder.py         # Prompt builder tests
 │   ├── test_prompts.py                # Prompt tests
+│   ├── test_schema.py                 # Schema tests
+│   ├── test_stack_canary_analyzer.py  # Stack canary analyzer tests
+│   ├── test_stack_canary_client.py    # Stack canary client tests
 │   ├── test_state_manager.py          # State manager tests
 │   └── test_vmcore_analysis_step.py   # VMCore analysis step tests
-└── tools/
-    └── show_first_global_func.sh      # Debug symbol verification script
+├── tools/
+│   ├── show_first_global_func.sh      # Debug symbol verification script
+│   └── test_key.py                    # API key testing script
+└── test_simple.py                     # Simple integration test
 ```
 
 ## Quick Start
@@ -451,13 +468,15 @@ After service startup:
 #### 4.1 Check Service Health Status
 
 ```bash
-uv run client/main.py --health
+cd client
+uv run main.py --health
 ```
 
 #### 4.2 Standard Streaming Analysis (Recommended)
 
 ```bash
-uv run client/main.py --url http://192.168.14.132:8000 --stream \
+cd client
+uv run main.py --url http://192.168.14.132:8000 --stream \
                        --vmcore-path "/crash_case/Case_04387188/vmcore" \
                        --vmlinux-path "/usr/lib/debug/lib/modules/4.18.0-305.40.2.el8_4.x86_64/vmlinux" \
                        --vmcore-dmesg-path "/crash_case/Case_04387188/vmcore-dmesg.txt"

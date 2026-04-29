@@ -274,7 +274,7 @@ _REQUIRED_GATES: ClassVar[Dict[str, List[str]]] = {
 
 **三、在项目中的作用**
 
-Gates 在整个分析流程中扮演 质量守门人（Quality Gatekeeper） 的角色：
+Gates 在整个分析流程中扮演 质量守门人（Quality Gatekeeper）的角色：
 
 ```
 ┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
@@ -379,6 +379,8 @@ vmcore-analysis-agent/
 │   │   ├── playbooks.py               # 分析剧本定义
 │   │   ├── prompt_builder.py          # Prompt 构建器
 │   │   ├── prompt_layers.py           # Prompt 分层管理
+│   │   ├── prompt_overlays.py         # Prompt 覆盖层定义
+│   │   ├── prompt_phrases.py          # Prompt 短语模板
 │   │   ├── prompts.py                 # 专业分析 Prompt
 │   │   ├── report_generator.py        # Markdown 报告生成
 │   │   ├── schema.py                  # 数据结构定义 (VMCoreAnalysisStep)
@@ -389,11 +391,19 @@ vmcore-analysis-agent/
 │   │   │   ├── server.py              # crash MCP 服务器
 │   │   │   ├── client.py              # crash MCP 客户端
 │   │   │   ├── executor.py            # crash 命令执行器
+│   │   │   ├── scsishow.py            # SCSI 显示工具
 │   │   │   └── __init__.py            # crash 工具包初始化
-│   │   └── source_patch/              # source_patch MCP Server 实现
-│   │       ├── server.py              # 源码补丁 MCP 服务器
-│   │       ├── client.py              # 源码补丁 MCP 客户端
-│   │       └── __init__.py            # 源码补丁工具包初始化
+│   │   ├── source_patch/              # source_patch MCP Server 实现
+│   │   │   ├── server.py              # 源码补丁 MCP 服务器
+│   │   │   ├── client.py              # 源码补丁 MCP 客户端
+│   │   │   └── __init__.py            # 源码补丁工具包初始化
+│   │   ├── stack_canary/              # 栈金丝雀分析工具
+│   │   │   ├── server.py              # 栈金丝雀 MCP 服务器
+│   │   │   ├── client.py              # 栈金丝雀 MCP 客户端
+│   │   │   ├── analyzer.py            # 栈金丝雀分析器
+│   │   │   └── __init__.py            # 栈金丝雀工具包初始化
+│   │   ├── __init__.py                # MCP 工具包初始化
+│   │   └── registry.py                # MCP 工具注册表
 │   └── utils/                         # 工具函数
 │       ├── config.py                  # 配置管理
 │       ├── logging.py                 # 日志配置
@@ -404,15 +414,22 @@ vmcore-analysis-agent/
 │   ├── soft_lockup/                   # Soft lockup 复现场景
 │   └── dma_memory_corruption/         # DMA 内存破坏复现场景
 ├── reports/                           # 分析报告输出目录
-├── logs/                              # 运行日志目录
 ├── tests/                             # 测试套件
 │   ├── test_action_guard.py           # 行动保护测试
+│   ├── test_crash_client.py           # Crash 客户端测试
+│   ├── test_llm_runtime.py            # LLM 运行时测试
 │   ├── test_output_parser.py          # 输出解析器测试
+│   ├── test_prompt_builder.py         # Prompt 构建器测试
 │   ├── test_prompts.py                # Prompt 测试
+│   ├── test_schema.py                 # 数据结构测试
+│   ├── test_stack_canary_analyzer.py  # 栈金丝雀分析器测试
+│   ├── test_stack_canary_client.py    # 栈金丝雀客户端测试
 │   ├── test_state_manager.py          # 状态管理器测试
 │   └── test_vmcore_analysis_step.py   # VMCore 分析步骤测试
-└── tools/
-    └── show_first_global_func.sh      # 调试符号验证脚本
+├── tools/
+│   ├── show_first_global_func.sh      # 调试符号验证脚本
+│   └── test_key.py                    # API 密钥测试脚本
+└── test_simple.py                     # 简单集成测试
 ```
 
 ## 快速开始
@@ -454,13 +471,15 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 #### 4.1 检查服务健康状态
 
 ```
-uv run client/main.py --health
+cd client
+uv run main.py --health
 ```
 
 #### 4.2 标准流式分析（推荐）
 
 ```
-uv run client/main.py --url http://192.168.14.132:8000 --stream \
+cd client
+uv run main.py --url http://192.168.14.132:8000 --stream \
                        --vmcore-path "/crash_case/Case_04387188/vmcore" \
                        --vmlinux-path "/usr/lib/debug/lib/modules/4.18.0-305.40.2.el8_4.x86_64/vmlinux" \
                        --vmcore-dmesg-path "/crash_case/Case_04387188/vmcore-dmesg.txt"
