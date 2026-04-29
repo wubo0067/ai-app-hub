@@ -39,7 +39,7 @@ Each step: reason about current evidence, identify missing information, invoke o
 	Correct alternative: put that note in reasoning; spend commands only on diagnostic evidence collection
 - Forbidden: kmem -S with no address or kmem -a <addr>
 	Correct alternative: kmem -S <addr>
-- Forbidden: bt -a except hard_lockup
+- Forbidden: bt -a except hard_lockup or NMI watchdog panic
 	Correct alternative: bt <pid>, bt -c <cpu>, foreach UN bt
 - Forbidden: ps or ps -m standalone
 	Correct alternative: ps | grep <pat>, ps <pid>
@@ -70,7 +70,7 @@ bt -a is permitted only when confirming a hard_lockup or NMI watchdog panic. Use
 | struct <type> -o | struct -o <type> |
 | struct -o piped through grep | Use a concrete type name directly |
 | kmem -p <kernel_VA> | vtop <VA> first, then kmem -p <PA> |
-| kmem -S <kernel_stack_addr> | Use task -R or vtop to validate kernel stack pages |
+| kmem -S <kernel_stack_addr> | Kernel stack is allocated via alloc_thread_stack_node, not slab; kmem -S always fails with no diagnostic value. Use vtop to validate kernel stack pages |
 | set <cpu_number> to switch CPU context | Use set -c <cpu> to switch CPU context; bare set <N> switches to PID N |
 | NULL as address in struct or rd | Report NULL as a diagnostic finding; do not read it |
 | grep -E or grep -Ei with alternation but no quotes | Quote the regex, e.g. grep -Ei "dma|iommu|mapping|buffer" |
@@ -79,7 +79,7 @@ bt -a is permitted only when confirming a hard_lockup or NMI watchdog panic. Use
 
 - Do not name a specific driver or device before object validation and corruption-source exclusion are complete.
 - Do not escalate a bad pointer directly to DMA or hardware without corroborating evidence.
-- Do not advance to DMA or hardware without explicit S1-S5 exclusion reasoning.
+- Do not advance to DMA or hardware without explicitly completing Stage 1 through Stage 5 exclusion reasoning (Fault Instruction ID through Corruption Source Analysis) as defined in Part 2.3.
 - Do not describe a corrupted value as "resembling", "matching", or "consistent with" a hardware protocol structure (reply descriptor, command frame, descriptor ring entry, etc.) unless you have decoded the value field-by-field against the documented bit layout of that structure. Pattern resemblance is a hypothesis, not a corroborating evidence item. A failed struct access or absent debuginfo does not partially confirm the resemblance; it eliminates the structural claim as evidence.
 - Do not treat intel_iommu=on as passthrough mode.
 - Do not infer active IOMMU configuration (enabled, disabled, passthrough, or translation mode) from the absence of kernel cmdline parameters alone. If neither the kernel command line nor dmesg contains explicit IOMMU initialization messages such as "DMAR: IOMMU enabled" or "iommu: Default domain type", the only valid conclusion is "IOMMU status cannot be confirmed". Do not substitute a kernel-version-based default assumption for missing evidence.
@@ -88,8 +88,7 @@ bt -a is permitted only when confirming a hard_lockup or NMI watchdog panic. Use
 - Do not treat a bt frame address as if it were automatically the function's RBP. Prove frame layout from disassembly, saved-frame links, and stack contents before doing rbp-relative arithmetic.
 - Do not spend crash commands on narration, breadcrumbs, labels, or comments. If a fact is already known from prior output or your reasoning, do not emit echo/printf just to restate it.
 - Do not abandon investigation of a kernel address merely because sym returns "invalid address". A non-symbol address can still be a data pointer, per-CPU variable, vmalloc address, or module data. Follow up with vtop and kmem -p to determine page ownership.
-- Do not use kmem -S on kernel stack addresses. The kernel stack is allocated via alloc_thread_stack_node, not the slab allocator. kmem -S will always fail with zero diagnostic value. Use vtop instead.
-- Do not treat two adjacent frames in a corrupted or exception-nested backtrace as a proven caller-callee edge merely because they appear next to each other in bt or vmcore-dmesg. If the implied edge is static-call implausible, crosses unrelated subsystems without a proven exception bridge, or conflicts with known helper structure such as security_inode_permission leading into LSM hooks, downgrade bt reliability first and validate saved return addresses or frame provenance before inferring ordinary control flow or RIP misdirection. Always cross-verify with dis -l near the return address to check whether the corresponding call instruction actually exists.
+- Do not treat two adjacent frames in a corrupted or exception-nested backtrace as a proven caller-callee edge merely because they appear next to each other in bt or vmcore-dmesg. If the implied edge is static-call implausible, crosses unrelated subsystems without a proven exception bridge, or conflicts with known helper structure such as security_inode_permission leading into LSM hooks, downgrade bt reliability first and validate saved return addresses or frame provenance before inferring ordinary control flow or RIP misdirection. Always cross-verify with dis -l near the return address to check whether the corresponding call instruction actually exists. See Part 2.4 for the complete bt reliability assessment and three-way edge classification protocol.
 
 ## Log Query Budget
 
@@ -139,7 +138,7 @@ Root-cause families such as out_of_bounds, double_free, wild_pointer, dma_corrup
 
 ## 1.2 Address Search SOP (Condensed)
 
-- Never emit search -k or search -p directly against an unvalidated value.
+- Never emit search -k or search -p. These forms are globally forbidden (see Part 0). Use the bounded form search -s <start> -e <end> <value> for any memory scan instead.
 - First classify whether the candidate is a VA, PA, embedded node, or plain payload bytes.
 - When deep-inspecting a suspicious kernel memory region for a page-fault or pointer-corruption case, you may use run_script with rd -SS <address> <small_count> | grep "<concrete_anchor>" to surface candidate function-pointer or validated string anchors.
 - Keep rd -SS windows small and explicit. Do not issue broad printable-character sweeps such as grep -E '[ -~]{8,}' or other generic "show me any ASCII" patterns across large ranges.
@@ -215,15 +214,11 @@ Correct arithmetic handling examples:
 
 ## 1.6 RIP-Relative Global Variable Access
 
-For RIP-relative loads, use the next-instruction address plus displacement. For pointer globals, use p or p /x to read the runtime value rather than sym.
+For RIP-relative loads, use the next-instruction address plus displacement. For pointer globals in any context, use p or p /x to read the runtime value rather than sym. sym returns the symbol address, not its stored value.
 
 ## 1.7 Embedded Link-Node Rule
 
 When a bucket lookup returns a node pointer, determine whether it is the container-object base or an embedded member address before interpreting offsets.
-
-## 1.8 Symbol vs Variable Value
-
-sym returns the address of the symbol, not its runtime value. Use p or p /x when you need the value of a pointer global.
 
 ================================================================================
 # PART 2: DIAGNOSTIC WORKFLOW
