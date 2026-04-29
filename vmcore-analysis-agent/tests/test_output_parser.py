@@ -1,12 +1,446 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from langchain_core.messages import HumanMessage, ToolMessage
 
-from src.react.output_parser import apply_executor_consistency_audit
+from src.react.output_parser import (
+    apply_executor_consistency_audit,
+    build_tool_calls,
+    repair_structured_output,
+    render_action_arguments,
+)
 from src.react.schema import FinalDiagnosis, SuspectCode, VMCoreLLMAnalysisStep
 
 
 class OutputParserAuditTests(unittest.TestCase):
+    def test_promotes_standalone_mcp_tool_out_of_run_script(self) -> None:
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 3,
+                "reasoning": "The next diagnostic action is to resolve the canary slot using the tool.",
+                "action": {
+                    "command_name": "run_script",
+                    "arguments": ["resolve_stack_canary_slot search_module_extables"],
+                },
+                "is_conclusive": False,
+                "signature_class": "stack_corruption",
+                "root_cause_class": None,
+                "partial_dump": "partial",
+            }
+        )
+
+        with patch(
+            "src.react.output_parser.get_registered_tool_provider",
+            return_value=SimpleNamespace(package_name="stack_canary"),
+        ):
+            audited = apply_executor_consistency_audit(llm_step, state={})
+
+        self.assertEqual(audited.action.command_name, "resolve_stack_canary_slot")
+        self.assertEqual(audited.action.arguments, ["search_module_extables"])
+        self.assertIn(
+            "run_script wrapped a standalone MCP tool call",
+            audited.additional_notes,
+        )
+
+    def test_keeps_real_crash_run_script_unchanged(self) -> None:
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 4,
+                "reasoning": "Bundle two crash commands in one session.",
+                "action": {
+                    "command_name": "run_script",
+                    "arguments": ["sym ffffffffb4b1f419\ndis -rl ffffffffb4b1f419"],
+                },
+                "is_conclusive": False,
+                "signature_class": "stack_corruption",
+                "root_cause_class": None,
+                "partial_dump": "partial",
+            }
+        )
+
+        audited = apply_executor_consistency_audit(llm_step, state={})
+
+        self.assertEqual(audited.action.command_name, "run_script")
+        self.assertEqual(
+            audited.action.arguments,
+            ["sym ffffffffb4b1f419\ndis -rl ffffffffb4b1f419"],
+        )
+
+    def test_corrects_gpf_signature_for_oops_0000_kernel_paging_request(self) -> None:
+        state = {
+            "messages": [
+                HumanMessage(
+                    content=(
+                        "BUG: unable to handle kernel paging request at 000000e500080008\n"
+                        "Oops: 0000 [#1] SMP NOPTI\n"
+                        "RIP: 0010:ffffffffc051a3c4\n"
+                    )
+                )
+            ]
+        }
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 2,
+                "reasoning": "The crash should be treated as a protection fault first.",
+                "action": {
+                    "command_name": "dis",
+                    "arguments": ["-rl", "ffffffffc051a3c4"],
+                },
+                "is_conclusive": False,
+                "signature_class": "general_protection_fault",
+                "root_cause_class": None,
+                "partial_dump": "partial",
+            }
+        )
+
+        audited = apply_executor_consistency_audit(llm_step, state)
+
+        self.assertEqual(audited.signature_class, "pointer_corruption")
+        self.assertIn(
+            "corrected from general_protection_fault to pointer_corruption",
+            audited.reasoning,
+        )
+        self.assertIn("page-fault context", audited.additional_notes)
+
+    def test_normalizes_final_diagnosis_page_fault_wording(self) -> None:
+        state = {
+            "messages": [
+                HumanMessage(
+                    content=(
+                        "BUG: unable to handle kernel paging request at 000000e500080008\n"
+                        "Oops: 0000 [#1] SMP NOPTI\n"
+                        "RIP: 0010:ffffffffc051a3c4\n"
+                    )
+                )
+            ]
+        }
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 12,
+                "reasoning": "The evidence chain has converged.",
+                "action": None,
+                "is_conclusive": True,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": "wild_pointer",
+                "partial_dump": "partial",
+                "confidence": "high",
+                "final_diagnosis": FinalDiagnosis(
+                    crash_type="general protection fault",
+                    panic_string="BUG: unable to handle kernel paging request at 000000e500080008",
+                    faulting_instruction="movzbl (%rcx,%rax,1),%eax",
+                    root_cause=(
+                        "A wild pointer led to a general protection fault in interrupt context."
+                    ),
+                    detailed_analysis=(
+                        "The register provenance points to a corrupted queue pointer, and the final "
+                        "failure manifests as a general protection fault during queue processing."
+                    ),
+                    suspect_code=SuspectCode(
+                        file="drivers/scsi/mpt3sas/mpt3sas_base.c",
+                        function="_base_process_reply_queue",
+                        line="unknown",
+                    ),
+                    evidence=[
+                        "Oops: 0000",
+                        "BUG: unable to handle kernel paging request",
+                    ],
+                ),
+            }
+        )
+
+        audited = apply_executor_consistency_audit(llm_step, state)
+
+        self.assertEqual(
+            audited.final_diagnosis.crash_type,
+            "kernel paging request",
+        )
+        self.assertIn("page fault", audited.final_diagnosis.root_cause.lower())
+        self.assertNotIn(
+            "general protection fault",
+            audited.final_diagnosis.detailed_analysis.lower(),
+        )
+        self.assertIn(
+            "page-fault context wording corrected in final_diagnosis.crash_type",
+            audited.additional_notes,
+        )
+
+    def test_render_action_arguments_quotes_grep_alternation_pattern(self) -> None:
+        rendered = render_action_arguments(
+            ["-m", "|", "grep", "-Ei", "dma|iommu|mapping|buffer"]
+        )
+
+        self.assertEqual(rendered, '-m | grep -Ei "dma|iommu|mapping|buffer"')
+
+    def test_render_action_arguments_quotes_plain_grep_pattern_with_pipe_chars(
+        self,
+    ) -> None:
+        rendered = render_action_arguments(
+            ["-m", "|", "grep", "-i", "dma|iommu|mapping|buffer", "|", "head", "-10"]
+        )
+
+        self.assertEqual(
+            rendered,
+            '-m | grep -i "dma|iommu|mapping|buffer" | head -10',
+        )
+
+    def test_render_action_arguments_preserves_existing_grep_quotes(self) -> None:
+        rendered = render_action_arguments(
+            [
+                "-m",
+                "|",
+                "grep",
+                "-i",
+                "mpt3sas",
+                "|",
+                "grep",
+                "-Ei",
+                '"fail|error|timeout|fault|xid|mmu|fifo|dma|map|reset"',
+            ]
+        )
+
+        self.assertEqual(
+            rendered,
+            '-m | grep -i mpt3sas | grep -Ei "fail|error|timeout|fault|xid|mmu|fifo|dma|map|reset"',
+        )
+
+    def test_build_tool_calls_preserves_grep_pattern_quoting(self) -> None:
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 8,
+                "reasoning": "Need a filtered log query next.",
+                "action": {
+                    "command_name": "log",
+                    "arguments": [
+                        "-m",
+                        "|",
+                        "grep",
+                        "-Ei",
+                        "dma|iommu|mapping|buffer",
+                    ],
+                },
+                "is_conclusive": False,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": None,
+                "partial_dump": "partial",
+            }
+        )
+
+        tool_calls = build_tool_calls(llm_step, is_last_step=False)
+
+        self.assertEqual(tool_calls[0]["name"], "log")
+        self.assertEqual(
+            tool_calls[0]["args"]["command"],
+            '-m | grep -Ei "dma|iommu|mapping|buffer"',
+        )
+
+    def test_build_tool_calls_quotes_plain_grep_pattern_with_pipe_chars(self) -> None:
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 9,
+                "reasoning": "Need a broader filtered log query next.",
+                "action": {
+                    "command_name": "log",
+                    "arguments": [
+                        "-m",
+                        "|",
+                        "grep",
+                        "-i",
+                        "dma|iommu|mapping|buffer",
+                        "|",
+                        "head",
+                        "-10",
+                    ],
+                },
+                "is_conclusive": False,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": None,
+                "partial_dump": "partial",
+            }
+        )
+
+        tool_calls = build_tool_calls(llm_step, is_last_step=False)
+
+        self.assertEqual(
+            tool_calls[0]["args"]["command"],
+            '-m | grep -i "dma|iommu|mapping|buffer" | head -10',
+        )
+
+    def test_build_tool_calls_preserves_existing_grep_quotes(self) -> None:
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 10,
+                "reasoning": "Need a quoted filtered driver log query next.",
+                "action": {
+                    "command_name": "log",
+                    "arguments": [
+                        "-m",
+                        "|",
+                        "grep",
+                        "-i",
+                        "mpt3sas",
+                        "|",
+                        "grep",
+                        "-Ei",
+                        '"fail|error|timeout|fault|xid|mmu|fifo|dma|map|reset"',
+                    ],
+                },
+                "is_conclusive": False,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": None,
+                "partial_dump": "partial",
+            }
+        )
+
+        tool_calls = build_tool_calls(llm_step, is_last_step=False)
+
+        self.assertEqual(
+            tool_calls[0]["args"]["command"],
+            '-m | grep -i mpt3sas | grep -Ei "fail|error|timeout|fault|xid|mmu|fifo|dma|map|reset"',
+        )
+
+    def test_repair_structured_output_normalizes_mechanism_into_root_cause_class(
+        self,
+    ) -> None:
+        repaired = repair_structured_output(
+            (
+                "{"
+                '"step_id": 22,'
+                '"reasoning": "source typing confirms a dma field misuse",'
+                '"action": null,'
+                '"is_conclusive": true,'
+                '"signature_class": "pointer_corruption",'
+                '"root_cause_class": "field_type_misuse",'
+                '"partial_dump": "partial"'
+                "}"
+            ),
+            model_class=VMCoreLLMAnalysisStep,
+        )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(repaired.root_cause_class, "dma_corruption")
+        self.assertEqual(repaired.corruption_mechanism, "field_type_misuse")
+
+    def test_repair_structured_output_lifts_stack_corruption_from_mechanism(
+        self,
+    ) -> None:
+        repaired = repair_structured_output(
+            (
+                "{"
+                '"step_id": 23,'
+                '"reasoning": "stack canary overwrite is confirmed",'
+                '"action": null,'
+                '"is_conclusive": false,'
+                '"signature_class": "stack_corruption",'
+                '"root_cause_class": "memory_corruption",'
+                '"corruption_mechanism": "stack_corruption",'
+                '"partial_dump": "partial"'
+                "}"
+            ),
+            model_class=VMCoreLLMAnalysisStep,
+        )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(repaired.root_cause_class, "stack_corruption")
+        self.assertEqual(repaired.corruption_mechanism, "unknown")
+
+    def test_top_level_step_accepts_explicit_corruption_mechanism(self) -> None:
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 22,
+                "reasoning": "The driver dereferenced a DMA-side field as a virtual pointer.",
+                "action": None,
+                "is_conclusive": True,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": "dma_corruption",
+                "corruption_mechanism": "field_type_misuse",
+                "partial_dump": "partial",
+            }
+        )
+
+        self.assertEqual(llm_step.root_cause_class, "dma_corruption")
+        self.assertEqual(llm_step.corruption_mechanism, "field_type_misuse")
+
+    def test_repair_structured_output_moves_out_of_bounds_to_root_cause_class(
+        self,
+    ) -> None:
+        repaired = repair_structured_output(
+            (
+                "{"
+                '"step_id": 24,'
+                '"reasoning": "stack text suggests an upward overwrite into older frames",'
+                '"action": null,'
+                '"is_conclusive": true,'
+                '"signature_class": "bug_on",'
+                '"root_cause_class": "memory_corruption",'
+                '"corruption_mechanism": "out_of_bounds",'
+                '"partial_dump": "partial",'
+                '"final_diagnosis": {'
+                '"crash_type": "stack protector",'
+                '"panic_string": "Kernel stack is corrupted",'
+                '"faulting_instruction": "search_module_extables+0x99",'
+                '"root_cause": "A stack overwrite is the most likely cause.",'
+                '"detailed_analysis": "The stack contains text-like payload and corrupted older frames.",'
+                '"suspect_code": {'
+                '"file": "fs/namei.c",'
+                '"function": "link_path_walk",'
+                '"line": "unknown"},'
+                '"evidence": ["ASCII text on stack"],'
+                '"corruption_mechanism": "out_of_bounds"'
+                "}"
+                "}"
+            ),
+            model_class=VMCoreLLMAnalysisStep,
+        )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(repaired.root_cause_class, "out_of_bounds")
+        self.assertEqual(repaired.corruption_mechanism, "unknown")
+        self.assertIsNotNone(repaired.final_diagnosis)
+        self.assertEqual(repaired.final_diagnosis.corruption_mechanism, "unknown")
+
+    def test_repair_structured_output_accepts_stack_corruption_root_cause(
+        self,
+    ) -> None:
+        repaired = repair_structured_output(
+            (
+                "{"
+                '"step_id": 24,'
+                '"reasoning": "stack canary overwrite confirms stack damage but not the exact overwrite primitive",'
+                '"action": null,'
+                '"is_conclusive": false,'
+                '"signature_class": "stack_corruption",'
+                '"root_cause_class": "stack_corruption",'
+                '"partial_dump": "partial"'
+                "}"
+            ),
+            model_class=VMCoreLLMAnalysisStep,
+        )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(repaired.root_cause_class, "stack_corruption")
+
+    def test_repair_structured_output_maps_stack_protector_root_cause_alias(
+        self,
+    ) -> None:
+        repaired = repair_structured_output(
+            (
+                "{"
+                '"step_id": 24,'
+                '"reasoning": "legacy stack-protector wording should not break structured output",'
+                '"action": null,'
+                '"is_conclusive": false,'
+                '"signature_class": "stack_corruption",'
+                '"root_cause_class": "stack_protector",'
+                '"partial_dump": "partial"'
+                "}"
+            ),
+            model_class=VMCoreLLMAnalysisStep,
+        )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(repaired.root_cause_class, "stack_corruption")
+
     def test_downgrades_conclusion_when_write_fault_is_attributed_to_plain_read(
         self,
     ) -> None:
@@ -105,6 +539,37 @@ class OutputParserAuditTests(unittest.TestCase):
             llm_step.reasoning,
         )
         self.assertIsNone(audited.additional_notes)
+
+    def test_rebuilds_structured_action_from_explicit_piped_action_hint(self) -> None:
+        state = {"messages": [HumanMessage(content="BUG: stack protector triggered\n")]}
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 16,
+                "reasoning": (
+                    "The next diagnostic step should search the kernel log for BUG markers.\n"
+                    'Action: log -m | grep -Ei "BUG|page fault|kernel BUG" | head -30'
+                ),
+                "action": {
+                    "command_name": "log",
+                    "arguments": ["-m"],
+                },
+                "is_conclusive": False,
+                "signature_class": "stack_corruption",
+                "root_cause_class": None,
+                "partial_dump": "partial",
+            }
+        )
+
+        audited = apply_executor_consistency_audit(llm_step, state)
+
+        self.assertEqual(audited.action.command_name, "run_script")
+        self.assertEqual(
+            audited.action.arguments,
+            ['log -m | grep -Ei "BUG|page fault|kernel BUG" | head -30'],
+        )
+        self.assertIn(
+            "structured action dropped the pipeline", audited.additional_notes
+        )
 
 
 if __name__ == "__main__":

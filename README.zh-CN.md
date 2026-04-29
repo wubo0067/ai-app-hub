@@ -9,18 +9,15 @@ README.md
 
 ### Linux Kernel Crash 定位分析
 
-Linux 内核崩溃分析是系统工程领域皇冠上的明珠，也是最具挑战性的技术难题之一。
+**VMCore Analysis Agent** 是一个生产级的自动化 Linux 内核崩溃（vmcore）诊断平台。它通过将 **LangGraph ReAct** 模式与 **MCP (Model Context Protocol)** 工具体系相结合，将原本高度依赖人工经验的复杂内核调试过程转化为可自动执行的 AI 工作流。
 
-**挑战与难点**：
-- **知识体系庞杂**：要求精通 C 语言、操作系统原理、常用数据结构与算法、内核子系统架构（内存管理、调度、文件系统等）。
-- **技能要求极高**：需掌握各类硬件工作原理及内核基础架构实现，熟练运用 crash、gdb 等复杂的调试工具。
-- **推理能力门槛**：在海量堆栈和内存数据中抽丝剥茧，需要极其强大的逻辑推理和归纳分析能力。
+### 核心技术亮点
 
-**项目核心优势**：
-本项目创新性地引入了 **ReAct (Reasoning + Acting)** 模式的 AI Agent 架构，结合 **MCP (Model Context Protocol)** 工具体系，实现了自动化的 vmcore 深度分析：
-- **专家经验数字化**：复刻 RHEL 资深工程师的分析思维，通过精心设计的专业 Prompts，让 LLM 习得顶级专家的推理路径。
-- **工具使用智能化**：AI 能够自主规划和执行 crash 调试命令，像人类专家一样动态探索内存现场，而非简单的静态匹配。
-- **分析过程透明化**：提供完整的思考链（Chain of Thought）和操作记录，不仅给出结论，更展示完整的分析逻辑。
+- **分层专家知识体系**：不同于简单的 RAG，本项目实现了**三层动态 Prompt 注入架构**（全局基座、场景剧本、SOP 片段）。系统根据崩溃特征（如 Soft Lockup 或内存损坏）按需加载诊断逻辑，显著降低 Token 噪音并提升推理精度。
+- **证据驱动的状态机管理**：代理维护着包含**活跃假设 (Hypotheses)** 与 **验证门控 (Gates)** 的结构化状态。强制要求 LLM 在得出结论前必须收集特定的诊断证据（如寄存器来源追踪、堆栈回溯），确保分析过程的严谨性与可追溯性。
+- **基于 MCP 的深度工具集成**：利用模型上下文协议 (MCP)，代理实现了与 Linux `crash` 工具的高保真连接。AI 不再是“盲目猜测”，而是根据推理路径动态地探索内存、反汇编代码并检索内核对象状态。
+- **执行器级安全防护**：内置 `action_guard` 模块，防止 LLM 执行资源消耗过大或高风险的命令（如在大系统上盲目执行 `bt -a`），同时通过命令去重机制确保分析效率，防止推理陷入死循环。
+- **透明的思考链报告**：每一次分析都会生成结构化的 Markdown 报告，完整记录每一步命令的执行意图、假设的验证过程以及基于证据的最终根因定界。
 
 ## 架构设计
 
@@ -126,7 +123,7 @@ DEFAULT_CRASH_COMMANDS = [
 **核心实现逻辑**（[`call_llm_analysis`](vmcore-analysis-agent/src/react/llm_node.py#L27-L212) 函数）：
 
 1. **消息压缩**：通过 [`compress_messages_for_llm`](vmcore-analysis-agent/src/react/llm_runtime.py#L104-L134) 压缩历史消息，避免 reasoning_content 累积导致 token 暴增
-2. **系统提示构建**：使用 [`analysis_crash_prompt`](vmcore-analysis-agent/src/react/prompts.py#L8-L1936)，包含：
+2. **系统提示构建**：使用动态分层注入架构（[`prompt_builder.py`](vmcore-analysis-agent/src/react/prompt_builder.py)），包含：
    - 角色定义：资深 Linux Kernel Crash Dump 分析专家
    - 输出契约：严格遵循 `VMCoreLLMAnalysisStep` JSON Schema
    - 最后一步强制约束：当 `is_last_step=True` 时，必须给出结论且禁止工具调用
@@ -142,6 +139,30 @@ DEFAULT_CRASH_COMMANDS = [
 - 禁止触发 token 溢出的高危命令（`sym -l`、`bt -a`、`ps -m` 等）
 - 支持 `run_script` 批量执行，确保模块符号在同一 crash session 内加载
 - 强调基于诊断证据的推理，禁止无证据猜测
+
+**System Prompt 分层注入架构**：
+代理实现了一个精密的三层动态 Prompt 注入系统，体现了生产级 Agent 架构中**"指令按需加载"**的核心原则：
+
+- **Layer 0: 全局基座 (Global Base)**
+  - 由 `LAYER0_SYSTEM_PROMPT_TEMPLATE` 组成
+  - 定义了 Agent 的身份（Role）、核心禁止事项和输出契约
+  - 作为不可变的"宪法"，在所有分析阶段始终保持激活状态
+
+- **Layer 1: 场景剧本 (Scenario Playbooks)**
+  - 通过 `_select_playbook` 根据 `current_signature_class` 动态选择
+  - 实现指令隔离：分析 `null_deref` 时，LLM 完全接触不到 `lockup` 或 `rcu_stall` 的复杂逻辑
+  - 消除干扰项，有效解决复杂分析中的注意力下降问题
+
+- **Layer 2: 动态片段 (Dynamic SOP Fragments)**
+  - 通过 `_select_sop_fragments` 根据步数、关键字和 Gate 状态动态注入
+  - 采用**上下文触发逻辑**：仅在满足相关条件时才显示 SOP 片段
+  - 示例：`per-cpu` SOP 仅在最近消息中出现 "%gs" 或 "per-cpu" 时注入；`dma_corruption` SOP 仅在外存损坏门控开启时激活
+
+**实现亮点**：
+- **状态驱动注入**：利用 `managed_gates` 状态有条件地注入专业 SOP，避免在无证据时进行推测性分析
+- **智能去重**：`_dedupe_preserve_order` 确保即使多个触发条件同时激活同一 SOP，生成的 Prompt 依然简洁无冗余
+- **动态执行器状态**：`build_executor_state_section` 为 LLM 提供清晰的"任务地图"，显示当前假设、门控状态和近期命令
+- **Token 优化**：相比静态完整 Prompt，系统 Prompt 的 token 消耗减少 40-70%，同时保持全面的知识覆盖
 
 **输出 Schema**（[`VMCoreLLMAnalysisStep`](vmcore-analysis-agent/src/react/schema.py#L70-L114)）：
 ```json
@@ -195,6 +216,87 @@ DEFAULT_CRASH_COMMANDS = [
 | [`FinalDiagnosis`](vmcore-analysis-agent/src/react/schema.py#L45-L67) | 最终结论的完整记录，仅在 [`is_conclusive`](vmcore-analysis-agent/src/react/schema.py#L294-L294) 为 `true` 时填充。 |
 | [`Hypothesis`](vmcore-analysis-agent/src/react/schema.py#L165-L192) | 代表代理正在跟踪的一个候选根本原因。[`active_hypotheses`](vmcore-analysis-agent/src/react/schema.py#L326-L333) 列表强制对竞争性理论进行显式管理。 |
 | [`GateEntry`](vmcore-analysis-agent/src/react/schema.py#L195-L220) | 代表一个强制性的验证检查点。[`gates`](vmcore-analysis-agent/src/react/schema.py#L335-L343) 字典确保在允许得出确定性诊断之前，收集到所有必需的证据。 |
+
+#### `_REQUIRED_GATES`：验证门控系统
+
+**一、Gates 是什么**
+
+Gates（门控/检查点）是该项目中 VMCore 崩溃分析状态机的一个核心概念——它代表在宣布分析"已得出结论"（is_conclusive=True）之前，必须完成的验证步骤（检查点）。
+
+可以从代码中 GateEntry 的定义清楚看到这一点：
+
+```python
+class GateEntry(BaseModel):
+    """
+    is_conclusive=True 前必须完成的验证检查点。
+
+    每个 gate 代表一个必须完成的验证步骤，用于确认崩溃根因的特定假设。
+    在将分析结论标记为"最终结论"（is_conclusive=True）之前，所有相关的 gate
+    必须处于 closed 或 n/a 状态，且 evidence 字段必须填写具体的工具输出。
+    """
+    status: Literal["open", "closed", "blocked", "n/a"]
+    evidence: Optional[str]  # 必须填写具体的工具输出，不得使用泛泛总结
+    prerequisite: Optional[str]  # 前置依赖 gate
+```
+
+Gate 的四种状态：
+
+| 状态 | 含义 |
+|------|------|
+| `open` | 尚未调查或调查未完成 |
+| `closed` | 已验证通过（evidence 必须填具体工具输出） |
+| `blocked` | 前置 gate 未关闭，当前 gate 无法开始 |
+| `n/a` | 确实不适用（evidence 必须解释为何不适用） |
+
+**二、`_REQUIRED_GATES` 的结构**
+
+它是一个 崩溃签名类型 → 必需 gate 列表 的映射：
+
+```python
+_REQUIRED_GATES: ClassVar[Dict[str, List[str]]] = {
+    "pointer_corruption": [
+        "register_provenance",         # 寄存器来源验证
+        "object_lifetime",             # 对象生命周期验证
+        "local_corruption_exclusion",  # 排除本地损坏
+        "external_corruption_gate",    # 外部损坏门控
+        "field_type_classification",   # 字段类型分类
+    ],
+    "null_deref":     ["register_provenance"],
+    "use_after_free": ["register_provenance", "object_lifetime"],
+    "soft_lockup":    ["stack_integrity", "lock_holder"],
+    # ... 等等
+}
+```
+
+每种崩溃类型需要的验证深度不同：
+- **简单类型**（如 null_deref、divide_error）只需 1-2 个 gate
+- **复杂类型**（如 pointer_corruption）需要 5 个 gate，形成完整的证据链
+
+**三、在项目中的作用**
+
+Gates 在整个分析流程中扮演 质量守门人（Quality Gatekeeper） 的角色：
+
+```
+┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│ LLM 逐步推理 │ ──► │ 更新 gates 状态   │ ──► │ 所有 gate closed │
+│ 调用 crash   │     │ (open→closed/n/a)│     │ 才能 is_        │
+│ 工具收集证据  │     │                  │     │ conclusive=true  │
+└─────────────┘     └──────────────────┘     └─────────────────┘
+```
+
+具体来说：
+
+- **防止过早结论** — LLM 容易"急于下结论"，gates 强制要求它完成所有必要的验证步骤后才能输出 is_conclusive=True。
+
+- **保证证据完整性** — 例如 pointer_corruption 必须依次验证：寄存器来源 → 对象生命周期 → 排除本地损坏 → 外部损坏判定 → 字段类型分类，形成一条完整的证据链，缺一不可。
+
+- **支持依赖关系** — gate 之间可以有 prerequisite（前置依赖），例如 external_corruption_gate 的前置是 local_corruption_exclusion，必须先排除本地损坏才能判断是否外部损坏。
+
+- **可审计性** — 每个 gate 关闭时必须附带 evidence（具体工具输出），使得整个分析过程可追溯、可验证，不是 LLM 自由发挥的"黑盒推理"。
+
+**四、类比理解**
+
+可以把 gates 想象成飞行检查清单：飞行员在起飞前必须逐项检查并确认（襟翼、燃油、引擎...），全部打勾后才能起飞。同样，分析 Agent 在宣布"找到根因"之前，必须逐个完成对应崩溃类型的检查项，全部 closed 后才能真正输出最终诊断。
 
 **核心概念**：
 - **[`CrashSignatureClass`](vmcore-analysis-agent/src/react/schema.py#L117-L134) 与 [`RootCauseClass`](vmcore-analysis-agent/src/react/schema.py#L139-L162)**：前者是从 panic 日志中观察到的症状（例如 `soft_lockup`），后者是推断出的底层机制（例如 `deadlock`）。它们在分析流程中扮演不同的角色。
@@ -260,34 +362,55 @@ vmcore-analysis-agent/
 │   └── main.py                        # 命令行客户端入口
 ├── src/
 │   ├── llm/
-│   │   └── ...                        # DeepSeek LLM 初始化和工具函数
+│   │   └── model.py                   # DeepSeek LLM 初始化和模型配置
 │   ├── react/
 │   │   ├── __init__.py                # 包初始化文件
-│   │   ├── graph.py                   # LangGraph 图构建
-│   │   ├── nodes.py                   # 核心节点实现
+│   │   ├── action_guard.py            # 行动保护和安全验证
 │   │   ├── edges.py                   # 路由逻辑和状态转换
+│   │   ├── fragment_flags.py          # 片段标志管理
+│   │   ├── graph.py                   # LangGraph 图构建
 │   │   ├── graph_state.py             # AgentState 定义
+│   │   ├── layer0_system.py           # 系统层 Prompt 定义
 │   │   ├── llm_node.py                # LLM 调用和响应处理
 │   │   ├── llm_runtime.py             # LLM 运行时配置
+│   │   ├── logging_callback.py        # 图执行日志回调
+│   │   ├── nodes.py                   # 核心节点实现
 │   │   ├── output_parser.py           # LLM 输出解析和验证
+│   │   ├── playbooks.py               # 分析剧本定义
+│   │   ├── prompt_builder.py          # Prompt 构建器
+│   │   ├── prompt_layers.py           # Prompt 分层管理
 │   │   ├── prompts.py                 # 专业分析 Prompt
 │   │   ├── report_generator.py        # Markdown 报告生成
 │   │   ├── schema.py                  # 数据结构定义 (VMCoreAnalysisStep)
-│   │   └── logging_callback.py        # 图执行日志回调
+│   │   ├── sop_fragments.py           # 标准操作程序片段
+│   │   └── state_manager.py           # 状态管理器
 │   ├── mcp_tools/
 │   │   ├── crash/                     # crash MCP Server 实现
-│   │   │   └── ...                    # crash 命令执行器和客户端
+│   │   │   ├── server.py              # crash MCP 服务器
+│   │   │   ├── client.py              # crash MCP 客户端
+│   │   │   ├── executor.py            # crash 命令执行器
+│   │   │   └── __init__.py            # crash 工具包初始化
 │   │   └── source_patch/              # source_patch MCP Server 实现
-│   │       └── ...                    # 补丁生成工具
-│   └── utils/                         # 工具函数（日志、配置等）
+│   │       ├── server.py              # 源码补丁 MCP 服务器
+│   │       ├── client.py              # 源码补丁 MCP 客户端
+│   │       └── __init__.py            # 源码补丁工具包初始化
+│   └── utils/                         # 工具函数
+│       ├── config.py                  # 配置管理
+│       ├── logging.py                 # 日志配置
+│       ├── os.py                      # 操作系统工具函数
+│       └── __init__.py                # 工具包初始化
 ├── simulate-crash/                    # 内核崩溃模拟模块
 │   ├── rcu_stall/                     # RCU stall 复现场景
 │   ├── soft_lockup/                   # Soft lockup 复现场景
-│   └── ...                            # 其他崩溃场景
+│   └── dma_memory_corruption/         # DMA 内存破坏复现场景
 ├── reports/                           # 分析报告输出目录
 ├── logs/                              # 运行日志目录
 ├── tests/                             # 测试套件
-│   └── ...                            # 单元测试和集成测试
+│   ├── test_action_guard.py           # 行动保护测试
+│   ├── test_output_parser.py          # 输出解析器测试
+│   ├── test_prompts.py                # Prompt 测试
+│   ├── test_state_manager.py          # 状态管理器测试
+│   └── test_vmcore_analysis_step.py   # VMCore 分析步骤测试
 └── tools/
     └── show_first_global_func.sh      # 调试符号验证脚本
 ```

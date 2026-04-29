@@ -6,14 +6,25 @@
 
 import json
 import re
+import shlex
 from typing import Any, TypeVar
 
 from json_repair import repair_json
 from pydantic import BaseModel
 
+from src.mcp_tools import get_registered_tool_provider
 from src.utils.logging import logger
 
-from .schema import VMCoreAnalysisStep, VMCoreLLMAnalysisStep
+from .action_guard import validate_tool_call_request
+from .schema import (
+    VMCoreAnalysisStep,
+    VMCoreLLMAnalysisStep,
+    get_corruption_mechanism_aliases,
+    get_root_cause_class_aliases,
+    get_root_cause_from_mechanism_mapping,
+    get_root_cause_like_mechanisms,
+    get_signature_class_aliases,
+)
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
@@ -21,8 +32,14 @@ _DISASM_LINE_RE = re.compile(
     r"^\s*0x(?P<addr>[0-9a-fA-F]+)\s+<[^>]+>:\s+(?P<inst>.+)$",
     re.MULTILINE,
 )
+
+# 正则表达式用于提取 RIP（指令指针）地址
 _RIP_RE = re.compile(r"\bRIP:\s*(?:[0-9a-fA-F]+:)?(?P<addr>[0-9a-fA-F]{8,16})\b")
+
+# 正则表达式用于提取 Oops 错误代码
 _OOPS_RE = re.compile(r"\bOops:\s*(?P<code>[0-9a-fA-F]{4})\b")
+
+# 非故障指令助记符集合 - 这些指令通常不会导致页面错误
 _NON_FAULTING_MNEMONICS = {
     "pause",
     "nop",
@@ -36,6 +53,8 @@ _NON_FAULTING_MNEMONICS = {
     "sfence",
     "mfence",
 }
+
+# 写入指令助记符集合 - 这些指令执行写操作
 _WRITE_MNEMONICS = {
     "push",
     "call",
@@ -45,6 +64,8 @@ _WRITE_MNEMONICS = {
     "stosl",
     "stosq",
 }
+
+# 读写指令助记符集合 - 这些指令同时执行读和写操作
 _READWRITE_MNEMONICS = {
     "xchg",
     "cmpxchg",
@@ -65,31 +86,180 @@ _READWRITE_MNEMONICS = {
 }
 
 
+def render_action_arguments(arguments: list[str]) -> str:
+    """将结构化 action 参数渲染为可执行的 crash 命令字符串。
+
+    LLM 输出的 arguments 是 JSON 字符串数组，不携带 shell 引号语义。
+    对于 grep 模式中包含 alternation 的场景，需要在拼回命令时恢复引号，
+    否则 `a|b|c` 会和真正的管道符混淆。
+
+    Args:
+        arguments: LLM 生成的命令参数列表
+
+    Returns:
+        str: 渲染后的可执行 crash 命令字符串
+
+    使用场景：
+        当 LLM 决定调用 crash 工具时，需要将参数列表转换为实际可执行的命令行字符串
+
+    注意事项：
+        特别处理 grep 命令中的管道符，避免与 shell 管道符混淆
+    """
+    rendered_tokens: list[str] = []
+    in_grep_command = False
+    grep_expects_pattern = False
+
+    for token in arguments:
+        if token == "|":
+            rendered_tokens.append(token)
+            in_grep_command = False
+            grep_expects_pattern = False
+            continue
+
+        if token == "grep":
+            rendered_tokens.append(token)
+            in_grep_command = True
+            grep_expects_pattern = True
+            continue
+
+        if in_grep_command and grep_expects_pattern and token.startswith("-"):
+            rendered_tokens.append(token)
+            grep_expects_pattern = True
+            continue
+
+        if in_grep_command and grep_expects_pattern and _is_quoted_shell_token(token):
+            rendered_tokens.append(token)
+            grep_expects_pattern = False
+            continue
+
+        if in_grep_command and grep_expects_pattern and "|" in token:
+            rendered_tokens.append(f'"{token}"')
+            grep_expects_pattern = False
+            continue
+
+        rendered_tokens.append(token)
+        if in_grep_command and grep_expects_pattern:
+            grep_expects_pattern = False
+
+    return " ".join(rendered_tokens)
+
+
+def _is_quoted_shell_token(token: str) -> bool:
+    """检查 token 是否已经被 shell 引号包围。
+
+    Args:
+        token: 待检查的字符串 token
+
+    Returns:
+        bool: 如果 token 被双引号或单引号包围则返回 True
+    """
+    return len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"}
+
+
+def _normalize_signature_class(content_str: str) -> str:
+    """在 JSON 解析前对 signature_class 做别名归一化，防止 LLM 输出未知值导致验证失败。"""
+    alias_mapping = get_signature_class_aliases()
+    for alias, canonical in alias_mapping.items():
+        pattern = r'("signature_class"\s*:\s*")' + re.escape(alias) + r'"'
+        replacement = r"\1" + canonical + r'"'
+        content_str = re.sub(pattern, replacement, content_str)
+    return content_str
+
+
 def _normalize_root_cause_class(content_str: str) -> str:
     """
-    在 JSON 解析前对 root_cause_class 字段进行语义归一化。
-    将常见的别名映射到合法的枚举值，避免因 schema 严格验证导致的解析失败。
-    """
-    # 定义常见别名到合法值的映射
-    alias_mapping = {
-        "pointer_corruption": "wild_pointer",  # pointer_corruption 更接近 wild_pointer 的语义
-        "corruption": "memory_corruption",
-        "memory_error": "memory_corruption",
-        "address_corruption": "wild_pointer",
-        "invalid_pointer": "wild_pointer",
-    }
+    在 JSON 解析前对 root_cause_class / corruption_mechanism 做语义归一化。
 
-    # 使用正则表达式匹配并替换 root_cause_class 字段值
-    for alias, canonical in alias_mapping.items():
-        # 匹配 "root_cause_class": "pointer_corruption" 这样的模式
-        pattern = r'("root_cause_class"\s*:\s*")' + re.escape(alias) + r'"'
+    兼容两类常见错位：
+    1. root_cause_class 使用了旧别名；
+    2. 模型把细粒度 corruption_mechanism 错塞进 root_cause_class。
+
+    Args:
+        content_str: 包含 root_cause_class 字段的 JSON 字符串
+
+    Returns:
+        str: 归一化后的 JSON 字符串
+
+    用途：
+        解决 LLM 输出中分类标签不一致的问题，确保后续验证通过
+
+    注意事项：
+        维护映射表的完整性，避免遗漏新的别名变体
+    """
+    root_cause_alias_mapping = get_root_cause_class_aliases()
+    mechanism_to_root_cause_mapping = get_root_cause_from_mechanism_mapping()
+
+    mechanism_pattern = "|".join(
+        re.escape(value) for value in mechanism_to_root_cause_mapping
+    )
+
+    def _replace_root_cause(match: re.Match[str]) -> str:
+        """替换 root_cause_class 值的回调函数"""
+        prefix = match.group("prefix")
+        value = match.group("value")
+
+        # 如果值实际上是 corruption_mechanism，则同时设置两个字段
+        if value in mechanism_to_root_cause_mapping:
+            suffix = f',\n  "corruption_mechanism": "{value}"'
+            if re.search(r'"corruption_mechanism"\s*:', content_str):
+                suffix = ""
+            return f'{prefix}{mechanism_to_root_cause_mapping[value]}"{suffix}'
+
+        # 否则使用别名映射
+        canonical = root_cause_alias_mapping.get(value, value)
+        return f'{prefix}{canonical}"'
+
+    # 应用 root_cause_class 的归一化
+    root_cause_pattern = re.compile(
+        r'(?P<prefix>"root_cause_class"\s*:\s*")(?P<value>[^"]+)"'
+    )
+    content_str = root_cause_pattern.sub(_replace_root_cause, content_str)
+
+    corruption_mechanism_alias_mapping = get_corruption_mechanism_aliases()
+    for alias, canonical in corruption_mechanism_alias_mapping.items():
+        pattern = r'("corruption_mechanism"\s*:\s*")' + re.escape(alias) + r'"'
         replacement = r"\1" + canonical + r'"'
         content_str = re.sub(pattern, replacement, content_str)
 
-        # 也处理 null 值的情况（虽然不太可能）
-        pattern_null = r'("root_cause_class"\s*:\s*)null'
-        replacement_null = r'\1"' + canonical + r'"'
-        # 只在特定上下文中替换 null，避免误替换
+    # 某些 root-cause 标签会被 LLM 错塞进 corruption_mechanism。
+    # 对这类值，保留现有 schema 语义：它属于 root_cause_class，
+    # corruption_mechanism 则降级为 unknown 以避免结构化输出失败。
+    misplaced_mechanism_to_root_cause = {
+        value: value for value in sorted(get_root_cause_like_mechanisms())
+    }
+
+    for (
+        misplaced_value,
+        canonical_root_cause,
+    ) in misplaced_mechanism_to_root_cause.items():
+        content_str, replaced_count = re.subn(
+            r'("corruption_mechanism"\s*:\s*")' + re.escape(misplaced_value) + r'"',
+            r'\1unknown"',
+            content_str,
+        )
+
+        if replaced_count == 0:
+            continue
+
+        if re.search(r'"root_cause_class"\s*:', content_str):
+            content_str = re.sub(
+                r'("root_cause_class"\s*:\s*")(?P<value>memory_corruption|unknown)"',
+                r"\1" + canonical_root_cause + '"',
+                content_str,
+            )
+        else:
+            content_str = re.sub(
+                r'("signature_class"\s*:\s*"[^"]+"\s*,)',
+                r'\1\n  "root_cause_class": "' + canonical_root_cause + '",',
+                content_str,
+                count=1,
+            )
+
+    # 警告检查：确保归一化后没有机制标签残留在 root_cause_class 中
+    if re.search(rf'"root_cause_class"\s*:\s*"(?:{mechanism_pattern})"', content_str):
+        logger.warning(
+            "root_cause_class still contains a mechanism label after normalization; check mapping coverage."
+        )
 
     return content_str
 
@@ -97,7 +267,21 @@ def _normalize_root_cause_class(content_str: str) -> str:
 def select_analysis_content(
     content: Any, reasoning: str | None
 ) -> tuple[str | None, str | None]:
-    """选择用于结构化解析的内容源，必要时回退到 reasoning_content。"""
+    """选择用于结构化解析的内容源，必要时回退到 reasoning_content。
+
+    Args:
+        content: LLM 的主要输出内容
+        reasoning: LLM 的推理内容（备用）
+
+    Returns:
+        tuple: (用于结构化解析的内容，备用推理内容)
+
+    使用场景：
+        当主 content 为空或无效时，尝试从 reasoning 中提取有效信息
+
+    注意事项：
+        优先使用 content，只有在 content 无效时才回退到 reasoning
+    """
     content_str = content if isinstance(content, str) else json.dumps(content)
 
     if content_str and content_str.strip():
@@ -120,6 +304,18 @@ def repair_analysis_step(
     *,
     log_prefix: str = "",
 ) -> VMCoreAnalysisStep | None:
+    """修复并验证 VMCoreAnalysisStep 结构化输出。
+
+    Args:
+        content_str: 原始 LLM 输出字符串
+        log_prefix: 日志前缀，用于调试
+
+    Returns:
+        VMCoreAnalysisStep | None: 修复后的分析步骤对象，失败时返回 None
+
+    用途：
+        将可能格式错误的 LLM 输出转换为有效的 VMCoreAnalysisStep 对象
+    """
     return repair_structured_output(
         content_str,
         model_class=VMCoreAnalysisStep,
@@ -133,13 +329,33 @@ def repair_structured_output(
     model_class: type[ModelT],
     log_prefix: str = "",
 ) -> ModelT | None:
-    """尝试从原始 LLM 文本中修复并恢复指定的结构化模型。"""
+    """尝试从原始 LLM 文本中修复并恢复指定的结构化模型。
+
+    Args:
+        content_str: 原始 LLM 输出字符串
+        model_class: 目标 Pydantic 模型类
+        log_prefix: 日志前缀
+
+    Returns:
+        BaseModel | None: 修复后的模型实例，失败时返回 None
+
+    修复策略：
+        1. 首先进行语义归一化
+        2. 尝试使用 json_repair 库自动修复
+        3. 如果失败，手动提取 JSON 对象并修复常见错误
+        4. 最终验证并返回模型实例
+
+    注意事项：
+        所有修复步骤都会记录日志，便于调试 LLM 输出问题
+    """
     repaired_prefix = f"{log_prefix}: " if log_prefix else ""
 
     # 在任何修复尝试之前，先进行语义归一化
+    content_str = _normalize_signature_class(content_str)
     content_str = _normalize_root_cause_class(content_str)
 
     try:
+        # 尝试使用 json_repair 库自动修复
         repaired_obj = repair_json(content_str, return_objects=True)
         if isinstance(repaired_obj, list):
             for item in repaired_obj:
@@ -161,10 +377,12 @@ def repair_structured_output(
         )
 
     try:
+        # 手动修复策略
         fixed_content = _extract_outer_json_object(content_str)
         fixed_content = _normalize_invalid_escapes(fixed_content)
         fixed_content = _inject_missing_arguments_field(fixed_content)
         # 再次应用语义归一化，确保手动修复后的内容也被处理
+        fixed_content = _normalize_signature_class(fixed_content)
         fixed_content = _normalize_root_cause_class(fixed_content)
         result = model_class.model_validate_json(fixed_content)
         logger.warning(
@@ -185,7 +403,22 @@ def build_tool_calls(
     is_last_step: bool,
     log_prefix: str = "",
 ) -> list[dict[str, Any]]:
-    """从结构化分析结果中构造 LangChain tool_calls。"""
+    """从结构化分析结果中构造 LangChain tool_calls。
+
+    Args:
+        analysis_result: 分析结果对象
+        is_last_step: 是否为最后一步
+        log_prefix: 日志前缀
+
+    Returns:
+        list: 工具调用字典列表
+
+    用途：
+        将 LLM 的分析决策转换为实际的工具调用指令
+
+    注意事项：
+        如果是最后一步但仍有 action，则强制清除以确保结束分析
+    """
     prefix = f"{log_prefix}: " if log_prefix else ""
 
     if is_last_step and analysis_result.action:
@@ -205,7 +438,9 @@ def build_tool_calls(
     if tool_name == "run_script":
         tool_args = {"script": "\n".join(analysis_result.action.arguments)}
     else:
-        tool_args = {"command": " ".join(analysis_result.action.arguments)}
+        tool_args = {
+            "command": render_action_arguments(analysis_result.action.arguments)
+        }
 
     return [
         {
@@ -222,8 +457,48 @@ def apply_executor_consistency_audit(
     *,
     log_prefix: str = "",
 ) -> VMCoreLLMAnalysisStep:
-    """在 structured output 落地前执行额外的一致性审计。"""
+    """在 structured output 落地前执行额外的一致性审计。
+
+    Args:
+        analysis_step: LLM 分析步骤
+        state: 当前状态
+        log_prefix: 日志前缀
+
+    Returns:
+        VMCoreLLMAnalysisStep: 审计修正后的分析步骤
+
+    审计内容：
+        1. 基于故障上下文标准化 signature_class
+        2. 基于故障上下文标准化 final_diagnosis
+        3. 检测页面错误访问类型不匹配
+
+    用途：
+        确保 LLM 输出与实际 vmcore 上下文保持一致，防止幻觉
+    """
     prefix = f"{log_prefix}: " if log_prefix else ""
+    analysis_step = _normalize_signature_class_from_fault_context(
+        analysis_step,
+        state,
+        log_prefix=log_prefix,
+    )
+    analysis_step = _normalize_final_diagnosis_for_fault_context(
+        analysis_step,
+        state,
+        log_prefix=log_prefix,
+    )
+    analysis_step = _lift_standalone_mcp_tool_out_of_run_script(
+        analysis_step,
+        log_prefix=log_prefix,
+    )
+    analysis_step = _reconcile_explicit_action_hint(
+        analysis_step,
+        log_prefix=log_prefix,
+    )
+    analysis_step = _preflight_action_with_guard(
+        analysis_step,
+        state,
+        log_prefix=log_prefix,
+    )
     mismatch = _detect_page_fault_access_mismatch(state)
     if mismatch is None:
         return analysis_step
@@ -266,7 +541,421 @@ def apply_executor_consistency_audit(
     return analysis_step
 
 
+def _lift_standalone_mcp_tool_out_of_run_script(
+    analysis_step: VMCoreLLMAnalysisStep,
+    *,
+    log_prefix: str = "",
+) -> VMCoreLLMAnalysisStep:
+    """将被误包裹进 run_script 的独立 MCP 工具提升为真实工具调用。"""
+    action = analysis_step.action
+    if action is None or action.command_name != "run_script":
+        return analysis_step
+
+    if len(action.arguments) != 1:
+        return analysis_step
+
+    script_line = action.arguments[0].strip()
+    if not script_line or "\n" in script_line:
+        return analysis_step
+
+    try:
+        tokens = shlex.split(script_line)
+    except ValueError:
+        return analysis_step
+
+    if not tokens:
+        return analysis_step
+
+    tool_name = tokens[0]
+    provider = get_registered_tool_provider(tool_name)
+    if provider is None or provider.package_name == "crash":
+        return analysis_step
+
+    prefix = f"{log_prefix}: " if log_prefix else ""
+    audit_note = (
+        "Executor audit: run_script wrapped a standalone MCP tool call. "
+        f"Promoted '{script_line}' to direct tool '{tool_name}'."
+    )
+    logger.warning("%s%s", prefix, audit_note)
+
+    action.command_name = tool_name
+    action.arguments = tokens[1:]
+
+    if audit_note not in analysis_step.reasoning:
+        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
+
+    if analysis_step.additional_notes:
+        if audit_note not in analysis_step.additional_notes:
+            analysis_step.additional_notes = (
+                f"{analysis_step.additional_notes} {audit_note}"
+            ).strip()
+    else:
+        analysis_step.additional_notes = audit_note
+
+    return analysis_step
+
+
+def _reconcile_explicit_action_hint(
+    analysis_step: VMCoreLLMAnalysisStep,
+    *,
+    log_prefix: str = "",
+) -> VMCoreLLMAnalysisStep:
+    """对齐 reasoning 中的显式 Action 提示与结构化 action。"""
+    if analysis_step.action is None or not analysis_step.reasoning:
+        return analysis_step
+
+    explicit_action = _extract_explicit_action_hint(analysis_step.reasoning)
+    if not explicit_action:
+        return analysis_step
+
+    structured_action = _render_structured_action_text(analysis_step)
+    if not structured_action:
+        return analysis_step
+
+    if "|" not in explicit_action:
+        return analysis_step
+
+    if "|" in structured_action:
+        return analysis_step
+
+    if not explicit_action.startswith(f"{analysis_step.action.command_name} "):
+        return analysis_step
+
+    prefix = f"{log_prefix}: " if log_prefix else ""
+    audit_note = (
+        "Executor audit: reasoning contained an explicit piped action, but the "
+        "structured action dropped the pipeline. The structured action was rebuilt "
+        f"from the explicit hint: {explicit_action}"
+    )
+    logger.warning("%s%s", prefix, audit_note)
+
+    analysis_step.action.command_name = "run_script"
+    analysis_step.action.arguments = [explicit_action]
+
+    if audit_note not in analysis_step.reasoning:
+        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
+
+    if analysis_step.additional_notes:
+        if audit_note not in analysis_step.additional_notes:
+            analysis_step.additional_notes = (
+                f"{analysis_step.additional_notes} {audit_note}"
+            ).strip()
+    else:
+        analysis_step.additional_notes = audit_note
+
+    return analysis_step
+
+
+def _preflight_action_with_guard(
+    analysis_step: VMCoreLLMAnalysisStep,
+    state: dict[str, Any],
+    *,
+    log_prefix: str = "",
+) -> VMCoreLLMAnalysisStep:
+    """在构造 tool_calls 前执行一次动作预检与归一化。"""
+    action = analysis_step.action
+    if action is None:
+        return analysis_step
+
+    prefix = f"{log_prefix}: " if log_prefix else ""
+    rendered_action = _render_structured_action_text(analysis_step)
+
+    if action.command_name != "run_script" and "|" in rendered_action:
+        audit_note = (
+            "Executor audit: piped crash actions must use run_script. "
+            f"Re-encoded structured action as run_script: {rendered_action}"
+        )
+        logger.warning("%s%s", prefix, audit_note)
+        action.command_name = "run_script"
+        action.arguments = [rendered_action]
+
+        if audit_note not in analysis_step.reasoning:
+            analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
+
+        if analysis_step.additional_notes:
+            if audit_note not in analysis_step.additional_notes:
+                analysis_step.additional_notes = (
+                    f"{analysis_step.additional_notes} {audit_note}"
+                ).strip()
+        else:
+            analysis_step.additional_notes = audit_note
+
+    action = analysis_step.action
+    if action is None:
+        return analysis_step
+
+    tool_args = (
+        {"script": "\n".join(action.arguments)}
+        if action.command_name == "run_script"
+        else {"command": render_action_arguments(action.arguments)}
+    )
+    validation_error = validate_tool_call_request(
+        action.command_name,
+        tool_args,
+        allow_bt_a=analysis_step.signature_class == "hard_lockup",
+        observed_struct_offsets=state.get("crash_path_struct_offsets"),
+        struct_layout_cache=dict(state.get("struct_layout_cache", {})),
+    )
+    if validation_error is None:
+        return analysis_step
+
+    rejected_action = _render_structured_action_text(analysis_step)
+    audit_note = (
+        "Executor preflight rejected the proposed action before tool dispatch: "
+        f"{validation_error}. Replan with a compliant command. Rejected action: {rejected_action}"
+    )
+    logger.warning("%s%s", prefix, audit_note)
+    analysis_step.action = None
+
+    if audit_note not in analysis_step.reasoning:
+        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
+
+    if analysis_step.additional_notes:
+        if audit_note not in analysis_step.additional_notes:
+            analysis_step.additional_notes = (
+                f"{analysis_step.additional_notes} {audit_note}"
+            ).strip()
+    else:
+        analysis_step.additional_notes = audit_note
+
+    if analysis_step.is_conclusive:
+        analysis_step.is_conclusive = False
+        analysis_step.final_diagnosis = None
+        analysis_step.fix_suggestion = None
+
+    if analysis_step.confidence not in {None, "low"}:
+        analysis_step.confidence = "low"
+
+    return analysis_step
+
+
+def _extract_explicit_action_hint(reasoning: str) -> str | None:
+    """从 reasoning 文本中提取显式声明的 Action 命令。"""
+    if not reasoning:
+        return None
+
+    patterns = [
+        r"(?:^|\n)Action:\s*(?P<command>.+?)(?:\n|$)",
+        r"(?:^|\n)Next action:\s*(?P<command>.+?)(?:\n|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, reasoning, flags=re.IGNORECASE)
+        if match is None:
+            continue
+
+        command = match.group("command").strip()
+        command = command.rstrip(".。")
+        if not command:
+            continue
+        return command
+    return None
+
+
+def _render_structured_action_text(analysis_step: VMCoreLLMAnalysisStep) -> str:
+    """将当前结构化 action 渲染为可比较的文本形式。"""
+    action = analysis_step.action
+    if action is None:
+        return ""
+
+    rendered_args = render_action_arguments(action.arguments)
+    if action.command_name == "run_script":
+        return "\n".join(action.arguments).strip()
+    if rendered_args:
+        return f"{action.command_name} {rendered_args}".strip()
+    return action.command_name
+
+
+def _normalize_signature_class_from_fault_context(
+    analysis_step: VMCoreLLMAnalysisStep,
+    state: dict[str, Any],
+    *,
+    log_prefix: str = "",
+) -> VMCoreLLMAnalysisStep:
+    """基于故障上下文标准化 signature_class。
+
+    Args:
+        analysis_step: 分析步骤
+        state: 当前状态
+        log_prefix: 日志前缀
+
+    Returns:
+        VMCoreLLMAnalysisStep: 修正后的分析步骤
+
+    逻辑：
+        如果 signature_class 是 general_protection_fault 但上下文显示是页面错误，
+        则修正为 pointer_corruption
+    """
+    prefix = f"{log_prefix}: " if log_prefix else ""
+    if analysis_step.signature_class != "general_protection_fault":
+        return analysis_step
+
+    text = _collect_state_text(state)
+    if not _is_kernel_paging_request_page_fault_context(text):
+        return analysis_step
+
+    analysis_step.signature_class = "pointer_corruption"
+    audit_note = (
+        "Executor audit: Oops 0x0000 with BUG: unable to handle kernel paging request "
+        "is a page-fault context, so signature_class was corrected from "
+        "general_protection_fault to pointer_corruption."
+    )
+    logger.warning("%s%s", prefix, audit_note)
+
+    if audit_note not in analysis_step.reasoning:
+        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
+
+    if analysis_step.additional_notes:
+        if audit_note not in analysis_step.additional_notes:
+            analysis_step.additional_notes = (
+                f"{analysis_step.additional_notes} {audit_note}"
+            ).strip()
+    else:
+        analysis_step.additional_notes = audit_note
+
+    return analysis_step
+
+
+def _normalize_final_diagnosis_for_fault_context(
+    analysis_step: VMCoreLLMAnalysisStep,
+    state: dict[str, Any],
+    *,
+    log_prefix: str = "",
+) -> VMCoreLLMAnalysisStep:
+    """基于故障上下文标准化 final_diagnosis 中的文本。
+
+    Args:
+        analysis_step: 分析步骤
+        state: 当前状态
+        log_prefix: 日志前缀
+
+    Returns:
+        VMCoreLLMAnalysisStep: 修正后的分析步骤
+
+    用途：
+        将诊断文本中的"general protection fault"替换为"page fault"，
+        确保术语与实际故障上下文一致
+    """
+    prefix = f"{log_prefix}: " if log_prefix else ""
+    diagnosis = analysis_step.final_diagnosis
+    if diagnosis is None:
+        return analysis_step
+
+    text = _collect_state_text(state)
+    if not _is_kernel_paging_request_page_fault_context(text):
+        return analysis_step
+
+    changed_fields: list[str] = []
+    if _contains_general_protection_fault_text(diagnosis.crash_type):
+        diagnosis.crash_type = _replace_general_protection_fault_text(
+            diagnosis.crash_type,
+            replacement="kernel paging request",
+        )
+        changed_fields.append("final_diagnosis.crash_type")
+
+    if _contains_general_protection_fault_text(diagnosis.root_cause):
+        diagnosis.root_cause = _replace_general_protection_fault_text(
+            diagnosis.root_cause,
+            replacement="page fault",
+        )
+        changed_fields.append("final_diagnosis.root_cause")
+
+    if _contains_general_protection_fault_text(diagnosis.detailed_analysis):
+        diagnosis.detailed_analysis = _replace_general_protection_fault_text(
+            diagnosis.detailed_analysis,
+            replacement="page fault",
+        )
+        changed_fields.append("final_diagnosis.detailed_analysis")
+
+    if not changed_fields:
+        return analysis_step
+
+    audit_note = (
+        "Executor audit: page-fault context wording corrected in "
+        + ", ".join(changed_fields)
+        + "; general protection fault phrasing was normalized to page-fault wording."
+    )
+    logger.warning("%s%s", prefix, audit_note)
+
+    if audit_note not in analysis_step.reasoning:
+        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
+
+    if analysis_step.additional_notes:
+        if audit_note not in analysis_step.additional_notes:
+            analysis_step.additional_notes = (
+                f"{analysis_step.additional_notes} {audit_note}"
+            ).strip()
+    else:
+        analysis_step.additional_notes = audit_note
+
+    return analysis_step
+
+
+def _is_kernel_paging_request_page_fault_context(text: str) -> bool:
+    """判断文本是否包含内核页面请求页面错误上下文。
+
+    Args:
+        text: 待检查的文本
+
+    Returns:
+        bool: 如果是页面错误上下文则返回 True
+
+    判断条件：
+        1. 包含"BUG: unable to handle kernel paging request"
+        2. Oops 错误代码为 0x0000（表示页面错误）
+    """
+    if not text:
+        return False
+
+    lowered = text.lower()
+    if "bug: unable to handle kernel paging request" not in lowered:
+        return False
+
+    oops_match = _OOPS_RE.search(text)
+    return oops_match is not None and oops_match.group("code").lower() == "0000"
+
+
+def _contains_general_protection_fault_text(text: str) -> bool:
+    """检查文本是否包含通用保护错误相关文本。
+
+    Args:
+        text: 待检查的文本
+
+    Returns:
+        bool: 如果包含则返回 True
+    """
+    return bool(re.search(r"\bgeneral protection fault\b", text, flags=re.IGNORECASE))
+
+
+def _replace_general_protection_fault_text(text: str, *, replacement: str) -> str:
+    """将文本中的通用保护错误替换为指定文本。
+
+    Args:
+        text: 原始文本
+        replacement: 替换文本
+
+    Returns:
+        str: 替换后的文本
+    """
+    return re.sub(
+        r"\bgeneral protection fault\b",
+        replacement,
+        text,
+        flags=re.IGNORECASE,
+    )
+
+
 def _extract_outer_json_object(content_str: str) -> str:
+    """从可能包含额外文本的字符串中提取最外层的 JSON 对象。
+
+    Args:
+        content_str: 包含 JSON 的字符串
+
+    Returns:
+        str: 提取的 JSON 字符串
+
+    算法：
+        使用括号计数法找到完整的 JSON 对象边界
+    """
     first_brace = content_str.find("{")
     if first_brace == -1:
         return content_str
@@ -290,6 +979,21 @@ def _extract_outer_json_object(content_str: str) -> str:
 
 
 def _normalize_invalid_escapes(content_str: str) -> str:
+    """修复 JSON 中的无效转义字符。
+
+    Args:
+        content_str: 原始字符串
+
+    Returns:
+        str: 修复后的字符串
+
+    修复的转义：
+        \| -> |
+        \/ -> /
+        \> -> >
+        \< -> <
+        \& -> &
+    """
     invalid_escapes = [
         (r"\|", "|"),
         (r"\/", "/"),
@@ -304,6 +1008,17 @@ def _normalize_invalid_escapes(content_str: str) -> str:
 
 
 def _inject_missing_arguments_field(content_str: str) -> str:
+    """为缺少 arguments 字段的 JSON 注入该字段。
+
+    Args:
+        content_str: JSON 字符串
+
+    Returns:
+        str: 注入 arguments 字段后的 JSON 字符串
+
+    用途：
+        修复 LLM 输出中 command_name 后直接跟数组而缺少 arguments 键的问题
+    """
     pattern = r'("command_name"\s*:\s*"[^"]*"\s*,)\s*(\[)'
     return re.sub(pattern, r'\1 "arguments": \2', content_str)
 
@@ -311,6 +1026,22 @@ def _inject_missing_arguments_field(content_str: str) -> str:
 def _detect_page_fault_access_mismatch(
     state: dict[str, Any],
 ) -> dict[str, str] | None:
+    """检测页面错误访问类型不匹配。
+
+    Args:
+        state: 当前状态
+
+    Returns:
+        dict | None: 如果发现不匹配则返回详细信息，否则返回 None
+
+    检测逻辑：
+        1. 从 Oops 代码解码预期的访问方向（读/写/执行）
+        2. 分析 RIP 指令的实际访问类型
+        3. 比较两者是否一致
+
+    用途：
+        发现 LLM 分析中可能忽略的关键矛盾点
+    """
     text = _collect_state_text(state)
     if not text:
         return None
@@ -344,6 +1075,7 @@ def _detect_page_fault_access_mismatch(
     candidate_instruction = rip_instruction
     candidate_access = _classify_instruction_access(rip_instruction)
 
+    # 如果 RIP 指令无法确定访问类型，向前查找最近的可确定指令
     if candidate_access in {"none", "unknown"}:
         for previous_index in range(rip_index - 1, -1, -1):
             previous_instruction = instructions[previous_index][1]
@@ -381,6 +1113,17 @@ def _detect_page_fault_access_mismatch(
 
 
 def _collect_state_text(state: dict[str, Any]) -> str:
+    """从状态中收集所有文本内容。
+
+    Args:
+        state: 当前状态字典
+
+    Returns:
+        str: 合并的文本内容
+
+    用途：
+        为审计函数提供完整的上下文信息
+    """
     parts: list[str] = []
     for message in state.get("messages", []):
         content = getattr(message, "content", "")
@@ -395,6 +1138,21 @@ def _collect_state_text(state: dict[str, Any]) -> str:
 
 
 def _decode_access_direction(error_code: int) -> str:
+    """根据 x86 页面错误错误代码解码访问方向。
+
+    Args:
+        error_code: 页面错误错误代码
+
+    Returns:
+        str: 访问方向（"execute", "write", "read", "unknown"）
+
+    x86 页面错误错误代码位含义：
+        bit 0: 0=不存在的页，1=保护违例
+        bit 1: 0=读访问，1=写访问
+        bit 2: 0=内核模式，1=用户模式
+        bit 3: 0=非保留，1=保留位违例
+        bit 4: 0=数据/非指令获取，1=指令获取
+    """
     if error_code & 0x10:
         return "execute"
     if error_code & 0x2:
@@ -403,6 +1161,19 @@ def _decode_access_direction(error_code: int) -> str:
 
 
 def _classify_instruction_access(instruction: str) -> str:
+    """分类 x86 指令的内存访问类型。
+
+    Args:
+        instruction: x86 汇编指令
+
+    Returns:
+        str: 访问类型（"read", "write", "readwrite", "none", "unknown"）
+
+    分类逻辑：
+        1. 处理指令前缀（lock, rep 等）
+        2. 根据助记符和操作数确定访问类型
+        3. 特殊处理 mov、cmp 等指令
+    """
     cleaned = instruction.strip().lower()
     for prefix in ("lock ", "rep ", "repz ", "repnz "):
         if cleaned.startswith(prefix):
@@ -442,10 +1213,30 @@ def _classify_instruction_access(instruction: str) -> str:
 
 
 def _has_memory_operand(operand_text: str) -> bool:
+    """检查操作数文本是否包含内存操作数。
+
+    Args:
+        operand_text: 操作数文本
+
+    Returns:
+        bool: 如果包含内存操作数则返回 True
+
+    内存操作数特征：
+        1. 包含括号（如 (%rax)）
+        2. 以%gs:或%fs:开头（段寄存器）
+    """
     return any(_is_memory_operand(operand) for operand in operand_text.split(","))
 
 
 def _is_memory_operand(operand: str) -> bool:
+    """检查单个操作数是否为内存操作数。
+
+    Args:
+        operand: 单个操作数
+
+    Returns:
+        bool: 如果是内存操作数则返回 True
+    """
     token = operand.strip().lower()
     return "(" in token or token.startswith("%gs:") or token.startswith("%fs:")
 
@@ -454,6 +1245,18 @@ def _mentions_access_type_mismatch(
     analysis_step: VMCoreLLMAnalysisStep,
     mismatch: dict[str, str],
 ) -> bool:
+    """检查分析步骤是否已经提到了访问类型不匹配。
+
+    Args:
+        analysis_step: 分析步骤
+        mismatch: 不匹配信息
+
+    Returns:
+        bool: 如果已提及则返回 True
+
+    用途：
+        避免重复添加相同的审计注释
+    """
     text_parts = [analysis_step.reasoning]
     if analysis_step.additional_notes:
         text_parts.append(analysis_step.additional_notes)

@@ -20,8 +20,7 @@ from src.react import (
     generate_markdown_report,
     graph_logging_callback,
 )
-from src.mcp_tools.crash.client import initialize_crash_tools
-from src.mcp_tools.source_patch.client import initialize_patch_tools
+from src.mcp_tools import initialize_all_mcp_tools
 
 # Agent 图最大递归轮次（LangGraph superstep 上限）
 # 注意：每轮可见分析消耗 3 个 superstep：
@@ -93,8 +92,7 @@ def validate_file_paths(request: VmcoreAnalysisRequest) -> Optional[str]:
 app_state: dict[str, Any] = {
     "reasoning_llm": None,
     "structured_llm": None,
-    "crash_tools": None,
-    "source_patch_tools": None,
+    "mcp_tools": None,
     "agent_graph": None,
 }
 
@@ -116,26 +114,35 @@ async def lifespan(app: FastAPI):
     logger.info(f"Chat LLM Model: {app_state['structured_llm'].model_name}")
 
     # 初始化工具
-    logger.info("Initializing crash and patch tools...")
-    app_state["crash_tools"] = await initialize_crash_tools()
-    app_state["source_patch_tools"] = await initialize_patch_tools()
+    logger.info("Initializing MCP tools via auto discovery...")
+    app_state["mcp_tools"] = await initialize_all_mcp_tools()
 
-    if not app_state["crash_tools"]:
-        logger.error("No crash tools available. Please check MCP server configuration.")
+    if not app_state["mcp_tools"]:
+        logger.error("No MCP tools available. Please check MCP server configuration.")
     else:
-        logger.info(f"Loaded {len(app_state['crash_tools'])} crash tools successfully.")
+        logger.info(f"Loaded {len(app_state['mcp_tools'])} MCP tools successfully.")
 
     # 创建 agent 图
-    all_tools = (app_state["crash_tools"] or []) + (
-        app_state["source_patch_tools"] or []
-    )
     app_state["agent_graph"] = create_agent_graph(
         app_state["reasoning_llm"],
-        all_tools,
+        app_state["mcp_tools"] or [],
         structured_llm=app_state["structured_llm"],
     )
     logger.info("Agent graph created successfully.")
 
+    # 这里的 yield 出现在 asynccontextmanager 修饰的 lifespan 函数里，
+    # 它不是“返回结果给调用方继续用”的普通生成器用法，而是把这个函数一分为二：
+    # yield 之前：应用启动阶段执行
+    # yield 之后：应用关闭阶段执行
+    # 它等价于“异步上下文管理器”的中间分界点。FastAPI 在启动时进入这个上下文，在关闭时退出这个上下文。
+
+    # 放到这段代码里，语义基本就是：
+    # 启动时：
+    #   初始化 reasonining_llm、structured_llm、mcp_tools、agent_graph
+    # 服务运行中：
+    #   应用开始接收 /health、/analyze、/analyze/stream 请求
+    # 关闭时：
+    #   执行清理资源、打印 shutdown 日志，后续如果你要关闭 MCP 连接、释放客户端、停止后台任务，也应该写在 yield 后面
     yield
 
     # 清理资源
@@ -159,8 +166,8 @@ async def health_check():
     """健康检查接口"""
     return {
         "status": "healthy",
-        "llm_ready": app_state["llm"] is not None,
-        "tools_ready": app_state["crash_tools"] is not None,
+        "llm_ready": app_state["reasoning_llm"] is not None,
+        "tools_ready": app_state["mcp_tools"] is not None,
     }
 
 

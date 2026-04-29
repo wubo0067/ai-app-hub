@@ -9,12 +9,63 @@ from src.react.action_guard import (
 
 
 class ActionGuardTests(unittest.TestCase):
-    def test_rejects_sym_list_in_run_script(self) -> None:
+    def test_rejects_standalone_log_m(self) -> None:
+        error = validate_tool_call_request(
+            "log",
+            {"command": "log -m"},
+        )
+        self.assertIn("standalone log -m is forbidden", error)
+
+    def test_rejects_log_m_without_grep_after_pipe(self) -> None:
         error = validate_tool_call_request(
             "run_script",
-            {"script": "mod -s mpt3sas /tmp/mpt3sas.ko.debug\nsym -l | grep -i reply"},
+            {"script": "log -m | sed -n '1,20p'"},
+        )
+        self.assertIn("must be piped to grep", error)
+
+    def test_allows_log_m_with_grep(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": 'log -m | grep -Ei "BUG|page fault|kernel BUG"'},
+        )
+        self.assertIsNone(error)
+
+    def test_rejects_unfiltered_sym_list_in_run_script(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": "mod -s mpt3sas /tmp/mpt3sas.ko.debug\nsym -l mpt3sas"},
         )
         self.assertIn("sym -l is forbidden", error)
+
+    def test_allows_grep_filtered_sym_list_in_run_script(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {
+                "script": "mod -s mpt3sas /tmp/mpt3sas.ko.debug\nsym -l mpt3sas | grep -i reply"
+            },
+        )
+        self.assertIsNone(error)
+
+    def test_rejects_large_rd_ss_printable_sweep(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": "rd -SS 0xffff8b817de14000 8192 | grep -E '[ -~]{8,}'"},
+        )
+        self.assertIn("broad printable-character grep", error)
+
+    def test_rejects_oversized_rd_ss_even_with_specific_grep(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": 'rd -SS 0xffff8b817de14000 1024 | grep -i "task_struct"'},
+        )
+        self.assertIn("rd -SS count 1024 is too large", error)
+
+    def test_allows_bounded_rd_ss_with_specific_anchor(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": 'rd -SS 0xffff8b817de17b40 64 | grep -i "task_struct"'},
+        )
+        self.assertIsNone(error)
 
     def test_rejects_bt_a_without_hard_lockup_context(self) -> None:
         error = validate_tool_call_request("bt", {"command": "bt -a"})

@@ -1,9 +1,10 @@
 # To separate your traces from other application
-LANGSMITH_PROJECT: vmcore-analysis-agent
-LANGSMITH_TRACING: false
+langsmith_project: vmcore-analysis-agent
+langsmith_tracing: false
 
 ## LLM choice:
-LLM_MODEL: deepseek-chat
-#LLM_MODEL: deepseek-reasoner
-BASE_URL: https://api.deepseek.com
-TEMPERATURE: 0.1
+thinking: "enabled" # enabled or disabled
+llm_model: deepseek-v4-flash #
+reasoning_effort: "max" # high
+base_url: https://api.deepseek.com
+temperature: 0.1

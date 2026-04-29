@@ -8,6 +8,10 @@ from typing import Any, Iterable, List, Optional
 
 # 匹配 head/tail 管道后缀的正则表达式，用于清理命令输出过滤操作
 _HEAD_TAIL_SUFFIX_RE = re.compile(r"\s*\|\s*(?:head|tail)\s+-\d+\s*$")
+# 匹配宽泛可打印字符 grep 模式，避免把大块内存当作任意 ASCII 文本扫出海量结果
+_BROAD_ASCII_GREP_RE = re.compile(
+    r"\|\s*grep(?:\s+-[A-Za-z]+)*\s+(?:'[^']*(?:\[\s*-~\]\{\d+,?\}|\[\[:print:\]\]\{\d+,?\}|\.\{\d+,?\}|\.\*)[^']*'|\"[^\"]*(?:\[\s*-~\]\{\d+,?\}|\[\[:print:\]\]\{\d+,?\}|\.\{\d+,?\}|\.\*)[^\"]*\")"
+)
 # 禁止的表达式模式：shell 变量、寄存器引用等，防止命令注入
 _FORBIDDEN_EXPR_RE = re.compile(
     r"\$\(|\$\(\(|\$[A-Za-z_][A-Za-z0-9_]*|%[A-Za-z0-9]+:|\(%[A-Za-z0-9]+\)|%rip\+|\$r[A-Za-z0-9]+"
@@ -40,6 +44,8 @@ _STRUCT_LAYOUT_HEADER_RE = re.compile(r"^struct\s+(?P<type_name>\S+)\s+\{$")
 _STRUCT_FIELD_OFFSET_RE = re.compile(r"^\s*\[(?P<offset>\d+)\]\s+")
 # struct 大小匹配：提取结构体总大小
 _STRUCT_SIZE_RE = re.compile(r"^SIZE:\s+(?P<size>\d+)")
+
+_MAX_RD_SS_COUNT = 256
 
 
 def _collapse_whitespace(text: str) -> str:
@@ -266,16 +272,30 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
     if _ADDRESS_ARITHMETIC_RE.search(normalized):
         return f"address arithmetic must be resolved before execution: {normalized}"
 
+    rd_ss_error = _validate_rd_ss_command(normalized)
+    if rd_ss_error is not None:
+        return rd_ss_error
+
     parts = normalized.split()
     command = parts[0]
 
-    # sym -l 禁止：列出所有符号输出过大
+    # sym -l 默认禁止；若后续立即通过 grep 过滤，则允许受限查询
     if command == "sym" and len(parts) > 1 and parts[1] == "-l":
-        return "sym -l is forbidden; use sym <symbol>."
+        if "|" not in parts or "grep" not in parts[parts.index("|") + 1 :]:
+            return "sym -l is forbidden unless it is piped to grep; otherwise use sym <symbol>."
 
     # bt -a 默认禁止：除非是 hard_lockup 场景
     if command == "bt" and "-a" in parts[1:] and not allow_bt_a:
         return "bt -a is forbidden unless the current signature_class is hard_lockup."
+
+    if command == "bt" and "-f" in parts[1:]:
+        flag_index = parts.index("-f")
+        if flag_index == len(parts) - 1:
+            return "bt -f requires a concrete pid or task argument."
+
+        target = parts[flag_index + 1]
+        if target.isdigit() and len(parts) == flag_index + 2:
+            return "bt -f must target a concrete pid or task context, not a frame number from bt output."
 
     # log 命令检查：必须配合 grep 使用，禁止单独使用
     if command == "log":
@@ -283,8 +303,18 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
             return "standalone log is forbidden; pipe it with grep."
         if normalized.startswith("log |"):
             return "log must use log -m | grep <pattern>, not log | grep."
-        if len(parts) >= 2 and parts[1] in {"-m", "-t", "-a"} and "|" not in normalized:
-            return f"standalone {parts[0]} {parts[1]} is forbidden; pipe it with grep."
+        if len(parts) >= 2 and parts[1] in {"-m", "-t", "-a"}:
+            if "|" not in normalized:
+                return (
+                    f"standalone {parts[0]} {parts[1]} is forbidden; pipe it with grep."
+                )
+
+            pipe_index = parts.index("|") if "|" in parts else -1
+            if pipe_index == -1 or "grep" not in parts[pipe_index + 1 :]:
+                return (
+                    f"{parts[0]} {parts[1]} must be piped to grep with a concrete pattern; "
+                    "do not pipe log output to other commands first."
+                )
 
     # kmem 命令检查：必须带有效选项
     if command == "kmem":
@@ -294,6 +324,10 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
             return "kmem -a <addr> is forbidden; use kmem -S <addr>."
         if parts[1] == "-S" and len(parts) == 2:
             return "bare kmem -S is forbidden; use kmem -S <addr>."
+        if parts[1] == "-S" and len(parts) >= 3:
+            candidate = parts[2].lower()
+            if candidate.startswith("ffff"):
+                return "kmem -S is only for slab or heap object addresses; do not use it on possible kernel stack addresses. Use task -R or vtop instead."
 
     # struct 命令检查：禁止裸用 struct -o
     if command == "struct":
@@ -310,6 +344,52 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
         return f"{command} requires a target operand."
 
     return None
+
+
+def _validate_rd_ss_command(normalized: str) -> str | None:
+    """限制高放大量的 rd -SS 扫描，避免单个 action 淹没上下文。"""
+    parts = normalized.split()
+    if not parts or parts[0] != "rd" or "-SS" not in parts[1:]:
+        return None
+
+    if _BROAD_ASCII_GREP_RE.search(normalized):
+        return (
+            "rd -SS with a broad printable-character grep is forbidden; use a concrete anchor "
+            "pattern such as a symbol, device tag, or validated string fragment."
+        )
+
+    address, count = _extract_rd_target_and_count(parts)
+    if address is None:
+        return "rd -SS must provide an address target."
+    if count is None:
+        return "rd -SS must include an explicit bounded count."
+    if count > _MAX_RD_SS_COUNT:
+        return (
+            f"rd -SS count {count} is too large; keep rd -SS bounded to {_MAX_RD_SS_COUNT} "
+            "or less and narrow the grep pattern first."
+        )
+    return None
+
+
+def _extract_rd_target_and_count(parts: list[str]) -> tuple[str | None, int | None]:
+    """从 rd 命令中提取目标地址和显式 count。"""
+    operand_index = 1
+    while operand_index < len(parts) and parts[operand_index].startswith("-"):
+        operand_index += 1
+
+    if operand_index >= len(parts):
+        return None, None
+
+    address = parts[operand_index]
+    count_index = operand_index + 1
+    if count_index >= len(parts) or parts[count_index] == "|":
+        return address, None
+
+    count_token = parts[count_index]
+    try:
+        return address, int(count_token, 0)
+    except ValueError:
+        return address, None
 
 
 def _uses_module_specific_symbol(lines: Iterable[str]) -> bool:

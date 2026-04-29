@@ -20,27 +20,54 @@ def project_managed_analysis_step(
     *,
     original_reasoning: str,
 ) -> tuple[VMCoreAnalysisStep, Dict[str, Any]]:
+    """
+    将 LLM 生成的分析步骤投影到受管理的状态中，并更新当前的分析上下文。
+
+    该函数负责处理“受管理”的分析流程，它会结合当前的签名类 (SignatureClass)、
+    根因类 (RootCauseClass) 以及已有的假设 (Hypotheses) 和闸门 (Gates) 状态，
+    生成一个包含完整上下文的分析步骤对象，并计算出需要更新到全局状态中的增量。
+
+    Args:
+        llm_step: LLM 直接生成的原始分析步骤对象。
+        state: 当前的分析全局状态，包含历史上下文、当前的签名/根因类等。
+        original_reasoning: 最初引发分析的原始推理内容，用于解析 partial_dump。
+
+    Returns:
+        tuple[VMCoreAnalysisStep, Dict[str, Any]]:
+            - 第一个元素是投影后的 VMCoreAnalysisStep，包含了补全后的上下文。
+            - 第二个元素是包含需要更新到 state 中的新键值对的字典。
+    """
+    # 确定当前的签名类：优先使用 llm_step 中指定的，如果没有则回退到 state 中的当前类
     signature_class = cast(
         Optional[CrashSignatureClass],
         llm_step.signature_class or state.get("current_signature_class"),
     )
+
+    # 确定当前的根因类：优先使用 llm_step 中指定的，如果没有则回退到 state 中的当前类
     root_cause_class = cast(
         Optional[RootCauseClass],
         llm_step.root_cause_class or state.get("current_root_cause_class"),
     )
+
+    # 解析 Partial Dump：根据原始推理和当前状态，将 LLM 提供的片段 dump 还原/关联到具体上下文
     partial_dump = _resolve_partial_dump(
         llm_step.partial_dump, state, original_reasoning
     )
+
+    # 构建受管理的活跃假设列表：基于当前的签名/根因类，从 state 中继承或更新假设
     active_hypotheses = _build_managed_hypotheses(
         signature_class,
         root_cause_class,
         state.get("managed_active_hypotheses"),
     )
+
+    # 构建受管理的闸门 (Gates)：基于当前的签名类，从 state 中继承或更新决策闸门
     gates = _build_managed_gates(
         signature_class,
         state.get("managed_gates"),
     )
 
+    # 构造最终的 VMCoreAnalysisStep 对象，将 LLM 的原始数据与补全后的上下文进行合并
     step = VMCoreAnalysisStep.model_validate(
         {
             **llm_step.model_dump(),
@@ -60,6 +87,7 @@ def project_managed_analysis_step(
         }
     )
 
+    # 准备需要更新到全局 state 中的数据包
     managed_updates: Dict[str, Any] = {
         "current_signature_class": signature_class,
         "current_root_cause_class": root_cause_class,
@@ -136,37 +164,80 @@ def _build_managed_gates(
     signature_class: Optional[CrashSignatureClass],
     prior_gates: Optional[Dict[str, GateEntry]],
 ) -> Optional[Dict[str, GateEntry]]:
+    """
+    构建受管理的门控（gate）集合。
+
+    该函数根据崩溃签名的类别，从预定义的门控配置中提取所需门控，
+    并结合已有的历史门控状态，生成一个完整的受管理门控字典。
+
+    门控（Gate）用于控制分析流程的执行条件，例如：
+    - external_corruption_gate：外部破坏检测门控
+    - local_corruption_exclusion：本地破坏排除门控
+    - field_type_classification：字段类型分类门控
+
+    Args:
+        signature_class: 崩溃签名的类别，用于确定需要哪些门控。
+                        若为 None 或 "unknown"，则直接返回历史门控。
+        prior_gates: 已有的历史门控字典，包含之前分析阶段的状态。
+
+    Returns:
+        若签名类别有效且存在对应的门控配置，返回受管理门控字典；
+        否则返回 None 或直接返回历史门控。
+
+    Note:
+        - 历史门控状态会被深拷贝，避免修改原始数据。
+        - 新创建的门控会设置默认状态和证据信息。
+        - external_corruption_gate 的状态依赖于 local_corruption_exclusion 的状态。
+    """
+    # 若签名类别无效，直接返回历史门控
     if signature_class is None or signature_class == "unknown":
         return prior_gates
 
+    # 从全局配置中获取该类签名所需的所有门控名称列表
     required = VMCoreAnalysisStep._REQUIRED_GATES.get(signature_class, [])
     if not required:
         return None
 
     managed: Dict[str, GateEntry] = {}
     for gate_name in required:
+        # 若历史门控中存在该门控，深拷贝其状态作为初始值
         previous = (prior_gates or {}).get(gate_name)
         if previous is not None:
             managed[gate_name] = GateEntry.model_validate(previous.model_dump())
             continue
 
+        # 根据门控类型创建默认实例
         if gate_name == "external_corruption_gate":
             managed[gate_name] = GateEntry(
                 required_for=[signature_class],
-                status="blocked",
+                status="blocked",  # 初始阻塞，等待本地破坏排除
                 prerequisite="local_corruption_exclusion",
                 evidence="Managed by executor state: waiting for local_corruption_exclusion to close.",
             )
+        elif gate_name == "field_type_classification":
+            managed[gate_name] = GateEntry(
+                required_for=[signature_class],
+                status="open",  # 初始开放，等待类型推断结果
+                prerequisite=None,
+                evidence=(
+                    "Managed by executor state: awaiting source-level field typing via "
+                    "function-pointer anchoring, source cross-reference, or defensible offset inference."
+                ),
+            )
         else:
+            # 默认门控：开放状态，等待确定性的分析证据
             managed[gate_name] = GateEntry(
                 required_for=[signature_class],
                 status="open",
+                prerequisite=None,
                 evidence="Managed by executor state: awaiting deterministic evidence.",
             )
 
+    # 处理 external_corruption_gate 与 local_corruption_exclusion 的依赖关系
     external_gate = managed.get("external_corruption_gate")
     local_gate = managed.get("local_corruption_exclusion")
     if external_gate is not None and external_gate.status not in ("closed", "n/a"):
+        # 若 local_corruption_exclusion 尚未关闭，则 external_corruption_gate 保持阻塞
         if local_gate is None or local_gate.status not in ("closed", "n/a"):
             managed["external_corruption_gate"] = GateEntry(
                 required_for=external_gate.required_for,
@@ -175,10 +246,11 @@ def _build_managed_gates(
                 evidence=external_gate.evidence
                 or "Managed by executor state: waiting for local_corruption_exclusion to close.",
             )
+        # 若 local_corruption_exclusion 已关闭但 external_corruption_gate 仍被阻塞，则将其开放
         elif external_gate.status == "blocked":
             managed["external_corruption_gate"] = GateEntry(
                 required_for=external_gate.required_for,
-                status="open",
+                status="open",  # 解除阻塞，转为开放等待证据
                 prerequisite="local_corruption_exclusion",
                 evidence="Managed by executor state: prerequisite satisfied; awaiting deterministic evidence.",
             )
