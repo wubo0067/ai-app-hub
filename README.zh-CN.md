@@ -217,6 +217,87 @@ DEFAULT_CRASH_COMMANDS = [
 | [`Hypothesis`](vmcore-analysis-agent/src/react/schema.py#L165-L192) | 代表代理正在跟踪的一个候选根本原因。[`active_hypotheses`](vmcore-analysis-agent/src/react/schema.py#L326-L333) 列表强制对竞争性理论进行显式管理。 |
 | [`GateEntry`](vmcore-analysis-agent/src/react/schema.py#L195-L220) | 代表一个强制性的验证检查点。[`gates`](vmcore-analysis-agent/src/react/schema.py#L335-L343) 字典确保在允许得出确定性诊断之前，收集到所有必需的证据。 |
 
+#### `_REQUIRED_GATES`：验证门控系统
+
+**一、Gates 是什么**
+
+Gates（门控/检查点）是该项目中 VMCore 崩溃分析状态机的一个核心概念——它代表在宣布分析"已得出结论"（is_conclusive=True）之前，必须完成的验证步骤（检查点）。
+
+可以从代码中 GateEntry 的定义清楚看到这一点：
+
+```python
+class GateEntry(BaseModel):
+    """
+    is_conclusive=True 前必须完成的验证检查点。
+
+    每个 gate 代表一个必须完成的验证步骤，用于确认崩溃根因的特定假设。
+    在将分析结论标记为"最终结论"（is_conclusive=True）之前，所有相关的 gate
+    必须处于 closed 或 n/a 状态，且 evidence 字段必须填写具体的工具输出。
+    """
+    status: Literal["open", "closed", "blocked", "n/a"]
+    evidence: Optional[str]  # 必须填写具体的工具输出，不得使用泛泛总结
+    prerequisite: Optional[str]  # 前置依赖 gate
+```
+
+Gate 的四种状态：
+
+| 状态 | 含义 |
+|------|------|
+| `open` | 尚未调查或调查未完成 |
+| `closed` | 已验证通过（evidence 必须填具体工具输出） |
+| `blocked` | 前置 gate 未关闭，当前 gate 无法开始 |
+| `n/a` | 确实不适用（evidence 必须解释为何不适用） |
+
+**二、`_REQUIRED_GATES` 的结构**
+
+它是一个 崩溃签名类型 → 必需 gate 列表 的映射：
+
+```python
+_REQUIRED_GATES: ClassVar[Dict[str, List[str]]] = {
+    "pointer_corruption": [
+        "register_provenance",         # 寄存器来源验证
+        "object_lifetime",             # 对象生命周期验证
+        "local_corruption_exclusion",  # 排除本地损坏
+        "external_corruption_gate",    # 外部损坏门控
+        "field_type_classification",   # 字段类型分类
+    ],
+    "null_deref":     ["register_provenance"],
+    "use_after_free": ["register_provenance", "object_lifetime"],
+    "soft_lockup":    ["stack_integrity", "lock_holder"],
+    # ... 等等
+}
+```
+
+每种崩溃类型需要的验证深度不同：
+- **简单类型**（如 null_deref、divide_error）只需 1-2 个 gate
+- **复杂类型**（如 pointer_corruption）需要 5 个 gate，形成完整的证据链
+
+**三、在项目中的作用**
+
+Gates 在整个分析流程中扮演 质量守门人（Quality Gatekeeper） 的角色：
+
+```
+┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│ LLM 逐步推理 │ ──► │ 更新 gates 状态   │ ──► │ 所有 gate closed │
+│ 调用 crash   │     │ (open→closed/n/a)│     │ 才能 is_        │
+│ 工具收集证据  │     │                  │     │ conclusive=true  │
+└─────────────┘     └──────────────────┘     └─────────────────┘
+```
+
+具体来说：
+
+- **防止过早结论** — LLM 容易"急于下结论"，gates 强制要求它完成所有必要的验证步骤后才能输出 is_conclusive=True。
+
+- **保证证据完整性** — 例如 pointer_corruption 必须依次验证：寄存器来源 → 对象生命周期 → 排除本地损坏 → 外部损坏判定 → 字段类型分类，形成一条完整的证据链，缺一不可。
+
+- **支持依赖关系** — gate 之间可以有 prerequisite（前置依赖），例如 external_corruption_gate 的前置是 local_corruption_exclusion，必须先排除本地损坏才能判断是否外部损坏。
+
+- **可审计性** — 每个 gate 关闭时必须附带 evidence（具体工具输出），使得整个分析过程可追溯、可验证，不是 LLM 自由发挥的"黑盒推理"。
+
+**四、类比理解**
+
+可以把 gates 想象成飞行检查清单：飞行员在起飞前必须逐项检查并确认（襟翼、燃油、引擎...），全部打勾后才能起飞。同样，分析 Agent 在宣布"找到根因"之前，必须逐个完成对应崩溃类型的检查项，全部 closed 后才能真正输出最终诊断。
+
 **核心概念**：
 - **[`CrashSignatureClass`](vmcore-analysis-agent/src/react/schema.py#L117-L134) 与 [`RootCauseClass`](vmcore-analysis-agent/src/react/schema.py#L139-L162)**：前者是从 panic 日志中观察到的症状（例如 `soft_lockup`），后者是推断出的底层机制（例如 `deadlock`）。它们在分析流程中扮演不同的角色。
 - **托管状态 ([`active_hypotheses`](vmcore-analysis-agent/src/react/schema.py#L326-L333), [`gates`](vmcore-analysis-agent/src/react/schema.py#L335-L343))**：这些字段并非由 LLM 生成，而是由代理的执行器逻辑维护。它们是代理能够进行透明、可追溯且严谨分析的能力基石。

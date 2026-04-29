@@ -20,27 +20,54 @@ def project_managed_analysis_step(
     *,
     original_reasoning: str,
 ) -> tuple[VMCoreAnalysisStep, Dict[str, Any]]:
+    """
+    将 LLM 生成的分析步骤投影到受管理的状态中，并更新当前的分析上下文。
+
+    该函数负责处理“受管理”的分析流程，它会结合当前的签名类 (SignatureClass)、
+    根因类 (RootCauseClass) 以及已有的假设 (Hypotheses) 和闸门 (Gates) 状态，
+    生成一个包含完整上下文的分析步骤对象，并计算出需要更新到全局状态中的增量。
+
+    Args:
+        llm_step: LLM 直接生成的原始分析步骤对象。
+        state: 当前的分析全局状态，包含历史上下文、当前的签名/根因类等。
+        original_reasoning: 最初引发分析的原始推理内容，用于解析 partial_dump。
+
+    Returns:
+        tuple[VMCoreAnalysisStep, Dict[str, Any]]:
+            - 第一个元素是投影后的 VMCoreAnalysisStep，包含了补全后的上下文。
+            - 第二个元素是包含需要更新到 state 中的新键值对的字典。
+    """
+    # 确定当前的签名类：优先使用 llm_step 中指定的，如果没有则回退到 state 中的当前类
     signature_class = cast(
         Optional[CrashSignatureClass],
         llm_step.signature_class or state.get("current_signature_class"),
     )
+
+    # 确定当前的根因类：优先使用 llm_step 中指定的，如果没有则回退到 state 中的当前类
     root_cause_class = cast(
         Optional[RootCauseClass],
         llm_step.root_cause_class or state.get("current_root_cause_class"),
     )
+
+    # 解析 Partial Dump：根据原始推理和当前状态，将 LLM 提供的片段 dump 还原/关联到具体上下文
     partial_dump = _resolve_partial_dump(
         llm_step.partial_dump, state, original_reasoning
     )
+
+    # 构建受管理的活跃假设列表：基于当前的签名/根因类，从 state 中继承或更新假设
     active_hypotheses = _build_managed_hypotheses(
         signature_class,
         root_cause_class,
         state.get("managed_active_hypotheses"),
     )
+
+    # 构建受管理的闸门 (Gates)：基于当前的签名类，从 state 中继承或更新决策闸门
     gates = _build_managed_gates(
         signature_class,
         state.get("managed_gates"),
     )
 
+    # 构造最终的 VMCoreAnalysisStep 对象，将 LLM 的原始数据与补全后的上下文进行合并
     step = VMCoreAnalysisStep.model_validate(
         {
             **llm_step.model_dump(),
@@ -60,6 +87,7 @@ def project_managed_analysis_step(
         }
     )
 
+    # 准备需要更新到全局 state 中的数据包
     managed_updates: Dict[str, Any] = {
         "current_signature_class": signature_class,
         "current_root_cause_class": root_cause_class,

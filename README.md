@@ -214,6 +214,87 @@ The agent's reasoning and state are structured around a set of Pydantic models d
 | [`Hypothesis`](vmcore-analysis-agent/src/react/schema.py#L165-L192) | Represents a single candidate root cause being tracked by the agent. The [`active_hypotheses`](vmcore-analysis-agent/src/react/schema.py#L326-L333) list forces explicit management of competing theories. |
 | [`GateEntry`](vmcore-analysis-agent/src/react/schema.py#L195-L220) | Represents a mandatory verification checkpoint. The [`gates`](vmcore-analysis-agent/src/react/schema.py#L335-L343) dictionary ensures all required evidence is gathered before a conclusive diagnosis is allowed. |
 
+#### `_REQUIRED_GATES`: The Verification Gatekeeper System
+
+**What are Gates?**
+
+Gates (门控/检查点) are a core concept in the VMCore crash analysis state machine—they represent mandatory verification steps (checkpoints) that must be completed before declaring the analysis as "conclusive" (`is_conclusive=True`).
+
+This is clearly visible from the `GateEntry` definition:
+
+```python
+class GateEntry(BaseModel):
+    """
+    is_conclusive=True 前必须完成的验证检查点。
+
+    每个 gate 代表一个必须完成的验证步骤，用于确认崩溃根因的特定假设。
+    在将分析结论标记为"最终结论"（is_conclusive=True）之前，所有相关的 gate
+    必须处于 closed 或 n/a 状态，且 evidence 字段必须填写具体的工具输出。
+    """
+    status: Literal["open", "closed", "blocked", "n/a"]
+    evidence: Optional[str]  # 必须填写具体的工具输出，不得使用泛泛总结
+    prerequisite: Optional[str]  # 前置依赖 gate
+```
+
+**Gate States:**
+
+| Status | Meaning |
+|--------|---------|
+| `open` | Not yet investigated or investigation incomplete |
+| `closed` | Verified and passed (evidence must contain specific tool output) |
+| `blocked` | Prerequisite gate not closed, current gate cannot start |
+| `n/a` | Truly not applicable (evidence must explain why it's not applicable) |
+
+**Structure of `_REQUIRED_GATES`**
+
+`_REQUIRED_GATES` is a mapping from crash signature types to required gate lists:
+
+```python
+_REQUIRED_GATES: ClassVar[Dict[str, List[str]]] = {
+    "pointer_corruption": [
+        "register_provenance",         # Register provenance validation
+        "object_lifetime",             # Object lifetime validation  
+        "local_corruption_exclusion",  # Exclude local corruption
+        "external_corruption_gate",    # External corruption gate
+        "field_type_classification",   # Field type classification
+    ],
+    "null_deref":     ["register_provenance"],
+    "use_after_free": ["register_provenance", "object_lifetime"],
+    "soft_lockup":    ["stack_integrity", "lock_holder"],
+    # ... and more
+}
+```
+
+Different crash types require different validation depths:
+- **Simple types** (e.g., `null_deref`, `divide_error`) require only 1-2 gates
+- **Complex types** (e.g., `pointer_corruption`) require 5 gates, forming a complete evidence chain
+
+**Role in the Project**
+
+Gates serve as **Quality Gatekeepers** throughout the analysis workflow:
+
+```
+┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│ LLM 逐步推理 │ ──► │ 更新 gates 状态   │ ──► │ 所有 gate closed │
+│ 调用 crash   │     │ (open→closed/n/a)│     │ 才能 is_        │
+│ 工具收集证据  │     │                  │     │ conclusive=true  │
+└─────────────┘     └──────────────────┘     └─────────────────┘
+```
+
+Specifically:
+
+- **Prevents premature conclusions**: LLMs tend to "rush to conclusions," but gates force completion of all necessary verification steps before allowing `is_conclusive=True`.
+
+- **Ensures evidence completeness**: For example, `pointer_corruption` must sequentially verify: register provenance → object lifetime → exclude local corruption → external corruption determination → field type classification, forming a complete evidence chain with no gaps.
+
+- **Supports dependencies**: Gates can have prerequisites (e.g., `external_corruption_gate` depends on `local_corruption_exclusion`), ensuring proper analysis order.
+
+- **Enables auditability**: Each closed gate must include `evidence` (specific tool output), making the entire analysis process traceable and verifiable—not just LLM "black box" reasoning.
+
+**Analogy**
+
+Think of gates as an aircraft pre-flight checklist: pilots must systematically check and confirm each item (flaps, fuel, engines...) before takeoff. Similarly, the analysis Agent must complete each required checkpoint for its crash type before announcing "root cause found"—all gates must be closed before the final diagnosis can be truly output.
+
 **Key Concepts**:
 - **[`CrashSignatureClass`](vmcore-analysis-agent/src/react/schema.py#L117-L134) vs [`RootCauseClass`](vmcore-analysis-agent/src/react/schema.py#L139-L162)**: The former is an observable symptom from the panic log (e.g., `soft_lockup`), while the latter is the inferred underlying mechanism (e.g., `deadlock`). They serve different purposes in the analysis flow.
 - **Managed State ([`active_hypotheses`](vmcore-analysis-agent/src/react/schema.py#L326-L333), [`gates`](vmcore-analysis-agent/src/react/schema.py#L335-L343))**: These fields are not generated by the LLM but are maintained by the agent's executor logic. They are the backbone of the agent's ability to perform transparent, traceable, and rigorous analysis.
