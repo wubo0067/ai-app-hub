@@ -98,6 +98,9 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
     try:
         # 使用 include_raw=True 后，ainvoke 返回包含 'parsed' 和 'raw' 的字典
         output_data = await ainvoke_with_retry(llm_analysis, messages_to_send)
+        if output_data is None:
+            logger.error("LLM output_data is None")
+            raise ValueError("LLM returned None output")
         llm_step = cast(VMCoreLLMAnalysisStep, output_data["parsed"])
         raw_message = cast(AIMessage, output_data["raw"])
 

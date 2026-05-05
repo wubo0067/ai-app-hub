@@ -51,6 +51,7 @@ async def ainvoke_with_retry(
             await asyncio.sleep(delay)
 
 
+# TODO: 摘要化压缩 (Summarization/Compression), 利用一个更小、更便宜的模型（如 GPT-4o-mini 或本地的 Llama-3-8B）对过长的 ToolMessage 进行预处理。
 def compress_messages_for_llm(
     messages: list,
     max_tool_output_chars: int = 4000,  # 较早的 ToolMessage 内容的最大字符数限制
