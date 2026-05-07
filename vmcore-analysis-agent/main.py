@@ -3,6 +3,7 @@ import uuid
 import yaml
 import json
 import asyncio
+import argparse
 from pathlib import Path
 from typing import cast, Optional, Any
 from contextlib import asynccontextmanager
@@ -88,12 +89,22 @@ def validate_file_paths(request: VmcoreAnalysisRequest) -> Optional[str]:
     return None
 
 
+# ==========================================
+# 命令行启动参数解析
+# ==========================================
+parser = argparse.ArgumentParser(description="Vmcore Analysis Agent Server")
+parser.add_argument(
+    "--crash_mpykdump", type=str, default=None, help="mpykdump 路径 (全局启动参数)"
+)
+cmd_args, _ = parser.parse_known_args()
+
 # 全局变量存储初始化的组件
 app_state: dict[str, Any] = {
     "reasoning_llm": None,
     "structured_llm": None,
     "mcp_tools": None,
     "agent_graph": None,
+    "crash_mpykdump_path": cmd_args.crash_mpykdump,
 }
 
 
@@ -104,6 +115,12 @@ async def lifespan(app: FastAPI):
     logger.info(
         f"config: \n{yaml.dump(config_manager.get_all(), allow_unicode=True, sort_keys=False)}"
     )
+
+    # 打印启动时的全局参数
+    if app_state["crash_mpykdump_path"]:
+        logger.info(f"Startup mpykdump path: {app_state['crash_mpykdump_path']}")
+    else:
+        logger.info("Startup mpykdump path: None (not configured)")
 
     # 初始化 推理 LLM
     app_state["reasoning_llm"] = create_reasoning_llm()
@@ -213,6 +230,7 @@ async def analyze_vmcore(request: VmcoreAnalysisRequest):
             "vmlinux_path": request.vmlinux_path,
             "vmcore_dmesg_path": request.vmcore_dmesg_path,
             "debug_symbol_paths": request.debug_symbol_paths,
+            "mpykdump_path": app_state["crash_mpykdump_path"],
             "messages": [],
             "step_count": 0,
             "token_usage": 0,
@@ -290,6 +308,7 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
 
     task_id = str(uuid.uuid4())
     logger.info(f"Starting stream analysis task: {task_id}")
+    logger.info(f"Request: vmcore_path={request.vmcore_path}")
 
     # 验证文件路径
     validation_error = validate_file_paths(request)
@@ -317,6 +336,7 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
                 "vmlinux_path": request.vmlinux_path,
                 "vmcore_dmesg_path": request.vmcore_dmesg_path,
                 "debug_symbol_paths": request.debug_symbol_paths,
+                "mpykdump_path": app_state["crash_mpykdump_path"],
                 "messages": [],
                 "step_count": 0,
                 "token_usage": 0,

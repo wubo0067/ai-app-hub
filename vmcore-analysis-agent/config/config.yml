@@ -4,7 +4,7 @@ langsmith_tracing: false
 
 ## LLM choice:
 thinking: "enabled" # enabled or disabled
-llm_model: deepseek-v4-flash #
+llm_model: deepseek-v4-pro #
 reasoning_effort: "max" # high
 base_url: https://api.deepseek.com
 temperature: 0.1

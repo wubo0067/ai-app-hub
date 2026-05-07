@@ -459,7 +459,10 @@ llm:
 # 方式1：直接运行
 uv run main.py
 
-# 方式2：使用 uvicorn（推荐，支持热加载）
+# 方式2：直接运行并配置 crash mpykdump 扩展插件路径（支持 Python 脚本在 crash 内运行）
+uv run main.py --crash_mpykdump=/usr/local/lib/mpykdump-3.10.1-crash9.so
+
+# 方式3：使用 uvicorn（推荐，支持热加载）
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
