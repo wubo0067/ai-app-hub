@@ -19,25 +19,6 @@ from .schema import (
     RootCauseClass,
 )
 
-# def add_and_trim_messages(
-#     left: list[AnyMessage], right: Union[list[AnyMessage], AnyMessage]
-# ) -> list[AnyMessage]:
-#     """
-#     基于 LangGraph 的 add_messages 进行合并，但增加了窗口限制。
-#     """
-#     # 1. 先使用标准 add_messages 处理 ID 去重和合并
-#     merged = cast(list[AnyMessage], add_messages(left, right))  # type: ignore
-
-#     # 2. 保留最近的 N 条消息
-#     # 注意：实际场景中可能需要保留 SystemMessage (第一条)，这里做简单切片演示
-#     max_len = 20
-#     if len(merged) > max_len:
-#         logger.info(
-#             f"Trimming messages from {len(merged)} to {max_len} to maintain window size."
-#         )
-#         return merged[-max_len:]
-#     return merged
-
 
 class AgentError(TypedDict):
     """

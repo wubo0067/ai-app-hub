@@ -437,6 +437,7 @@ vmcore-analysis-agent/
 ### 1. 安装依赖
 
 ```
+bash tools/install_mpykdump.sh
 cd vmcore-analysis-agent
 uv sync
 ```
@@ -456,7 +457,7 @@ llm:
 
 ```
 # 方式1：直接运行
-python main.py
+uv run main.py
 
 # 方式2：使用 uvicorn（推荐，支持热加载）
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
@@ -488,35 +489,41 @@ uv run main.py --url http://192.168.14.132:8000 --stream \
 #### 4.3 同步模式分析（可选）
 
 ```
-uv run client/main.py
+cd client
+uv run main.py
 ```
 
 #### 4.4 自定义参数分析
 
 ```
-uv run client/main.py --vmcore-path "/path/to/vmcore" \
-                      --vmlinux-path "/path/to/vmlinux" \
-                      --vmcore-dmesg-path "/path/to/vmcore-dmesg.txt" \
-                      --debug-symbols "/path/to/module1.ko" "/path/to/module2.ko"
+cd client
+uv run main.py --vmcore-path "/path/to/vmcore" \
+               --vmlinux-path "/path/to/vmlinux" \
+               --vmcore-dmesg-path "/path/to/vmcore-dmesg.txt" \
+               --debug-symbols "/path/to/module1.ko" "/path/to/module2.ko"
 ```
 
 #### 4.5 指定服务地址
 
 ```
-uv run client/main.py --url http://192.168.1.100:8000 --stream
+cd client
+uv run main.py --url http://192.168.1.100:8000 --stream
 ```
 
 #### 4.6 报告保存选项
 
 ```
 # 流式模式分析并保存报告到当前目录（默认行为）
-uv run client/main.py --stream
+cd client
+uv run main.py --stream
 
 # 指定报告输出目录
-uv run client/main.py --stream --output-dir ./reports
+cd client
+uv run main.py --stream --output-dir ./reports
 
 # 不保存文件，仅显示
-uv run client/main.py --stream --no-save
+cd client
+uv run main.py --stream --no-save
 ```
 
 #### 4.7 客户端完整参数说明

@@ -434,6 +434,7 @@ vmcore-analysis-agent/
 ### 1. Install Dependencies
 
 ```bash
+bash tools/install_mpykdump.sh
 cd vmcore-analysis-agent
 uv sync
 ```
@@ -453,7 +454,7 @@ llm:
 
 ```bash
 # Method 1: Direct run
-python main.py
+uv run main.py
 
 # Method 2: Using uvicorn (recommended, supports hot reload)
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
@@ -485,35 +486,41 @@ uv run main.py --url http://192.168.14.132:8000 --stream \
 #### 4.3 Synchronous Mode Analysis (Optional)
 
 ```bash
-uv run client/main.py
+cd client
+uv run main.py
 ```
 
 #### 4.4 Custom Parameter Analysis
 
 ```bash
-uv run client/main.py --vmcore-path "/path/to/vmcore" \
-                      --vmlinux-path "/path/to/vmlinux" \
-                      --vmcore-dmesg-path "/path/to/vmcore-dmesg.txt" \
-                      --debug-symbols "/path/to/module1.ko" "/path/to/module2.ko"
+cd client
+uv run main.py --vmcore-path "/path/to/vmcore" \
+               --vmlinux-path "/path/to/vmlinux" \
+               --vmcore-dmesg-path "/path/to/vmcore-dmesg.txt" \
+               --debug-symbols "/path/to/module1.ko" "/path/to/module2.ko"
 ```
 
 #### 4.5 Specify Service Address
 
 ```bash
-uv run client/main.py --url http://192.168.1.100:8000 --stream
+cd client
+uv run main.py --url http://192.168.1.100:8000 --stream
 ```
 
 #### 4.6 Report Saving Options
 
 ```
 # Streaming analysis and save report to current directory (default behavior)
-uv run client/main.py --stream
+cd client
+uv run main.py --stream
 
 # Specify report output directory
-uv run client/main.py --stream --output-dir ./reports
+cd client
+uv run main.py --stream --output-dir ./reports
 
 # Don't save file, display only
-uv run client/main.py --stream --no-save
+cd client
+uv run main.py --stream --no-save
 ```
 
 #### 4.7 Complete Client Parameter Description
