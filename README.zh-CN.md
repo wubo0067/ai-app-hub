@@ -165,7 +165,7 @@ DEFAULT_CRASH_COMMANDS = [
 - **Token 优化**：相比静态完整 Prompt，系统 Prompt 的 token 消耗减少 40-70%，同时保持全面的知识覆盖
 
 **输出 Schema**（[`VMCoreLLMAnalysisStep`](vmcore-analysis-agent/src/react/schema.py#L70-L114)）：
-```json
+``json
 {
   "step_id": 1,
   "reasoning": "3-6 句结构化分析总结： (1) 从最新工具输出中学到什么？(2) 如何更新假设？(3) 下一步最诊断性的行动及原因",
@@ -436,7 +436,7 @@ vmcore-analysis-agent/
 
 ### 1. 安装依赖
 
-#### 1.1 安装crash扩展
+#### 1.1 安装 crash 扩展（必需 - 否则关键功能缺失）
 
 ```
 bash tools/install_mpykdump.sh

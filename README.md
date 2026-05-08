@@ -433,7 +433,7 @@ vmcore-analysis-agent/
 
 ### 1. Install Dependencies
 
-#### 1.1 Install crash extension
+#### 1.1 Install crash extension (Required - Critical Functionality Depends on It)
 
 ```
 bash tools/install_mpykdump.sh
