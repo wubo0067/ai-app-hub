@@ -433,7 +433,7 @@ vmcore-analysis-agent/
 
 ### 1. Install Dependencies
 
-#### 1.1 Install crash extension (Required - Critical Functionality Depends on It)
+#### 1.1 Install crash extension (<span style="color: yellow;">Required - Critical Functionality Depends on It</span>)
 
 ```
 bash tools/install_mpykdump.sh
@@ -453,7 +453,7 @@ Edit `config/config.yml` to configure LLM API Key and MCP service paths:
 ```yaml
 llm:
   api_key: "your-deepseek-api-key"
-  model: "deepseek-reasoner"
+  model: "deepseek-v4-pro"
   base_url: "https://api.deepseek.com"
 ```
 

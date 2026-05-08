@@ -436,7 +436,7 @@ vmcore-analysis-agent/
 
 ### 1. 安装依赖
 
-#### 1.1 安装 crash 扩展（必需 - 否则关键功能缺失）
+#### 1.1 安装 crash 扩展（<span style="color: yellow;">必需 - 否则关键功能缺失</span>）
 
 ```
 bash tools/install_mpykdump.sh
@@ -456,20 +456,20 @@ uv sync
 ```
 llm:
   api_key: "your-deepseek-api-key"
-  model: "deepseek-reasoner"
+  model: "deepseek-v4-pro"
   base_url: "https://api.deepseek.com"
 ```
 
 ### 3. 启动 FastAPI 服务
 
 ```
-# 方式1：直接运行
+# 方式 1：直接运行
 uv run main.py
 
-# 方式2：直接运行并配置 crash mpykdump 扩展插件路径（支持 Python 脚本在 crash 内运行）
+# 方式 2：直接运行并配置 crash mpykdump 扩展插件路径（支持 Python 脚本在 crash 内运行）
 uv run main.py --crash_mpykdump=/usr/local/lib/mpykdump-3.10.1-crash9.so
 
-# 方式3：使用 uvicorn（推荐，支持热加载）
+# 方式 3：使用 uvicorn（推荐，支持热加载）
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
@@ -540,15 +540,15 @@ uv run main.py --stream --no-save
 
 ```
 参数说明：
-  --url URL                   API 服务地址 (默认: http://localhost:8000)
+  --url URL                   API 服务地址 (默认：http://localhost:8000)
   --stream                    使用流式模式
   --health                    仅检查服务健康状态
   --vmcore-path PATH          vmcore 文件路径
   --vmlinux-path PATH         vmlinux 调试符号路径
   --vmcore-dmesg-path PATH    vmcore-dmesg.txt 文件路径
   --debug-symbols [PATH ...]  额外的调试符号路径列表
-  --timeout SECONDS           请求超时时间（秒）(默认: 600)
-  --output-dir DIR            报告输出目录 (默认: 当前目录)
+  --timeout SECONDS           请求超时时间（秒）(默认：600)
+  --output-dir DIR            报告输出目录 (默认：当前目录)
   --no-save                   不保存 markdown 报告文件
 ```
 
