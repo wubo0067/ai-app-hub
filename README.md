@@ -463,10 +463,7 @@ llm:
 # Method 1: Direct run
 uv run main.py
 
-# Method 2: Run directly with crash mpykdump extension path (Enables Python script execution inside crash)
-uv run main.py --crash_mpykdump=/usr/local/lib/mpykdump-3.10.1-crash9.so
-
-# Method 3: Use uvicorn (Recommended, supports hot reload)
+# Method 2: Use uvicorn (Recommended, supports hot reload)
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 

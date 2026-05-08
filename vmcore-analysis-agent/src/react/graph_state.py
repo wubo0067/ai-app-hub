@@ -50,8 +50,6 @@ class AgentState(MessagesState):
     vmlinux_path: str
     # 第三方内核调试符号路径列表，用于在缺少主符号时补充符号解析能力。
     debug_symbol_paths: Sequence[str]
-    # mpykdump 脚本路径
-    mpykdump_path: Optional[str]
 
     # 当前图执行的累计分析步数。
     # 该字段通过 operator.add 聚合，适合在多个节点返回增量值后自动累加。
