@@ -436,8 +436,15 @@ vmcore-analysis-agent/
 
 ### 1. 安装依赖
 
+#### 1.1 安装crash扩展
+
 ```
 bash tools/install_mpykdump.sh
+```
+
+#### 1.2 安装项目依赖
+
+```
 cd vmcore-analysis-agent
 uv sync
 ```

@@ -433,8 +433,15 @@ vmcore-analysis-agent/
 
 ### 1. Install Dependencies
 
-```bash
+#### 1.1 Install crash extension
+
+```
 bash tools/install_mpykdump.sh
+```
+
+#### 1.2 Install project dependencies
+
+```
 cd vmcore-analysis-agent
 uv sync
 ```
