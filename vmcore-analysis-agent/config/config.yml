@@ -1,6 +1,7 @@
 # To separate your traces from other application
 langsmith_project: vmcore-analysis-agent
 langsmith_tracing: false
+debug_tools_schema: true
 
 ## LLM choice:
 thinking: "enabled" # enabled or disabled
