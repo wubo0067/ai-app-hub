@@ -21,8 +21,10 @@ class ChildState(BaseModel):
     prompt: str = Field(..., description="What is going to be asked to the user?")
     # Latest response returned when execution resumes after interrupt.
     human_input: str | None = Field(None, description="What the human said")
+    dolphin_input: str | None = Field(None, description="What the dolphin said")
     # Accumulated responses. `operator.add` means list values are concatenated
     # when multiple updates merge into this field.
+    # 这是 LangGraph 的**同名字段自动提升（state promotion）**机制。
     human_inputs: Annotated[list[str], operator.add] = Field(
         default_factory=list, description="All of my messages"
     )
@@ -45,6 +47,20 @@ def get_human_input(state: ChildState):
     return dict(
         human_input=human_input,  # update child state
         human_inputs=[human_input],  # update parent state
+    )
+
+
+def get_dolphin_input(state: ChildState):
+    dolphin_input = interrupt(state.prompt)
+    print(
+        f"Asking dolphin with prompt: {state.prompt} -> got response: {dolphin_input}"
+    )
+
+    return dict(
+        dolphin_input=dolphin_input,
+        human_inputs=[
+            dolphin_input
+        ],  # update parent state with dolphin input for testing purposes
     )
 
 
@@ -74,7 +90,7 @@ def assign_workers(state: ParentState):
 
 
 def cleanup(state: ParentState):
-    assert len(state.human_inputs) == len(state.prompts)
+    assert len(state.human_inputs) == len(state.prompts) * 2
 
 
 def main():
@@ -87,13 +103,17 @@ def main():
     child_graph_builder = StateGraph(ChildState)
     # Add the node with the processing function, then connect it to START and END.
     child_graph_builder.add_node("get_human_input", get_human_input)
+    child_graph_builder.add_node("get_dolphin_input", get_dolphin_input)
     child_graph_builder.add_edge(START, "get_human_input")
-    child_graph_builder.add_edge("get_human_input", END)
+    child_graph_builder.add_edge(START, "get_dolphin_input")
+    # child_graph_builder.add_edge("get_human_input", END)
 
     # Compile the declarative graph definition into an executable graph object.
     child_graph = child_graph_builder.compile()
 
     parent_graph_builder = StateGraph(ParentState)
+    # 当 child_graph 作为父图的一个节点运行时，LangGraph 在子图执行完成后，
+    # 会把子图输出的 state 更新与父图 state 做字段名匹配：
     parent_graph_builder.add_node("child_graph", child_graph)
     parent_graph_builder.add_node("cleanup", cleanup)
 
@@ -163,8 +183,8 @@ def main():
     else:
         assert False, "Detected infinite loop"
 
-    assert invokes == 3
-    assert len(events) == 3
+    assert invokes == 5
+    assert len(events) == 5
 
 
 if __name__ == "__main__":
