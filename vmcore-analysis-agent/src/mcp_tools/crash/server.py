@@ -349,7 +349,8 @@ commands = [
         "hanginfo [-h]",
         "hanginfo",
         "Print information about UNINTERRUPTIBLE threads and categorize them by mutex/semaphore waits.",
-    )(
+    ),
+    (
         "keyringshow",
         "keyringshow [-h] (-k KEYRING | -p PID | -a)",
         "keyringshow -a",
