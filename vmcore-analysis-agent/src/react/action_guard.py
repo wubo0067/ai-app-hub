@@ -18,8 +18,12 @@ _FORBIDDEN_EXPR_RE = re.compile(
 )
 # 地址算术运算模式检测，要求在执行前解析地址计算
 _ADDRESS_ARITHMETIC_RE = re.compile(
-    r"^(?:rd|ptov|vtop|struct|sym|kmem)\b.*(?:0x[0-9A-Fa-f]+|\b[0-9A-Fa-f]{8,}\b)\+\s*(?:0x[0-9A-Fa-f]+|\d+)"
+    r"^(?:rd|ptov|vtop|struct|sym|kmem|search|dis|p(?:\s+/x|/x)?)\b.*"
+    r"(?:0x[0-9A-Fa-f]+|\b[0-9A-Fa-f]{8,}\b|[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:\s*[+-]\s*)"
+    r"(?:0x[0-9A-Fa-f]+|\d+|[A-Za-z_][A-Za-z0-9_]*)"
 )
+_KMEM_S_CACHE_NAME_RE = re.compile(r"^kmem\s+-S\s+[A-Za-z_][A-Za-z0-9_-]*$")
 # 模块相关符号的前缀列表，用于检测是否需要先加载模块符号表
 _MODULE_SYMBOL_PREFIXES = (
     "mlx5_",  # Mellanox 网卡驱动
@@ -100,21 +104,44 @@ def extract_command_lines(tool_name: str, args: Any) -> List[str]:
     """
     从工具调用参数中提取命令行列表。
 
-    支持两种形式：
-    1. run_script: 从 script 字段提取多行脚本
-    2. 单一命令：从 command 字段或直接作为字符串参数
+    支持的输入形式：
+    1. run_script: dict 里的 script 多行文本
+    2. run_script: dict 里的 arguments 行列表（与 ToolCall.arguments schema 保持兼容）
+    3. run_script: 直接传入的行列表
+    4. 单一命令：从 command 字段或直接作为字符串参数
 
     Args:
         tool_name: 工具名称（如 "run_script", "crash"）
-        args: 工具调用参数，可以是 dict 或字符串
+        args: 工具调用参数，可以是 dict、list 或字符串
 
     Returns:
         命令行字符串列表
     """
-    # 处理 run_script 特殊情况：支持多行脚本
+    # 处理 run_script 特殊情况：兼容 script 文本、arguments 列表和直接传入的列表
     if tool_name == "run_script":
-        script = args.get("script", "") if isinstance(args, dict) else str(args)
-        return [line.strip() for line in str(script).splitlines() if line.strip()]
+        if isinstance(args, dict):
+            script = args.get("script")
+            if script not in {None, ""}:
+                return [
+                    line.strip() for line in str(script).splitlines() if line.strip()
+                ]
+
+            arguments = args.get("arguments")
+            if isinstance(arguments, list):
+                return [str(line).strip() for line in arguments if str(line).strip()]
+
+            if arguments not in {None, ""}:
+                return [
+                    line.strip() for line in str(arguments).splitlines() if line.strip()
+                ]
+
+            return []
+
+        if isinstance(args, list):
+            return [str(line).strip() for line in args if str(line).strip()]
+
+        script = str(args)
+        return [line.strip() for line in script.splitlines() if line.strip()]
 
     # 处理普通命令：从 dict 或字符串中提取
     if isinstance(args, dict):
@@ -192,6 +219,16 @@ def validate_tool_call_request(
     """
     lines = extract_command_lines(tool_name, args)
 
+    if tool_name != "run_script":
+        for line in lines:
+            normalized = canonicalize_command_line(line)
+            parts = normalized.split()
+            if parts[:2] == ["sym", "-l"]:
+                return (
+                    "sym -l is only allowed inside run_script with an immediate grep filter; "
+                    "otherwise use sym <symbol>."
+                )
+
     # 检查 run_script 至少包含一条命令
     if tool_name == "run_script" and not lines:
         return "run_script must contain at least one command line."
@@ -268,8 +305,12 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
     if _FORBIDDEN_EXPR_RE.search(normalized):
         return f"forbidden shell/register expression in crash command: {normalized}"
 
-    # 检查是否包含未解析的地址算术运算
-    if _ADDRESS_ARITHMETIC_RE.search(normalized):
+    # 地址算术只检查首个 pipe 之前的 crash 命令主体，避免把 grep tail
+    # 中的选项或模式误判成 "identifier - identifier" 一类算术表达式。
+    arithmetic_target = normalized.split("|", 1)[0].strip()
+    if not _KMEM_S_CACHE_NAME_RE.fullmatch(
+        arithmetic_target
+    ) and _ADDRESS_ARITHMETIC_RE.search(arithmetic_target):
         return f"address arithmetic must be resolved before execution: {normalized}"
 
     rd_ss_error = _validate_rd_ss_command(normalized)
@@ -279,10 +320,33 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
     parts = normalized.split()
     command = parts[0]
 
-    # sym -l 默认禁止；若后续立即通过 grep 过滤，则允许受限查询
+    # sym -l 默认禁止；仅允许 run_script 中的 target-scoped、grep-bounded 受限查询
     if command == "sym" and len(parts) > 1 and parts[1] == "-l":
-        if "|" not in parts or "grep" not in parts[parts.index("|") + 1 :]:
-            return "sym -l is forbidden unless it is piped to grep; otherwise use sym <symbol>."
+        if len(parts) < 3 or parts[2] == "|":
+            return (
+                "sym -l must include a concrete module or symbol target before the grep filter; "
+                "otherwise use sym <symbol>."
+            )
+
+        pipe_index = parts.index("|") if "|" in parts else -1
+        if (
+            pipe_index == -1
+            or pipe_index == len(parts) - 1
+            or parts[pipe_index + 1] != "grep"
+        ):
+            return (
+                "sym -l is forbidden unless it is immediately piped to grep inside run_script; "
+                "otherwise use sym <symbol>."
+            )
+
+        grep_pattern_index = pipe_index + 2
+        while grep_pattern_index < len(parts) and parts[grep_pattern_index].startswith(
+            "-"
+        ):
+            grep_pattern_index += 1
+
+        if grep_pattern_index >= len(parts):
+            return "sym -l grep filter must include a concrete pattern."
 
     # bt -a 默认禁止：除非是 hard_lockup 场景
     if command == "bt" and "-a" in parts[1:] and not allow_bt_a:
@@ -310,11 +374,24 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
                 )
 
             pipe_index = parts.index("|") if "|" in parts else -1
-            if pipe_index == -1 or "grep" not in parts[pipe_index + 1 :]:
+            if (
+                pipe_index == -1
+                or pipe_index == len(parts) - 1
+                or parts[pipe_index + 1] != "grep"
+            ):
                 return (
-                    f"{parts[0]} {parts[1]} must be piped to grep with a concrete pattern; "
+                    f"{parts[0]} {parts[1]} must be immediately piped to grep; "
                     "do not pipe log output to other commands first."
                 )
+
+            grep_pattern_index = pipe_index + 2
+            while grep_pattern_index < len(parts) and parts[
+                grep_pattern_index
+            ].startswith("-"):
+                grep_pattern_index += 1
+
+            if grep_pattern_index >= len(parts):
+                return f"{parts[0]} {parts[1]} grep filter must include a concrete pattern."
 
     # kmem 命令检查：必须带有效选项
     if command == "kmem":
@@ -324,10 +401,6 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
             return "kmem -a <addr> is forbidden; use kmem -S <addr>."
         if parts[1] == "-S" and len(parts) == 2:
             return "bare kmem -S is forbidden; use kmem -S <addr>."
-        if parts[1] == "-S" and len(parts) >= 3:
-            candidate = parts[2].lower()
-            if candidate.startswith("ffff"):
-                return "kmem -S is only for slab or heap object addresses; do not use it on possible kernel stack addresses. Use task -R or vtop instead."
 
     # struct 命令检查：禁止裸用 struct -o
     if command == "struct":
@@ -338,6 +411,19 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
     if command == "rd":
         if all(part.startswith("-") for part in parts[1:]):
             return "rd command is incomplete; provide an address target."
+
+    if command == "dis" and "-l" in parts[1:]:
+        flag_index = parts.index("-l")
+        if flag_index == len(parts) - 1:
+            return "dis -l requires a concrete function or address target."
+
+        dis_target = parts[flag_index + 1]
+        if "," in dis_target:
+            return (
+                "dis -l does not accept comma-appended offsets such as func,0x150; "
+                "use 'dis -l <func> <count>' for forward disassembly from a function start, "
+                "or resolve a literal address first and use dis -rl <addr>."
+            )
 
     # ptov/vtop/sym 命令检查：必须有目标操作数
     if command in {"ptov", "vtop", "sym"} and len(parts) == 1:

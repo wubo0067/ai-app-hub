@@ -65,6 +65,7 @@ def project_managed_analysis_step(
     gates = _build_managed_gates(
         signature_class,
         state.get("managed_gates"),
+        llm_step.gates,
     )
 
     # 构造最终的 VMCoreAnalysisStep 对象，将 LLM 的原始数据与补全后的上下文进行合并
@@ -163,6 +164,7 @@ def _build_managed_hypotheses(
 def _build_managed_gates(
     signature_class: Optional[CrashSignatureClass],
     prior_gates: Optional[Dict[str, GateEntry]],
+    llm_gates: Optional[Dict[str, GateEntry]],
 ) -> Optional[Dict[str, GateEntry]]:
     """
     构建受管理的门控（gate）集合。
@@ -200,6 +202,16 @@ def _build_managed_gates(
 
     managed: Dict[str, GateEntry] = {}
     for gate_name in required:
+        llm_gate = (llm_gates or {}).get(gate_name)
+        if llm_gate is not None:
+            managed[gate_name] = GateEntry(
+                required_for=[signature_class],
+                status=llm_gate.status,
+                prerequisite=llm_gate.prerequisite,
+                evidence=llm_gate.evidence,
+            )
+            continue
+
         # 若历史门控中存在该门控，深拷贝其状态作为初始值
         previous = (prior_gates or {}).get(gate_name)
         if previous is not None:

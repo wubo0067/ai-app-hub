@@ -2,6 +2,7 @@ import unittest
 
 from src.react.prompts import (
     analysis_crash_prompt,
+    build_structure_reasoning_force_conclusion,
     build_minimal_schema_enum_contract,
     simplified_structure_reasoning_prompt,
 )
@@ -97,10 +98,30 @@ class PromptContractTests(unittest.TestCase):
     ) -> None:
         prompt = analysis_crash_prompt()
 
-        self.assertIn('log -m | grep -i mpt3sas | grep -Evi "log_info"', prompt)
+        self.assertIn(
+            'log -m | grep -i <driver_or_module> | grep -Evi "<heartbeat_or_info_pattern>"',
+            prompt,
+        )
         self.assertIn(
             "If the first grep returns repetitive info or heartbeat lines", prompt
         )
+
+    def test_analysis_prompt_keeps_accident_specific_examples_out_of_global_layers(
+        self,
+    ) -> None:
+        prompt = analysis_crash_prompt()
+
+        self.assertNotIn("security_inode_permission", prompt)
+        self.assertNotIn("zone_statistics", prompt)
+        self.assertNotIn("handle_mm_fault", prompt)
+
+    def test_analysis_prompt_injects_stack_specific_examples_only_in_stack_context(
+        self,
+    ) -> None:
+        prompt = self._stack_frame_prompt()
+
+        self.assertIn("zone_statistics", prompt)
+        self.assertIn("handle_mm_fault", prompt)
 
     def test_analysis_prompt_forbids_standalone_log_actions(self) -> None:
         prompt = analysis_crash_prompt()
@@ -141,6 +162,20 @@ class PromptContractTests(unittest.TestCase):
         )
         self.assertIn("If the last such event occurs seconds before the crash", prompt)
 
+    def test_analysis_prompt_treats_partial_dump_unreadability_as_coverage_limit(
+        self,
+    ) -> None:
+        prompt = analysis_crash_prompt()
+
+        self.assertIn(
+            "Treat read failure in a partial dump as evidence of dump coverage limitation",
+            prompt,
+        )
+        self.assertIn(
+            "Do not use unreadability in a partial dump to rule out a mechanism",
+            prompt,
+        )
+
     def test_analysis_prompt_requires_dma_address_validation_before_labeling(
         self,
     ) -> None:
@@ -162,6 +197,24 @@ class PromptContractTests(unittest.TestCase):
             "If struct -o <guessed_type> fails on a module crash path", prompt
         )
         self.assertIn("sym -l <module> | grep -i <keyword>", prompt)
+        self.assertIn("Forbidden: unbounded sym -l", prompt)
+
+    def test_analysis_prompt_allows_bounded_log_t_and_log_a(self) -> None:
+        prompt = analysis_crash_prompt()
+
+        self.assertIn("Preferred form: log -m | grep <pattern>", prompt)
+        self.assertIn(
+            "Allowed when timestamp or all-buffer evidence is specifically needed: log -t | grep <pattern>, log -a | grep <pattern>",
+            prompt,
+        )
+        self.assertIn(
+            "Allowed when timestamp evidence is needed: log -t | grep -i <pattern>",
+            prompt,
+        )
+        self.assertIn(
+            "Allowed when all-buffer evidence is needed: log -a | grep -i <pattern>",
+            prompt,
+        )
 
     def test_analysis_prompt_adds_driver_source_correlation_rules(self) -> None:
         prompt = self._driver_dma_prompt()
@@ -224,12 +277,35 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn('"command_name": "dis"', prompt)
         self.assertIn('"step_id": 4', prompt)
 
+    def test_structure_reasoning_last_step_prompt_allows_bounded_nonconclusive(
+        self,
+    ) -> None:
+        force_conclusion = build_structure_reasoning_force_conclusion(is_last_step=True)
+
+        self.assertIn("Do not request tools; action must be null", force_conclusion)
+        self.assertIn(
+            "Set is_conclusive=true ONLY if the reasoning explicitly satisfies the Layer0 convergence criteria",
+            force_conclusion,
+        )
+        self.assertIn(
+            "If mandatory verification gaps remain, set is_conclusive=false",
+            force_conclusion,
+        )
+        self.assertNotIn("MUST set 'is_conclusive' to true", force_conclusion)
+
+    def test_structure_reasoning_force_conclusion_empty_before_last_step(self) -> None:
+        self.assertEqual(
+            build_structure_reasoning_force_conclusion(is_last_step=False),
+            "",
+        )
+
     def test_minimal_schema_enum_contract_requires_canonical_values(self) -> None:
         contract = build_minimal_schema_enum_contract()
 
         self.assertIn("Do not emit aliases or shorthand in final JSON", contract)
         self.assertIn("'stack_protector' -> 'stack_corruption'", contract)
         self.assertIn("'type_misuse' -> 'field_type_misuse'", contract)
+        self.assertNotIn("'memory_corruption'", contract)
 
     def test_analysis_prompt_treats_mechanism_in_root_cause_class_as_schema_error(
         self,

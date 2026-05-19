@@ -24,25 +24,25 @@ crash_server = FastMCP(
 )
 
 
-@crash_server.tool()
-def scsishow(
-    vmcore_path: Annotated[
-        str, Field(description="The absolute path to the vmcore file.")
-    ],
-    vmlinux_path: Annotated[
-        str, Field(description="The absolute path to the vmlinux file.")
-    ],
-    kver: Annotated[
-        str, Field(description="The target kernel version (e.g., 4.18.0).")
-    ],
-) -> str:
-    """
-    Run scsishow crash subcommand to extract SCSI subsystem properties across 3.10, 4.18, 5.14.
-    """
-    try:
-        return run_scsishow(vmcore_path, vmlinux_path, kver)
-    except Exception as e:
-        return f"Failed to execute scsishow: {str(e)}"
+# @crash_server.tool()
+# def scsishow(
+#     vmcore_path: Annotated[
+#         str, Field(description="The absolute path to the vmcore file.")
+#     ],
+#     vmlinux_path: Annotated[
+#         str, Field(description="The absolute path to the vmlinux file.")
+#     ],
+#     kver: Annotated[
+#         str, Field(description="The target kernel version (e.g., 4.18.0).")
+#     ],
+# ) -> str:
+#     """
+#     Run scsishow crash subcommand to extract SCSI subsystem properties across 3.10, 4.18, 5.14.
+#     """
+#     try:
+#         return run_scsishow(vmcore_path, vmlinux_path, kver)
+#     except Exception as e:
+#         return f"Failed to execute scsishow: {str(e)}"
 
 
 @crash_server.tool()
@@ -332,12 +332,12 @@ commands = [
         "dmshow",
         "Display information about multipath devices and LVM volumes from vmcore dumps.",
     ),
-    (
-        "epython",
-        "epython program.py arg ...",
-        "epython xportshow.py --help",
-        "Invoke the embedded Python interpreter to run crash extension scripts.",
-    ),
+    # (
+    #     "epython",
+    #     "epython program.py arg ...",
+    #     "epython xportshow.py --help",
+    #     "Invoke the embedded Python interpreter to run crash extension scripts.",
+    # ),
     (
         "fregs",
         "fregs [-h]",
@@ -421,6 +421,12 @@ commands = [
         "xportshow [-h] [--summary] [-iv] [-a] [-t] [--everything]",
         "xportshow --summary",
         "Display networking information including connections summary, interfaces, and TCP/UDP state.",
+    ),
+    (
+        "scsishow",
+        "scsishow [-h]",
+        "scsishow",
+        "Display information about SCSI adapters, devices, and commands from vmcore dumps. Includes heuristics to detect stuck SCSI error handling and stalled commands.",
     ),
 ]
 

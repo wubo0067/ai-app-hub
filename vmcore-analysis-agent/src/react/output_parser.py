@@ -417,13 +417,14 @@ def build_tool_calls(
         将 LLM 的分析决策转换为实际的工具调用指令
 
     注意事项：
-        如果是最后一步但仍有 action，则强制清除以确保结束分析
+        如果是最后一步但仍有 action，则强制清除以确保结束分析。
+        最后一步的结束状态可以是 conclusive，也可以是 bounded non-conclusive。
     """
     prefix = f"{log_prefix}: " if log_prefix else ""
 
     if is_last_step and analysis_result.action:
         logger.warning(
-            "%sis_last_step=True but LLM still returned action. Stripping tool_calls to force conclusion.",
+            "%sis_last_step=True but LLM still returned action. Stripping tool_calls to force a terminal response.",
             prefix,
         )
         analysis_result.action = None
@@ -979,7 +980,7 @@ def _extract_outer_json_object(content_str: str) -> str:
 
 
 def _normalize_invalid_escapes(content_str: str) -> str:
-    """修复 JSON 中的无效转义字符。
+    r"""修复 JSON 中的无效转义字符。
 
     Args:
         content_str: 原始字符串

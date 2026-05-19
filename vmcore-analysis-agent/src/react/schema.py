@@ -14,6 +14,13 @@ _CORRUPTION_MECHANISM_ALIASES = {
     "overwrite": "write_corruption",
     "write_overwrite": "write_corruption",
     "reinit_bug": "reinit_path_bug",
+    "local_overflow": "self_frame_local_overflow",
+    "self_overflow": "self_frame_local_overflow",
+    "callee_overwrite": "active_callee_upward_overwrite",
+    "upward_overwrite": "active_callee_upward_overwrite",
+    "exception_overwrite": "exception_path_overwrite",
+    "stale_residue": "ghost_frame_stale_residue",
+    "stack_residue": "ghost_frame_stale_residue",
 }
 
 _ROOT_CAUSE_LIKE_MECHANISMS = {
@@ -21,7 +28,6 @@ _ROOT_CAUSE_LIKE_MECHANISMS = {
     "double_free",
     "wild_pointer",
     "slab_corruption",
-    "memory_corruption",
     "pointer_corruption",
     "use_after_free",
     "null_deref",
@@ -30,8 +36,6 @@ _ROOT_CAUSE_LIKE_MECHANISMS = {
 }
 
 _ROOT_CAUSE_CLASS_ALIASES = {
-    "corruption": "memory_corruption",
-    "memory_error": "memory_corruption",
     "address_corruption": "wild_pointer",
     "invalid_pointer": "wild_pointer",
     "stack_protector": "stack_corruption",
@@ -42,9 +46,13 @@ _ROOT_CAUSE_CLASS_ALIASES = {
 _ROOT_CAUSE_FROM_MECHANISM = {
     "field_type_misuse": "dma_corruption",
     "missing_conversion": "dma_corruption",
-    "write_corruption": "memory_corruption",
+    "write_corruption": "unknown",
     "reinit_path_bug": "race_condition",
     "race_condition": "race_condition",
+    "self_frame_local_overflow": "stack_corruption",
+    "active_callee_upward_overwrite": "stack_corruption",
+    "exception_path_overwrite": "stack_corruption",
+    "ghost_frame_stale_residue": "stack_corruption",
     "unknown": "unknown",
 }
 
@@ -55,6 +63,10 @@ CorruptionMechanism = Literal[
     "race_condition",
     "missing_conversion",
     "reinit_path_bug",
+    "self_frame_local_overflow",
+    "active_callee_upward_overwrite",
+    "exception_path_overwrite",
+    "ghost_frame_stale_residue",
     "unknown",
 ]
 
@@ -206,6 +218,7 @@ def _coerce_corruption_mechanism(
 
     if normalized in _ROOT_CAUSE_LIKE_MECHANISMS and root_cause_field:
         current_root_cause = data.get(root_cause_field)
+        # Accept legacy placeholders here so a more specific misplaced mechanism can overwrite them.
         if current_root_cause in {
             None,
             "unknown",
@@ -389,6 +402,13 @@ class VMCoreLLMAnalysisStep(BaseModel):
         ),
     )
     partial_dump: "PartialDumpStatus" = Field("unknown")
+    gates: Optional[Dict[str, "GateEntry"]] = Field(
+        None,
+        description=(
+            "Optional gate updates emitted by the LLM for the current signature_class. "
+            "Executor state will merge these updates into managed gates."
+        ),
+    )
     final_diagnosis: Optional[FinalDiagnosis] = Field(
         None, description="Populated only when is_conclusive=True."
     )
@@ -477,7 +497,6 @@ RootCauseClass = Literal[
     "double_free",  # 重复释放 - 同一内存被多次释放
     "wild_pointer",  # 野指针 - 未初始化或已损坏的指针
     "slab_corruption",  # Slab 内存池损坏 - slab metadata 或对象损坏
-    "memory_corruption",  # 内存损坏 - 通用内存损坏，机制不明
     "race_condition",  # 竞态条件 - 多线程/多 CPU 竞争导致的状态不一致
     "deadlock",  # 死锁 - 循环等待资源导致的阻塞
     "rcu_misuse",  # RCU 误用 - RCU API 使用不当
@@ -709,7 +728,8 @@ class VMCoreAnalysisStep(BaseModel):
             "Vmcore completeness status. Set from sys output at step 2 and carry forward unchanged. "
             "When 'partial': NEVER retry rd/ptov/vtop on a VA that already returned empty output "
             "or seek-error in a prior step — treat it as permanently unreadable and move on. "
-            "Record unreadable pages as 'page not in dump' evidence, do not spend more steps on them."
+            "Record unreadability as dump-coverage limitation evidence, do not spend more steps on the same address. "
+            "Do not use unreadability alone to infer runtime object absence or to rule out mechanisms such as overwrite, UAF, or DMA unless page metadata corroborates that conclusion."
         ),
     )
 
@@ -750,8 +770,54 @@ class VMCoreAnalysisStep(BaseModel):
     @model_validator(mode="after")
     def validate_and_patch(self) -> "VMCoreAnalysisStep":
         """
-        仅保留根因类默认映射；managed gates/hypotheses 由外部状态机维护。
+        执行 conclusive contract 约束，并保留根因类默认映射；managed gates/hypotheses 由外部状态机维护。
         """
+        conclusive_audit_notes: list[str] = []
+
+        if self.is_conclusive and self.action is not None:
+            conclusive_audit_notes.append(
+                "Conclusive output downgraded: action must be null when is_conclusive=true."
+            )
+
+        if self.is_conclusive and self.final_diagnosis is None:
+            conclusive_audit_notes.append(
+                "Conclusive output downgraded: final_diagnosis is required when is_conclusive=true."
+            )
+
+        if self.is_conclusive:
+            required_gate_names = self._REQUIRED_GATES.get(
+                self.signature_class or "", []
+            )
+            unresolved_gates = [
+                gate_name
+                for gate_name in required_gate_names
+                if self.gates is None
+                or gate_name not in self.gates
+                or self.gates[gate_name].status not in {"closed", "n/a"}
+            ]
+            if unresolved_gates:
+                conclusive_audit_notes.append(
+                    "Conclusive output downgraded: required gates are not closed/n/a: "
+                    + ", ".join(unresolved_gates)
+                    + "."
+                )
+
+        if conclusive_audit_notes:
+            self.is_conclusive = False
+            self.final_diagnosis = None
+            self.fix_suggestion = None
+            if self.confidence not in {None, "low"}:
+                self.confidence = "low"
+
+            audit_text = " ".join(conclusive_audit_notes)
+            if self.additional_notes:
+                if audit_text not in self.additional_notes:
+                    self.additional_notes = (
+                        f"{self.additional_notes} {audit_text}"
+                    ).strip()
+            else:
+                self.additional_notes = audit_text
+
         if self.root_cause_class is None and self.is_conclusive:
             default_root_cause = self._DEFAULT_ROOT_CAUSE_FROM_SIGNATURE.get(
                 self.signature_class or ""

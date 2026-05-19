@@ -213,8 +213,84 @@ class VMCoreAnalysisStepRegressionTests(unittest.TestCase):
             },
         }
         model = VMCoreAnalysisStep.model_validate(payload)
-        self.assertEqual(model.root_cause_class, "divide_error")
+        self.assertFalse(model.is_conclusive)
+        self.assertIsNone(model.final_diagnosis)
         self.assertIsNone(model.gates)
+        self.assertIn("required gates are not closed/n/a", model.additional_notes)
+
+    def test_conclusive_step_with_action_is_downgraded(self) -> None:
+        payload = {
+            "step_id": 6,
+            "reasoning": "actionful conclusive sample",
+            "action": {
+                "command_name": "rd",
+                "arguments": ["-x", "ffff888012340000", "8"],
+            },
+            "is_conclusive": True,
+            "signature_class": "pointer_corruption",
+            "root_cause_class": "unknown",
+            "final_diagnosis": {
+                "crash_type": "page fault",
+                "panic_string": "BUG: unable to handle kernel paging request",
+                "faulting_instruction": "RIP: foo+0x10",
+                "root_cause": "sample",
+                "detailed_analysis": "sample",
+                "suspect_code": {
+                    "file": "kernel/foo.c",
+                    "function": "foo",
+                    "line": "unknown",
+                },
+                "evidence": ["sample"],
+            },
+        }
+
+        model = VMCoreAnalysisStep.model_validate(payload)
+        self.assertFalse(model.is_conclusive)
+        self.assertIsNotNone(model.action)
+        self.assertIsNone(model.final_diagnosis)
+        self.assertIn("action must be null", model.additional_notes)
+
+    def test_conclusive_step_without_final_diagnosis_is_downgraded(self) -> None:
+        payload = {
+            "step_id": 7,
+            "reasoning": "missing final diagnosis sample",
+            "action": None,
+            "is_conclusive": True,
+            "signature_class": "pointer_corruption",
+            "root_cause_class": "unknown",
+            "gates": {
+                "register_provenance": {
+                    "required_for": ["pointer_corruption"],
+                    "status": "closed",
+                    "evidence": "sample",
+                },
+                "object_lifetime": {
+                    "required_for": ["pointer_corruption"],
+                    "status": "closed",
+                    "evidence": "sample",
+                },
+                "local_corruption_exclusion": {
+                    "required_for": ["pointer_corruption"],
+                    "status": "closed",
+                    "evidence": "sample",
+                },
+                "external_corruption_gate": {
+                    "required_for": ["pointer_corruption"],
+                    "status": "closed",
+                    "evidence": "sample",
+                },
+                "field_type_classification": {
+                    "required_for": ["pointer_corruption"],
+                    "status": "closed",
+                    "evidence": "sample",
+                },
+            },
+        }
+
+        model = VMCoreAnalysisStep.model_validate(payload)
+        self.assertFalse(model.is_conclusive)
+        self.assertIsNone(model.final_diagnosis)
+        self.assertIn("final_diagnosis is required", model.additional_notes)
 
 
 if __name__ == "__main__":

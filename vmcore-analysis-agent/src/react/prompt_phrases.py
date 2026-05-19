@@ -14,6 +14,35 @@ CANARY_POINTER_VALUE_PARTIAL_DUMP_RULE = (
     "before attempting it; only an actual read failure may establish inaccessibility."
 )
 
+CANARY_RESIDUAL_DATA_RULE = (
+    "Do NOT attribute canary corruption (__stack_chk_fail) to residual stack data, stale data "
+    "from prior function calls, or pre-fault stack pollution. The stack protector prologue "
+    "unconditionally writes the canary at function entry, overwriting any prior data. Only writes "
+    "occurring DURING the canary-bearing function's execution can corrupt the canary."
+)
+
+CANARY_SLOT_ONLY_SCOPE_NOTE = (
+    "This restriction applies ONLY to the canary slot, not to saved-RBP, saved-RIP, or non-canary "
+    "locals."
+)
+
+LITERAL_ADDRESS_RULE = (
+    "Any address argument emitted in action must already be a fully computed literal address. "
+    "Never emit arithmetic expressions inside crash commands, including +, -, parentheses, "
+    "register syntax, or shell-style substitution. Compute the final literal address in reasoning "
+    "first, then issue the crash command against that literal target."
+)
+
+S1_S5_DMA_GATE_RULE = (
+    "Before considering or promoting DMA or hardware, explicitly close the system-layer S1-S5 "
+    "exclusion reasoning."
+)
+
+DMA_PROMOTION_EVIDENCE_RULE = (
+    "Do not promote DMA unless the stronger non-DMA explanations have been explicitly closed first "
+    "and the device-side evidence threshold is met."
+)
+
 STACK_CAUSALITY_RED_LINE_RULE = (
     "If standard x86-64 stack-growth causality has already proved that a candidate frame sits at "
     "a HIGHER address than the corrupted canary slot, you are strictly FORBIDDEN from spending `dis` "

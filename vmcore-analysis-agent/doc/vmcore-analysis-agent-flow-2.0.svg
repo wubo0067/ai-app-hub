@@ -1,0 +1,147 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="820" viewBox="0 220 1600 820">
+  <defs>
+    <style>
+      .title { font: 700 34px "Microsoft YaHei", "Noto Sans SC", Arial, sans-serif; fill: #111827; }
+      .subtitle { font: 400 16px "Microsoft YaHei", "Noto Sans SC", Arial, sans-serif; fill: #4b5563; }
+      .box-title { font: 700 18px "Microsoft YaHei", "Noto Sans SC", Arial, sans-serif; fill: #111827; }
+      .box-text { font: 400 14px "Microsoft YaHei", "Noto Sans SC", Arial, sans-serif; fill: #374151; }
+      .small { font: 400 13px "Microsoft YaHei", "Noto Sans SC", Arial, sans-serif; fill: #4b5563; }
+      .note { font: 400 13px "Microsoft YaHei", "Noto Sans SC", Arial, sans-serif; fill: #6b7280; }
+      .lane-title { font: 700 15px "Microsoft YaHei", "Noto Sans SC", Arial, sans-serif; fill: #0f172a; }
+      .arrow { stroke: #334155; stroke-width: 2.2; fill: none; marker-end: url(#arrowhead); }
+      .arrow-soft { stroke: #64748b; stroke-width: 2; fill: none; marker-end: url(#arrowhead-soft); }
+      .arrow-dashed { stroke: #94a3b8; stroke-width: 2; fill: none; stroke-dasharray: 7 6; marker-end: url(#arrowhead-soft); }
+      .shadow { filter: drop-shadow(0 8px 18px rgba(15, 23, 42, 0.10)); }
+    </style>
+    <marker id="arrowhead" markerWidth="12" markerHeight="8" refX="11" refY="4" orient="auto">
+      <path d="M0,0 L12,4 L0,8 Z" fill="#334155"/>
+    </marker>
+    <marker id="arrowhead-soft" markerWidth="12" markerHeight="8" refX="11" refY="4" orient="auto">
+      <path d="M0,0 L12,4 L0,8 Z" fill="#64748b"/>
+    </marker>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f8fafc"/>
+      <stop offset="1" stop-color="#eef2ff"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1600" height="1120" fill="url(#bg)"/>
+
+  <rect x="70" y="262" width="1460" height="752" rx="16" fill="#ffffff" stroke="#cbd5e1" class="shadow"/>
+  <text x="96" y="292" class="lane-title">一次 /analyze 或 /analyze/stream 请求的运行时链路</text>
+
+  <rect x="96" y="330" width="190" height="86" rx="10" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="124" y="360" class="box-title">客户端请求</text>
+  <text x="124" y="386" class="box-text">vmcore_path</text>
+  <text x="124" y="407" class="box-text">vmlinux_path / dmesg</text>
+
+  <rect x="345" y="330" width="214" height="86" rx="10" fill="#eef2ff" stroke="#818cf8"/>
+  <text x="375" y="360" class="box-title">FastAPI 入口</text>
+  <text x="375" y="386" class="box-text">POST /analyze</text>
+  <text x="375" y="407" class="box-text">POST /analyze/stream</text>
+
+  <rect x="615" y="330" width="230" height="86" rx="10" fill="#fef9c3" stroke="#eab308"/>
+  <text x="642" y="360" class="box-title">路径校验</text>
+  <text x="642" y="386" class="box-text">vmcore / vmlinux</text>
+  <text x="642" y="407" class="box-text">vmcore-dmesg / debug symbols</text>
+
+  <rect x="900" y="330" width="238" height="86" rx="10" fill="#f0fdf4" stroke="#22c55e"/>
+  <text x="930" y="360" class="box-title">构造 AgentState</text>
+  <text x="930" y="386" class="box-text">messages=[], step=0</text>
+  <text x="930" y="407" class="box-text">token_usage/error 初始化</text>
+
+  <rect x="1195" y="330" width="230" height="86" rx="10" fill="#f0f9ff" stroke="#0ea5e9"/>
+  <text x="1224" y="360" class="box-title">LangGraph astream</text>
+  <text x="1224" y="386" class="box-text">thread_id=task_id</text>
+  <text x="1224" y="407" class="box-text">recursion_limit=40/50</text>
+
+  <path d="M286 373 H345" class="arrow"/>
+  <path d="M559 373 H615" class="arrow"/>
+  <path d="M845 373 H900" class="arrow"/>
+  <path d="M1138 373 H1195" class="arrow"/>
+
+  <rect x="120" y="505" width="310" height="118" rx="12" fill="#ecfeff" stroke="#06b6d4"/>
+  <text x="145" y="536" class="box-title">collect_crash_init_data_node</text>
+  <text x="145" y="563" class="box-text">默认命令：sys、bt</text>
+  <text x="145" y="585" class="box-text">从 bt 提取 PID/CPU/COMMAND</text>
+  <text x="145" y="607" class="box-text">按上下文读取 vmcore-dmesg</text>
+
+  <rect x="492" y="505" width="300" height="118" rx="12" fill="#f8fafc" stroke="#94a3b8"/>
+  <text x="520" y="536" class="box-title">dispatch_crash_commands</text>
+  <text x="520" y="563" class="box-text">打开 crash_client.session</text>
+  <text x="520" y="585" class="box-text">load_mcp_tools(session)</text>
+  <text x="520" y="607" class="box-text">并发执行匹配到的工具</text>
+
+  <rect x="850" y="505" width="260" height="118" rx="12" fill="#fff7ed" stroke="#fb923c"/>
+  <text x="884" y="536" class="box-title">MCP crash_server</text>
+  <text x="884" y="563" class="box-text">FastMCP 动态注册命令</text>
+  <text x="884" y="585" class="box-text">sys/bt/ps/kmem/dis/rd...</text>
+  <text x="884" y="607" class="box-text">run_script 保持单会话状态</text>
+
+  <rect x="1200" y="505" width="245" height="118" rx="12" fill="#fee2e2" stroke="#f87171"/>
+  <text x="1228" y="536" class="box-title">crash executor</text>
+  <text x="1228" y="563" class="box-text">subprocess 启动 crash</text>
+  <text x="1228" y="585" class="box-text">输入命令 + quit</text>
+  <text x="1228" y="607" class="box-text">过滤 banner/噪声输出</text>
+
+  <path d="M1325 416 V470 H258 V505" class="arrow"/>
+  <path d="M430 564 H492" class="arrow"/>
+  <path d="M792 564 H850" class="arrow"/>
+  <path d="M1110 564 H1200" class="arrow"/>
+  <path d="M1200 618 C1040 686, 624 686, 430 618" class="arrow-soft"/>
+
+  <rect x="120" y="702" width="290" height="112" rx="12" fill="#f0fdf4" stroke="#22c55e"/>
+  <text x="145" y="733" class="box-title">形成 Initial Context</text>
+  <text x="145" y="760" class="box-text">crash_init_data_prompt()</text>
+  <text x="145" y="782" class="box-text">HumanMessage 加入 messages</text>
+  <text x="145" y="804" class="box-text">step_count += 1</text>
+
+  <rect x="492" y="702" width="300" height="112" rx="12" fill="#ede9fe" stroke="#8b5cf6"/>
+  <text x="520" y="733" class="box-title">llm_analysis_node</text>
+  <text x="520" y="760" class="box-text">analysis_crash_prompt()</text>
+  <text x="520" y="782" class="box-text">结构化输出 VMCoreAnalysisStep</text>
+  <text x="520" y="804" class="box-text">生成 AIMessage / tool_calls</text>
+
+  <path d="M410 758 H492" class="arrow"/>
+
+  <polygon points="1010,696 1173,758 1010,820 847,758" fill="#fff1f2" stroke="#fb7185" stroke-width="1.6"/>
+  <text x="953" y="748" class="box-title">需要继续</text>
+  <text x="950" y="773" class="box-title">调用工具？</text>
+
+  <path d="M792 758 H847" class="arrow"/>
+  <path d="M1010 820 V894" class="arrow"/>
+  <text x="1018" y="850" class="small">否：已有结论或错误</text>
+
+  <rect x="1220" y="702" width="245" height="112" rx="12" fill="#fff7ed" stroke="#fb923c"/>
+  <text x="1246" y="733" class="box-title">crash_tool_node</text>
+  <text x="1246" y="760" class="box-text">解析 AIMessage.tool_calls</text>
+  <text x="1246" y="782" class="box-text">再次 dispatch crash 命令</text>
+  <text x="1246" y="804" class="box-text">ToolMessage 回填给 LLM</text>
+
+  <path d="M1173 758 H1220" class="arrow"/>
+  <text x="1190" y="745" class="small">是</text>
+  <path d="M1220 812 C1115 890, 700 895, 642 814" class="arrow-soft"/>
+  <text x="740" y="850" class="small">工具结果返回后继续分析循环</text>
+
+  <rect x="840" y="894" width="278" height="92" rx="12" fill="#dcfce7" stroke="#22c55e"/>
+  <text x="858" y="925" class="box-title">generate_markdown_report</text>
+  <text x="858" y="952" class="box-text">遍历 Human/AI/Tool messages</text>
+  <text x="858" y="974" class="box-text">输出最终诊断报告</text>
+
+  <rect x="1220" y="894" width="245" height="92" rx="12" fill="#e0f2fe" stroke="#38bdf8"/>
+  <text x="1248" y="925" class="box-title">返回响应</text>
+  <text x="1248" y="952" class="box-text">VmcoreAnalysisResponse</text>
+  <text x="1248" y="974" class="box-text">或 SSE complete 事件</text>
+
+  <path d="M1118 940 H1220" class="arrow"/>
+<!-- 
+  <rect x="96" y="870" width="520" height="116" rx="12" fill="#f8fafc" stroke="#cbd5e1" stroke-dasharray="7 6"/>
+  <text x="124" y="902" class="box-title">RAG / 知识库现状</text>
+  <text x="124" y="929" class="box-text">rag-preprocessing 中有 MD → DSL → DKB 数据链路</text>
+  <text x="124" y="951" class="box-text">src/rag/retrieval.py 会加载 rcu_stall_dkb.json</text>
+  <text x="124" y="973" class="box-text">但当前 graph.py 未注册 retrieval_rag_node，运行时主图未接入</text>
+  <path d="M616 928 C690 906, 710 840, 672 814" class="arrow-dashed"/> -->
+<!-- 
+  <rect x="96" y="1038" width="1360" height="44" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="120" y="1066" class="note">备注：source_patch MCP 工具在服务启动时被加载并绑定给 LLM，但当前 ReAct prompt 与 crash_tool_node 路由主要面向 crash 命令；补丁工具未形成独立执行节点。</text> -->
+</svg>

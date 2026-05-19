@@ -1,7 +1,19 @@
 import unittest
+from pathlib import Path
+import sys
+import types
+
+root = Path(__file__).resolve().parents[1]
+src_pkg = types.ModuleType("src")
+src_pkg.__path__ = [str(root / "src")]
+sys.modules.setdefault("src", src_pkg)
+react_pkg = types.ModuleType("src.react")
+react_pkg.__path__ = [str(root / "src" / "react")]
+sys.modules.setdefault("src.react", react_pkg)
 
 from src.react.action_guard import (
     build_command_fingerprint,
+    extract_command_lines,
     extract_crash_path_struct_offsets,
     extract_struct_layouts,
     validate_tool_call_request,
@@ -21,7 +33,30 @@ class ActionGuardTests(unittest.TestCase):
             "run_script",
             {"script": "log -m | sed -n '1,20p'"},
         )
-        self.assertIn("must be piped to grep", error)
+        self.assertIn("must be immediately piped to grep", error)
+
+    def test_rejects_log_m_when_non_grep_command_appears_first_in_pipeline(
+        self,
+    ) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": "log -m | head -20 | grep error"},
+        )
+        self.assertIn("must be immediately piped to grep", error)
+
+    def test_rejects_log_m_with_bare_grep(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": "log -m | grep"},
+        )
+        self.assertIn("grep filter must include a concrete pattern", error)
+
+    def test_rejects_log_m_with_grep_option_but_no_pattern(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": "log -m | grep -i"},
+        )
+        self.assertIn("grep filter must include a concrete pattern", error)
 
     def test_allows_log_m_with_grep(self) -> None:
         error = validate_tool_call_request(
@@ -30,12 +65,76 @@ class ActionGuardTests(unittest.TestCase):
         )
         self.assertIsNone(error)
 
+    def test_allows_log_t_with_grep(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": 'log -t | grep -Ei "watchdog|hard LOCKUP|NMI"'},
+        )
+        self.assertIsNone(error)
+
+    def test_allows_log_a_with_grep(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": 'log -a | grep -Ei "firmware|ACPI Error|BIOS bug"'},
+        )
+        self.assertIsNone(error)
+
+    def test_extract_command_lines_accepts_run_script_arguments_list(self) -> None:
+        lines = extract_command_lines(
+            "run_script",
+            [
+                "log -m | grep -i error",
+                "sym mpt3sas_base_attach",
+            ],
+        )
+
+        self.assertEqual(
+            lines,
+            [
+                "log -m | grep -i error",
+                "sym mpt3sas_base_attach",
+            ],
+        )
+
+    def test_extract_command_lines_accepts_run_script_arguments_dict(self) -> None:
+        lines = extract_command_lines(
+            "run_script",
+            {
+                "arguments": [
+                    "log -m | grep -i error",
+                    "sym mpt3sas_base_attach",
+                ]
+            },
+        )
+
+        self.assertEqual(
+            lines,
+            [
+                "log -m | grep -i error",
+                "sym mpt3sas_base_attach",
+            ],
+        )
+
     def test_rejects_unfiltered_sym_list_in_run_script(self) -> None:
         error = validate_tool_call_request(
             "run_script",
             {"script": "mod -s mpt3sas /tmp/mpt3sas.ko.debug\nsym -l mpt3sas"},
         )
         self.assertIn("sym -l is forbidden", error)
+
+    def test_rejects_sym_list_outside_run_script(self) -> None:
+        error = validate_tool_call_request(
+            "sym",
+            {"command": "sym -l mpt3sas | grep -i reply"},
+        )
+        self.assertIn("sym -l is only allowed inside run_script", error)
+
+    def test_rejects_grep_filtered_sym_list_without_target(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": "sym -l | grep -i reply"},
+        )
+        self.assertIn("must include a concrete module or symbol target", error)
 
     def test_allows_grep_filtered_sym_list_in_run_script(self) -> None:
         error = validate_tool_call_request(
@@ -45,6 +144,38 @@ class ActionGuardTests(unittest.TestCase):
             },
         )
         self.assertIsNone(error)
+
+    def test_rejects_grep_filtered_sym_list_without_pattern(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": "mod -s mpt3sas /tmp/mpt3sas.ko.debug\nsym -l mpt3sas | grep"},
+        )
+        self.assertIn("sym -l grep filter must include a concrete pattern", error)
+
+    def test_allows_grep_filtered_sym_list_with_grep_options(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {
+                "script": 'mod -s mpt3sas /tmp/mpt3sas.ko.debug\nsym -l mpt3sas | grep -Ei "reply|queue"'
+            },
+        )
+        self.assertIsNone(error)
+
+    def test_allows_grep_filtered_sym_list_with_single_dash_grep_option(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {
+                "script": "mod -s mpt3sas /tmp/mpt3sas.ko.debug\nsym -l mpt3sas | grep -i mpt"
+            },
+        )
+        self.assertIsNone(error)
+
+    def test_still_rejects_address_arithmetic_before_grep_tail(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": "rd -x ffff888012340000+0x40 16 | grep abc"},
+        )
+        self.assertIn("address arithmetic must be resolved", error)
 
     def test_rejects_large_rd_ss_printable_sweep(self) -> None:
         error = validate_tool_call_request(
@@ -93,6 +224,69 @@ class ActionGuardTests(unittest.TestCase):
         )
         self.assertIn("address arithmetic must be resolved", error)
 
+    def test_rejects_address_subtraction(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": "rd -x ffff8b817de17a10-0x40 16"},
+        )
+        self.assertIn("address arithmetic must be resolved", error)
+
+    def test_rejects_symbol_arithmetic(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": "sym security_inode_permission+0x34"},
+        )
+        self.assertIn("address arithmetic must be resolved", error)
+
+    def test_rejects_search_arithmetic(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": "search -s ffff8b817de17a10-0x40 -e ffff8b817de17a10 deadbeef"},
+        )
+        self.assertIn("address arithmetic must be resolved", error)
+
+    def test_rejects_dis_arithmetic(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": "dis -rl security_inode_permission+0x34"},
+        )
+        self.assertIn("address arithmetic must be resolved", error)
+
+    def test_rejects_dis_l_with_comma_appended_offset(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": "dis -l show_interrupts,0x150"},
+        )
+        self.assertIn("does not accept comma-appended offsets", error)
+
+    def test_rejects_symbol_on_symbol_arithmetic(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": "rd -x symbol_a+symbol_b 16"},
+        )
+        self.assertIn("address arithmetic must be resolved", error)
+
+    def test_rejects_p_x_arithmetic(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": "p/x some_symbol+0x8"},
+        )
+        self.assertIn("address arithmetic must be resolved", error)
+
+    def test_allows_plain_p_x_symbol_read(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": "p/x __per_cpu_offset[5]"},
+        )
+        self.assertIsNone(error)
+
+    def test_rejects_struct_symbol_arithmetic(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {"script": "struct foo some_symbol+bar"},
+        )
+        self.assertIn("address arithmetic must be resolved", error)
+
     def test_rejects_old_struct_offset_order(self) -> None:
         error = validate_tool_call_request(
             "run_script",
@@ -101,6 +295,20 @@ class ActionGuardTests(unittest.TestCase):
             },
         )
         self.assertIn("struct offset queries must use struct -o <type>", error)
+
+    def test_allows_kmem_s_with_kernel_virtual_address(self) -> None:
+        error = validate_tool_call_request(
+            "kmem",
+            {"command": "kmem -S ffff8b817de17a10"},
+        )
+        self.assertIsNone(error)
+
+    def test_allows_kmem_s_with_cache_name(self) -> None:
+        error = validate_tool_call_request(
+            "kmem",
+            {"command": "kmem -S kmalloc-128"},
+        )
+        self.assertIsNone(error)
 
     def test_rejects_module_symbol_without_mod_s(self) -> None:
         error = validate_tool_call_request(
@@ -200,6 +408,17 @@ SIZE: 64"""
             },
         )
         self.assertEqual(left, right)
+
+    def test_fingerprint_accepts_run_script_arguments_list_shape(self) -> None:
+        fingerprint = build_command_fingerprint(
+            "run_script",
+            [
+                "mod -s mpt3sas /tmp/mpt3sas.ko.debug",
+                "log -m | grep -i error",
+            ],
+        )
+
+        self.assertEqual(fingerprint, "log -m | grep -i error")
 
 
 if __name__ == "__main__":

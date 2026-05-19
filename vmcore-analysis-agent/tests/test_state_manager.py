@@ -1,6 +1,17 @@
 import unittest
+from pathlib import Path
+import sys
+import types
 
-from src.react.schema import VMCoreLLMAnalysisStep
+root = Path(__file__).resolve().parents[1]
+src_pkg = types.ModuleType("src")
+src_pkg.__path__ = [str(root / "src")]
+sys.modules.setdefault("src", src_pkg)
+react_pkg = types.ModuleType("src.react")
+react_pkg.__path__ = [str(root / "src" / "react")]
+sys.modules.setdefault("src.react", react_pkg)
+
+from src.react.schema import FinalDiagnosis, SuspectCode, VMCoreLLMAnalysisStep
 from src.react.state_manager import project_managed_analysis_step
 
 
@@ -65,6 +76,74 @@ class StateManagerTests(unittest.TestCase):
         self.assertEqual(step.signature_class, "pointer_corruption")
         self.assertEqual(step.partial_dump, "partial")
         self.assertEqual(updates["current_partial_dump"], "partial")
+
+    def test_preserves_llm_gate_closures_in_managed_projection(self) -> None:
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 12,
+                "reasoning": "All required pointer-corruption gates are closed by concrete evidence.",
+                "action": None,
+                "is_conclusive": True,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": "dma_corruption",
+                "partial_dump": "partial",
+                "gates": {
+                    "register_provenance": {
+                        "required_for": ["pointer_corruption"],
+                        "status": "closed",
+                        "evidence": "pt_regs and disassembly show the poisoned pointer origin.",
+                    },
+                    "object_lifetime": {
+                        "required_for": ["pointer_corruption"],
+                        "status": "closed",
+                        "evidence": "kmem confirms the slab object is still allocated.",
+                    },
+                    "local_corruption_exclusion": {
+                        "required_for": ["pointer_corruption"],
+                        "status": "closed",
+                        "evidence": "No local writer on the crash path reaches the corrupted fields.",
+                    },
+                    "external_corruption_gate": {
+                        "required_for": ["pointer_corruption"],
+                        "status": "closed",
+                        "prerequisite": "local_corruption_exclusion",
+                        "evidence": "Cross-driver evidence supports an external overwrite.",
+                    },
+                    "field_type_classification": {
+                        "required_for": ["pointer_corruption"],
+                        "status": "closed",
+                        "evidence": "Source cross-reference identifies the corrupted field type.",
+                    },
+                },
+                "final_diagnosis": FinalDiagnosis(
+                    crash_type="kernel paging request",
+                    panic_string="BUG: unable to handle kernel paging request",
+                    faulting_instruction="RIP: foo+0x10",
+                    root_cause="DMA overwrite corrupted a live irqaction object.",
+                    detailed_analysis="All mandatory gates were closed with concrete crash evidence.",
+                    suspect_code=SuspectCode(
+                        file="drivers/scsi/mpt3sas/mpt3sas_base.c",
+                        function="_base_process_reply_queue",
+                        line="unknown",
+                    ),
+                    evidence=["sample evidence"],
+                ),
+            }
+        )
+
+        step, updates = project_managed_analysis_step(
+            llm_step,
+            {},
+            original_reasoning="All required pointer-corruption gates are closed by concrete evidence.",
+        )
+
+        self.assertTrue(step.is_conclusive)
+        self.assertEqual(step.gates["register_provenance"].status, "closed")
+        self.assertEqual(step.gates["external_corruption_gate"].status, "closed")
+        self.assertEqual(
+            updates["managed_gates"]["field_type_classification"].status,
+            "closed",
+        )
 
 
 if __name__ == "__main__":

@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+from .prompt_phrases import (
+    CANARY_RESIDUAL_DATA_RULE,
+    CANARY_SLOT_ONLY_SCOPE_NOTE,
+    DMA_PROMOTION_EVIDENCE_RULE,
+    S1_S5_DMA_GATE_RULE,
+)
+
 _LOCKUP_PLAYBOOK = """
 ## 3.2 Soft Lockup / Hard Lockup
 Pattern: soft lockup or NMI watchdog hard lockup.
@@ -13,10 +20,10 @@ Analysis:
 """.strip()
 
 
-_PROVENANCE_AND_CORRUPTION_SOURCE_GUIDE = """
+_PROVENANCE_AND_CORRUPTION_SOURCE_GUIDE = f"""
 ## Provenance and Corruption-Source Guide
 
-Use this guide as part of the S1-S5 exclusion reasoning required before promoting DMA or hardware. In this file, S1 mainly covers instruction-level provenance closure, S2 covers ordinary object-state validation, S3 covers snapshot or unwind artifact exclusion, and S4 covers stronger software corruption sources.
+Use this guide as part of {S1_S5_DMA_GATE_RULE} In this file, S1 mainly covers instruction-level provenance closure, S2 covers ordinary object-state validation, S3 covers snapshot or unwind artifact exclusion, and S4 covers stronger software corruption sources.
 
 - Trace the last writer of every suspect register before classifying the overwrite mechanism.
 - If crash-time register values differ from current vmcore bytes, treat the mismatch as a snapshot observation, not proof of DMA or overwrite source.
@@ -82,31 +89,73 @@ Pattern: paging request at a non-NULL address or a KASAN-style report.
 
 Analysis:
 1. Run kmem -S <address> only when the candidate address is expected to be a slab object or heap allocation; if the address may belong to a kernel stack, text, or non-slab page, use vtop or kmem -p on the translated page instead.
-2. Recognize poison values such as 0x6b6b..., 0x5a5a..., and 0xdead....
-3. Distinguish UAF, heap OOB write, and double-free style symptoms.
+   First classify the address type when it is not already known: run vtop <address> to determine whether the page is a kernel stack, vmalloc/module mapping, or another non-slab page. If the address resolves to a kernel stack, vmalloc/module area, text mapping, or any other non-slab page, do NOT run kmem -S on that address; continue with vtop or kmem -p based analysis instead.
+   Interpret the result immediately and explicitly: a slot marked [ALLOCATED] means the object is currently live; a slot without brackets (listed in the FREE section) means the object has been freed. This distinction determines which mechanisms remain open -- do not defer or skip this interpretation.
+2. Perform a raw memory dump of the corrupted slab object: run rd -x <addr> <object_size_in_words> (e.g., rd -x <addr> 16 for a 128-byte object). Scan the raw content systematically for SLUB free-list poison patterns before interpreting struct fields:
+   - 0x6b6b6b6b6b6b6b6b (repeated): POISON_FREE -- object was freed while SLUB_DEBUG is active; strong evidence of UAF without reallocation.
+   - 0x5a5a5a5a5a5a5a5a (repeated): POISON_END / red-zone boundary marker; indicates overrun into a freed adjacent region.
+   - 0xdead000000000100 or 0xdead000000000200: LIST_POISON1/2 from list_del() debug; list-based UAF or double-unlink.
+   - No poison pattern in an ALLOCATED slot: rules out simple free-list UAF; the slot was overwritten while live (OOB, DMA, or race), or freed and reallocated before observation.
+   Also inspect at least one adjacent slab slot (pre-compute offset: addr +/- objsize, emit rd -x <literal_addr> 16): correlated corruption in neighboring slots points to bulk OOB or DMA overwrite; isolated single-slot corruption points to targeted write or single-object UAF.
+3. Distinguish UAF, heap OOB write, and double-free style symptoms:
+   - UAF without reallocation: kmem -S shows FREE, poison values (0x6b6b..) visible.
+   - UAF with reallocation: kmem -S shows ALLOCATED, but type-identity fields (e.g., irq number, socket type, magic) are inconsistent with the traversal context; the slot was freed and reallocated to a different object type or instance.
+   - OOB overwrite: kmem -S shows ALLOCATED, all fields garbled with no recognizable type patterns; check whether adjacent slab slots are also corrupted.
+   - DMA overwrite: kmem -S shows ALLOCATED, physical-address overlap with device DMA range confirmed.
+   Do not collapse any of these scenarios into memory_corruption without first classifying the mechanism.
 4. When KASAN is present, prioritize allocation and free stacks from dmesg.
 5. Inspect slab state, shadow markers, and bad-page metadata before escalating.
 
 """
     + _PROVENANCE_AND_CORRUPTION_SOURCE_GUIDE,
-    "pointer_corruption": """
+    "pointer_corruption": f"""
 ## Pointer Corruption Playbook
 
 - Treat pointer corruption as a provenance-first workflow, not a device-attribution workflow.
-- Before considering DMA or hardware, explicitly close S1-S5 exclusion reasoning. At minimum in this playbook: close register provenance first (S1), object lifetime and ordinary object-state validation next (S2), stack or snapshot artifact exclusion when relevant (S3), local corruption exclusion after that (S4), and only then assess whether any affirmative device-side evidence exists (S5).
+- {S1_S5_DMA_GATE_RULE} At minimum in this playbook: close register provenance first (S1), object lifetime and ordinary object-state validation next (S2), stack or snapshot artifact exclusion when relevant (S3), local corruption exclusion after that (S4), and only then assess whether any affirmative device-side evidence exists (S5).
+- S2 (object-state validation) for slab objects: if the corrupted object's slab cache (e.g., kmalloc-128) is routinely used by the suspected hardware driver, check whether the suspicious values could be residue from a prior allocation of that cache by the same driver. kmalloc caches are NOT zeroed on free or re-allocation; a prior valid allocation can leave its entire content as stale data in the returned slab slot.
+- S5 (device-side evidence): {DMA_PROMOTION_EVIDENCE_RULE} Before naming a specific device as the DMA source, you MUST either: (a) confirm a DMA-range overlap between the corrupted page's physical address and the device's DMA buffers, OR (b) explicitly document why range overlap cannot be verified AND provide a protocol-level bit-layout verification of the payload. Additionally, you must consider ALL DMA-capable devices present in the system (check lspci-equivalent output or device tree). Name the suspected device only after other DMA-capable devices (e.g., mlx5 NICs, other HBAs, NVMe controllers) have been explicitly evaluated and found less likely, even if the evaluation is brief.
 - A snapshot mismatch between crash-time registers and current vmcore memory is diagnostic context only; it does not prove overwrite mechanism.
 - If a driver or third-party module is on the crash path, validate the full driver object shape before escalating to external corruption.
 - If the bad value came from a concrete load like mov 0x10(%r13), %rcx, the next validation target is the r13-based object, not a different argument register.
 - If nearby fields repeat a suspicious high-bit prefix or bus-address-like pattern, preserve that as a corruption fingerprint and test it explicitly instead of hand-waving it as "looks physical".
 - If a guessed struct name fails on a module-private object, stop guessing protocol-layer types and switch to module-symbol loading plus raw-object validation.
 
+### Corruption Mechanism Gate (mandatory before setting final_root_cause)
+
+A corrupted slab object with garbled fields is a SYMPTOM observation, not a root cause mechanism. Apply this gate explicitly before setting final_root_cause:
+1. Interpret kmem -S explicitly: [ALLOCATED] means the object is currently live (in-place overwrite, DMA, or UAF-with-reuse are candidates); not-bracketed or FREE means freed before access (classic UAF confirmed).
+2. Check type-identity field consistency: if a field that identifies the object's role (e.g., irqaction.irq, type code, magic number) does not match the current traversal context, the slot was likely reallocated to a different use (UAF with reuse) or type-confused.
+3. Check neighboring slab slots: if adjacent slots show the same corruption pattern, suspect bulk overwrite (OOB or DMA); if only one slot is corrupted, suspect targeted write or pointer misdirection.
+Set final_root_cause to a mechanism label -- use_after_free, out_of_bounds, dma_corruption, or wild_pointer -- never to memory_corruption.
+
+### Data Structure Traversal Rule (mandatory when crash occurs during iterator traversal)
+
+When the crash occurs inside a function iterating a kernel data structure (irqaction chain, list_head, hlist, radix tree, hash table, etc.), validate BOTH the traversed element AND its traversal source:
+1. Identify how the iterator register was populated: from a HEAD pointer in a parent struct (e.g., irq_desc->action) or from a ->next field in a previous element.
+2. HEAD pointer case: identify the parent struct by its register address and verify it matches the expected parent via diagnostic commands (e.g., run irq <N> to confirm irq_desc address). A register value that does not match the diagnostic output means either a different context is being processed than expected, or the parent struct itself is corrupted.
+3. ->next pointer case: identify which preceding element carried the corrupted ->next field and inspect that element's allocation state and field values separately.
+4. Verify type-identity field consistency in the accessed object: for example, irqaction.irq must match the IRQ being processed. A mismatch means the object does not belong in this chain (UAF-with-reuse, corruption, or stale pointer).
+
 ## 3.4 Use-After-Free / Memory Corruption
 Pattern: paging request at a non-NULL address or a KASAN-style report.
 
 Analysis:
 1. Run kmem -S <address> only when the candidate address is expected to be a slab object or heap allocation; if the address may belong to a kernel stack, text, or non-slab page, use vtop or kmem -p on the translated page instead.
-2. Recognize poison values such as 0x6b6b..., 0x5a5a..., and 0xdead....
-3. Distinguish UAF, heap OOB write, and double-free style symptoms.
+   First classify the address type when it is not already known: run vtop <address> to determine whether the page is a kernel stack, vmalloc/module mapping, or another non-slab page. If the address resolves to a kernel stack, vmalloc/module area, text mapping, or any other non-slab page, do NOT run kmem -S on that address; continue with vtop or kmem -p based analysis instead.
+   Interpret the result immediately and explicitly: a slot marked [ALLOCATED] means the object is currently live; a slot without brackets (listed in the FREE section) means the object has been freed. This distinction determines which mechanisms remain open -- do not defer or skip this interpretation.
+2. Perform a raw memory dump of the corrupted slab object: run rd -x <addr> <object_size_in_words> (e.g., rd -x <addr> 16 for a 128-byte object). Scan the raw content systematically for SLUB free-list poison patterns before interpreting struct fields:
+   - 0x6b6b6b6b6b6b6b6b (repeated): POISON_FREE -- object was freed while SLUB_DEBUG is active; strong evidence of UAF without reallocation.
+   - 0x5a5a5a5a5a5a5a5a (repeated): POISON_END / red-zone boundary marker; indicates overrun into a freed adjacent region.
+   - 0xdead000000000100 or 0xdead000000000200: LIST_POISON1/2 from list_del() debug; list-based UAF or double-unlink.
+   - No poison pattern in an ALLOCATED slot: rules out simple free-list UAF; the slot was overwritten while live (OOB, DMA, or race), or freed and reallocated before observation.
+   Also inspect at least one adjacent slab slot (pre-compute offset: addr +/- objsize, emit rd -x <literal_addr> 16): correlated corruption in neighboring slots points to bulk OOB or DMA overwrite; isolated single-slot corruption points to targeted write or single-object UAF.
+3. Distinguish UAF, heap OOB write, and double-free style symptoms:
+   - UAF without reallocation: kmem -S shows FREE, poison values (0x6b6b..) visible.
+   - UAF with reallocation: kmem -S shows ALLOCATED, but type-identity fields (e.g., irq number, socket type, magic) are inconsistent with the traversal context; the slot was freed and reallocated to a different object type or instance.
+   - OOB overwrite: kmem -S shows ALLOCATED, all fields garbled with no recognizable type patterns; check whether adjacent slab slots are also corrupted.
+   - DMA overwrite: kmem -S shows ALLOCATED, physical-address overlap with device DMA range confirmed.
+   Do not collapse any of these scenarios into memory_corruption without first classifying the mechanism.
 4. When KASAN is present, prioritize allocation and free stacks from dmesg.
 5. Inspect slab state, shadow markers, and bad-page metadata before escalating.
 
@@ -183,7 +232,7 @@ non-zero, non-trivial, and does not match any expected kernel object layout; the
 appears random, offset-shifted, or clearly outside any kernel-mapped region, yet is
 architecturally canonical.
 
-Triage — classify the address BEFORE proceeding:
+Triage -- classify the address BEFORE proceeding:
 - If the address is TRULY NON-CANONICAL (bits 63:48 are not all 0 or all 1 on x86-64):
   this is a General Protection Fault (#GP, x86 vector 13). Route to general_protection_fault.
 - If the address is near zero (< 0x1000 or a small struct-member offset from zero):
@@ -193,11 +242,11 @@ Triage — classify the address BEFORE proceeding:
 
 Analysis:
 1. Confirm the address is canonical: verify that bits 63:48 sign-extend bit 47.
-   If not canonical, stop — this is a #GP; switch to general_protection_fault playbook.
+   If not canonical, stop -- this is a #GP; switch to general_protection_fault playbook.
 2. Use sym <RIP> and dis -rl <RIP> to identify the faulting instruction and the register
    holding the bad address.
 3. Identify the producer: which register carries the bad value, and where was it last
-   loaded? Trace back through the register chain — was this a memory load, the result of
+   loaded? Trace back through the register chain -- was this a memory load, the result of
    arithmetic, a function return value, or a struct-member dereference?
 4. Evaluate likely root causes in order:
    a. Pointer overflow / underflow: iterating a pointer past the end of an allocation, or
@@ -210,7 +259,7 @@ Analysis:
    d. Stale/wild pointer from UAF: the object holding the pointer was freed and its memory
       reclaimed; the stored pointer now refers to reclaimed or remapped address space.
 5. Run vtop <fault_addr> to confirm the page is absent.  If vtop succeeds and a valid
-   page is found, the access may be a protection fault — re-evaluate the Oops error code.
+   page is found, the access may be a protection fault -- re-evaluate the Oops error code.
 6. If the bad address has a recognizable bit pattern (e.g., a valid address shifted by one
    byte, a bus address stored in a kernel virtual pointer slot, or a value matching a known
    struct field), treat that pattern as a corruption fingerprint and trace it aggressively.
@@ -222,38 +271,38 @@ Analysis:
     "write_protection_violation": """
 ## 3.12 Write Protection Violation (Read-Only Page Fault)
 Pattern: BUG: unable to handle kernel paging request at <address>; Oops error code with
-bit 0 (protection fault, page IS present) and bit 1 (write access) both set — e.g.,
+bit 0 (protection fault, page IS present) and bit 1 (write access) both set -- e.g.,
 Oops: 0003; or "kernel BUG at ... write to read-only memory"; or dmesg explicitly states
 "Write protect fault" or "kernel attempted to write to read-only page".
 
 Oops error code quick decode (relevant bits):
-  bit 0 = 1 → protection fault (page present, access denied)
-  bit 1 = 1 → write fault
-  bit 4 = 1 → instruction-fetch fault (SMEP) → use smap_smep_violation instead
+  bit 0 = 1 -> protection fault (page present, access denied)
+  bit 1 = 1 -> write fault
+  bit 4 = 1 -> instruction-fetch fault (SMEP) -> use smap_smep_violation instead
 
 Analysis:
 1. Confirm the error code: bits 0 and 1 both set, bit 4 clear.
-   If bit 4 is also set, this is a SMEP violation — route to smap_smep_violation.
+   If bit 4 is also set, this is a SMEP violation -- route to smap_smep_violation.
 2. Identify the fault address. Use sym <fault_addr> to classify the write target:
-   a. Kernel .text section → kernel code segment is being modified. Highest-priority
+   a. Kernel .text section -> kernel code segment is being modified. Highest-priority
       security concern; treat as potential exploit (inline hook, code patch, ret2dir).
-   b. .rodata or __ro_after_init data → attempt to modify data sealed after init;
+   b. .rodata or __ro_after_init data -> attempt to modify data sealed after init;
       likely a driver lifecycle bug or post-init write to a configuration constant.
-   c. Module .text or .rodata → faulty module self-modifying its own code or constants.
-   d. Kernel page table or credential struct pages → memory corruption reaching
+   c. Module .text or .rodata -> faulty module self-modifying its own code or constants.
+   d. Kernel page table or credential struct pages -> memory corruption reaching
       write-protected structural pages; may indicate heap OOB or DMA overwrite.
 3. Use dis -rl <RIP> to locate the exact store instruction that triggered the fault.
 4. Trace the write source: identify the object being written and the value being stored.
    Determine whether this is a direct store, a memcpy, a copy_from_user overrun, or an
    indirect write through a corrupted function pointer or struct field.
 5. Assess the write mechanism:
-   a. Direct store to a known kernel text or RO symbol from a driver path → driver bug
+   a. Direct store to a known kernel text or RO symbol from a driver path -> driver bug
       directly writing a constant or code address (e.g., self-patching, miscounted offset).
-   b. memcpy or bulk copy overrunning into a read-only region adjacent to a writable one →
+   b. memcpy or bulk copy overrunning into a read-only region adjacent to a writable one ->
       OOB write; investigate source buffer bounds and copy length.
-   c. Attempt to modify __ro_after_init config data long after init completed →
+   c. Attempt to modify __ro_after_init config data long after init completed ->
       driver lifecycle bug; check whether the init vs. runtime paths are correctly split.
-   d. Corrupted pointer directing a store to a protected region → route the pointer
+   d. Corrupted pointer directing a store to a protected region -> route the pointer
       provenance investigation to pointer_corruption or use_after_free as appropriate.
 6. Cross-check dmesg for preceding events: module loads, setuid/setcap syscalls, mprotect
    calls on kernel memory, or prior BUG/WARN lines indicating pre-existing corruption.
@@ -262,16 +311,16 @@ Analysis:
    as forensic evidence before drawing conclusions.
 """.strip(),
     "page_not_present": """
-## 3.13 Page Not Present (Missing Mapping — VMalloc / VMap / Module Space)
+## 3.13 Page Not Present (Missing Mapping -- VMalloc / VMap / Module Space)
 Pattern: unable to handle kernel paging request at <address>; Oops error code 0x0000
-(neither protection fault nor write fault — the page is simply absent); fault address is
+(neither protection fault nor write fault -- the page is simply absent); fault address is
 in the vmalloc region, the module address range, a driver vmap area, or another
-dynamically-mapped kernel virtual range — not the slab/kmalloc heap and not near NULL.
+dynamically-mapped kernel virtual range -- not the slab/kmalloc heap and not near NULL.
 
 Key distinction from use_after_free (slab):
-  use_after_free  → physical page is typically still present; kmem -S finds a freed slab
+  use_after_free  -> physical page is typically still present; kmem -S finds a freed slab
                     object; poison markers (0x6b6b...) are visible in the slab data.
-  page_not_present → vtop <fault_addr> FAILS or returns an invalid/absent PTE;
+  page_not_present -> vtop <fault_addr> FAILS or returns an invalid/absent PTE;
                     the physical page backing that virtual address does not exist.
 
 Analysis:
@@ -279,9 +328,9 @@ Analysis:
    If vtop succeeds and the page IS present, re-evaluate: this may be a use_after_free
    with slab reuse, or a protection fault with wrong error code interpretation.
 2. Identify the address range of the fault address:
-   a. vmalloc range (typically 0xffffc90000000000–0xffffe8ffffffffff on x86-64):
-      likely vmalloc UAF — the region was vfree'd while a stale pointer remained live.
-   b. Module text/data range (0xffffffffc0000000–0xffffffffff000000):
+   a. vmalloc range (typically 0xffffc90000000000-0xffffe8ffffffffff on x86-64):
+      likely vmalloc UAF -- the region was vfree'd while a stale pointer remained live.
+   b. Module text/data range (0xffffffffc0000000-0xffffffffff000000):
       module was unloaded (or partially initialized) while still referenced; check whether
       module_put or module unload raced with in-flight callers.
    c. Driver vmap or ioremap region: driver unmapped its own I/O or buffer window while a
@@ -292,15 +341,15 @@ Analysis:
    from an interrupt handler, a work-queue callback, a timer, or an RCU callback that
    outlived the allocation?
 5. For vmalloc UAF: identify (a) the vmalloc/vmap call that allocated the region, and
-   (b) the vfree/vunmap call that freed it. Determine which reference — pointer stored in
-   a struct, argument passed to a callback, cached in a per-CPU variable — was not cleared
+   (b) the vfree/vunmap call that freed it. Determine which reference -- pointer stored in
+   a struct, argument passed to a callback, cached in a per-CPU variable -- was not cleared
    before the free.
 6. For module-range faults: use mod -s <module> to inspect module state. Verify whether
    the module is in MODULE_STATE_UNFORMED or MODULE_STATE_GOING at crash time.
 7. Distinguish from vmalloc_fault (normal TLB sync): the kernel vmalloc_fault handler
    propagates page-table entries from init_mm for legitimate vmalloc mappings. If
    vmalloc_fault appears in the call stack and the crash still occurred, the mapping truly
-   no longer exists — this confirms the vmalloc region was freed before the access.
+   no longer exists -- this confirms the vmalloc region was freed before the access.
 8. If the fault is in a DMA-mapped region, consider whether the DMA mapping was torn down
    (dma_unmap_*) while device-side DMA was still in flight. Check IOMMU fault logs.
 """.strip(),
@@ -310,7 +359,7 @@ Pattern: unable to handle kernel paging request at <user-space address>; fault a
 in user-space range (typically < 0x00007fffffffffff); Oops error code with bit 2 (user-mode
 page accessed from CPL=0) set, and/or bit 4 (instruction-fetch fault) set.
 
-Triage — distinguish SMEP from SMAP before proceeding:
+Triage -- distinguish SMEP from SMAP before proceeding:
   SMEP violation: kernel attempted to EXECUTE a user-space page.
     Oops error code bit 4 (instruction-fetch) is set (e.g., 0x0011, 0x0015).
     RIP is at a valid kernel address; the faulting instruction is an indirect call/jmp
@@ -322,7 +371,7 @@ Triage — distinguish SMEP from SMAP before proceeding:
 Analysis:
 1. Confirm the fault address is in user-space range (below the user-kernel split,
    typically < 0x00007fffffffffff on x86-64). If the fault address is in kernel range,
-   this is not a SMAP/SMEP violation — re-evaluate using a different playbook.
+   this is not a SMAP/SMEP violation -- re-evaluate using a different playbook.
 2. Decode the Oops error code to classify the violation (SMEP vs. SMAP) as above.
 3. Use sym <RIP> and dis -rl <RIP> to identify the exact instruction that faulted.
    - SMEP: locate the indirect call or jmp in kernel code whose target resolved to the
@@ -410,7 +459,7 @@ indeterminate and no specific function may be named as the overflow source.
 
 ### Appendix: Guardrails and Invariants (Reference)
 
-**⛔ COMPILER-LEVEL CANARY INVARIANT**: The stack protector prologue unconditionally writes
+**[STOP] COMPILER-LEVEL CANARY INVARIANT**: The stack protector prologue unconditionally writes
 the canary at function entry (`mov %gs:0x28,%rax; mov %rax,<slot>(%rbp)`). Residual stack
 data, pre-fault stack reuse, and stale task pointers CANNOT explain __stack_chk_fail. Only
 a write DURING the function's execution (after prologue, before epilogue) can corrupt the canary.
@@ -425,12 +474,12 @@ window is AFTER the prologue store and BEFORE the epilogue check.
 
 **Blame guardrails**: Do not blame link_path_walk, zone_statistics, handle_mm_fault, or any interrupted-path frame merely because its address appears on the stack. Do not identify the canary slot by scanning for a recognizable value and reverse-justifying the address. Do not use stack direction across an exception boundary unless frame provenance and active overlap have been explicitly proven.
 """.strip(),
-    "stack_corruption": """
-## Stack Corruption (Generic — Non-Canary)
+    "stack_corruption": f"""
+## Stack Corruption (Generic -- Non-Canary)
 Pattern: Kernel stack overflow, stack smashing detected, or frame-pointer corruption where the
 panic did NOT contain stack-protector or __stack_chk_fail.
 
-### ⛔ FIRST ACTION RULE
+### [STOP] FIRST ACTION RULE
 
 Your VERY FIRST analysis actions (before any hypothesis about overflow sources) MUST be:
 1. Execute Phase 1 of the Stack Frame Forensics SOP (3.8a): frame-by-frame saved-RIP and
@@ -439,7 +488,7 @@ Your VERY FIRST analysis actions (before any hypothesis about overflow sources) 
 3. Then proceed to Phase 2 (overflow window reconstruction) and Phase 3 (blame triage).
 
 You are FORBIDDEN from naming a specific overflow source or disassembling suspected callers
-until Phase 1–3 of the SOP are complete with their required outputs.
+until Phase 1-3 of the SOP are complete with their required outputs.
 
 ### Mandatory Stack Corruption Analysis Checklist
 
@@ -454,7 +503,7 @@ Before naming a local overflow source, complete this checklist in order:
 6. Evaluate at least these alternative mechanisms before final blame: self-frame local overflow
    (canary-bearing function's own code or unprotected leaf callees), active overwrite inside the
    exception path, stack-slot reuse from pre-fault returned frames (valid for saved RBP/RIP/locals
-   but NOT for the canary slot — see CANARY INVARIANT above), and frame reconstruction error.
+   but NOT for the canary slot -- see CANARY INVARIANT above), and frame reconstruction error.
 
 ### CRITICAL: Stack Growth Direction and Causality Constraint (x86-64)
 
@@ -486,30 +535,30 @@ suspect_frame_addr (address of the suspected overflow source):
 Example of INVALID reasoning:
   "link_path_walk (frame at 0x17c08) overflowed and corrupted the canary of
    search_module_extables (frame at 0x17a10)"
-  → WRONG: 0x17c08 > 0x17a10, so link_path_walk's frame is at a higher address (earlier caller).
+  -> WRONG: 0x17c08 > 0x17a10, so link_path_walk's frame is at a higher address (earlier caller).
   Its overflow writes toward even higher addresses and cannot reach 0x17a20.
 
-### ⛔ MANDATORY PRE-CONCLUSION GATE (stack_protector_canary)
+### [STOP] MANDATORY PRE-CONCLUSION GATE (stack_protector_canary)
 
 You MUST execute this gate explicitly and in writing BEFORE stating any final diagnosis or
 naming any overflow source. Failure to complete this gate makes the conclusion invalid.
 
-**Gate Checklist** — fill in ALL items:
+**Gate Checklist** -- fill in ALL items:
 
 ```
 Canary-bearing function    : <name>
-Canary frame address       : 0x<addr>          ← from bt output
-Canary slot address        : 0x<addr>          ← RBP - <offset> from disassembly
+Canary frame address       : 0x<addr>          <- from bt output
+Canary slot address        : 0x<addr>          <- RBP - <offset> from disassembly
 
 For each candidate function you intend to blame:
   Candidate                : <name>
-  Candidate frame address  : 0x<addr>          ← from bt output
+  Candidate frame address  : 0x<addr>          <- from bt output
   Comparison               : candidate (0x<X>) vs canary_slot (0x<Y>)
-  candidate > canary_slot? : YES → ❌ EXCLUDED (PHYSICALLY IMPOSSIBLE, reject immediately)
-                             NO  → ✅ Plausible, continue investigation
+  candidate > canary_slot? : YES -> [NO] EXCLUDED (PHYSICALLY IMPOSSIBLE, reject immediately)
+                             NO  -> [OK] Plausible, continue investigation
 ```
 
-**Gate Rule**: If candidate frame address > canary frame address → the candidate is an earlier
+**Gate Rule**: If candidate frame address > canary frame address -> the candidate is an earlier
 (outer) caller. Its local overflow writes toward higher addresses. It CANNOT reach the canary at
 a lower address. You MUST mark this candidate as EXCLUDED and MUST NOT name it as the overflow
 source in the final diagnosis.
@@ -544,7 +593,7 @@ Example of INVALID reasoning:
    "zone_statistics faulted, then handle_mm_fault and search_module_extables ran later at lower
     addresses, therefore handle_mm_fault is the likely local overflow source because only later
     frames can overwrite the canary"
-   → INSUFFICIENT: this treats the page-fault path as an ordinary contiguous call nest and ignores
+   -> INSUFFICIENT: this treats the page-fault path as an ordinary contiguous call nest and ignores
    the interrupted-frame / exception-entry / handler segmentation. The frame provenance must be
    established first.
 
@@ -558,7 +607,7 @@ Key indicators of nested exception frames:
 - Frames prefixed with ? that belong to mm subsystem (handle_mm_fault, __do_page_fault)
   or exception handling appearing below VFS/filesystem frames.
 - A function like search_module_extables appearing below inode_permission/link_path_walk
-  — this means the page fault handler called search_module_extables DURING link_path_walk's
+  -- this means the page fault handler called search_module_extables DURING link_path_walk's
   execution, not that link_path_walk called it directly.
 
 When analyzing nested exception frames:
@@ -611,7 +660,7 @@ Analysis:
    handler nesting. Check whether an exception handler (page fault, interrupt) inserted
    intermediate frames.
 11. Use vtop on the kernel stack address to verify the stack page is not shared or aliased.
-    **NEVER use kmem -S on kernel stack addresses** — the stack is not a slab allocation;
+    **NEVER use kmem -S on kernel stack addresses** -- the stack is not a slab allocation;
     kmem -S will always return "address is not allocated in slab subsystem" with zero
     diagnostic value. Use vtop <stack_addr> to verify page ownership instead.
 
@@ -675,11 +724,9 @@ is a critical forensic clue. Pursue it aggressively:
 
 ### Stack Reuse and Prior-Frame Pollution Mechanism
 
-⛔ **CANARY INVARIANT REMINDER**: The following discussion of residual stack data applies to
-corruption of saved RBP, saved RIP, and non-canary local variables. It does NOT apply to canary
-corruption. The stack protector prologue unconditionally writes the canary at function entry,
-overwriting any residual data. For __stack_chk_fail cases, the canary was corrupted DURING the
-function's execution, not before it.
+[STOP] **CANARY INVARIANT REMINDER**: {CANARY_RESIDUAL_DATA_RULE} {CANARY_SLOT_ONLY_SCOPE_NOTE}
+The following discussion of residual stack data applies to corruption of saved-RBP, saved-RIP,
+and non-canary local variables.
 
 On a kernel stack, when a function returns, its frame data remains in memory as stale residue
 until another function call overwrites it. This creates a "ghost frame" effect that can corrupt
@@ -691,17 +738,17 @@ non-canary frame data:
     from the normal (pre-exception) call chain.
 
     Example timeline:
-    a. sys_open → do_filp_open → path_openat → link_path_walk calls deep helper functions
-       (e.g., walk_component → lookup_slow → various inode ops) that push frames to low addresses.
-    b. Those deep helpers return — stack pointer moves back up, but their written data persists
+    a. sys_open -> do_filp_open -> path_openat -> link_path_walk calls deep helper functions
+       (e.g., walk_component -> lookup_slow -> various inode ops) that push frames to low addresses.
+    b. Those deep helpers return -- stack pointer moves back up, but their written data persists
        as stale residue in the low-address region.
     c. Execution continues in the VFS permission or path-walk region, for example
-       inode_permission → __inode_permission → security_inode_permission and then into the
+       inode_permission -> __inode_permission -> security_inode_permission and then into the
        relevant LSM hook path. If a later corrupted bt appears to place an unrelated helper such as
        zone_statistics directly adjacent to security_inode_permission, do NOT treat that edge as
        proven ordinary control flow; first decide whether it is an exception splice, stack-scan
        artifact, or corrupted saved return path.
-    d. The page fault handler pushes new frames (handle_mm_fault → search_module_extables)
+    d. The page fault handler pushes new frames (handle_mm_fault -> search_module_extables)
        into the SAME low-address region that was previously used by the returned deep helpers.
     e. search_module_extables's saved RBP, saved RIP, or non-canary local variables may now
        occupy addresses that were previously written by those returned helpers. However, the
@@ -719,9 +766,8 @@ non-canary frame data:
     c. If a prior-occupant function had an off-by-one or boundary error that wrote past its
        frame into adjacent stack space, the residue would persist and be discoverable when
        the slot is reused.
-    d. ⛔ Do NOT use this mechanism to explain canary corruption. The canary prologue
-       overwrites any residual data. For __stack_chk_fail cases, focus on self-frame overflow
-       (mechanism 25a) instead.
+    d. [STOP] {CANARY_RESIDUAL_DATA_RULE} {CANARY_SLOT_ONLY_SCOPE_NOTE} For __stack_chk_fail
+       cases, focus on self-frame overflow (mechanism 25a) instead.
 
 20a. **Analyze the active call chain before exception-path blame**:
     a. If the panic task is still on a coherent syscall path such as sys_open -> do_filp_open ->
@@ -736,14 +782,14 @@ non-canary frame data:
 21. **Residual data pattern matching**: Compare corrupted stack data and surrounding bytes
     against known kernel data patterns. For NON-CANARY slots (saved RBP, saved RIP, locals),
     residual data from prior functions is a valid corruption source. For the CANARY SLOT,
-    residual data is irrelevant — the prologue overwrites it; only in-execution writes matter.
-    a. task_struct pointer at canary slot → the canary-bearing function (or its active callee)
+    residual data is irrelevant -- the prologue overwrites it; only in-execution writes matter.
+    a. task_struct pointer at canary slot -> the canary-bearing function (or its active callee)
        accessed `current` and an OOB write during execution spilled it into the canary slot;
        NOT residual data from a prior function
-    b. task_struct pointer at non-canary slot → prior function may have stored `current` as
+    b. task_struct pointer at non-canary slot -> prior function may have stored `current` as
        residual, or active function spilled it
-    c. Repeated non-symbol addresses → structure copy or memcpy overflow from a known object
-    d. Contiguous validated string object → only then consider string-copy style overflow; an
+    c. Repeated non-symbol addresses -> structure copy or memcpy overflow from a known object
+    d. Contiguous validated string object -> only then consider string-copy style overflow; an
        isolated ASCII-decodable 8-byte word is only a weak clue and cannot establish pathname,
        filename, or userspace-string provenance by itself
 
@@ -790,9 +836,7 @@ Before final diagnosis, you must explicitly work through this closure checklist:
        own local bounds into the canary slot;
     c. current-pointer spill/copy overflow: some function stored `current` or `current->xxx` in a
        local stack slot and then copied or wrote beyond that slot;
-    d. ⛔ Do NOT list "pre-fault residual-stack pollution" as a canary corruption mechanism. The
-       prologue unconditionally writes the canary, overwriting any residual data. Residual data
-       can only corrupt saved RBP, saved RIP, or non-canary locals.
+   d. [STOP] {CANARY_RESIDUAL_DATA_RULE} {CANARY_SLOT_ONLY_SCOPE_NOTE}
 
 26. **Conclusive-output gate**:
     a. Do not set is_conclusive=true unless at least one mechanism family above has positive
