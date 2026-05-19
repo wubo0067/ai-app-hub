@@ -60,6 +60,12 @@ graph TB
 - **Bracket nodes** represent concrete functional nodes or external services
 - The flow starts from `START`, goes through initial data collection, enters the loop of LLM analysis and tool invocation, and ends when `is_conclusive=true` or the recursion limit is reached
 
+### Runtime Request Flow Diagram
+
+The following SVG shows the full runtime path of a single `/analyze` or `/analyze/stream` request across the FastAPI entrypoint, LangGraph loop, MCP tools, and the crash executor. It is more detailed than the overview diagram above and is useful when tracing the real execution path.
+
+![VMCore Analysis Agent Runtime Request Flow](./vmcore-analysis-agent/doc/vmcore-analysis-agent-flow-2.0.svg)
+
 ## Vmcore Analysis React Agent
 
 ### Agent Architecture

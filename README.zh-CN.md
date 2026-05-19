@@ -63,6 +63,12 @@ graph TB
 - **方括号节点** 表示具体的功能节点或外部服务
 - 流程从 `START` 开始，经过初始化数据收集，进入 LLM 分析与工具调用的循环，直到 `is_conclusive=true` 或达到递归限制时结束
 
+### 运行时请求链路图
+
+下图展示了一次 `/analyze` 或 `/analyze/stream` 请求在服务端、LangGraph、MCP 与 crash executor 之间的完整运行时链路，相比上面的总览图更适合查看实际执行路径。
+
+![VMCore Analysis Agent 运行时请求链路图](./vmcore-analysis-agent/doc/vmcore-analysis-agent-flow-2.0.svg)
+
 ## Vmcore Analysis React Agent
 
 ### 代理架构
