@@ -43,6 +43,22 @@ DMA_PROMOTION_EVIDENCE_RULE = (
     "and the device-side evidence threshold is met."
 )
 
+DMA_MINIMUM_EVIDENCE_GATE_RULE = (
+    "Treat DMA corruption as a gated hypothesis. To elevate DMA from possible to likely or confirmed, "
+    "you MUST satisfy at least TWO independent device-side evidence families from this set: DMA-address "
+    "or physical-page overlap, IOMMU fault or remapping evidence, validated descriptor bit-layout decode, "
+    "PCI or device ownership tied to the corrupted object, MSI or IRQ vector ownership tied to the device, "
+    "or sg/dma mapping overlap. If fewer than two families are satisfied, DMA may remain only a possible "
+    "corruption hypothesis and must not be emitted as the final root cause."
+)
+
+ADJACENT_SLAB_VALUE_COINCIDENCE_RULE = (
+    "A driver-specific value found only in an adjacent slab slot or elsewhere on the same slab page does NOT "
+    "exclude software mechanisms such as OOB, UAF-with-reuse, or stale residue. It proves only that the driver "
+    "or a related object may have allocated somewhere on that slab page; it is not by itself DMA evidence and it "
+    "does not negate software-side adjacency reasoning."
+)
+
 STACK_CAUSALITY_RED_LINE_RULE = (
     "If standard x86-64 stack-growth causality has already proved that a candidate frame sits at "
     "a HIGHER address than the corrupted canary slot, you are strictly FORBIDDEN from spending `dis` "
@@ -51,4 +67,13 @@ STACK_CAUSALITY_RED_LINE_RULE = (
     "lower-address active callees, or overwritten-canary-value provenance, and revisit the higher-address "
     "frame only for saved-RIP provenance, exception-entry classification, or a newly supported non-local "
     "write mechanism."
+)
+
+SLAB_OOB_DIRECTION_RULE = (
+    "In kmalloc/slab adjacency reasoning, a standard contiguous out-of-bounds write "
+    "from object A extends from lower to higher addresses. Therefore, if victim object V "
+    "is at a LOWER address than suspect object S, do not claim S performed a standard "
+    "OOB overflow into V unless you can prove a non-standard write primitive (for example "
+    "negative index, wrong-pointer memcpy/memmove, explicit reverse copy, arbitrary write, "
+    "or UAF/write-through alias) and show concrete evidence for that primitive."
 )

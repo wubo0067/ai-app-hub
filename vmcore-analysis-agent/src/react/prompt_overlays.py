@@ -2,11 +2,14 @@
 # -*- coding: utf-8 -*-
 
 from .prompt_phrases import (
+    ADJACENT_SLAB_VALUE_COINCIDENCE_RULE,
     CANARY_RESIDUAL_DATA_RULE,
     CANARY_SLOT_ONLY_SCOPE_NOTE,
     CANARY_POINTER_VALUE_PARTIAL_DUMP_RULE,
     CANARY_POINTER_VALUE_RULE,
+    DMA_MINIMUM_EVIDENCE_GATE_RULE,
     DMA_PROMOTION_EVIDENCE_RULE,
+    SLAB_OOB_DIRECTION_RULE,
     STACK_CAUSALITY_RED_LINE_RULE,
 )
 
@@ -125,6 +128,21 @@ facts that share a value coincidence. The causal chain is as follows:
    physical addresses) as a SEPARATE and INDEPENDENT evidence item before elevating DMA confidence.
 5. Never use "the value 0xXXXXXXXX was logged by driver Y AND appears in slab memory" as a
    standalone argument that driver Y performed a stray DMA write to that slab location.
+6. {ADJACENT_SLAB_VALUE_COINCIDENCE_RULE}
+
+### Step I: Slab OOB Directionality (CRITICAL Distinction)
+
+- {SLAB_OOB_DIRECTION_RULE}
+- If your claim requires a reverse-direction overwrite (higher-address object corrupting a lower-address neighbor),
+  you MUST name the exact non-standard primitive and provide evidence from disassembly, call path, or object writes.
+- Address coincidence plus adjacent-slot layout is insufficient to prove reverse-direction overwrite.
+
+### Step J: DMA Promotion Gate (CRITICAL Distinction)
+
+- {DMA_MINIMUM_EVIDENCE_GATE_RULE}
+- Required validation examples include: `vtop <corrupted_addr>` for page translation, explicit comparison against driver DMA mappings such as reply ring or sg buffers, `log -m | grep -Ei "iommu|dma|fault|remap"` when relevant, and ownership closure for the IRQ/MSI or PCI device path.
+- If range overlap cannot be proven in a partial dump, keep DMA as a bounded alternative hypothesis unless another independent device-side evidence family is still positively established.
+- A sentence such as "software OOB cannot explain this value on the slab page" is forbidden unless the software mechanisms were actually tested and eliminated with object-local evidence rather than value coincidence.
 
 For third-party or driver-private object corruption, root cause is not complete until one of the following is true:
 - the corrupted field's declared type is identified, or

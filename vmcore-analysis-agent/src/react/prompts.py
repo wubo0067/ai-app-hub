@@ -12,6 +12,7 @@ from .prompt_phrases import (
     CANARY_POINTER_VALUE_PARTIAL_DUMP_RULE,
     CANARY_POINTER_VALUE_RULE,
     LITERAL_ADDRESS_RULE,
+    SLAB_OOB_DIRECTION_RULE,
     STACK_CAUSALITY_RED_LINE_RULE,
 )
 from .schema import (
@@ -147,6 +148,12 @@ Q4 — Offset coverage:
 ### Review Red-Line Rule: Causality-Eliminated Frames
 
 - {STACK_CAUSALITY_RED_LINE_RULE}
+
+### Review Red-Line Rule: Reverse Slab OOB Claims
+
+- {SLAB_OOB_DIRECTION_RULE}
+- Reject any root-cause claim that relies on a standard forward OOB write from a higher-address slab object into a lower-address victim object.
+- If a reverse-direction claim remains, it must be explicitly downgraded to a non-standard primitive hypothesis and supported with concrete write-path evidence.
 
 ### Review Red-Line Rule: Invalid Caller-Edge Narratives
 

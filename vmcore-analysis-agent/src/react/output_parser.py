@@ -39,6 +39,16 @@ _RIP_RE = re.compile(r"\bRIP:\s*(?:[0-9a-fA-F]+:)?(?P<addr>[0-9a-fA-F]{8,16})\b"
 # 正则表达式用于提取 Oops 错误代码
 _OOPS_RE = re.compile(r"\bOops:\s*(?P<code>[0-9a-fA-F]{4})\b")
 
+# 正则表达式用于提取可能的地址迁移叙述（source -> destination）
+_ADDRESS_FLOW_RE = re.compile(
+    r"(?P<src>0x[0-9a-fA-F]{8,16}|[0-9a-fA-F]{12,16})"
+    r"[^\n]{0,120}?"
+    r"(?:->|to|into|corrupt(?:ed)?|overwrite(?:d)?)"
+    r"[^\n]{0,120}?"
+    r"(?P<dst>0x[0-9a-fA-F]{8,16}|[0-9a-fA-F]{12,16})",
+    flags=re.IGNORECASE,
+)
+
 # 非故障指令助记符集合 - 这些指令通常不会导致页面错误
 _NON_FAULTING_MNEMONICS = {
     "pause",
@@ -500,6 +510,19 @@ def apply_executor_consistency_audit(
         state,
         log_prefix=log_prefix,
     )
+    analysis_step = _audit_reverse_slab_oob_claim(
+        analysis_step,
+        log_prefix=log_prefix,
+    )
+    analysis_step = _audit_allocated_slot_uaf_claim(
+        analysis_step,
+        state,
+        log_prefix=log_prefix,
+    )
+    analysis_step = _audit_dma_promotion_gate(
+        analysis_step,
+        log_prefix=log_prefix,
+    )
     mismatch = _detect_page_fault_access_mismatch(state)
     if mismatch is None:
         return analysis_step
@@ -540,6 +563,372 @@ def apply_executor_consistency_audit(
         analysis_step.confidence = "low"
 
     return analysis_step
+
+
+def _audit_reverse_slab_oob_claim(
+    analysis_step: VMCoreLLMAnalysisStep,
+    *,
+    log_prefix: str = "",
+) -> VMCoreLLMAnalysisStep:
+    """拦截“高地址对象标准 OOB 覆盖低地址对象”的反向归因结论。"""
+    text = _collect_analysis_text_for_oob_audit(analysis_step)
+    if not text:
+        return analysis_step
+
+    lowered = text.lower()
+    if not _looks_like_slab_oob_context(lowered):
+        return analysis_step
+
+    if not _looks_like_reverse_direction_claim(lowered):
+        return analysis_step
+
+    conflicting_pair = _find_reverse_address_flow_pair(text)
+    if conflicting_pair is None:
+        return analysis_step
+
+    src, dst = conflicting_pair
+    prefix = f"{log_prefix}: " if log_prefix else ""
+    audit_note = (
+        "Executor audit: detected a reverse slab OOB causality claim "
+        f"({src} -> {dst}). A standard contiguous OOB overwrite in kmalloc/slab "
+        "extends from lower to higher addresses, so this attribution is invalid "
+        "unless a non-standard write primitive is explicitly proven."
+    )
+    logger.warning("%s%s", prefix, audit_note)
+
+    if audit_note not in analysis_step.reasoning:
+        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
+
+    if analysis_step.additional_notes:
+        if audit_note not in analysis_step.additional_notes:
+            analysis_step.additional_notes = (
+                f"{analysis_step.additional_notes} {audit_note}"
+            ).strip()
+    else:
+        analysis_step.additional_notes = audit_note
+
+    if analysis_step.root_cause_class not in {None, "unknown"}:
+        analysis_step.root_cause_class = "unknown"
+
+    if analysis_step.is_conclusive:
+        analysis_step.is_conclusive = False
+        analysis_step.final_diagnosis = None
+        analysis_step.fix_suggestion = None
+
+    if analysis_step.confidence not in {None, "low"}:
+        analysis_step.confidence = "low"
+
+    return analysis_step
+
+
+def _audit_dma_promotion_gate(
+    analysis_step: VMCoreLLMAnalysisStep,
+    *,
+    log_prefix: str = "",
+) -> VMCoreLLMAnalysisStep:
+    """拦截缺少最小设备侧证据门槛的 DMA 定论。"""
+    if analysis_step.root_cause_class != "dma_corruption":
+        return analysis_step
+
+    if (
+        not analysis_step.is_conclusive
+        and analysis_step.final_diagnosis is None
+        and analysis_step.confidence not in {"medium", "high"}
+    ):
+        return analysis_step
+
+    text = _collect_analysis_text_for_oob_audit(analysis_step)
+    if not text:
+        return analysis_step
+
+    lowered = text.lower()
+    evidence_families = _collect_dma_evidence_families(lowered)
+    if len(evidence_families) >= 2:
+        return analysis_step
+
+    prefix = f"{log_prefix}: " if log_prefix else ""
+    family_summary = (
+        ", ".join(sorted(evidence_families)) if evidence_families else "none"
+    )
+    audit_note = (
+        "Executor audit: DMA promotion gate not satisfied. "
+        "Final DMA attribution requires at least two independent device-side evidence families "
+        "such as DMA-range overlap, IOMMU fault/remap evidence, validated descriptor decode, "
+        "PCI ownership, MSI/vector ownership, or sg/dma mapping overlap. "
+        f"Observed evidence families: {family_summary}. "
+        "DMA may remain only as a possible hypothesis."
+    )
+    logger.warning("%s%s", prefix, audit_note)
+
+    if audit_note not in analysis_step.reasoning:
+        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
+
+    if analysis_step.additional_notes:
+        if audit_note not in analysis_step.additional_notes:
+            analysis_step.additional_notes = (
+                f"{analysis_step.additional_notes} {audit_note}"
+            ).strip()
+    else:
+        analysis_step.additional_notes = audit_note
+
+    analysis_step.root_cause_class = "unknown"
+
+    if analysis_step.is_conclusive:
+        analysis_step.is_conclusive = False
+        analysis_step.final_diagnosis = None
+        analysis_step.fix_suggestion = None
+
+    if analysis_step.confidence not in {None, "low"}:
+        analysis_step.confidence = "low"
+
+    return analysis_step
+
+
+def _audit_allocated_slot_uaf_claim(
+    analysis_step: VMCoreLLMAnalysisStep,
+    state: dict[str, Any],
+    *,
+    log_prefix: str = "",
+) -> VMCoreLLMAnalysisStep:
+    """拦截与 kmem -S 已分配结论相冲突的 UAF/free-then-reuse 归因。"""
+    text = _collect_analysis_text_for_oob_audit(analysis_step)
+    if not text:
+        return analysis_step
+
+    lowered = text.lower()
+    if not _looks_like_uaf_claim(lowered):
+        return analysis_step
+
+    state_text = _collect_state_text(state)
+    if not _looks_like_allocated_slab_observation(state_text.lower()):
+        return analysis_step
+
+    if _has_positive_lifetime_reuse_evidence(lowered):
+        return analysis_step
+
+    prefix = f"{log_prefix}: " if log_prefix else ""
+    audit_note = (
+        "Executor audit: kmem -S context shows the candidate slab slot is currently allocated, "
+        "but the analysis still asserted freed/stale-pointer UAF or free-then-reuse without separate "
+        "positive lifetime evidence. ALLOCATED rules out a simple freed-object explanation; absent "
+        "independent lifetime evidence, treat this as live-slot overwrite, type confusion, or another "
+        "non-UAF mechanism instead of concluding use-after-free."
+    )
+    logger.warning("%s%s", prefix, audit_note)
+
+    if audit_note not in analysis_step.reasoning:
+        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
+
+    if analysis_step.additional_notes:
+        if audit_note not in analysis_step.additional_notes:
+            analysis_step.additional_notes = (
+                f"{analysis_step.additional_notes} {audit_note}"
+            ).strip()
+    else:
+        analysis_step.additional_notes = audit_note
+
+    if analysis_step.root_cause_class == "use_after_free":
+        analysis_step.root_cause_class = "unknown"
+
+    if analysis_step.is_conclusive:
+        analysis_step.is_conclusive = False
+        analysis_step.final_diagnosis = None
+        analysis_step.fix_suggestion = None
+
+    if analysis_step.confidence not in {None, "low"}:
+        analysis_step.confidence = "low"
+
+    return analysis_step
+
+
+def _collect_dma_evidence_families(lowered_text: str) -> set[str]:
+    """提取 DMA 结论中已经满足的独立设备侧证据族。"""
+    family_markers: dict[str, tuple[str, ...]] = {
+        "dma_overlap": (
+            "dma-range overlap",
+            "physical-page overlap",
+            "mapping overlap",
+            "reply_frames_dma",
+            "reply frame dma",
+            "dma buffer overlap",
+            "sg/dma mapping overlap",
+            "scatterlist overlap",
+        ),
+        "iommu": (
+            "iommu fault",
+            "iommu remap",
+            "dma remap fault",
+            "dmar fault",
+            "remapping fault",
+        ),
+        "descriptor_decode": (
+            "bit-layout verification",
+            "bit layout verification",
+            "field-by-field decode",
+            "field by field decode",
+            "descriptor decode",
+            "descriptor bit layout",
+            "decoded sub-field",
+        ),
+        "pci_ownership": (
+            "pci ownership",
+            "pci device ownership",
+            "pcie ownership",
+            "owned by pci",
+            "owned by device",
+        ),
+        "msi_vector_ownership": (
+            "msi vector ownership",
+            "msix vector ownership",
+            "irq vector ownership",
+            "vector ownership",
+        ),
+        "sg_mapping": (
+            "sg mapping overlap",
+            "dma mapping overlap",
+            "scatter-gather overlap",
+            "scatter gather overlap",
+        ),
+    }
+
+    matched: set[str] = set()
+    for family, markers in family_markers.items():
+        for marker in markers:
+            index = lowered_text.find(marker)
+            if index == -1:
+                continue
+            window_start = max(0, index - 48)
+            window_end = min(len(lowered_text), index + len(marker) + 48)
+            context = lowered_text[window_start:window_end]
+            if any(
+                negation in context
+                for negation in (
+                    "missing",
+                    "cannot verify",
+                    "could not verify",
+                    "unverified",
+                    "not verified",
+                    "no ",
+                    "lack ",
+                    "lacking",
+                    "without ",
+                    "absent",
+                )
+            ):
+                continue
+            matched.add(family)
+            break
+
+    return matched
+
+
+def _looks_like_uaf_claim(lowered_text: str) -> bool:
+    """判断文本是否在主张 freed/stale-pointer 风格的 UAF。"""
+    return any(
+        marker in lowered_text
+        for marker in (
+            "use-after-free",
+            "use after free",
+            "uaf",
+            "stale pointer",
+            "freed and reallocated",
+            "freed and reused",
+            "original object was freed",
+            "pointer in",
+        )
+    )
+
+
+def _looks_like_allocated_slab_observation(lowered_text: str) -> bool:
+    """判断状态文本是否明确给出了 kmem -S 的 ALLOCATED 观察。"""
+    return "kmem -s" in lowered_text and "free / [allocated]" in lowered_text
+
+
+def _has_positive_lifetime_reuse_evidence(lowered_text: str) -> bool:
+    """判断文本是否给出了超越类型不一致的正向生命周期复用证据。"""
+    evidence_markers = (
+        "free stack",
+        "alloc stack",
+        "allocation stack",
+        "free path",
+        "kfree",
+        "kmem_cache_free",
+        "refcount reached zero",
+        "lifetime transition",
+        "rcu callback",
+        "retained stale reference",
+        "survived free",
+        "after reuse",
+    )
+    return any(marker in lowered_text for marker in evidence_markers)
+
+
+def _collect_analysis_text_for_oob_audit(analysis_step: VMCoreLLMAnalysisStep) -> str:
+    """汇总分析步骤文本，用于 OOB 因果方向审计。"""
+    chunks: list[str] = [
+        analysis_step.reasoning or "",
+        analysis_step.additional_notes or "",
+    ]
+    diagnosis = analysis_step.final_diagnosis
+    if diagnosis is not None:
+        chunks.extend(
+            [
+                diagnosis.root_cause,
+                diagnosis.detailed_analysis,
+                "\n".join(diagnosis.evidence),
+            ]
+        )
+    return "\n".join(chunk for chunk in chunks if chunk)
+
+
+def _looks_like_slab_oob_context(lowered_text: str) -> bool:
+    """判断文本是否处于 slab/kmalloc OOB 推理上下文。"""
+    oob_markers = (
+        "oob",
+        "out-of-bounds",
+        "out of bounds",
+        "overflow",
+    )
+    slab_markers = (
+        "slab",
+        "kmalloc",
+        "object",
+        "slot",
+    )
+    return any(marker in lowered_text for marker in oob_markers) and any(
+        marker in lowered_text for marker in slab_markers
+    )
+
+
+def _looks_like_reverse_direction_claim(lowered_text: str) -> bool:
+    """判断文本是否出现高地址写低地址的反向因果叙述。"""
+    reverse_markers = (
+        "higher-address",
+        "higher address",
+        "lower-address",
+        "lower address",
+        "previous slot",
+        "previous object",
+        "preceding object",
+        "toward lower",
+        "into lower",
+    )
+    return any(marker in lowered_text for marker in reverse_markers)
+
+
+def _find_reverse_address_flow_pair(text: str) -> tuple[str, str] | None:
+    """查找地址流叙述中 source > destination 的反向写入对。"""
+    for match in _ADDRESS_FLOW_RE.finditer(text):
+        src = match.group("src")
+        dst = match.group("dst")
+        try:
+            src_val = int(src, 16)
+            dst_val = int(dst, 16)
+        except ValueError:
+            continue
+        if src_val > dst_val:
+            return src, dst
+    return None
 
 
 def _lift_standalone_mcp_tool_out_of_run_script(

@@ -222,6 +222,11 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("## Driver-Private Object Overlay", prompt)
         self.assertIn("### Step A: Function Pointer Anchoring", prompt)
         self.assertIn("### Step D: Open Source Cross-Reference", prompt)
+        self.assertIn("### Step I: Slab OOB Directionality", prompt)
+        self.assertIn(
+            "a standard contiguous out-of-bounds write from object A extends from lower to higher addresses",
+            prompt,
+        )
         self.assertIn(
             "field type must drive the corruption-mechanism classification", prompt
         )
@@ -234,6 +239,31 @@ class PromptContractTests(unittest.TestCase):
         )
         self.assertIn("If the field type is dma_addr_t", prompt)
         self.assertIn("Do not conflate these mechanisms", prompt)
+
+    def test_analysis_prompt_requires_dma_minimum_evidence_gate(self) -> None:
+        prompt = self._driver_dma_prompt()
+
+        self.assertIn(
+            "you MUST satisfy at least TWO independent device-side evidence families",
+            prompt,
+        )
+        self.assertIn("DMA may remain only a possible corruption hypothesis", prompt)
+        self.assertIn(
+            'A sentence such as "software OOB cannot explain this value on the slab page" is forbidden',
+            prompt,
+        )
+
+    def test_analysis_prompt_does_not_allow_allocated_slot_to_imply_uaf(self) -> None:
+        prompt = self._driver_dma_prompt()
+
+        self.assertIn(
+            "type-identity mismatch alone is NOT enough",
+            prompt,
+        )
+        self.assertIn(
+            "Without that evidence, treat the slot as a live object whose contents were overwritten, type-confused, or otherwise corrupted",
+            prompt,
+        )
 
     def test_simplified_prompt_separates_root_cause_class_and_corruption_mechanism(
         self,
@@ -403,6 +433,10 @@ class PromptContractTests(unittest.TestCase):
         )
         self.assertNotIn(
             "Prefer `classify_saved_rip_frames_tool` for phantom-frame and saved-RIP classification. Only if the tool is unavailable or unproven may you fall back to manual frame-by-frame saved-RIP validation.",
+            prompt,
+        )
+        self.assertIn(
+            "DMA may remain only a possible corruption hypothesis",
             prompt,
         )
         self.assertEqual(
