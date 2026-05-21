@@ -18,6 +18,10 @@ README.md
 - **基于 MCP 的深度工具集成**：利用模型上下文协议 (MCP)，代理实现了与 Linux `crash` 工具的高保真连接。AI 不再是“盲目猜测”，而是根据推理路径动态地探索内存、反汇编代码并检索内核对象状态。
 - **执行器级安全防护**：内置 `action_guard` 模块，防止 LLM 执行资源消耗过大或高风险的命令（如在大系统上盲目执行 `bt -a`），同时通过命令去重机制确保分析效率，防止推理陷入死循环。
 - **透明的思考链报告**：每一次分析都会生成结构化的 Markdown 报告，完整记录每一步命令的执行意图、假设的验证过程以及基于证据的最终根因定界。
+- **双层分类体系 (Two-tier Crash Classification)**：系统在 `src/react/schema.py` 中规范了清晰的内核诊断双层分类。**表层签名类** (`CrashSignatureClass`) 从 Panic 字符串直接可观测的早期路由标签（如 `null_deref`、`use_after_free`、`stack_corruption`、`soft_lockup`、`hard_lockup`、`rcu_stall` 等），用于匹配对应的诊断剧本 (Playbook)。**深层根因类** (`RootCauseClass`) 则是经过深度调查和证据验证后确定的最终根本原因（如 `out_of_bounds`、`double_free`、`race_condition`、`dma_corruption`、`mce` 等）。
+- **检查点控制门 (Verification Gates)**：为了彻底解决大模型"幻觉"和"浅尝辄止地盲猜"的弊端，系统引入了验证门控制机制。针对不同的崩溃签名，系统硬性规定了必须关闭的"证明门控"（例如 `pointer_corruption` 必须关闭 `register_provenance`（寄存器来源溯源）、`object_lifetime`（对象生命周期审核）、`local_corruption_exclusion` 等门控）。在所有必需的门控达到 `closed`（已通过具体工具输出验证）或 `n/a`（确认不适用）状态前，系统严禁将诊断状态标记为已闭环 (`is_conclusive=true`)。
+- **精准的 e820 BIOS 内存映射验证与相邻页指纹提取**：`memorandum.txt` 证实了本系统的强悍表现——在遇到 `reserved` 物理页时，AI 会在不触发 seek error 的前提下，提取相邻物理页的指纹，进行精细的内存鉴证。系统将崩溃物理地址与 BIOS 内存映射表 (e820) 进行严格数学区间比对，从而判断内存是硬件保留还是启动后被特定设备 DMA 越界覆写，这种分析思路已达到资深内核专家的专业水准。
+- **长时间连接保持与流式传输**：内核 crash 工具在对数 GB 级的 vmcore 镜像进行大面积内存搜索 (search) 或加载庞大模块的调试符号时，耗时通常较长。FastAPI 服务端引入了独立的 Task 队列，以 15 秒为间隔向客户端发送心跳注释 (Keep-Alive Heartbeat)，即使单个底层操作耗时超过 2 分钟，客户端也能稳定连接并实时展示诊断进度节点。
 
 ## 架构设计
 
