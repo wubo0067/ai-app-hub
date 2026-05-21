@@ -384,6 +384,41 @@ class OutputParserAuditTests(unittest.TestCase):
         self.assertEqual(audited.root_cause_class, "use_after_free")
         self.assertEqual(audited.confidence, "high")
 
+    def test_keeps_allocated_slot_uaf_when_optimized_evidence_exists(self) -> None:
+        state = {
+            "messages": [
+                HumanMessage(
+                    content=(
+                        "crash> kmem -S ff1148f4a2171e80\n"
+                        "  FREE / [ALLOCATED]\n"
+                        "  [ff1148f4a2171e80]\n"
+                    )
+                )
+            ]
+        }
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 23,
+                "reasoning": (
+                    "The slab slot is allocated, but this is a classic slab reuse scenario "
+                    "where the irqaction was freed and then reallocated to mpt3sas, "
+                    "leaving a stale pointer in the irq_desc action list."
+                ),
+                "action": None,
+                "is_conclusive": True,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": "use_after_free",
+                "partial_dump": "partial",
+                "confidence": "high",
+            }
+        )
+
+        audited = apply_executor_consistency_audit(llm_step, state)
+
+        self.assertTrue(audited.is_conclusive)
+        self.assertEqual(audited.root_cause_class, "use_after_free")
+        self.assertEqual(audited.confidence, "high")
+
     def test_render_action_arguments_quotes_grep_alternation_pattern(self) -> None:
         rendered = render_action_arguments(
             ["-m", "|", "grep", "-Ei", "dma|iommu|mapping|buffer"]
