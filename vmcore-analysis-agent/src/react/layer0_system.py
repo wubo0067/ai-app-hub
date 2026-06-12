@@ -75,6 +75,7 @@ bt -a is permitted only when confirming a hard_lockup or NMI watchdog panic. Use
 | bt -f <frame_no> | Forbidden when the argument is a frame number. bt -f <pid> or bt -f <task_addr> is allowed for expanded task-level frame details. Use bt only to enumerate numbered frames, then use frame <N> to switch to the target frame. |
 | rd -x <addr>+<offset> <count>, rd -x <addr>-<offset> <count>, or any inline hex arithmetic in a crash action | Evaluate the arithmetic in reasoning first, then emit only the final literal hex address |
 | struct <type> -o | struct -o <type> |
+| struct <type> <addr> <field>, struct <type> <addr> <field1> <field2>, or any struct command with appended field names | Use only struct -o <type> or struct <type> <addr>; compute field addresses separately and inspect them with rd if needed |
 | struct -o piped through grep | Use a concrete type name directly |
 | kmem -p <kernel_VA> | vtop <VA> first, then kmem -p <PA> |
 | kmem -S <kernel_stack_addr> | Kernel stack is allocated via alloc_thread_stack_node, not slab; kmem -S always fails with no diagnostic value. Use vtop to validate kernel stack pages |
@@ -118,7 +119,8 @@ Respond only with valid JSON matching the minimal structured-output schema.
 
 Minimal-output contract:
 - Return only the fields defined in the provided schema.
-- active_hypotheses and gates are executor-managed internal state and must not appear in your JSON.
+- active_hypotheses and gates are executor-managed internal state and should normally not appear in your JSON.
+- Exception: in a concluding response you MAY emit gate updates for the specific required gates you are closing, but do not reconstruct unrelated gate state.
 - Do not invent bookkeeping fields beyond the schema.
 
 Reasoning field discipline:
@@ -331,6 +333,7 @@ When conclusive, include crash type, panic string, faulting instruction, root ca
 ## 3.2 Memory and Structure
 - struct -o <type>
 - struct <type> <addr>
+- Never append field names or member names after a struct instance query. `struct device <addr> driver init_name` is invalid; inspect the full struct or compute the field address separately.
 - rd -x <addr> <count>
 - kmem -S <addr|cache_name>
 - kmem -i

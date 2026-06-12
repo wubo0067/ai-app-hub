@@ -43,8 +43,14 @@ class StateManagerTests(unittest.TestCase):
         self.assertEqual(step.active_hypotheses[0].status, "leading")
         self.assertEqual(step.active_hypotheses[0].label, "pointer_corruption")
         self.assertEqual(step.gates["register_provenance"].status, "open")
-        self.assertEqual(step.gates["external_corruption_gate"].status, "blocked")
-        self.assertEqual(step.gates["field_type_classification"].status, "open")
+        self.assertIn(
+            "does not require proving the upstream overflow",
+            step.gates["register_provenance"].evidence,
+        )
+        self.assertEqual(step.gates["object_lifetime"].status, "open")
+        self.assertEqual(step.gates["local_corruption_exclusion"].status, "open")
+        self.assertNotIn("external_corruption_gate", step.gates)
+        self.assertNotIn("field_type_classification", step.gates)
         self.assertEqual(updates["current_signature_class"], "pointer_corruption")
 
     def test_reuses_prior_managed_state_when_llm_omits_signature(self) -> None:

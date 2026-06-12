@@ -407,6 +407,27 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
         if parts == ["struct", "-o"]:
             return "bare struct -o is forbidden; use struct -o <type>."
 
+        if len(parts) < 2:
+            return "struct command is incomplete; use struct -o <type> or struct <type> <addr>."
+
+        if parts[1] == "-o":
+            if len(parts) != 3:
+                return (
+                    "struct layout queries only allow the form 'struct -o <type>'; "
+                    "do not append field names or extra operands."
+                )
+        else:
+            if parts[1].startswith("-"):
+                return (
+                    "struct only allows 'struct -o <type>' or 'struct <type> <addr>'; "
+                    "other flag forms are forbidden."
+                )
+            if len(parts) > 3:
+                return (
+                    "struct instance queries only allow 'struct <type>' or 'struct <type> <addr>'; "
+                    "do not append field names such as 'driver' or 'init_name'."
+                )
+
     # rd 命令检查：必须提供地址目标
     if command == "rd":
         if all(part.startswith("-") for part in parts[1:]):

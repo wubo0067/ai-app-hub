@@ -84,7 +84,8 @@ def build_analysis_system_prompt(state: AgentState, *, is_last_step: bool) -> st
     prompt_parts.append(
         "[STRUCTURED OUTPUT CONTRACT]\n"
         "active_hypotheses and gates are executor-managed. "
-        "Omit them entirely from your JSON and return only the minimal schema fields."
+        "Normally omit them from your JSON and return only the minimal schema fields. "
+        "Exception: when you are concluding or explicitly closing a blocker, you MAY emit gate updates for the required gates you are closing, and only those gates."
     )
 
     if is_last_step:
@@ -455,6 +456,11 @@ def _format_next_gate_objective(raw_gates: object) -> str:
             prerequisite = gate.prerequisite or "missing prerequisite"
             return f"unblock {gate_name} by advancing prerequisite {prerequisite}"
         if gate.status == "open":
+            if gate_name == "register_provenance":
+                return (
+                    "close register_provenance by tracing the bad register back to the exact source object "
+                    "and field/offset that produced the operand"
+                )
             return f"advance {gate_name} toward closed or n/a with concrete evidence"
 
     return "no outstanding gate"
@@ -474,6 +480,12 @@ def _format_reasoning_gate_contract(raw_gates: object) -> str:
                 "and state the expected evidence needed to unblock or advance the gate"
             )
         if gate.status == "open":
+            if gate_name == "register_provenance":
+                return (
+                    "name target gate register_provenance, explain which concrete source object and field/offset "
+                    "must be identified next, and state how the next action will close the bad-register chain. "
+                    "Do not demand proof of the ultimate overflow writer to close this gate"
+                )
             return (
                 f"name target gate {gate_name}, explain why the next action advances it, "
                 "and state the expected gate transition or evidence needed next"

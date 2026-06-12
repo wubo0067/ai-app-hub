@@ -259,6 +259,16 @@ class ActionGuardTests(unittest.TestCase):
         )
         self.assertIn("does not accept comma-appended offsets", error)
 
+    def test_rejects_struct_instance_query_with_appended_field_names(self) -> None:
+        error = validate_tool_call_request(
+            "struct",
+            {"command": "struct device ff1149f3d327a0b8 driver init_name"},
+        )
+        self.assertIn(
+            "struct instance queries only allow 'struct <type>' or 'struct <type> <addr>'",
+            error,
+        )
+
     def test_rejects_symbol_on_symbol_arithmetic(self) -> None:
         error = validate_tool_call_request(
             "run_script",

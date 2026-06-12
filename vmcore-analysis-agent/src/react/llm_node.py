@@ -29,6 +29,21 @@ from .state_manager import project_managed_analysis_step
 from src.utils.logging import logger
 
 
+def _reasoning_signals_convergence(reasoning: str) -> bool:
+    lowered = (reasoning or "").lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "i now have enough to conclude",
+            "enough to conclude",
+            "all evidence converges",
+            "convergence criteria are satisfied",
+            "i can now conclude",
+            "root cause is identified",
+        )
+    )
+
+
 async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
     """
     调用 LLM 分析节点，根据收集到的 vmcore 信息进行智能分析。
@@ -78,14 +93,33 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
     # is_last_step=true：强制停止继续查工具，要求输出终态结果
     last_msg = messages_to_send[-1] if messages_to_send else None
     if isinstance(last_msg, AIMessage) and not last_msg.tool_calls:
+        last_step = None
+        try:
+            raw = (
+                last_msg.content
+                if isinstance(last_msg.content, str)
+                else json.dumps(last_msg.content)
+            )
+            last_step = VMCoreAnalysisStep.model_validate_json(raw)
+        except Exception:
+            last_step = None
+
         logger.warning(
             "Last message was an AIMessage without tool calls. Injecting HumanMessage to force progress."
         )
         messages_to_send.append(
             HumanMessage(
                 content=(
-                    "Your previous response neither invoked any tools nor provided a valid terminal state. "
-                    "You cannot remain in this state. "
+                    (
+                        "Your previous response already states that the evidence is sufficient to conclude. "
+                        "Do NOT request more tools. Convert the current evidence into a final structured conclusion now. "
+                        "If your remaining blocker is only gate bookkeeping, emit the specific gate updates needed to close the required gates, set action=null, set is_conclusive=true, and provide final_diagnosis. "
+                        if last_step is not None
+                        and last_step.root_cause_class not in {None, "unknown"}
+                        and _reasoning_signals_convergence(last_step.reasoning)
+                        else "Your previous response neither invoked any tools nor provided a valid terminal state. "
+                        "You cannot remain in this state. "
+                    )
                     + (
                         "This is the last step: do not call tools; either return a conclusive result with final_diagnosis, "
                         "or return a bounded non-conclusive result with action=null and explicit verification gaps."

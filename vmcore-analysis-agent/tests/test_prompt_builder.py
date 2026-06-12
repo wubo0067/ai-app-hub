@@ -87,7 +87,7 @@ class PromptBuilderTests(unittest.TestCase):
             section,
         )
         self.assertIn(
-            "Current gate objective: advance register_provenance toward closed or n/a with concrete evidence",
+            "Current gate objective: close register_provenance by tracing the bad register back to the exact source object and field/offset that produced the operand",
             section,
         )
         self.assertIn(
@@ -95,7 +95,7 @@ class PromptBuilderTests(unittest.TestCase):
             section,
         )
         self.assertIn(
-            "Reasoning gate contract: name target gate register_provenance, explain why the next action advances it, and state the expected gate transition or evidence needed next",
+            "Reasoning gate contract: name target gate register_provenance, explain which concrete source object and field/offset must be identified next, and state how the next action will close the bad-register chain.",
             section,
         )
         self.assertIn("Commands already run (do not repeat):", section)
@@ -447,6 +447,10 @@ class PromptBuilderTests(unittest.TestCase):
             layered_prompt,
         )
         self.assertIn("leave final_diagnosis null", layered_prompt)
+        self.assertIn(
+            "you MAY emit gate updates for the specific required gates you are closing",
+            layered_prompt,
+        )
         self.assertNotIn(
             "Set is_conclusive to true and do NOT request any further tool calls",
             layered_prompt,

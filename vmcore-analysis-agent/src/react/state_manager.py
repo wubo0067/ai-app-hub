@@ -200,8 +200,14 @@ def _build_managed_gates(
     if not required:
         return None
 
+    gate_names = list(required)
+    if signature_class == "pointer_corruption":
+        for gate_name in ("external_corruption_gate", "field_type_classification"):
+            if gate_name in (llm_gates or {}) or gate_name in (prior_gates or {}):
+                gate_names.append(gate_name)
+
     managed: Dict[str, GateEntry] = {}
-    for gate_name in required:
+    for gate_name in gate_names:
         llm_gate = (llm_gates or {}).get(gate_name)
         if llm_gate is not None:
             managed[gate_name] = GateEntry(
@@ -234,6 +240,17 @@ def _build_managed_gates(
                 evidence=(
                     "Managed by executor state: awaiting source-level field typing via "
                     "function-pointer anchoring, source cross-reference, or defensible offset inference."
+                ),
+            )
+        elif gate_name == "register_provenance":
+            managed[gate_name] = GateEntry(
+                required_for=[signature_class],
+                status="open",
+                prerequisite=None,
+                evidence=(
+                    "Managed by executor state: identify the exact bad operand source by closing the "
+                    "faulting-register chain back to a concrete source object and field/offset. This gate "
+                    "does not require proving the upstream overflow or final writer mechanism."
                 ),
             )
         else:

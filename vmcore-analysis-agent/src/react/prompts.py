@@ -91,7 +91,8 @@ _ANALYSIS_PROMPT_COMPATIBILITY_APPENDIX = f"""
 
 ### Minimal-Output Contract Reminder
 
-- active_hypotheses and gates are executor-managed internal state and MUST NOT appear in your JSON.
+- active_hypotheses and gates are executor-managed internal state and should normally not appear in your JSON.
+- Exception: in a concluding response you MAY emit gate updates for the specific required gates you are closing, but do not reconstruct unrelated gate state.
 
 ### Type Validation Guardrails
 
@@ -629,6 +630,7 @@ def simplified_structure_reasoning_prompt() -> str:
         "- If labels like 'field_type_misuse', 'missing_conversion', 'write_corruption', or 'reinit_path_bug' appear "
         "in root_cause_class, that is a schema error and must be corrected before you answer\n"
         "- Any action containing a pipeline character '|' MUST use command_name='run_script' and store the full command line as a single string in arguments\n"
+        "- For struct actions, use ONLY one of these forms: 'struct -o <type>' or 'struct <type> <addr>'. Never append field names such as 'driver' or 'init_name' after the address; compute a concrete field address separately if needed\n"
         "- DO NOT attempt to reconstruct complex hypothesis lists or gate statuses\n"
         "- Output MUST be valid JSON with ONLY the required fields above\n\n"
         "Schema for required fields only:\n"

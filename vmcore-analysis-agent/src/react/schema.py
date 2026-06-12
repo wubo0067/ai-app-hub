@@ -792,8 +792,6 @@ class VMCoreAnalysisStep(BaseModel):
             "register_provenance",
             "object_lifetime",
             "local_corruption_exclusion",
-            "external_corruption_gate",
-            "field_type_classification",
         ],
         "null_deref": ["register_provenance"],
         "use_after_free": ["register_provenance", "object_lifetime"],
