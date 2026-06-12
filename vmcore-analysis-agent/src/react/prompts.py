@@ -7,13 +7,21 @@
 from .prompt_layers import LAYER0_SYSTEM_PROMPT_TEMPLATE, PLAYBOOKS, SOP_FRAGMENTS
 from .prompt_overlays import DRIVER_OBJECT_OVERLAY, STACK_CORRUPTION_OVERLAY
 from .prompt_phrases import (
+    CANARY_RESIDUAL_DATA_RULE,
+    CANARY_SLOT_ONLY_SCOPE_NOTE,
     CANARY_POINTER_VALUE_PARTIAL_DUMP_RULE,
     CANARY_POINTER_VALUE_RULE,
+    LITERAL_ADDRESS_RULE,
+    SLAB_OOB_DIRECTION_RULE,
     STACK_CAUSALITY_RED_LINE_RULE,
 )
 from .schema import (
+    get_confidence_aliases,
+    get_confidence_values,
     get_corruption_mechanism_aliases,
     get_corruption_mechanism_values,
+    get_driver_inference_method_aliases,
+    get_driver_inference_method_values,
     get_partial_dump_values,
     get_root_cause_class_aliases,
     get_root_cause_class_values,
@@ -32,6 +40,8 @@ def _invalid_aliases_text() -> str:
             *get_signature_class_aliases().keys(),
             *get_root_cause_class_aliases().keys(),
             *get_corruption_mechanism_aliases().keys(),
+            *get_driver_inference_method_aliases().keys(),
+            *get_confidence_aliases().keys(),
         }
     )
     return _quote_values(tuple(aliases))
@@ -49,11 +59,30 @@ def build_minimal_schema_enum_contract() -> str:
         f"- signature_class: {_quote_values(get_signature_class_values())}\n"
         f"- root_cause_class: {_quote_values(get_root_cause_class_values())}\n"
         f"- corruption_mechanism: {_quote_values(get_corruption_mechanism_values())}\n"
+        f"- driver_source_evidence.inference_method: {_quote_values(get_driver_inference_method_values())}\n"
+        f"- confidence: {_quote_values(get_confidence_values())}\n"
         f"- partial_dump: {_quote_values(get_partial_dump_values())}\n"
-        "Do not emit aliases or shorthand in final JSON. Normalize them to canonical schema values first.\n"
+        "Do not emit aliases, descriptive prose, or shorthand in final JSON. Normalize them to canonical schema values first.\n"
         f"- signature_class aliases to normalize: {_quote_alias_map(get_signature_class_aliases())}\n"
         f"- root_cause_class aliases to normalize: {_quote_alias_map(get_root_cause_class_aliases())}\n"
-        f"- corruption_mechanism aliases to normalize: {_quote_alias_map(get_corruption_mechanism_aliases())}"
+        f"- corruption_mechanism aliases to normalize: {_quote_alias_map(get_corruption_mechanism_aliases())}\n"
+        f"- driver_source_evidence.inference_method aliases to normalize: {_quote_alias_map(get_driver_inference_method_aliases())}\n"
+        f"- confidence aliases to normalize: {_quote_alias_map(get_confidence_aliases())}\n"
+        "If driver_source_evidence is present and the method is uncertain, set inference_method to 'unknown'."
+    )
+
+
+def build_structure_reasoning_force_conclusion(*, is_last_step: bool) -> str:
+    """构造 structured fallback 使用的最后一步附加约束。"""
+    if not is_last_step:
+        return ""
+
+    return (
+        "IMPORTANT: This is the LAST STEP. Do not request tools; action must be null. "
+        "Set is_conclusive=true ONLY if the reasoning explicitly satisfies the Layer0 "
+        "convergence criteria and contains a supported final diagnosis. "
+        "If mandatory verification gaps remain, set is_conclusive=false and summarize "
+        "the bounded non-conclusive findings in reasoning.\n\n"
     )
 
 
@@ -62,7 +91,8 @@ _ANALYSIS_PROMPT_COMPATIBILITY_APPENDIX = f"""
 
 ### Minimal-Output Contract Reminder
 
-- active_hypotheses and gates are executor-managed internal state and MUST NOT appear in your JSON.
+- active_hypotheses and gates are executor-managed internal state and should normally not appear in your JSON.
+- Exception: in a concluding response you MAY emit gate updates for the specific required gates you are closing, but do not reconstruct unrelated gate state.
 
 ### Type Validation Guardrails
 
@@ -73,11 +103,8 @@ Q4 — Offset coverage:
 
 ### Address Arithmetic Discipline
 
-- this agent forbids emitting address arithmetic directly in crash actions.
-- This agent forbids emitting address arithmetic directly in crash actions.
-- Never emit rd -x <addr>+<offset> <count>, rd -x <addr>-<offset> <count>, or any similar inline arithmetic as the final action.
+- {LITERAL_ADDRESS_RULE}
 - This prohibition applies to rd, struct, dis, ptov, vtop, search, kmem, and every other crash command that takes an address operand.
-- Pre-compute the final literal address first, then issue rd, struct, or related commands against that literal target.
 - Good example:
     reasoning: "ffff8b817de17a10 - 0x40 = ffff8b817de179d0"
     action: "rd -x ffff8b817de179d0 16"
@@ -89,7 +116,7 @@ Q4 — Offset coverage:
 
 - {CANARY_POINTER_VALUE_RULE}
 - {CANARY_POINTER_VALUE_PARTIAL_DUMP_RULE}
-- ⛔ CANARY INVARIANT: The stack protector prologue unconditionally writes the canary at function entry. Therefore "pre-fault residual-stack pollution" is NOT a valid canary corruption mechanism. Only writes occurring DURING the canary-bearing function's execution can corrupt the canary.
+- ⛔ {CANARY_RESIDUAL_DATA_RULE} {CANARY_SLOT_ONLY_SCOPE_NOTE}
 - Before finalizing, explicitly evaluate these mechanism families: self-frame local overflow (the canary-bearing function's own code or its unprotected leaf callees), exception-path local overwrite, and current/current->field spill or copy overflow.
 - Prefer `resolve_stack_canary_slot` for canary-slot and frame-pointer-chain closure. Only if the tool is unavailable or unproven may you fall back to verified RBP arithmetic; never scan the stack for recognizable values and reverse-justify the address.
 - Final diagnosis must either identify the most supported mechanism family or explicitly bound the remaining open set and explain why dump limitations prevent closure.
@@ -105,12 +132,12 @@ Q4 — Offset coverage:
 
 ### Review Red-Line Rule: Exception-Boundary Overflow Claims
 
-- Reject any conclusion that blames handle_mm_fault or another exception-path frame for canary corruption, or blames an interrupted pre-fault frame for a handler-frame canary, when the only support is relative stack position or ordinary downward-stack reasoning across a page-fault, interrupt, NMI, or similar exception boundary.
+- Reject any conclusion that blames a specific exception-path frame for canary corruption, or blames an interrupted pre-fault frame for a handler-frame canary, when the only support is relative stack position or ordinary downward-stack reasoning across a page-fault, interrupt, NMI, or similar exception boundary.
 - Such claims are invalid until the analysis explicitly proves frame provenance, exception-entry layout, and active overlap of the relevant stack regions.
 
 ### Review Red-Line Rule: Evidence-Free Suspect Promotion
 
-- Reject any conclusion that names handle_mm_fault or any other function as the likely overflow source when the support is only a non-trivial stack allocation, a deep in-function offset, or vague statements such as "large stack frame" or "complex routine with substantial local state."
+- Reject any conclusion that names a specific function as the likely overflow source when the support is only a non-trivial stack allocation, a deep in-function offset, or vague statements such as "large stack frame" or "complex routine with substantial local state."
 - A suspect function must be tied to the corrupted slot by concrete write evidence: an overflow-capable local object, a copy or store primitive, validated overlap arithmetic, or stack-byte provenance. Otherwise the result must remain provisional.
 
 ### Review Red-Line Rule: Stack-Resident Code Pointer Is Not Writer Proof
@@ -122,8 +149,8 @@ Q4 — Offset coverage:
 ### Review Red-Line Rule: Active Call Chain First
 
 - When the panic task remains on a coherent non-exception path, inspect that live chain before promoting exception handlers to suspects.
-- Example: if the active path is sys_open -> do_filp_open -> path_openat -> do_last -> link_path_walk -> inode_permission, those VFS/open-path frames must be audited with disassembly and stack-layout reasoning before any blame shifts to handle_mm_fault or fault.c.
-- A final recommendation that jumps directly from a stack-resident handle_mm_fault return site to arch/x86/mm/fault.c is incomplete unless the active syscall-path frames have already been checked and ruled down.
+- Example: if the active path remains a coherent syscall or subsystem path, those live frames must be audited with disassembly and stack-layout reasoning before any blame shifts to an exception handler or generic fault path.
+- A final recommendation that jumps directly from a stack-resident exception-handler return site to a generic fault handler is incomplete unless the active non-exception path has already been checked and ruled down.
 
 ### Review Red-Line Rule: Current-Valued Canary Requires Spill Proof
 
@@ -134,10 +161,16 @@ Q4 — Offset coverage:
 
 - {STACK_CAUSALITY_RED_LINE_RULE}
 
+### Review Red-Line Rule: Reverse Slab OOB Claims
+
+- {SLAB_OOB_DIRECTION_RULE}
+- Reject any root-cause claim that relies on a standard forward OOB write from a higher-address slab object into a lower-address victim object.
+- If a reverse-direction claim remains, it must be explicitly downgraded to a non-standard primitive hypothesis and supported with concrete write-path evidence.
+
 ### Review Red-Line Rule: Invalid Caller-Edge Narratives
 
 - Reject any conclusion that narrates two adjacent corrupted-backtrace frames as a proven ordinary caller-callee edge when static code structure does not support that edge, or when the edge crosses unrelated subsystems without a proven exception bridge.
-- Examples include treating a VFS permission helper as if it ordinarily called zone_statistics, or treating a scan-derived ? frame adjacency as a real call chain.
+- Examples include treating two helpers from unrelated subsystems as an ordinary direct call chain, or treating a scan-derived ? frame adjacency as a real call chain.
 - In such cases the analysis must first downgrade bt reliability and choose among bounded explanations such as exception-path splice, stack-scan artifact, stale-frame residue, or corrupted saved return path. It must not invent a normal call edge, and it must not promote a specific RIP-jump theory without validating saved return addresses or frame provenance.
 
 ### No-Op Command Hygiene
@@ -426,7 +459,7 @@ def _select_prompt_overlays(
     return overlays
 
 
-def analysis_crash_prompt(
+def analysis_crash_prompt_legacy_deprecated(
     *,
     signature_class: str | None = None,
     recent_text: str = "",
@@ -435,10 +468,10 @@ def analysis_crash_prompt(
     enabled_gates: set[str] | None = None,
 ) -> str:
     """
-    构建用于崩溃分析（Crash Analysis）的完整 Prompt 字符串。
+    已弃用的旧版完整 Prompt 组装器。
 
-    该函数通过组合多个层级的 Prompt 片段（System Prompt, Playbook, Overlays, SOP Fragments 等）
-    来构建一个结构化的、上下文丰富的指令，引导 LLM 进行深入的内核崩溃根因分析。
+    主执行路径已经迁移到 prompt_builder.build_analysis_system_prompt()。
+    这里保留旧接口仅用于测试、对比和离线调试，避免双路径继续被误当作 runtime source of truth。
 
     Args:
         signature_class: 崩溃特征类（Signature Class），用于匹配特定的分析策略（Playbook）。
@@ -483,6 +516,29 @@ def analysis_crash_prompt(
 
     # 使用两个换行符将所有非重复的 Prompt 片段连接成一个完整的文本块
     return "\n\n".join(sections)
+
+
+def analysis_crash_prompt(
+    *,
+    signature_class: str | None = None,
+    recent_text: str = "",
+    root_cause_class: str | None = None,
+    step_count: int = 0,
+    enabled_gates: set[str] | None = None,
+) -> str:
+    """
+    兼容保留的 legacy 包装器。
+
+    主运行时路径使用 prompt_builder.build_analysis_system_prompt()。
+    新代码不应再把本函数当作运行时主路径；保留它仅用于测试和 prompt 合同回归。
+    """
+    return analysis_crash_prompt_legacy_deprecated(
+        signature_class=signature_class,
+        recent_text=recent_text,
+        root_cause_class=root_cause_class,
+        step_count=step_count,
+        enabled_gates=enabled_gates,
+    )
 
 
 def crash_init_data_prompt() -> str:
@@ -570,9 +626,11 @@ def simplified_structure_reasoning_prompt() -> str:
         "- For root_cause_class, use 'stack_corruption' when stack damage is confirmed but the deeper mechanism is not yet proven. Use 'unknown' only when the reasoning bounds the failure family but still cannot isolate a canonical root-cause value\n"
         "- corruption_mechanism is narrower than root_cause_class. Put labels like 'field_type_misuse' or "
         "'missing_conversion' there, NEVER in root_cause_class\n"
+        "- By schema definition, corruption_mechanism='reinit_path_bug' implies root_cause_class='race_condition'. Use that pairing explicitly when the reasoning supports a reinit-path bug\n"
         "- If labels like 'field_type_misuse', 'missing_conversion', 'write_corruption', or 'reinit_path_bug' appear "
         "in root_cause_class, that is a schema error and must be corrected before you answer\n"
         "- Any action containing a pipeline character '|' MUST use command_name='run_script' and store the full command line as a single string in arguments\n"
+        "- For struct actions, use ONLY one of these forms: 'struct -o <type>' or 'struct <type> <addr>'. Never append field names such as 'driver' or 'init_name' after the address; compute a concrete field address separately if needed\n"
         "- DO NOT attempt to reconstruct complex hypothesis lists or gate statuses\n"
         "- Output MUST be valid JSON with ONLY the required fields above\n\n"
         "Schema for required fields only:\n"

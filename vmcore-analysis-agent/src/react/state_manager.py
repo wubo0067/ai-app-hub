@@ -65,6 +65,7 @@ def project_managed_analysis_step(
     gates = _build_managed_gates(
         signature_class,
         state.get("managed_gates"),
+        llm_step.gates,
     )
 
     # 构造最终的 VMCoreAnalysisStep 对象，将 LLM 的原始数据与补全后的上下文进行合并
@@ -163,6 +164,7 @@ def _build_managed_hypotheses(
 def _build_managed_gates(
     signature_class: Optional[CrashSignatureClass],
     prior_gates: Optional[Dict[str, GateEntry]],
+    llm_gates: Optional[Dict[str, GateEntry]],
 ) -> Optional[Dict[str, GateEntry]]:
     """
     构建受管理的门控（gate）集合。
@@ -198,8 +200,24 @@ def _build_managed_gates(
     if not required:
         return None
 
+    gate_names = list(required)
+    if signature_class == "pointer_corruption":
+        for gate_name in ("external_corruption_gate", "field_type_classification"):
+            if gate_name in (llm_gates or {}) or gate_name in (prior_gates or {}):
+                gate_names.append(gate_name)
+
     managed: Dict[str, GateEntry] = {}
-    for gate_name in required:
+    for gate_name in gate_names:
+        llm_gate = (llm_gates or {}).get(gate_name)
+        if llm_gate is not None:
+            managed[gate_name] = GateEntry(
+                required_for=[signature_class],
+                status=llm_gate.status,
+                prerequisite=llm_gate.prerequisite,
+                evidence=llm_gate.evidence,
+            )
+            continue
+
         # 若历史门控中存在该门控，深拷贝其状态作为初始值
         previous = (prior_gates or {}).get(gate_name)
         if previous is not None:
@@ -222,6 +240,17 @@ def _build_managed_gates(
                 evidence=(
                     "Managed by executor state: awaiting source-level field typing via "
                     "function-pointer anchoring, source cross-reference, or defensible offset inference."
+                ),
+            )
+        elif gate_name == "register_provenance":
+            managed[gate_name] = GateEntry(
+                required_for=[signature_class],
+                status="open",
+                prerequisite=None,
+                evidence=(
+                    "Managed by executor state: identify the exact bad operand source by closing the "
+                    "faulting-register chain back to a concrete source object and field/offset. This gate "
+                    "does not require proving the upstream overflow or final writer mechanism."
                 ),
             )
         else:

@@ -34,15 +34,32 @@ if [ ! -f "$SO_PATH" ]; then
 fi
 
 TARGET_SO_NAME=$(basename "$SO_FILE")
+TARGET_DIR="/usr/lib64/crash/extensions"
 
-# 拷贝到 /usr/local/lib 路径下
-echo "正在拷贝 $SO_PATH 到 /usr/local/lib/$TARGET_SO_NAME ..."
-sudo cp "$SO_PATH" "/usr/local/lib/$TARGET_SO_NAME"
+# 确保目标目录存在
+if [ ! -d "$TARGET_DIR" ]; then
+    echo "目录 $TARGET_DIR 不存在，正在创建..."
+    sudo mkdir -p "$TARGET_DIR"
+fi
+
+# 拷贝到目标路径下
+echo "正在拷贝 $SO_PATH 到 $TARGET_DIR/$TARGET_SO_NAME ..."
+sudo cp "$SO_PATH" "$TARGET_DIR/$TARGET_SO_NAME"
 
 if [ $? -eq 0 ]; then
     echo "安装成功！"
-    echo "请在运行 crash 后输入指令: extend /usr/local/lib/$TARGET_SO_NAME 即可加载扩展。"
 else
     echo "安装失败，请检查是否具备 sudo 权限或目标路径是否可写。"
     exit 1
+fi
+
+# 自动写入 ~/.crashrc
+# 先检查是否已经配置过，避免重复写入
+grep -q "$TARGET_SO_NAME" ~/.crashrc 2>/dev/null
+if [ $? -ne 0 ]; then
+    echo "正在配置 crash 自动加载插件..."
+    echo "extend $TARGET_DIR/$TARGET_SO_NAME" >> ~/.crashrc
+    echo "配置完成。"
+else
+    echo "配置已存在，无需重复操作。"
 fi

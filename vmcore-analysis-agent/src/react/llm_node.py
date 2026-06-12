@@ -20,12 +20,28 @@ from .llm_runtime import ainvoke_with_retry, compress_messages_for_llm
 from .llm_runtime import compute_adaptive_max_tokens
 from .prompt_builder import build_analysis_system_prompt, build_executor_state_section
 from .prompts import (
+    build_structure_reasoning_force_conclusion,
     crash_init_data_prompt,
     simplified_structure_reasoning_prompt,
 )
 from .schema import VMCoreAnalysisStep, VMCoreLLMAnalysisStep
 from .state_manager import project_managed_analysis_step
 from src.utils.logging import logger
+
+
+def _reasoning_signals_convergence(reasoning: str) -> bool:
+    lowered = (reasoning or "").lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "i now have enough to conclude",
+            "enough to conclude",
+            "all evidence converges",
+            "convergence criteria are satisfied",
+            "i can now conclude",
+            "root cause is identified",
+        )
+    )
 
 
 async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
@@ -51,11 +67,11 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
 
     # 准备系统消息，包含诊断知识库和输出格式
     # 检查是否是最后一步 (LangGraph recursion_limit 触发前)
-    # 如果是最后一步，要求 LLM 必须给出最终结论，停止工具调用
+    # 如果是最后一步，要求 LLM 停止工具调用并给出终止响应；该响应可以是有界的非结论总结
     is_last_step = state.get("is_last_step", False)
     if is_last_step:
         logger.warning(
-            f"Agent reached the last step (is_last_step=True). Forcing conclusion."
+            f"Agent reached the last step (is_last_step=True). Forcing a terminal response with no further tool calls."
         )
 
     system_message = build_analysis_system_prompt(
@@ -72,19 +88,47 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         f"Prepared messages for LLM analysis (step {current_step}): {[type(m).__name__ for m in messages_to_send]} with system prompt length {len(system_message)} and adaptive max_tokens {adaptive_max_tokens}"
     )
 
-    # 如果上一条消息是 AIMessage 且没有工具调用，说明在此之前发生过 fallback（如 LLM 返回了无效的动作或未提供结论）
-    # 增加一条 HumanMessage 提示 LLM 不能空转
+    # 这段代码既不是单纯让 LLM 终止推理，也不是单纯让它继续推理。它的真实作用是防止 agent 空转，并根据 is_last_step 决定：
+    # is_last_step=false：优先推动继续诊断，必要时允许有边界地收口
+    # is_last_step=true：强制停止继续查工具，要求输出终态结果
     last_msg = messages_to_send[-1] if messages_to_send else None
     if isinstance(last_msg, AIMessage) and not last_msg.tool_calls:
+        last_step = None
+        try:
+            raw = (
+                last_msg.content
+                if isinstance(last_msg.content, str)
+                else json.dumps(last_msg.content)
+            )
+            last_step = VMCoreAnalysisStep.model_validate_json(raw)
+        except Exception:
+            last_step = None
+
         logger.warning(
-            "Last message was an AIMessage without tool calls. Injecting HumanMessage to force action or conclusion."
+            "Last message was an AIMessage without tool calls. Injecting HumanMessage to force progress."
         )
         messages_to_send.append(
             HumanMessage(
                 content=(
-                    "Your previous response neither invoked any tools nor concluded the analysis (is_conclusive=false). "
-                    "You cannot remain in this state. Please EITHER call a tool out of the available options to "
-                    "gather more information, OR set 'is_conclusive'=true and provide your final_diagnosis."
+                    (
+                        "Your previous response already states that the evidence is sufficient to conclude. "
+                        "Do NOT request more tools. Convert the current evidence into a final structured conclusion now. "
+                        "If your remaining blocker is only gate bookkeeping, emit the specific gate updates needed to close the required gates, set action=null, set is_conclusive=true, and provide final_diagnosis. "
+                        if last_step is not None
+                        and last_step.root_cause_class not in {None, "unknown"}
+                        and _reasoning_signals_convergence(last_step.reasoning)
+                        else "Your previous response neither invoked any tools nor provided a valid terminal state. "
+                        "You cannot remain in this state. "
+                    )
+                    + (
+                        "This is the last step: do not call tools; either return a conclusive result with final_diagnosis, "
+                        "or return a bounded non-conclusive result with action=null and explicit verification gaps."
+                        if is_last_step
+                        else "Please EITHER call a compliant tool out of the available options to gather more information, "
+                        "OR, if no further tool can reduce uncertainty, return a bounded non-conclusive result with "
+                        "action=null and explicit verification gaps. Set 'is_conclusive'=true with final_diagnosis "
+                        "ONLY if the convergence criteria are actually satisfied."
+                    )
                 )
             )
         )
@@ -185,7 +229,8 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
 
         # 手动构造 AIMessage 以便 edges.py 识别路由。
         # 如果 LLM 决定调用工具 (action 不为空)，我们需要手动填充 tool_calls
-        # 安全屏障：当 is_last_step=True 时，强制清除 action，阻止生成 tool_calls
+        # 安全屏障：当 is_last_step=True 时，强制清除 action，阻止生成 tool_calls。
+        # 最后一步允许 bounded non-conclusive 结束，但不允许继续请求工具。
         tool_calls = build_tool_calls(analysis_result, is_last_step=is_last_step)
 
         # 将结构化后的对象序列化存入 content，并携带调用的工具信息
@@ -258,9 +303,9 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
 
     # 构建简化结构化提示（只提取核心字段）
 
-    force_conclusion = ""
-    if is_last_step:
-        force_conclusion = "IMPORTANT: This is the LAST STEP. You MUST set 'is_conclusive' to true and 'action' to null.\n\n"
+    force_conclusion = build_structure_reasoning_force_conclusion(
+        is_last_step=is_last_step
+    )
 
     system_prompt = simplified_structure_reasoning_prompt().format(
         current_step=current_step,

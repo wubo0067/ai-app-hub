@@ -23,6 +23,18 @@ from .nodes import (
 )
 
 
+def _parse_analysis_step(message: AIMessage) -> VMCoreAnalysisStep | None:
+    try:
+        raw = (
+            message.content
+            if isinstance(message.content, str)
+            else json.dumps(message.content)
+        )
+        return VMCoreAnalysisStep.model_validate_json(raw)
+    except Exception:
+        return None
+
+
 def should_continue(state: AgentState) -> str:
     """
     根据当前 AgentState 决定下一步执行的节点。
@@ -69,36 +81,46 @@ def should_continue(state: AgentState) -> str:
             return crash_tool_node
         else:
             # If the LLM returned no tool calls but also is_conclusive=False,
-            # route back to llm_analysis_node so it can produce a final conclusion.
-            # LangGraph's recursion_limit acts as the safety net against infinite loops.
+            # allow at most one retry. A repeated no-tool/non-conclusive AIMessage means
+            # the retry prompt did not unblock progress, so keep the bounded non-conclusive
+            # result instead of looping until recursion_limit.
             if not is_last_step:
-                try:
-                    raw = (
-                        last_message.content
-                        if isinstance(last_message.content, str)
-                        else json.dumps(last_message.content)
-                    )
-                    step_obj = VMCoreAnalysisStep.model_validate_json(raw)
-                    if not step_obj.is_conclusive:
-                        # Sometimes json_repair fixes a truncated model output and sets is_conclusive=False
-                        # by default, even though final_diagnosis is populated. Check if we actually have
-                        # a final_diagnosis, and if so, consider it conclusive to prevent an infinite loop.
-                        if step_obj.final_diagnosis is not None:
-                            logger.info(
-                                "LLM returned is_conclusive=False but final_diagnosis is populated. "
-                                "Treating as conclusive to prevent infinite loop. Routing to __end__."
-                            )
-                            return "__end__"
-
-                        logger.warning(
-                            "LLM returned no tool calls but is_conclusive=False "
-                            "(step %s). Routing back to %s to force a conclusion.",
-                            step_obj.step_id,
-                            llm_analysis_node,
+                step_obj = _parse_analysis_step(last_message)
+                if step_obj is not None and not step_obj.is_conclusive:
+                    # Sometimes json_repair fixes a truncated model output and sets is_conclusive=False
+                    # by default, even though final_diagnosis is populated. Check if we actually have
+                    # a final_diagnosis, and if so, consider it conclusive to prevent an infinite loop.
+                    if step_obj.final_diagnosis is not None:
+                        logger.info(
+                            "LLM returned is_conclusive=False but final_diagnosis is populated. "
+                            "Treating as conclusive to prevent infinite loop. Routing to __end__."
                         )
-                        return llm_analysis_node
-                except Exception:
-                    pass  # parse failure → fall through to __end__
+                        return "__end__"
+
+                    previous_message = messages[-2] if len(messages) >= 2 else None
+                    previous_step = (
+                        _parse_analysis_step(previous_message)
+                        if isinstance(previous_message, AIMessage)
+                        and not (getattr(previous_message, "tool_calls", None) or [])
+                        else None
+                    )
+                    if previous_step is not None and not previous_step.is_conclusive:
+                        logger.warning(
+                            "LLM remained non-conclusive without tool calls after one retry "
+                            "(previous step %s, current step %s). Treating the latest response as a bounded "
+                            "non-conclusive terminal state to avoid an infinite loop.",
+                            previous_step.step_id,
+                            step_obj.step_id,
+                        )
+                        return "__end__"
+
+                    logger.warning(
+                        "LLM returned no tool calls but is_conclusive=False "
+                        "(step %s). Routing back to %s for one retry.",
+                        step_obj.step_id,
+                        llm_analysis_node,
+                    )
+                    return llm_analysis_node
             logger.info(
                 "No tool calls in AIMessage, analysis complete. Routing to __end__"
             )

@@ -15,6 +15,10 @@ An intelligent Linux kernel crash (vmcore) analysis agent based on LangGraph ReA
 - **Deep Tool Integration via MCP**: Leveraging the Model Context Protocol (MCP), the agent achieves high-fidelity connectivity with the Linux `crash` tool. The AI no longer "blindly guesses"; instead, it dynamically explores memory, disassembles code, and retrieves kernel object states based on its reasoning path.
 - **Executor-Level Safety Protection**: The built-in `action_guard` module prevents the LLM from executing commands that are overly resource-intensive or high-risk (e.g., blindly running `bt -a` on a large system). Simultaneously, a command deduplication mechanism ensures analysis efficiency and prevents reasoning from falling into infinite loops.
 - **Transparent Chain-of-Thought Reporting**: Each analysis generates a structured Markdown report, fully documenting the intent behind every command execution, the verification process of hypotheses, and the evidence-based final root cause isolation.
+- **Two-tier Crash Classification**: The system defines a rigorous two-tier classification for kernel diagnostics in `src/react/schema.py`. The **surface signature class** (`CrashSignatureClass`) captures immediately observable panic labels (e.g., `null_deref`, `use_after_free`, `stack_corruption`, `soft_lockup`, `hard_lockup`, `rcu_stall`) and routes them to the corresponding diagnostic Playbook. The **deep root cause class** (`RootCauseClass`) represents the final root cause determined after deep investigation and evidence validation (e.g., `out_of_bounds`, `double_free`, `race_condition`, `dma_corruption`, `mce`).
+- **Verification Gate Control Mechanism**: To fundamentally eliminate LLM "hallucination" and superficial guessing, the system introduces a mandatory gate-control mechanism. For each crash signature, the system enforces specific "proof gates" that must be closed (e.g., `pointer_corruption` requires closing `register_provenance`, `object_lifetime`, `local_corruption_exclusion`, etc.). The system strictly prohibits marking the diagnosis as conclusive (`is_conclusive=true`) until all required gates reach the `closed` (verified with concrete tool output) or `n/a` (confirmed not applicable) state.
+- **Precision e820 BIOS Memory Map Verification & Adjacent Page Fingerprinting**: As confirmed by `memorandum.txt`, the agent demonstrates expert-level memory forensics. When encountering a `reserved` physical page, the AI extracts fingerprints from adjacent physical pages without triggering seek errors, enabling fine-grained memory authentication. It performs rigorous mathematical interval comparison between the crash physical address and the BIOS memory map (e820), determining whether the memory is hardware-reserved or overwritten by a specific device's DMA out-of-bounds access after boot — a diagnostic approach matching the caliber of senior kernel experts.
+- **Long-Connection Keep-Alive & Streaming Transmission**: Kernel crash tools can take extended periods (minutes) when searching large memory regions (GB-scale vmcore images) or loading debug symbols for massive modules. The FastAPI server introduces an independent Task queue with a 15-second heartbeat comment (Keep-Alive Heartbeat) sent to the client via SSE. Even when a single underlying operation exceeds 2 minutes, the client maintains a stable connection and displays diagnostic progress nodes in real time.
 
 ## Architecture Design
 
@@ -59,6 +63,12 @@ graph TB
 - **Curly brace nodes** (e.g., `{should_continue}`) represent conditional routing decisions
 - **Bracket nodes** represent concrete functional nodes or external services
 - The flow starts from `START`, goes through initial data collection, enters the loop of LLM analysis and tool invocation, and ends when `is_conclusive=true` or the recursion limit is reached
+
+### Runtime Request Flow Diagram
+
+The following SVG shows the full runtime path of a single `/analyze` or `/analyze/stream` request across the FastAPI entrypoint, LangGraph loop, MCP tools, and the crash executor. It is more detailed than the overview diagram above and is useful when tracing the real execution path.
+
+![VMCore Analysis Agent Runtime Request Flow](./vmcore-analysis-agent/doc/vmcore-analysis-agent-flow-2.0.svg)
 
 ## Vmcore Analysis React Agent
 
@@ -433,8 +443,15 @@ vmcore-analysis-agent/
 
 ### 1. Install Dependencies
 
-```bash
+#### 1.1 Install crash extension (<span style="color: yellow;">Required - Critical Functionality Depends on It</span>)
+
+```
 bash tools/install_mpykdump.sh
+```
+
+#### 1.2 Install project dependencies
+
+```
 cd vmcore-analysis-agent
 uv sync
 ```
@@ -446,7 +463,7 @@ Edit `config/config.yml` to configure LLM API Key and MCP service paths:
 ```yaml
 llm:
   api_key: "your-deepseek-api-key"
-  model: "deepseek-reasoner"
+  model: "deepseek-v4-pro"
   base_url: "https://api.deepseek.com"
 ```
 
@@ -456,7 +473,7 @@ llm:
 # Method 1: Direct run
 uv run main.py
 
-# Method 2: Using uvicorn (recommended, supports hot reload)
+# Method 2: Use uvicorn (Recommended, supports hot reload)
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 

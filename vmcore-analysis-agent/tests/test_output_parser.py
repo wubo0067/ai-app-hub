@@ -165,6 +165,312 @@ class OutputParserAuditTests(unittest.TestCase):
             audited.additional_notes,
         )
 
+    def test_downgrades_reverse_slab_oob_claim(self) -> None:
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 18,
+                "reasoning": (
+                    "In kmalloc slab, object 0xff1148f4a2171f00 performed OOB overwrite "
+                    "into previous slot 0xff1148f4a2171e80 at lower address."
+                ),
+                "action": None,
+                "is_conclusive": True,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": "out_of_bounds",
+                "partial_dump": "partial",
+                "confidence": "high",
+                "final_diagnosis": FinalDiagnosis(
+                    crash_type="kernel paging request",
+                    panic_string="BUG: unable to handle kernel paging request",
+                    faulting_instruction="mov (%rax),%rbx",
+                    root_cause=(
+                        "mpt3sas reverse-direction slab OOB from 0xff1148f4a2171f00 "
+                        "to 0xff1148f4a2171e80 overwrote irqaction."
+                    ),
+                    detailed_analysis="Address adjacency proves reverse overwrite.",
+                    suspect_code=SuspectCode(
+                        file="drivers/scsi/mpt3sas/mpt3sas_base.c",
+                        function="_base_interrupt",
+                        line="unknown",
+                    ),
+                    evidence=["slab OOB", "0xff1148f4a2171f00 -> 0xff1148f4a2171e80"],
+                ),
+            }
+        )
+
+        audited = apply_executor_consistency_audit(llm_step, state={})
+
+        self.assertFalse(audited.is_conclusive)
+        self.assertIsNone(audited.final_diagnosis)
+        self.assertEqual(audited.root_cause_class, "unknown")
+        self.assertEqual(audited.confidence, "low")
+        self.assertIn("reverse slab OOB causality claim", audited.additional_notes)
+
+    def test_keeps_non_reverse_slab_oob_claim_unchanged(self) -> None:
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 19,
+                "reasoning": (
+                    "In kmalloc slab, object 0xff1148f4a2171e80 overflowed into adjacent "
+                    "slot 0xff1148f4a2171f00 at higher address."
+                ),
+                "action": None,
+                "is_conclusive": True,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": "out_of_bounds",
+                "partial_dump": "partial",
+                "confidence": "high",
+            }
+        )
+
+        audited = apply_executor_consistency_audit(llm_step, state={})
+
+        self.assertTrue(audited.is_conclusive)
+        self.assertEqual(audited.root_cause_class, "out_of_bounds")
+        self.assertEqual(audited.confidence, "high")
+
+    def test_downgrades_dma_conclusion_without_minimum_evidence_gate(self) -> None:
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 20,
+                "reasoning": (
+                    "No software buffer overflow from adjacent objects can explain the presence "
+                    "of a precise mpt3sas log-info code deep within the slab page. DMA range "
+                    "overlap proof is missing, but stray DMA is still the most likely root cause."
+                ),
+                "action": None,
+                "is_conclusive": True,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": "dma_corruption",
+                "partial_dump": "partial",
+                "confidence": "medium",
+                "final_diagnosis": FinalDiagnosis(
+                    crash_type="pointer_corruption",
+                    panic_string="BUG: unable to handle kernel paging request",
+                    faulting_instruction="mov 0x50(%rbp),%rdx",
+                    root_cause="Stray DMA write from mpt3sas corrupted irqaction.",
+                    detailed_analysis=(
+                        "A matching log_info value appears in the slab page, but no DMA-range "
+                        "overlap or IOMMU evidence was verified."
+                    ),
+                    suspect_code=SuspectCode(
+                        file="drivers/scsi/mpt3sas/mpt3sas_base.c",
+                        function="unknown",
+                        line="unknown",
+                    ),
+                    evidence=["0x30030109 appears in adjacent slab slot"],
+                ),
+            }
+        )
+
+        audited = apply_executor_consistency_audit(llm_step, state={})
+
+        self.assertFalse(audited.is_conclusive)
+        self.assertIsNone(audited.final_diagnosis)
+        self.assertEqual(audited.root_cause_class, "unknown")
+        self.assertEqual(audited.confidence, "low")
+        self.assertIn("DMA promotion gate not satisfied", audited.additional_notes)
+        self.assertIn("possible hypothesis", audited.reasoning)
+
+    def test_keeps_dma_conclusion_with_two_evidence_families(self) -> None:
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 21,
+                "reasoning": (
+                    "vtop confirmed physical-page overlap with reply_frames_dma, and an IOMMU "
+                    "fault log tied the remapping error to the same controller."
+                ),
+                "action": None,
+                "is_conclusive": True,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": "dma_corruption",
+                "partial_dump": "partial",
+                "confidence": "high",
+            }
+        )
+
+        audited = apply_executor_consistency_audit(llm_step, state={})
+
+        self.assertTrue(audited.is_conclusive)
+        self.assertEqual(audited.root_cause_class, "dma_corruption")
+        self.assertEqual(audited.confidence, "high")
+
+    def test_downgrades_uaf_claim_when_kmem_slot_is_allocated(self) -> None:
+        state = {
+            "messages": [
+                HumanMessage(
+                    content=(
+                        "crash> kmem -S ff1148f4a2171e80\n"
+                        "CACHE             OBJSIZE  ALLOCATED     TOTAL  SLABS  SSIZE  NAME\n"
+                        "ff1148f440004c40      128      78879    211008   3297     8k  kmalloc-128\n"
+                        "  FREE / [ALLOCATED]\n"
+                        "  [ff1148f4a2171e80]\n"
+                    )
+                )
+            ]
+        }
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 22,
+                "reasoning": (
+                    "This is consistent with a use-after-free: the original irqaction was "
+                    "freed and its memory reused for another kmalloc-128 allocation. The slab "
+                    "shows the page fully allocated, but the pointer in irq_desc->action is stale."
+                ),
+                "action": None,
+                "is_conclusive": True,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": "use_after_free",
+                "partial_dump": "partial",
+                "confidence": "high",
+                "final_diagnosis": FinalDiagnosis(
+                    crash_type="kernel paging request",
+                    panic_string="BUG: unable to handle kernel paging request",
+                    faulting_instruction="mov 0x50(%rbp),%rdx",
+                    root_cause="A freed irqaction was reused and later dereferenced.",
+                    detailed_analysis="Allocated slot was treated as stale UAF without free evidence.",
+                    suspect_code=SuspectCode(
+                        file="kernel/irq/proc.c",
+                        function="show_interrupts",
+                        line="unknown",
+                    ),
+                    evidence=["kmem -S ff1148f4a2171e80", "FREE / [ALLOCATED]"],
+                ),
+            }
+        )
+
+        audited = apply_executor_consistency_audit(llm_step, state)
+
+        self.assertFalse(audited.is_conclusive)
+        self.assertIsNone(audited.final_diagnosis)
+        self.assertEqual(audited.root_cause_class, "pointer_corruption")
+        self.assertEqual(audited.corruption_mechanism, "write_corruption")
+        self.assertEqual(audited.confidence, "low")
+        self.assertIn(
+            "candidate slab slot is currently allocated", audited.additional_notes
+        )
+
+    def test_keeps_allocated_slot_uaf_when_lifetime_evidence_exists(self) -> None:
+        state = {
+            "messages": [
+                HumanMessage(
+                    content=(
+                        "crash> kmem -S ff1148f4a2171e80\n"
+                        "  FREE / [ALLOCATED]\n"
+                        "  [ff1148f4a2171e80]\n"
+                    )
+                )
+            ]
+        }
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 23,
+                "reasoning": (
+                    "The slot is currently allocated, but alloc/free-stack evidence shows the "
+                    "pointer survived free and now references a replacement object instance after reuse; "
+                    "the retained stale reference confirms use-after-free with reallocation."
+                ),
+                "action": None,
+                "is_conclusive": True,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": "use_after_free",
+                "partial_dump": "partial",
+                "confidence": "high",
+            }
+        )
+
+        audited = apply_executor_consistency_audit(llm_step, state)
+
+        self.assertTrue(audited.is_conclusive)
+        self.assertEqual(audited.root_cause_class, "use_after_free")
+        self.assertEqual(audited.confidence, "high")
+
+    def test_prefix_overwrite_pattern_steers_mechanism_away_from_uaf(self) -> None:
+        state = {
+            "messages": [
+                HumanMessage(
+                    content=(
+                        "crash> kmem -S ff1148f4a2171e80\n"
+                        "  FREE / [ALLOCATED]\n"
+                        "  [ff1148f4a2171e80]\n"
+                    )
+                ),
+                ToolMessage(
+                    content=(
+                        "crash> rd -x ff1148f4a2171e80 16\n"
+                        "ff1148f4a2171e80:  0000000004060001 0000000000000000\n"
+                        "ff1148f4a2171e90:  0100070000000000 0000800c00000010\n"
+                        "ff1148f4a2171ea0:  0008002004690002 0001000000010000\n"
+                        "ff1148f4a2171eb0:  0020ffe000080002 0000000200000003\n"
+                        "ff1148f4a2171ec0:  0000000000000000 0000000000000000\n"
+                        "ff1148f4a2171ed0:  0000000000000000 0000000000000000\n"
+                        "ff1148f4a2171ee0:  0000000000000000 0000000000000000\n"
+                        "ff1148f4a2171ef0:  0000000000000000 0000000000000000\n"
+                    ),
+                    tool_call_id="call_9",
+                    name="rd",
+                ),
+            ]
+        }
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 24,
+                "reasoning": (
+                    "This still looks like use-after-free or an adjacent buffer overflow, because the "
+                    "irqaction does not match the traversal context."
+                ),
+                "action": None,
+                "is_conclusive": False,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": "unknown",
+                "partial_dump": "partial",
+            }
+        )
+
+        audited = apply_executor_consistency_audit(llm_step, state)
+
+        self.assertEqual(audited.root_cause_class, "pointer_corruption")
+        self.assertEqual(audited.corruption_mechanism, "write_corruption")
+        self.assertIn("prefix-overwrite signature", audited.additional_notes)
+
+    def test_does_not_retrigger_allocated_uaf_audit_for_hedged_candidate_list(
+        self,
+    ) -> None:
+        state = {
+            "messages": [
+                HumanMessage(
+                    content=(
+                        "crash> kmem -S ff1148f4a2171e80\n"
+                        "  FREE / [ALLOCATED]\n"
+                        "  [ff1148f4a2171e80]\n"
+                    )
+                )
+            ]
+        }
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 26,
+                "reasoning": (
+                    "Executor audit: kmem -S context shows the candidate slab slot is currently allocated, "
+                    "but the analysis still asserted freed/stale-pointer UAF or free-then-reuse without separate "
+                    "positive lifetime evidence. ALLOCATED rules out a simple freed-object explanation; absent "
+                    "independent lifetime evidence, treat this as live-slot overwrite, type confusion, or another "
+                    "non-UAF mechanism instead of concluding use-after-free. "
+                    "The exact corruption mechanism (use-after-free, out-of-bounds, or DMA) cannot be determined from this partial dump."
+                ),
+                "action": None,
+                "is_conclusive": False,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": "pointer_corruption",
+                "partial_dump": "partial",
+            }
+        )
+
+        audited = apply_executor_consistency_audit(llm_step, state)
+
+        self.assertEqual(audited.reasoning, llm_step.reasoning)
+        self.assertIsNone(audited.additional_notes)
+
     def test_render_action_arguments_quotes_grep_alternation_pattern(self) -> None:
         rendered = render_action_arguments(
             ["-m", "|", "grep", "-Ei", "dma|iommu|mapping|buffer"]

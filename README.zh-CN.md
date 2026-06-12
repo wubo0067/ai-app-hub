@@ -18,6 +18,10 @@ README.md
 - **基于 MCP 的深度工具集成**：利用模型上下文协议 (MCP)，代理实现了与 Linux `crash` 工具的高保真连接。AI 不再是“盲目猜测”，而是根据推理路径动态地探索内存、反汇编代码并检索内核对象状态。
 - **执行器级安全防护**：内置 `action_guard` 模块，防止 LLM 执行资源消耗过大或高风险的命令（如在大系统上盲目执行 `bt -a`），同时通过命令去重机制确保分析效率，防止推理陷入死循环。
 - **透明的思考链报告**：每一次分析都会生成结构化的 Markdown 报告，完整记录每一步命令的执行意图、假设的验证过程以及基于证据的最终根因定界。
+- **双层分类体系 (Two-tier Crash Classification)**：系统在 `src/react/schema.py` 中规范了清晰的内核诊断双层分类。**表层签名类** (`CrashSignatureClass`) 从 Panic 字符串直接可观测的早期路由标签（如 `null_deref`、`use_after_free`、`stack_corruption`、`soft_lockup`、`hard_lockup`、`rcu_stall` 等），用于匹配对应的诊断剧本 (Playbook)。**深层根因类** (`RootCauseClass`) 则是经过深度调查和证据验证后确定的最终根本原因（如 `out_of_bounds`、`double_free`、`race_condition`、`dma_corruption`、`mce` 等）。
+- **检查点控制门 (Verification Gates)**：为了彻底解决大模型"幻觉"和"浅尝辄止地盲猜"的弊端，系统引入了验证门控制机制。针对不同的崩溃签名，系统硬性规定了必须关闭的"证明门控"（例如 `pointer_corruption` 必须关闭 `register_provenance`（寄存器来源溯源）、`object_lifetime`（对象生命周期审核）、`local_corruption_exclusion` 等门控）。在所有必需的门控达到 `closed`（已通过具体工具输出验证）或 `n/a`（确认不适用）状态前，系统严禁将诊断状态标记为已闭环 (`is_conclusive=true`)。
+- **精准的 e820 BIOS 内存映射验证与相邻页指纹提取**：`memorandum.txt` 证实了本系统的强悍表现——在遇到 `reserved` 物理页时，AI 会在不触发 seek error 的前提下，提取相邻物理页的指纹，进行精细的内存鉴证。系统将崩溃物理地址与 BIOS 内存映射表 (e820) 进行严格数学区间比对，从而判断内存是硬件保留还是启动后被特定设备 DMA 越界覆写，这种分析思路已达到资深内核专家的专业水准。
+- **长时间连接保持与流式传输**：内核 crash 工具在对数 GB 级的 vmcore 镜像进行大面积内存搜索 (search) 或加载庞大模块的调试符号时，耗时通常较长。FastAPI 服务端引入了独立的 Task 队列，以 15 秒为间隔向客户端发送心跳注释 (Keep-Alive Heartbeat)，即使单个底层操作耗时超过 2 分钟，客户端也能稳定连接并实时展示诊断进度节点。
 
 ## 架构设计
 
@@ -62,6 +66,12 @@ graph TB
 - **花括号节点**（如 `{should_continue}`）表示条件路由判断
 - **方括号节点** 表示具体的功能节点或外部服务
 - 流程从 `START` 开始，经过初始化数据收集，进入 LLM 分析与工具调用的循环，直到 `is_conclusive=true` 或达到递归限制时结束
+
+### 运行时请求链路图
+
+下图展示了一次 `/analyze` 或 `/analyze/stream` 请求在服务端、LangGraph、MCP 与 crash executor 之间的完整运行时链路，相比上面的总览图更适合查看实际执行路径。
+
+![VMCore Analysis Agent 运行时请求链路图](./vmcore-analysis-agent/doc/vmcore-analysis-agent-flow-2.0.svg)
 
 ## Vmcore Analysis React Agent
 
@@ -165,7 +175,7 @@ DEFAULT_CRASH_COMMANDS = [
 - **Token 优化**：相比静态完整 Prompt，系统 Prompt 的 token 消耗减少 40-70%，同时保持全面的知识覆盖
 
 **输出 Schema**（[`VMCoreLLMAnalysisStep`](vmcore-analysis-agent/src/react/schema.py#L70-L114)）：
-```json
+``json
 {
   "step_id": 1,
   "reasoning": "3-6 句结构化分析总结： (1) 从最新工具输出中学到什么？(2) 如何更新假设？(3) 下一步最诊断性的行动及原因",
@@ -436,8 +446,15 @@ vmcore-analysis-agent/
 
 ### 1. 安装依赖
 
+#### 1.1 安装 crash 扩展（<span style="color: yellow;">必需 - 否则关键功能缺失</span>）
+
 ```
 bash tools/install_mpykdump.sh
+```
+
+#### 1.2 安装项目依赖
+
+```
 cd vmcore-analysis-agent
 uv sync
 ```
@@ -449,17 +466,17 @@ uv sync
 ```
 llm:
   api_key: "your-deepseek-api-key"
-  model: "deepseek-reasoner"
+  model: "deepseek-v4-pro"
   base_url: "https://api.deepseek.com"
 ```
 
 ### 3. 启动 FastAPI 服务
 
 ```
-# 方式1：直接运行
+# 方式 1：直接运行
 uv run main.py
 
-# 方式2：使用 uvicorn（推荐，支持热加载）
+# 方式 2：使用 uvicorn（推荐，支持热加载）
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
@@ -530,15 +547,15 @@ uv run main.py --stream --no-save
 
 ```
 参数说明：
-  --url URL                   API 服务地址 (默认: http://localhost:8000)
+  --url URL                   API 服务地址 (默认：http://localhost:8000)
   --stream                    使用流式模式
   --health                    仅检查服务健康状态
   --vmcore-path PATH          vmcore 文件路径
   --vmlinux-path PATH         vmlinux 调试符号路径
   --vmcore-dmesg-path PATH    vmcore-dmesg.txt 文件路径
   --debug-symbols [PATH ...]  额外的调试符号路径列表
-  --timeout SECONDS           请求超时时间（秒）(默认: 600)
-  --output-dir DIR            报告输出目录 (默认: 当前目录)
+  --timeout SECONDS           请求超时时间（秒）(默认：600)
+  --output-dir DIR            报告输出目录 (默认：当前目录)
   --no-save                   不保存 markdown 报告文件
 ```
 

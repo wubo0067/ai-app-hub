@@ -8,6 +8,7 @@ from typing import Iterable, Optional, Sequence, cast
 
 from langchain_core.messages import AIMessage, BaseMessage
 
+from .action_guard import canonicalize_command_line, extract_command_lines
 from .graph_state import AgentState
 from .prompt_overlays import DRIVER_OBJECT_OVERLAY, STACK_CORRUPTION_OVERLAY
 from .prompt_layers import LAYER0_SYSTEM_PROMPT_TEMPLATE, PLAYBOOKS, SOP_FRAGMENTS
@@ -32,8 +33,9 @@ def build_analysis_system_prompt(state: AgentState, *, is_last_step: bool) -> st
             - step_count: 当前分析步骤计数
             - 其他相关状态字段
 
-        is_last_step (bool): 标识是否为最后一步分析。当为 True 时，会添加关键警告信息，
-            强制 LLM 在此步骤提供最终诊断结论，不得再请求工具调用。
+        is_last_step (bool): 标识是否为最后一步分析。当为 True 时，会添加终止约束，
+            要求 LLM 在此步骤结束工具调用并输出最终状态；该状态可以是 conclusive，
+            也可以是在证据不足时的 bounded non-conclusive 总结。
 
     Returns:
         str: 完整的系统提示词字符串，包含以下组成部分（按顺序）：
@@ -42,7 +44,7 @@ def build_analysis_system_prompt(state: AgentState, *, is_last_step: bool) -> st
             3. 针对当前崩溃签名的专用分析剧本（如果存在）
             4. 相关的标准操作程序 (SOP) 片段（如果适用）
             5. 结构化输出约束说明
-            6. 最后步骤的关键警告（仅当 is_last_step=True 时）
+            6. 最后步骤的终止约束（仅当 is_last_step=True 时）
 
     使用场景：
         - 在每次 LLM 分析步骤开始前调用，为 DeepSeek-Reasoner 模型提供完整的分析上下文
@@ -82,15 +84,18 @@ def build_analysis_system_prompt(state: AgentState, *, is_last_step: bool) -> st
     prompt_parts.append(
         "[STRUCTURED OUTPUT CONTRACT]\n"
         "active_hypotheses and gates are executor-managed. "
-        "Omit them entirely from your JSON and return only the minimal schema fields."
+        "Normally omit them from your JSON and return only the minimal schema fields. "
+        "Exception: when you are concluding or explicitly closing a blocker, you MAY emit gate updates for the required gates you are closing, and only those gates."
     )
 
     if is_last_step:
         prompt_parts.append(
             "[CRITICAL WARNING]\n"
             "This is your LAST STEP. You have reached the execution limit.\n"
-            "You MUST provide a final_diagnosis based on the information gathered so far.\n"
-            "Set is_conclusive to true and do NOT request any further tool calls (action must be null)."
+            "Do NOT request any further tool calls (action must be null).\n"
+            "If the evidence satisfies the Layer0 convergence criteria, set is_conclusive to true and provide final_diagnosis.\n"
+            "If mandatory verification gaps remain, set is_conclusive to false, leave final_diagnosis null, and provide a bounded non-conclusive summary in reasoning and additional_notes.\n"
+            "For a bounded non-conclusive summary, explicitly list the unresolved mandatory gaps, the strongest remaining alternative hypotheses, and what evidence would be needed next."
         )
 
     return "\n\n".join(part for part in prompt_parts if part)
@@ -118,6 +123,11 @@ def build_executor_state_section(state: AgentState) -> str:
 
     hypotheses = _format_hypotheses(state.get("managed_active_hypotheses"))
     gates = _format_gates(state.get("managed_gates"))
+    unresolved_gates = _format_unresolved_gates(state.get("managed_gates"))
+    next_gate_objective = _format_next_gate_objective(state.get("managed_gates"))
+    reasoning_gate_contract = _format_reasoning_gate_contract(
+        state.get("managed_gates")
+    )
     recent_commands = _recent_command_summaries(state.get("messages", []))
     stage_name = _infer_stage_name(step_count, state.get("managed_gates"))
 
@@ -129,8 +139,18 @@ def build_executor_state_section(state: AgentState) -> str:
         f"- Current stage: {stage_name}",
         f"- Active hypotheses: {hypotheses}",
         f"- Gate status: {gates}",
-        f"- Commands already run (do not repeat): {recent_commands}",
+        f"- Unresolved mandatory gates: {unresolved_gates}",
+        f"- Current gate objective: {next_gate_objective}",
+        "- Action selection rule: if any mandatory gate remains open or blocked, the next action must directly advance the current gate objective or unblock its prerequisite.",
+        f"- Reasoning gate contract: {reasoning_gate_contract}",
     ]
+
+    if recent_commands == "none":
+        lines.append("- Commands already run (do not repeat): none")
+    else:
+        lines.append("- Commands already run (do not repeat):")
+        lines.extend(recent_commands.splitlines())
+
     return "\n".join(lines)
 
 
@@ -411,28 +431,139 @@ def _format_gates(raw_gates: object) -> str:
     return ", ".join(formatted)
 
 
+def _format_unresolved_gates(raw_gates: object) -> str:
+    gates = cast(Optional[dict[str, GateEntry]], raw_gates)
+    if not gates:
+        return "none"
+
+    unresolved = []
+    for gate_name, gate_entry in gates.items():
+        gate = GateEntry.model_validate(gate_entry)
+        if gate.status in {"open", "blocked"}:
+            unresolved.append(f"{gate_name}={gate.status}")
+
+    return ", ".join(unresolved) if unresolved else "none"
+
+
+def _format_next_gate_objective(raw_gates: object) -> str:
+    gates = cast(Optional[dict[str, GateEntry]], raw_gates)
+    if not gates:
+        return "no outstanding gate"
+
+    for gate_name, gate_entry in gates.items():
+        gate = GateEntry.model_validate(gate_entry)
+        if gate.status == "blocked":
+            prerequisite = gate.prerequisite or "missing prerequisite"
+            return f"unblock {gate_name} by advancing prerequisite {prerequisite}"
+        if gate.status == "open":
+            if gate_name == "register_provenance":
+                return (
+                    "close register_provenance by tracing the bad register back to the exact source object "
+                    "and field/offset that produced the operand"
+                )
+            return f"advance {gate_name} toward closed or n/a with concrete evidence"
+
+    return "no outstanding gate"
+
+
+def _format_reasoning_gate_contract(raw_gates: object) -> str:
+    gates = cast(Optional[dict[str, GateEntry]], raw_gates)
+    if not gates:
+        return "no gate-specific closure narrative required; reasoning may focus on the next diagnostic action"
+
+    for gate_name, gate_entry in gates.items():
+        gate = GateEntry.model_validate(gate_entry)
+        if gate.status == "blocked":
+            prerequisite = gate.prerequisite or "missing prerequisite"
+            return (
+                f"name target gate {gate_name}, explain why the next action advances prerequisite {prerequisite}, "
+                "and state the expected evidence needed to unblock or advance the gate"
+            )
+        if gate.status == "open":
+            if gate_name == "register_provenance":
+                return (
+                    "name target gate register_provenance, explain which concrete source object and field/offset "
+                    "must be identified next, and state how the next action will close the bad-register chain. "
+                    "Do not demand proof of the ultimate overflow writer to close this gate"
+                )
+            return (
+                f"name target gate {gate_name}, explain why the next action advances it, "
+                "and state the expected gate transition or evidence needed next"
+            )
+
+    return "all mandatory gates are already closed or n/a; reasoning may focus on conclusion quality and remaining alternatives"
+
+
 def _recent_command_summaries(messages: Sequence[BaseMessage]) -> str:
-    command_counts: dict[str, int] = {}
-    command_order: list[str] = []
+    recent_commands: list[str] = []
+    seen_commands: set[str] = set()
 
     for message in reversed(messages):
         if not isinstance(message, AIMessage):
             continue
 
-        for command_type in _extract_command_types_from_ai_message(message):
-            command_counts[command_type] = command_counts.get(command_type, 0) + 1
-            if command_type not in command_order:
-                command_order.append(command_type)
+        for command in reversed(_extract_canonical_commands_from_ai_message(message)):
+            if not command or command in seen_commands:
+                continue
+            seen_commands.add(command)
+            recent_commands.append(command)
+            if len(recent_commands) >= 8:
+                break
 
-    if not command_counts:
+        if len(recent_commands) >= 8:
+            break
+
+    if not recent_commands:
         return "none"
 
-    summaries = []
-    for command_type in command_order[:8]:
-        count = command_counts[command_type]
-        suffix = "call" if count == 1 else "calls"
-        summaries.append(f"{command_type}: {count} {suffix}")
-    return "; ".join(summaries)
+    ordered_commands = list(reversed(recent_commands))
+    return "\n".join(
+        f"  {index}. {command}"
+        for index, command in enumerate(ordered_commands, start=1)
+    )
+
+
+def _extract_canonical_commands_from_ai_message(message: AIMessage) -> list[str]:
+    commands: list[str] = []
+
+    for tool_call in message.tool_calls or []:
+        name = tool_call.get("name") or tool_call.get("command_name")
+        args = tool_call.get("args") or tool_call.get("arguments") or {}
+        commands.extend(_canonical_commands_from_tool_call(name, args))
+
+    if commands:
+        return commands
+
+    try:
+        parsed_content = json.loads(message.content)
+    except (TypeError, json.JSONDecodeError):
+        return []
+
+    action = parsed_content.get("action")
+    if not action:
+        return []
+
+    return _canonical_commands_from_tool_call(
+        action.get("command_name", "unknown"),
+        action.get("arguments") or [],
+    )
+
+
+def _canonical_commands_from_tool_call(name: object, args: object) -> list[str]:
+    tool_name = str(name or "unknown")
+    lines = extract_command_lines(tool_name, args)
+
+    if lines:
+        if tool_name != "run_script" and len(lines) == 1:
+            rendered = _render_command(tool_name, args)
+            if rendered and rendered != tool_name:
+                return [canonicalize_command_line(rendered)]
+        return [canonicalize_command_line(line) for line in lines if line.strip()]
+
+    if tool_name and tool_name != "unknown":
+        return [tool_name]
+
+    return []
 
 
 def _extract_command_types_from_ai_message(message: AIMessage) -> list[str]:
@@ -547,17 +678,13 @@ def _render_command(command_name: str, arguments: object) -> str:
     支持字符串参数直接使用，可迭代对象参数用逗号连接，其他类型忽略参数。
     """
     if isinstance(arguments, str):
-        # 字符串参数直接作为参数内容
-        rendered_args = arguments
-    elif isinstance(arguments, Iterable):
-        # 可迭代对象参数转换为逗号分隔的字符串
-        rendered_args = ", ".join(str(arg) for arg in arguments)
+        rendered_args = arguments.strip()
+    elif isinstance(arguments, Iterable) and not isinstance(arguments, (bytes, dict)):
+        rendered_args = " ".join(str(arg) for arg in arguments)
     else:
-        # 其他类型不显示参数
         rendered_args = ""
 
-    # 如果有参数内容，返回 "命令名 (参数)"，否则只返回命令名
-    return f"{command_name}({rendered_args})" if rendered_args else command_name
+    return f"{command_name} {rendered_args}".strip()
 
 
 def _recent_text_blob(messages: Sequence[BaseMessage]) -> str:

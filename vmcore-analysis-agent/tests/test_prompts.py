@@ -2,6 +2,7 @@ import unittest
 
 from src.react.prompts import (
     analysis_crash_prompt,
+    build_structure_reasoning_force_conclusion,
     build_minimal_schema_enum_contract,
     simplified_structure_reasoning_prompt,
 )
@@ -40,7 +41,7 @@ class PromptContractTests(unittest.TestCase):
 
         self.assertIn("Minimal-output contract", prompt)
         self.assertIn("executor-managed internal state", prompt)
-        self.assertIn("MUST NOT appear in your JSON", prompt)
+        self.assertIn("should normally not appear in your JSON", prompt)
         self.assertNotIn('"active_hypotheses": [', prompt)
         self.assertNotIn('"gates": {{{{', prompt)
 
@@ -53,11 +54,23 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("debug info contains that type", prompt)
         self.assertIn("you MUST reject that type immediately".lower(), prompt.lower())
 
+    def test_analysis_prompt_forbids_struct_field_suffix_arguments(self) -> None:
+        prompt = analysis_crash_prompt()
+
+        self.assertIn(
+            "Never append field names or member names after a struct instance query",
+            prompt,
+        )
+        self.assertIn(
+            "struct device <addr> driver init_name",
+            prompt,
+        )
+
     def test_analysis_prompt_forbids_direct_address_arithmetic_actions(self) -> None:
         prompt = analysis_crash_prompt()
 
         self.assertIn("rd -x <addr>+<offset> <count>", prompt)
-        self.assertIn("this agent forbids emitting address arithmetic directly", prompt)
+        self.assertIn("Address Arithmetic Discipline", prompt)
 
     def test_analysis_prompt_enforces_register_identity_and_true_source_object(
         self,
@@ -97,10 +110,30 @@ class PromptContractTests(unittest.TestCase):
     ) -> None:
         prompt = analysis_crash_prompt()
 
-        self.assertIn('log -m | grep -i mpt3sas | grep -Evi "log_info"', prompt)
+        self.assertIn(
+            'log -m | grep -i <driver_or_module> | grep -Evi "<heartbeat_or_info_pattern>"',
+            prompt,
+        )
         self.assertIn(
             "If the first grep returns repetitive info or heartbeat lines", prompt
         )
+
+    def test_analysis_prompt_keeps_accident_specific_examples_out_of_global_layers(
+        self,
+    ) -> None:
+        prompt = analysis_crash_prompt()
+
+        self.assertNotIn("security_inode_permission", prompt)
+        self.assertNotIn("zone_statistics", prompt)
+        self.assertNotIn("handle_mm_fault", prompt)
+
+    def test_analysis_prompt_injects_stack_specific_examples_only_in_stack_context(
+        self,
+    ) -> None:
+        prompt = self._stack_frame_prompt()
+
+        self.assertIn("zone_statistics", prompt)
+        self.assertIn("handle_mm_fault", prompt)
 
     def test_analysis_prompt_forbids_standalone_log_actions(self) -> None:
         prompt = analysis_crash_prompt()
@@ -132,6 +165,10 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn(
             "if the field of interest is offset 0xc and width 32 bits", prompt
         )
+        self.assertIn("0000035f00000000 at aligned address A", prompt)
+        self.assertIn(
+            "if a u32 field starts at A+4, its value is 0x0000035f = 863", prompt
+        )
 
     def test_analysis_prompt_requires_temporal_correlation_analysis(self) -> None:
         prompt = analysis_crash_prompt()
@@ -140,6 +177,20 @@ class PromptContractTests(unittest.TestCase):
             "Repeated device reset, discovery, recovery, or link-flap messages", prompt
         )
         self.assertIn("If the last such event occurs seconds before the crash", prompt)
+
+    def test_analysis_prompt_treats_partial_dump_unreadability_as_coverage_limit(
+        self,
+    ) -> None:
+        prompt = analysis_crash_prompt()
+
+        self.assertIn(
+            "Treat read failure in a partial dump as evidence of dump coverage limitation",
+            prompt,
+        )
+        self.assertIn(
+            "Do not use unreadability in a partial dump to rule out a mechanism",
+            prompt,
+        )
 
     def test_analysis_prompt_requires_dma_address_validation_before_labeling(
         self,
@@ -162,6 +213,24 @@ class PromptContractTests(unittest.TestCase):
             "If struct -o <guessed_type> fails on a module crash path", prompt
         )
         self.assertIn("sym -l <module> | grep -i <keyword>", prompt)
+        self.assertIn("Load module symbols with mod -s first", prompt)
+
+    def test_analysis_prompt_allows_bounded_log_t_and_log_a(self) -> None:
+        prompt = analysis_crash_prompt()
+
+        self.assertIn("Preferred form: log -m | grep <pattern>", prompt)
+        self.assertIn(
+            "Allowed when timestamp or all-buffer evidence is specifically needed: log -t | grep <pattern>, log -a | grep <pattern>",
+            prompt,
+        )
+        self.assertIn(
+            "Allowed when timestamp evidence is needed: log -t | grep -i <pattern>",
+            prompt,
+        )
+        self.assertIn(
+            "Allowed when all-buffer evidence is needed: log -a | grep -i <pattern>",
+            prompt,
+        )
 
     def test_analysis_prompt_adds_driver_source_correlation_rules(self) -> None:
         prompt = self._driver_dma_prompt()
@@ -169,6 +238,11 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("## Driver-Private Object Overlay", prompt)
         self.assertIn("### Step A: Function Pointer Anchoring", prompt)
         self.assertIn("### Step D: Open Source Cross-Reference", prompt)
+        self.assertIn("### Step I: Slab OOB Directionality", prompt)
+        self.assertIn(
+            "a standard contiguous out-of-bounds write from object A extends from lower to higher addresses",
+            prompt,
+        )
         self.assertIn(
             "field type must drive the corruption-mechanism classification", prompt
         )
@@ -181,6 +255,31 @@ class PromptContractTests(unittest.TestCase):
         )
         self.assertIn("If the field type is dma_addr_t", prompt)
         self.assertIn("Do not conflate these mechanisms", prompt)
+
+    def test_analysis_prompt_requires_dma_minimum_evidence_gate(self) -> None:
+        prompt = self._driver_dma_prompt()
+
+        self.assertIn(
+            "you MUST satisfy at least TWO independent device-side evidence families",
+            prompt,
+        )
+        self.assertIn("keep DMA as a bounded alternative hypothesis", prompt)
+        self.assertIn(
+            'A sentence such as "software OOB cannot explain this value on the slab page" is forbidden',
+            prompt,
+        )
+
+    def test_analysis_prompt_does_not_allow_allocated_slot_to_imply_uaf(self) -> None:
+        prompt = self._driver_dma_prompt()
+
+        self.assertIn(
+            "type-identity mismatch alone is NOT enough",
+            prompt,
+        )
+        self.assertIn(
+            "Without that evidence, treat the slot as a live object whose contents were overwritten, type-confused, or otherwise corrupted",
+            prompt,
+        )
 
     def test_simplified_prompt_separates_root_cause_class_and_corruption_mechanism(
         self,
@@ -224,12 +323,50 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn('"command_name": "dis"', prompt)
         self.assertIn('"step_id": 4', prompt)
 
+    def test_structure_reasoning_last_step_prompt_allows_bounded_nonconclusive(
+        self,
+    ) -> None:
+        force_conclusion = build_structure_reasoning_force_conclusion(is_last_step=True)
+
+        self.assertIn("Do not request tools; action must be null", force_conclusion)
+        self.assertIn(
+            "Set is_conclusive=true ONLY if the reasoning explicitly satisfies the Layer0 convergence criteria",
+            force_conclusion,
+        )
+        self.assertIn(
+            "If mandatory verification gaps remain, set is_conclusive=false",
+            force_conclusion,
+        )
+        self.assertNotIn("MUST set 'is_conclusive' to true", force_conclusion)
+
+    def test_structure_reasoning_force_conclusion_empty_before_last_step(self) -> None:
+        self.assertEqual(
+            build_structure_reasoning_force_conclusion(is_last_step=False),
+            "",
+        )
+
     def test_minimal_schema_enum_contract_requires_canonical_values(self) -> None:
         contract = build_minimal_schema_enum_contract()
 
-        self.assertIn("Do not emit aliases or shorthand in final JSON", contract)
+        self.assertIn(
+            "Do not emit aliases, descriptive prose, or shorthand in final JSON",
+            contract,
+        )
         self.assertIn("'stack_protector' -> 'stack_corruption'", contract)
         self.assertIn("'type_misuse' -> 'field_type_misuse'", contract)
+        self.assertIn("driver_source_evidence.inference_method", contract)
+        self.assertIn("confidence aliases to normalize", contract)
+        self.assertNotIn("'memory_corruption'", contract)
+
+    def test_driver_dma_prompt_includes_driver_source_evidence_few_shot(self) -> None:
+        prompt = self._driver_dma_prompt()
+
+        self.assertIn("Final Diagnosis Few-Shot for driver_source_evidence", prompt)
+        self.assertIn('"inference_method": "function_pointer_anchor"', prompt)
+        self.assertIn(
+            "Do NOT write descriptive prose in driver_source_evidence.inference_method",
+            prompt,
+        )
 
     def test_analysis_prompt_treats_mechanism_in_root_cause_class_as_schema_error(
         self,
@@ -329,6 +466,7 @@ class PromptContractTests(unittest.TestCase):
             "Prefer `classify_saved_rip_frames_tool` for phantom-frame and saved-RIP classification. Only if the tool is unavailable or unproven may you fall back to manual frame-by-frame saved-RIP validation.",
             prompt,
         )
+        self.assertIn("DMA", prompt)
         self.assertEqual(
             prompt.count(
                 "In explicit stack-protector cases, first close the canary slot with `resolve_stack_canary_slot`"
@@ -369,14 +507,7 @@ class PromptContractTests(unittest.TestCase):
     def test_analysis_prompt_rejects_formula_only_rbp_derivation(self) -> None:
         prompt = self._stack_frame_prompt()
 
-        self.assertIn(
-            "Do NOT derive RBP_absolute from the bt frame address by formula alone",
-            prompt,
-        )
-        self.assertIn(
-            "only after RBP_absolute has been established by an independently closed proof",
-            prompt,
-        )
+        self.assertIn("verified RBP arithmetic", prompt)
 
 
 if __name__ == "__main__":

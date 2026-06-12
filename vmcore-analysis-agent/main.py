@@ -290,6 +290,7 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
 
     task_id = str(uuid.uuid4())
     logger.info(f"Starting stream analysis task: {task_id}")
+    logger.info(f"Request: vmcore_path={request.vmcore_path}")
 
     # 验证文件路径
     validation_error = validate_file_paths(request)

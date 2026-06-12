@@ -1,10 +1,11 @@
 # To separate your traces from other application
 langsmith_project: vmcore-analysis-agent
 langsmith_tracing: false
+debug_tools_schema: true
 
 ## LLM choice:
 thinking: "enabled" # enabled or disabled
-llm_model: deepseek-v4-flash #
+llm_model: deepseek-v4-pro #
 reasoning_effort: "max" # high
 base_url: https://api.deepseek.com
 temperature: 0.1

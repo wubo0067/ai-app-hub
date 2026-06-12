@@ -24,25 +24,25 @@ crash_server = FastMCP(
 )
 
 
-@crash_server.tool()
-def scsishow(
-    vmcore_path: Annotated[
-        str, Field(description="The absolute path to the vmcore file.")
-    ],
-    vmlinux_path: Annotated[
-        str, Field(description="The absolute path to the vmlinux file.")
-    ],
-    kver: Annotated[
-        str, Field(description="The target kernel version (e.g., 4.18.0).")
-    ],
-) -> str:
-    """
-    Run scsishow crash subcommand to extract SCSI subsystem properties across 3.10, 4.18, 5.14.
-    """
-    try:
-        return run_scsishow(vmcore_path, vmlinux_path, kver)
-    except Exception as e:
-        return f"Failed to execute scsishow: {str(e)}"
+# @crash_server.tool()
+# def scsishow(
+#     vmcore_path: Annotated[
+#         str, Field(description="The absolute path to the vmcore file.")
+#     ],
+#     vmlinux_path: Annotated[
+#         str, Field(description="The absolute path to the vmlinux file.")
+#     ],
+#     kver: Annotated[
+#         str, Field(description="The target kernel version (e.g., 4.18.0).")
+#     ],
+# ) -> str:
+#     """
+#     Run scsishow crash subcommand to extract SCSI subsystem properties across 3.10, 4.18, 5.14.
+#     """
+#     try:
+#         return run_scsishow(vmcore_path, vmlinux_path, kver)
+#     except Exception as e:
+#         return f"Failed to execute scsishow: {str(e)}"
 
 
 @crash_server.tool()
@@ -307,6 +307,126 @@ commands = [
         "sbitmapq [-s struct[.member[,member]] -a address [-p] [-v]] -[x|d] address",
         "sbitmapq -s iscsi_cmd -a 0xc0000000671c0000 -v c0000000e118c808",
         "The command dumps the contents of the sbitmap_queue structure and the used bits in the bitmap.",
+    ),
+    (
+        "cifsshow",
+        "cifsshow [-h]",
+        "cifsshow",
+        "Print information about cifs mounts.",
+    ),
+    (
+        "cpuinfo",
+        "cpuinfo [-h]",
+        "cpuinfo",
+        "Print information about the physical CPUs (processors) in a system.",
+    ),
+    (
+        "detailedsearch",
+        "detailedsearch [-h] [-m MASK] [-s START] [-l LENGTH] [-k] [-K] [-u] [-c] [-w] [--slab-only] params",
+        "detailedsearch ffff8addd2b92700",
+        "Search for a value and print matching location details (slab object, task stack, etc.), enhanced version of 'search'.",
+    ),
+    (
+        "dmshow",
+        "dmshow [-h]",
+        "dmshow",
+        "Display information about multipath devices and LVM volumes from vmcore dumps.",
+    ),
+    # (
+    #     "epython",
+    #     "epython program.py arg ...",
+    #     "epython xportshow.py --help",
+    #     "Invoke the embedded Python interpreter to run crash extension scripts.",
+    # ),
+    (
+        "fregs",
+        "fregs [-h]",
+        "fregs",
+        "Decode and print subroutine registers and arguments from stack frames.",
+    ),
+    (
+        "hanginfo",
+        "hanginfo [-h]",
+        "hanginfo",
+        "Print information about UNINTERRUPTIBLE threads and categorize them by mutex/semaphore waits.",
+    ),
+    (
+        "keyringshow",
+        "keyringshow [-h] (-k KEYRING | -p PID | -a)",
+        "keyringshow -a",
+        "Print information about keyrings for a specific task or all tasks.",
+    ),
+    (
+        "lsdentry",
+        "lsdentry [-h] [-R] [-l] [--params FIELDS] [-x] [--negative] [--partial] dentry",
+        "lsdentry /var/log",
+        "Print directory information based on the dentry tree, similar to 'ls -l'.",
+    ),
+    (
+        "mdadm",
+        "mdadm [-h] [-m] [-d]",
+        "mdadm -d",
+        "Print information about MD devices (Linux Software RAID).",
+    ),
+    (
+        "modinfo",
+        "modinfo [-h] [--disasm=DISASM_MODULE] [--details=MODULE_DETAIL] [-t] [-g] [-a] [-u]",
+        "modinfo -t",
+        "Print information about DLKMs (dynamically loaded kernel modules).",
+    ),
+    (
+        "nbdshow",
+        "nbdshow [-h]",
+        "nbdshow",
+        "Display information about NBD (Network Block Device) devices and diagnose common issues.",
+    ),
+    (
+        "nfsshow",
+        "nfsshow [-h]",
+        "nfsshow",
+        "Print information about NFS subsystem (both client and server).",
+    ),
+    (
+        "nvme",
+        "nvme [-h] [-l [NS]] [-c [CTRL]] [-n [NS]] [-d [CTRL]] [-q [CTRL]] [-i [QID]] [-s [SUB]] [-k]",
+        "nvme -k",
+        "Print information about NVMe devices, controllers, queues, and check for common NVMe issues.",
+    ),
+    (
+        "pstree",
+        "pstree [-p] [-g] [-s] [-t]",
+        "pstree -p",
+        "Print process list in tree format.",
+    ),
+    (
+        "rqlist",
+        "rqlist [-h] [-q [FIELDS]] [-r [FIELDS]] [--bio [FIELDS]] [--pages [FIELDS]] [-x] [--summary] [--time] [--olderthan OLDERTHAN] [--youngerthan YOUNGERTHAN]",
+        "rqlist --summary",
+        "Print information about block I/O requests and request queues with state and timing info.",
+    ),
+    # (
+    #     "taskinfo",
+    #     "taskinfo [-h]",
+    #     "taskinfo",
+    #     "Print detailed information about tasks, more detailed than the built-in 'ps' command.",
+    # ),
+    # (
+    #     "tslog",
+    #     "tslog [-h]",
+    #     "tslog",
+    #     "Display kernel log (dmesg) with timestamps converted to real date/time.",
+    # ),
+    (
+        "xportshow",
+        "xportshow [-h] [--summary] [-iv] [-a] [-t] [--everything]",
+        "xportshow --summary",
+        "Display networking information including connections summary, interfaces, and TCP/UDP state.",
+    ),
+    (
+        "scsishow",
+        "scsishow [-h]",
+        "scsishow",
+        "Display information about SCSI adapters, devices, and commands from vmcore dumps. Includes heuristics to detect stuck SCSI error handling and stalled commands.",
     ),
 ]
 

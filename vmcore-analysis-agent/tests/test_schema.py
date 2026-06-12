@@ -1,6 +1,13 @@
 import unittest
 
-from src.react.schema import FinalDiagnosis, SuspectCode, VMCoreLLMAnalysisStep
+from src.react.schema import (
+    FinalDiagnosis,
+    GateEntry,
+    Hypothesis,
+    SuspectCode,
+    VMCoreAnalysisStep,
+    VMCoreLLMAnalysisStep,
+)
 
 
 class SchemaTests(unittest.TestCase):
@@ -111,6 +118,39 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(diagnosis.corruption_mechanism, "field_type_misuse")
         self.assertIsInstance(diagnosis.suspect_code, SuspectCode)
 
+    def test_final_diagnosis_normalizes_driver_inference_method_phrase(self) -> None:
+        diagnosis = FinalDiagnosis.model_validate(
+            {
+                "crash_type": "kernel paging request",
+                "panic_string": "BUG: unable to handle kernel paging request at 000000e500080008",
+                "faulting_instruction": "movzbl (%rcx,%rax,1), %eax",
+                "root_cause": "A driver queue field was misused as a virtual pointer.",
+                "detailed_analysis": "Source correlation identifies a DMA-side field at the corrupted offset.",
+                "suspect_code": {
+                    "file": "drivers/scsi/mpt3sas/mpt3sas_base.c",
+                    "function": "_base_process_reply_queue",
+                    "line": "unknown",
+                },
+                "evidence": [
+                    "offset 0x10 contains 0x000000e500000000",
+                    "offset 0x60 resolves to _base_interrupt",
+                ],
+                "driver_source_evidence": {
+                    "object_type": "struct adapter_reply_queue",
+                    "corrupted_field_name": "reply_post_free_dma",
+                    "corrupted_field_type": "dma_addr_t",
+                    "field_semantics": "DMA address field was used where a virtual pointer field was expected",
+                    "inference_method": "struct access from kernel debuginfo",
+                    "upstream_reference": "drivers/scsi/mpt3sas/mpt3sas_base.c",
+                },
+                "corruption_mechanism": "field_type_misuse",
+            }
+        )
+
+        self.assertEqual(
+            diagnosis.driver_source_evidence.inference_method, "symbol_lookup"
+        )
+
     def test_final_diagnosis_downgrades_unknown_corruption_mechanism(self) -> None:
         diagnosis = FinalDiagnosis.model_validate(
             {
@@ -182,6 +222,61 @@ class SchemaTests(unittest.TestCase):
             }
         )
         self.assertEqual(step.signature_class, "stack_corruption")
+
+    def test_vmcore_llm_analysis_step_normalizes_confidence_phrase(self) -> None:
+        step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 3,
+                "reasoning": "The evidence is bounded but not yet fully closed.",
+                "action": None,
+                "is_conclusive": False,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": "unknown",
+                "corruption_mechanism": None,
+                "partial_dump": "partial",
+                "confidence": "medium confidence",
+            }
+        )
+
+        self.assertEqual(step.confidence, "medium")
+
+    def test_hypothesis_normalizes_status_phrase(self) -> None:
+        hypothesis = Hypothesis.model_validate(
+            {
+                "id": "H1",
+                "label": "DMA_overwrite",
+                "status": "primary",
+            }
+        )
+
+        self.assertEqual(hypothesis.status, "leading")
+
+    def test_gate_entry_normalizes_status_phrase(self) -> None:
+        gate = GateEntry.model_validate(
+            {
+                "required_for": ["pointer_corruption"],
+                "status": "done",
+                "evidence": "register provenance is closed by disassembly",
+            }
+        )
+
+        self.assertEqual(gate.status, "closed")
+
+    def test_vmcore_analysis_step_normalizes_confidence_phrase(self) -> None:
+        step = VMCoreAnalysisStep.model_validate(
+            {
+                "step_id": 10,
+                "reasoning": "The evidence chain is suggestive but a gate remains open.",
+                "action": None,
+                "is_conclusive": False,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": "unknown",
+                "partial_dump": "partial",
+                "confidence": "low confidence",
+            }
+        )
+
+        self.assertEqual(step.confidence, "low")
 
 
 if __name__ == "__main__":

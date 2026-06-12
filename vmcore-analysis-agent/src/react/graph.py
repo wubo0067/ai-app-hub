@@ -15,13 +15,13 @@ VMCore 分析 Agent 图构建模块
 4. 循环执行 2-3 直到得出最终结论或达到递归限制
 """
 
-import os
 from functools import partial
 from typing import List
 
 from langgraph.graph import START, StateGraph
 from langgraph.checkpoint.memory import InMemorySaver
 
+from src.utils.config import config_manager
 from src.utils.logging import logger
 from .graph_state import AgentState
 from .nodes import (
@@ -34,6 +34,39 @@ from .nodes import (
 )
 from .llm_node import call_llm_analysis, structure_reasoning_content
 from .edges import should_continue, after_crash_tool
+
+
+def _debug_log_bound_tools_payload(bound_llm) -> None:
+    """Log bound tool schema payload when debug switch is enabled.
+
+    This helper intentionally uses best-effort introspection because different
+    LangChain model wrappers expose bound tool payloads via different fields.
+    """
+
+    if not config_manager.get("debug_tools_schema", False):
+        return
+
+    payload = None
+
+    # Common path for RunnableBinding-like objects created by bind_tools.
+    kwargs = getattr(bound_llm, "kwargs", None)
+    if isinstance(kwargs, dict):
+        payload = kwargs.get("tools") or kwargs.get("functions")
+
+    # Fallback for wrappers that store kwargs on an internal bound object.
+    if payload is None:
+        bound = getattr(bound_llm, "bound", None)
+        bound_kwargs = getattr(bound, "kwargs", None)
+        if isinstance(bound_kwargs, dict):
+            payload = bound_kwargs.get("tools") or bound_kwargs.get("functions")
+
+    if payload is None:
+        logger.warning(
+            "debug_tools_schema is enabled, but no bound tools/functions payload was found on llm_with_tools."
+        )
+        return
+
+    logger.info("[DEBUG] Bound tool schema payload (tools/functions): %s", payload)
 
 
 def create_agent_graph(llm, tools_list: List, structured_llm=None):
@@ -74,6 +107,7 @@ def create_agent_graph(llm, tools_list: List, structured_llm=None):
         # 将工具绑定到 LLM，使其能够在分析过程中主动发起工具调用。
         llm_with_tools = llm.bind_tools(tools_list)
         logger.info(f"Bound {len(tools_list)} tools to LLM for agent execution.")
+        _debug_log_bound_tools_payload(llm_with_tools)
 
     # 初始化内存检查点，用于保存图执行过程中的状态。
     checkpointer = InMemorySaver()

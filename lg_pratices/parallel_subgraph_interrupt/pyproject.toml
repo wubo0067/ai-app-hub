@@ -1,0 +1,10 @@
+[project]
+name = "parallel-subgraph-interrupt"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "langgraph>=1.2.0",
+    "pydantic>=2.13.4",
+]
