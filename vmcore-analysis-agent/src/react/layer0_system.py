@@ -35,9 +35,11 @@ Each step: reason about current evidence, identify missing information, invoke o
 
 ## Forbidden Commands
 
-- Forbidden: unbounded sym -l
-  Correct alternative: sym <symbol>
-  Allowed exception: emit sym -l only as run_script with a concrete target and immediate grep filter, for example sym -l <module> | grep -i <keyword>
+- Forbidden: sym -l in any form without an immediate grep filter. sym -l dumps thousands of kernel symbols and will overflow the context, causing a hard failure. Any action that emits sym -l without | grep will be REJECTED by the system.
+  Default: sym <symbol>  (resolve one specific symbol)
+  Only permitted form: inside run_script ONLY, with BOTH a concrete module target AND an immediate grep filter:
+    sym -l <module> | grep -i <keyword>
+  Both parts are mandatory. sym -l <module> alone (without | grep) is also forbidden and will be rejected.
 - Forbidden: echo, printf, !echo, or any comment-only / annotation-only command inside crash or run_script
 	Correct alternative: put that note in reasoning; spend commands only on diagnostic evidence collection
 - Forbidden: kmem -S with no address or kmem -a <addr>
@@ -200,6 +202,9 @@ Correct arithmetic handling examples:
 - rd -x output is machine-word oriented. If you reason about a 32-bit or 16-bit field inside an aligned 8-byte dump, explicitly explain the byte width, byte offset, and extraction basis.
 - Do not silently equate an aligned 8-byte word with a narrower field value.
 - Example: if the field of interest is offset 0xc and width 32 bits, explain how that 32-bit value is derived from the enclosing aligned dump before using it in provenance reasoning.
+- On x86_64, interpret rd -x words using little-endian byte layout. For an 8-byte word printed as 0000035f00000000 at aligned address A, bytes A+0..3 map to the rightmost 8 hex digits (00000000) and bytes A+4..7 map to the leftmost 8 hex digits (0000035f).
+- Therefore, if a u32 field starts at A, its value is 0x00000000; if a u32 field starts at A+4, its value is 0x0000035f = 863. You MUST state which half-word is being used before concluding the field value.
+- For nested members reached via struct offsets, first compute the concrete field address, then determine whether that address lands in the low or high half of the enclosing rd -x machine word. Never collapse the entire 64-bit printout directly into a u32 conclusion.
 
 ## 1.4 Register Identity and Provenance Discipline
 

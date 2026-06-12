@@ -859,16 +859,6 @@ def _has_positive_lifetime_reuse_evidence(lowered_text: str) -> bool:
         "retained stale reference",
         "survived free",
         "after reuse",
-        # 优化改进：泛化并丰富同义词及重用表现描述，避免由于叙述差异导致的审计误判
-        "stale reference",
-        "stale pointer",
-        "slab reuse",
-        "reallocated to",
-        "reallocated driver",
-        "overwritten with",
-        "overwritten by",
-        "freed and reallocated",
-        "freed and reused",
     )
     return any(marker in lowered_text for marker in evidence_markers)
 

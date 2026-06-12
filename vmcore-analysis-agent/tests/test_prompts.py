@@ -153,6 +153,10 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn(
             "if the field of interest is offset 0xc and width 32 bits", prompt
         )
+        self.assertIn("0000035f00000000 at aligned address A", prompt)
+        self.assertIn(
+            "if a u32 field starts at A+4, its value is 0x0000035f = 863", prompt
+        )
 
     def test_analysis_prompt_requires_temporal_correlation_analysis(self) -> None:
         prompt = analysis_crash_prompt()
@@ -332,10 +336,25 @@ class PromptContractTests(unittest.TestCase):
     def test_minimal_schema_enum_contract_requires_canonical_values(self) -> None:
         contract = build_minimal_schema_enum_contract()
 
-        self.assertIn("Do not emit aliases or shorthand in final JSON", contract)
+        self.assertIn(
+            "Do not emit aliases, descriptive prose, or shorthand in final JSON",
+            contract,
+        )
         self.assertIn("'stack_protector' -> 'stack_corruption'", contract)
         self.assertIn("'type_misuse' -> 'field_type_misuse'", contract)
+        self.assertIn("driver_source_evidence.inference_method", contract)
+        self.assertIn("confidence aliases to normalize", contract)
         self.assertNotIn("'memory_corruption'", contract)
+
+    def test_driver_dma_prompt_includes_driver_source_evidence_few_shot(self) -> None:
+        prompt = self._driver_dma_prompt()
+
+        self.assertIn("Final Diagnosis Few-Shot for driver_source_evidence", prompt)
+        self.assertIn('"inference_method": "function_pointer_anchor"', prompt)
+        self.assertIn(
+            "Do NOT write descriptive prose in driver_source_evidence.inference_method",
+            prompt,
+        )
 
     def test_analysis_prompt_treats_mechanism_in_root_cause_class_as_schema_error(
         self,

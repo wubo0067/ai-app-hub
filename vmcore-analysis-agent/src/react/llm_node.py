@@ -73,8 +73,9 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         f"Prepared messages for LLM analysis (step {current_step}): {[type(m).__name__ for m in messages_to_send]} with system prompt length {len(system_message)} and adaptive max_tokens {adaptive_max_tokens}"
     )
 
-    # 如果上一条消息是 AIMessage 且没有工具调用，说明在此之前发生过 fallback（如 LLM 返回了无效的动作或未提供终止状态）
-    # 增加一条 HumanMessage 提示 LLM 不能空转；这里只强制“前进”，不强制不满足 gate 的结论
+    # 这段代码既不是单纯让 LLM 终止推理，也不是单纯让它继续推理。它的真实作用是防止 agent 空转，并根据 is_last_step 决定：
+    # is_last_step=false：优先推动继续诊断，必要时允许有边界地收口
+    # is_last_step=true：强制停止继续查工具，要求输出终态结果
     last_msg = messages_to_send[-1] if messages_to_send else None
     if isinstance(last_msg, AIMessage) and not last_msg.tool_calls:
         logger.warning(

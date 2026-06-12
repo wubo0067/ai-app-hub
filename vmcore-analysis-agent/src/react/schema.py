@@ -43,6 +43,55 @@ _ROOT_CAUSE_CLASS_ALIASES = {
     "kernel_stack_corruption": "stack_corruption",
 }
 
+_DRIVER_INFERENCE_METHOD_ALIASES = {
+    "struct access from kernel debuginfo": "symbol_lookup",
+    "kernel debuginfo struct access": "symbol_lookup",
+    "struct_access_from_kernel_debuginfo": "symbol_lookup",
+    "source cross reference": "open_source_crossref",
+    "source_cross_reference": "open_source_crossref",
+}
+
+_CONFIDENCE_ALIASES = {
+    "high confidence": "high",
+    "medium confidence": "medium",
+    "low confidence": "low",
+    "moderate": "medium",
+    "tentative": "low",
+}
+
+_HYPOTHESIS_STATUS_ALIASES = {
+    "lead": "leading",
+    "primary": "leading",
+    "possible": "candidate",
+    "alternative": "candidate",
+    "unlikely": "weakened",
+    "ruled out": "ruled_out",
+    "rejected": "ruled_out",
+}
+
+_GATE_STATUS_ALIASES = {
+    "pending": "open",
+    "in_progress": "open",
+    "done": "closed",
+    "complete": "closed",
+    "not_applicable": "n/a",
+    "na": "n/a",
+}
+
+# 将 RootCauseClass 中独有的值映射到最近的 CrashSignatureClass，用于 GateEntry.required_for 容错
+_ROOT_CAUSE_TO_SIGNATURE_CLASS: dict[str, str] = {
+    "out_of_bounds": "pointer_corruption",
+    "double_free": "use_after_free",
+    "wild_pointer": "pointer_corruption",
+    "slab_corruption": "pointer_corruption",
+    "race_condition": "pointer_corruption",
+    "deadlock": "soft_lockup",
+    "rcu_misuse": "rcu_stall",
+    "dma_corruption": "pointer_corruption",
+    "iommu_fault": "pointer_corruption",
+    "oom": "oom_panic",
+}
+
 _ROOT_CAUSE_FROM_MECHANISM = {
     "field_type_misuse": "dma_corruption",
     "missing_conversion": "dma_corruption",
@@ -71,6 +120,15 @@ CorruptionMechanism = Literal[
 ]
 
 
+ConfidenceLevel = Literal["high", "medium", "low"]
+
+
+HypothesisStatus = Literal["leading", "candidate", "weakened", "ruled_out"]
+
+
+GateStatus = Literal["open", "closed", "blocked", "n/a"]
+
+
 def get_signature_class_aliases() -> dict[str, str]:
     """返回 signature_class 的兼容别名映射。"""
     return dict(_SIGNATURE_CLASS_ALIASES)
@@ -84,6 +142,16 @@ def get_root_cause_class_aliases() -> dict[str, str]:
 def get_corruption_mechanism_aliases() -> dict[str, str]:
     """返回 corruption_mechanism 的兼容别名映射。"""
     return dict(_CORRUPTION_MECHANISM_ALIASES)
+
+
+def get_driver_inference_method_aliases() -> dict[str, str]:
+    """返回 driver_source_evidence.inference_method 的兼容别名映射。"""
+    return dict(_DRIVER_INFERENCE_METHOD_ALIASES)
+
+
+def get_confidence_aliases() -> dict[str, str]:
+    """返回 confidence 的兼容别名映射。"""
+    return dict(_CONFIDENCE_ALIASES)
 
 
 def get_root_cause_from_mechanism_mapping() -> dict[str, str]:
@@ -121,6 +189,16 @@ def get_corruption_mechanism_values() -> tuple[str, ...]:
     return cast(tuple[str, ...], get_args(CorruptionMechanism))
 
 
+def get_driver_inference_method_values() -> tuple[str, ...]:
+    """返回 driver_source_evidence.inference_method 的 canonical 枚举值。"""
+    return cast(tuple[str, ...], get_args(DriverInferenceMethod))
+
+
+def get_confidence_values() -> tuple[str, ...]:
+    """返回 confidence 的 canonical 枚举值。"""
+    return cast(tuple[str, ...], get_args(ConfidenceLevel))
+
+
 def get_corruption_mechanism_value_set() -> set[str]:
     """返回 corruption_mechanism 的 canonical 枚举值集合。"""
     return set(get_corruption_mechanism_values())
@@ -129,6 +207,23 @@ def get_corruption_mechanism_value_set() -> set[str]:
 def get_partial_dump_values() -> tuple[str, ...]:
     """返回 partial_dump 的 canonical 枚举值。"""
     return cast(tuple[str, ...], get_args(PartialDumpStatus))
+
+
+def _coerce_confidence(data: Any) -> Any:
+    """对 confidence 做有边界的容错归一化。"""
+    if not isinstance(data, dict):
+        return data
+
+    raw = data.get("confidence")
+    if not isinstance(raw, str):
+        return data
+
+    normalized = _CONFIDENCE_ALIASES.get(raw, raw)
+    if normalized in get_confidence_values():
+        data["confidence"] = normalized
+    else:
+        data["confidence"] = "low"
+    return data
 
 
 _SIGNATURE_CLASS_ALIASES: dict[str, str] = {
@@ -276,8 +371,36 @@ class SuspectCode(BaseModel):
     line: str = Field(..., description="Line number or 'unknown'")
 
 
+DriverInferenceMethod = Literal[
+    "function_pointer_anchor",
+    "symbol_lookup",
+    "open_source_crossref",
+    "apic_fingerprint",
+    "list_head_selfref",
+    "disassembly_offset_inference",
+    "unknown",
+]
+
+
 class DriverSourceEvidence(BaseModel):
     """驱动源码层面的结构和字段推断证据。"""
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_inference_method(cls, data: Any) -> Any:
+        """将 inference_method 中的描述性短语归一化为 schema 允许的枚举值。"""
+        if not isinstance(data, dict):
+            return data
+
+        raw_value = data.get("inference_method")
+        if not isinstance(raw_value, str):
+            return data
+
+        normalized = _DRIVER_INFERENCE_METHOD_ALIASES.get(raw_value, raw_value)
+        if normalized not in get_driver_inference_method_values():
+            normalized = "unknown"
+        data["inference_method"] = normalized
+        return data
 
     object_type: Optional[str] = Field(
         None,
@@ -295,15 +418,9 @@ class DriverSourceEvidence(BaseModel):
         None,
         description="What the field should hold versus what the crash evidence shows it actually contains",
     )
-    inference_method: Literal[
-        "function_pointer_anchor",
-        "symbol_lookup",
-        "open_source_crossref",
-        "apic_fingerprint",
-        "list_head_selfref",
-        "disassembly_offset_inference",
-        "unknown",
-    ] = Field("unknown", description="How the struct or field identity was determined")
+    inference_method: DriverInferenceMethod = Field(
+        "unknown", description="How the struct or field identity was determined"
+    )
     upstream_reference: Optional[str] = Field(
         None,
         description="Upstream commit, CVE, stable patch, or source-file reference if known",
@@ -416,7 +533,7 @@ class VMCoreLLMAnalysisStep(BaseModel):
         None,
         description="Recommended fix or workaround.",
     )
-    confidence: Optional[Literal["high", "medium", "low"]] = Field(
+    confidence: Optional[ConfidenceLevel] = Field(
         None, description="Confidence level of the diagnosis."
     )
     additional_notes: Optional[str] = Field(
@@ -433,7 +550,8 @@ class VMCoreLLMAnalysisStep(BaseModel):
                 data["signature_class"] = legacy_value
         data = _coerce_signature_class(data)
         data = _coerce_root_cause_class(data)
-        return _coerce_corruption_mechanism(data, root_cause_field="root_cause_class")
+        data = _coerce_corruption_mechanism(data, root_cause_field="root_cause_class")
+        return _coerce_confidence(data)
 
 
 # =============================================================================
@@ -525,6 +643,21 @@ class Hypothesis(BaseModel):
     每步必须更新，只允许一个 leading 假设。
     """
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_status(cls, data: Any) -> Any:
+        """将 hypothesis.status 中的近似标签归一化为 schema 允许值。"""
+        if not isinstance(data, dict):
+            return data
+        raw_status = data.get("status")
+        if not isinstance(raw_status, str):
+            return data
+        normalized = _HYPOTHESIS_STATUS_ALIASES.get(raw_status, raw_status)
+        if normalized not in get_args(HypothesisStatus):
+            normalized = "candidate"
+        data["status"] = normalized
+        return data
+
     id: str = Field(..., description="Short identifier, e.g. 'H1', 'H2'")
     label: str = Field(
         ...,
@@ -538,7 +671,7 @@ class Hypothesis(BaseModel):
             "Optional — populate when multiple candidates compete."
         ),
     )
-    status: Literal["leading", "candidate", "weakened", "ruled_out"] = Field(
+    status: HypothesisStatus = Field(
         ...,
         description="Current standing. Only ONE hypothesis may be 'leading' at any step.",
     )
@@ -563,11 +696,41 @@ class GateEntry(BaseModel):
       n/a     — 确实不适用（evidence 字段必须解释为何不适用，如特定硬件环境未触发）
     """
 
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_required_for(cls, data: Any) -> Any:
+        """将 required_for 中 LLM 误填的 RootCauseClass 值归一化为最近的 CrashSignatureClass。"""
+        if not isinstance(data, dict):
+            return data
+        raw_status = data.get("status")
+        if isinstance(raw_status, str):
+            normalized_status = _GATE_STATUS_ALIASES.get(raw_status, raw_status)
+            if normalized_status not in get_args(GateStatus):
+                normalized_status = "open"
+            data["status"] = normalized_status
+        raw_list = data.get("required_for")
+        if not isinstance(raw_list, list):
+            return data
+        valid_set = get_signature_class_value_set()
+        coerced: list[str] = []
+        seen: set[str] = set()
+        for v in raw_list:
+            if not isinstance(v, str):
+                continue
+            mapped = _ROOT_CAUSE_TO_SIGNATURE_CLASS.get(v, v)
+            if mapped not in valid_set:
+                mapped = "pointer_corruption"  # 兜底：未知值归到通用损坏类
+            if mapped not in seen:
+                coerced.append(mapped)
+                seen.add(mapped)
+        data["required_for"] = coerced
+        return data
+
     required_for: List[CrashSignatureClass] = Field(
         ...,
         description="signature_class values that require this gate closed before is_conclusive=true",
     )
-    status: Literal["open", "closed", "blocked", "n/a"] = Field(
+    status: GateStatus = Field(
         "open",
         description="open=pending, closed=verified, blocked=prereq not met, n/a=not applicable",
     )
@@ -674,7 +837,7 @@ class VMCoreAnalysisStep(BaseModel):
             legacy_value = data.get("crash_class")
             if legacy_value is not None:
                 data["signature_class"] = legacy_value
-        return data
+        return _coerce_confidence(data)
 
     reasoning: str = Field(
         ...,
@@ -759,7 +922,7 @@ class VMCoreAnalysisStep(BaseModel):
         None,
         description="Recommended fix or workaround.",
     )
-    confidence: Optional[Literal["high", "medium", "low"]] = Field(
+    confidence: Optional[ConfidenceLevel] = Field(
         None, description="Confidence level of the diagnosis."
     )
     additional_notes: Optional[str] = Field(

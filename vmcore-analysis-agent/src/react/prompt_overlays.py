@@ -93,6 +93,44 @@ When struct -o fails for a third-party or out-of-tree module, reconstruct the ru
 - Once the driver and function are known, look for known upstream fixes, stable backports, or CVEs touching the same queue, reset, or reinitialization path.
 - If you cannot verify an exact patch, state the bounded pattern only. Do not invent commit IDs.
 
+### Final Diagnosis Few-Shot for driver_source_evidence
+
+Correct final_diagnosis fragment:
+```json
+{
+  "final_diagnosis": {
+    "crash_type": "kernel paging request",
+    "panic_string": "BUG: unable to handle kernel paging request at 000000e500080008",
+    "faulting_instruction": "movzbl (%rcx,%rax,1), %eax",
+    "root_cause": "A driver queue field was misused as a virtual pointer.",
+    "detailed_analysis": "Function-pointer anchoring and source correlation identify a driver-private queue object. The corrupted offset maps to a dma_addr_t field, so the mechanism is field-type misuse rather than generic write corruption.",
+    "suspect_code": {
+      "file": "drivers/scsi/mpt3sas/mpt3sas_base.c",
+      "function": "_base_process_reply_queue",
+      "line": "unknown"
+    },
+    "evidence": [
+      "offset 0x60 resolves to _base_interrupt",
+      "offset 0x10 contains a DMA-looking address later consumed as a virtual pointer"
+    ],
+    "driver_source_evidence": {
+      "object_type": "struct adapter_reply_queue",
+      "corrupted_field_name": "reply_post_free_dma",
+      "corrupted_field_type": "dma_addr_t",
+      "field_semantics": "DMA address field was used where a virtual pointer field was expected",
+      "inference_method": "function_pointer_anchor",
+      "upstream_reference": "drivers/scsi/mpt3sas/mpt3sas_base.c"
+    },
+    "corruption_mechanism": "field_type_misuse"
+  }
+}
+```
+
+Incorrect pattern to avoid:
+- Do NOT write descriptive prose in driver_source_evidence.inference_method such as "struct access from kernel debuginfo" or "looks like source correlation".
+- Use ONLY one canonical enum: function_pointer_anchor, symbol_lookup, open_source_crossref, apic_fingerprint, list_head_selfref, disassembly_offset_inference, or unknown.
+- If the struct or field identity is still uncertain, keep driver_source_evidence if needed but set inference_method to unknown.
+
 ### Step G: Protocol-Level Value Claims Require Bit Layout Verification
 - If a corrupted value is described as "resembling", "matching", or "consistent with" a hardware protocol structure (e.g., mpt3sas reply descriptor, NVMe command frame, SCSI CDB, descriptor ring entry), that description is a hypothesis, NOT evidence-quality correlation, until the bit layout is explicitly verified.
 - Required verification before elevating a resemblance claim to evidence:

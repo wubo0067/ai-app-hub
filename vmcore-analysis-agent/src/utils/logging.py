@@ -48,20 +48,23 @@ def setup_logger(log_filename="va-agent.log", log_dir="logs"):
     # Avoid adding handlers multiple times if logger already exists
     if not logger_instance.handlers:
         # Define the logging configuration
-        logger_instance = logging.getLogger("vmcore_analysis_agent")
         logging.setLogRecordFactory(CustomLogRecord)  # Only set once globally
         handler = logging.FileHandler(log_filepath)
         formatter = logging.Formatter(
             "%(asctime)s [%(levelname)s] [%(module)s] [%(pathname)s:%(lineno)d]: %(message)s"
         )
         handler.setFormatter(formatter)
+        handler.setLevel(logging.DEBUG)  # 显式设置文件处理器的级别
         logger_instance.addHandler(handler)
-        logger_instance.setLevel(logging.DEBUG)
 
         # Also add console handler for debugging
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
+        console_handler.setLevel(logging.DEBUG)  # 显式设置控制台处理器的级别
         logger_instance.addHandler(console_handler)
+
+    # 确保无论是否已存在 Handler（例如由于多次调用或环境预初始化），Logger 的级别都设置为 DEBUG
+    logger_instance.setLevel(logging.DEBUG)
 
     return logger_instance
 

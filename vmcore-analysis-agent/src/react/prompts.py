@@ -16,8 +16,12 @@ from .prompt_phrases import (
     STACK_CAUSALITY_RED_LINE_RULE,
 )
 from .schema import (
+    get_confidence_aliases,
+    get_confidence_values,
     get_corruption_mechanism_aliases,
     get_corruption_mechanism_values,
+    get_driver_inference_method_aliases,
+    get_driver_inference_method_values,
     get_partial_dump_values,
     get_root_cause_class_aliases,
     get_root_cause_class_values,
@@ -36,6 +40,8 @@ def _invalid_aliases_text() -> str:
             *get_signature_class_aliases().keys(),
             *get_root_cause_class_aliases().keys(),
             *get_corruption_mechanism_aliases().keys(),
+            *get_driver_inference_method_aliases().keys(),
+            *get_confidence_aliases().keys(),
         }
     )
     return _quote_values(tuple(aliases))
@@ -53,11 +59,16 @@ def build_minimal_schema_enum_contract() -> str:
         f"- signature_class: {_quote_values(get_signature_class_values())}\n"
         f"- root_cause_class: {_quote_values(get_root_cause_class_values())}\n"
         f"- corruption_mechanism: {_quote_values(get_corruption_mechanism_values())}\n"
+        f"- driver_source_evidence.inference_method: {_quote_values(get_driver_inference_method_values())}\n"
+        f"- confidence: {_quote_values(get_confidence_values())}\n"
         f"- partial_dump: {_quote_values(get_partial_dump_values())}\n"
-        "Do not emit aliases or shorthand in final JSON. Normalize them to canonical schema values first.\n"
+        "Do not emit aliases, descriptive prose, or shorthand in final JSON. Normalize them to canonical schema values first.\n"
         f"- signature_class aliases to normalize: {_quote_alias_map(get_signature_class_aliases())}\n"
         f"- root_cause_class aliases to normalize: {_quote_alias_map(get_root_cause_class_aliases())}\n"
-        f"- corruption_mechanism aliases to normalize: {_quote_alias_map(get_corruption_mechanism_aliases())}"
+        f"- corruption_mechanism aliases to normalize: {_quote_alias_map(get_corruption_mechanism_aliases())}\n"
+        f"- driver_source_evidence.inference_method aliases to normalize: {_quote_alias_map(get_driver_inference_method_aliases())}\n"
+        f"- confidence aliases to normalize: {_quote_alias_map(get_confidence_aliases())}\n"
+        "If driver_source_evidence is present and the method is uncertain, set inference_method to 'unknown'."
     )
 
 
