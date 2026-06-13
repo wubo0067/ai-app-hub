@@ -5,7 +5,7 @@
 # Created: 2026-01-19
 
 import json
-from typing import cast
+from typing import Any, cast
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage, HumanMessage
 from .graph_state import AgentState
 from .nodes import llm_analysis_node, structure_reasoning_node
@@ -209,14 +209,14 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
 
         llm_step = apply_executor_consistency_audit(
             llm_step,
-            state,
+            cast(dict[str, Any], state),
             log_prefix=llm_analysis_node,
         )
 
         # 记录 response
         analysis_result, managed_updates = project_managed_analysis_step(
             llm_step,
-            state,
+            cast(dict[str, Any], state),
             original_reasoning=raw_message.additional_kwargs.get(
                 "reasoning_content", ""
             )
@@ -333,6 +333,11 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
 
     try:
         output_data = await ainvoke_with_retry(chat_with_structured, messages_to_send)
+        if output_data is None:
+            raise ValueError(
+                f"ainvoke_with_retry returned None for structured output. "
+                f"Reasoning length: {len(reasoning or '')} chars."
+            )
         llm_step = cast(VMCoreLLMAnalysisStep, output_data["parsed"])
         raw_chat_message = cast(AIMessage, output_data["raw"])
 
@@ -356,7 +361,7 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
 
         llm_step = apply_executor_consistency_audit(
             llm_step,
-            state,
+            cast(dict[str, Any], state),
             log_prefix=structure_reasoning_node,
         )
 
@@ -365,8 +370,8 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
 
         analysis_result, managed_updates = project_managed_analysis_step(
             llm_step,
-            state,
-            original_reasoning=reasoning,
+            cast(dict[str, Any], state),
+            original_reasoning=reasoning or "",
         )
 
         logger.info(

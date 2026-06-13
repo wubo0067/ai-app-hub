@@ -123,7 +123,7 @@ async def dispatch_mcp_requests(
                 continue
 
             try:
-                payload = provider.build_tool_payload(tool_name, args, state)
+                payload = provider.build_tool_payload(tool_name, args, dict(**state))
             except Exception as exc:
                 logger.error("Failed to build payload for tool %s: %s", tool_name, exc)
                 tasks.append(
