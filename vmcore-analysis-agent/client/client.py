@@ -1,4 +1,4 @@
-# client.py
+# c,ient.py
 """
 Vmcore Analysis Agent 客户端库
 提供同步请求、流式请求、健康检查和报告保存等可复用接口
@@ -172,8 +172,9 @@ def save_markdown_report(
     if not safe_filename or safe_filename == ".":
         safe_filename = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    # 构造文件名
-    filename = f"{safe_filename}.md"
+    # 构造文件名，追加时间戳避免覆盖
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    filename = f"{safe_filename}-{timestamp}.md"
     filepath = Path(output_dir) / filename
 
     # 确保输出目录存在

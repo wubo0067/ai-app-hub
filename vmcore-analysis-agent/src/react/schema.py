@@ -59,6 +59,7 @@ _CONFIDENCE_ALIASES = {
     "tentative": "low",
 }
 
+#假设状态近似标签归一化
 _HYPOTHESIS_STATUS_ALIASES = {
     "lead": "leading",
     "primary": "leading",

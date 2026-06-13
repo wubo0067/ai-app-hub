@@ -236,4 +236,5 @@ def compute_adaptive_max_tokens(
 def _recent_index_set(indices: list[int], keep_count: int) -> set[int]:
     if keep_count <= 0:
         return set()
+    # 获取最近的索引集合，保留最后 keep_count 个索引
     return set(indices[-keep_count:])

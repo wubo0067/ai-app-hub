@@ -524,25 +524,44 @@ def _recent_command_summaries(messages: Sequence[BaseMessage]) -> str:
 
 
 def _extract_canonical_commands_from_ai_message(message: AIMessage) -> list[str]:
+    """
+    从 AIMessage 中提取并规范化所有工具调用命令。
+
+    优先从 tool_calls（LangChain 结构化调用）中提取；若无则回退到 JSON content
+    中解析传统 action 字段。两种路径均通过 _canonical_commands_from_tool_call
+    将参数渲染为规范化的 crash 命令字符串。
+
+    Args:
+        message: AI 消息，可能包含 tool_calls 或 JSON 格式的 content。
+
+    Returns:
+        规范化后的命令字符串列表；无命令时返回空列表。
+    """
     commands: list[str] = []
 
+    # --- 路径 A: 从结构化 tool_calls 提取 ---
     for tool_call in message.tool_calls or []:
+        # tool_call 中 name/args 可能有多种命名风格，兼容处理
         name = tool_call.get("name") or tool_call.get("command_name")
         args = tool_call.get("args") or tool_call.get("arguments") or {}
         commands.extend(_canonical_commands_from_tool_call(name, args))
 
+    # 路径 A 有结果则直接返回，避免走 content 解析
     if commands:
         return commands
 
+    # --- 路径 B: 回退到 JSON content 中解析传统 action 字段 ---
     try:
         parsed_content = json.loads(message.content)
     except (TypeError, json.JSONDecodeError):
+        # content 为空或非 JSON 格式，无法解析
         return []
 
     action = parsed_content.get("action")
     if not action:
         return []
 
+    # 从 action 字典中提取命令名称和参数
     return _canonical_commands_from_tool_call(
         action.get("command_name", "unknown"),
         action.get("arguments") or [],
