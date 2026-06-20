@@ -11,7 +11,6 @@ Crash MCP 服务器实现
 每个 crash 子命令都被注册为一个独立的 MCP 工具。
 """
 
-import os
 from typing import Annotated
 from pydantic import Field
 from fastmcp import FastMCP
@@ -435,4 +434,5 @@ for cmd_info in commands:
     register_crash_tool(*cmd_info)
 
 if __name__ == "__main__":
+    # 作为独立进程启动时，通过 stdio 与 MCP 客户端通信。
     crash_server.run(transport="stdio", show_banner=False)

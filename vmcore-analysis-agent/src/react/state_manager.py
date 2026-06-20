@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bi,/env python3
 # -*- coding: utf-8 -*-
 
 from typing import Any, Dict, List, Optional, cast
@@ -104,6 +104,24 @@ def _resolve_partial_dump(
     state: Dict[str, Any],
     original_reasoning: str,
 ) -> PartialDumpStatus:
+    """
+    解析并确定当前崩溃转储（dump）的状态（完整转储或部分转储）。
+
+    解析优先级：
+    1. 显式的转储状态：如果传入的 `partial_dump` 指定了非 "unknown" 的有效状态，则优先使用。
+    2. 继承历史状态：如果全局上下文 `state` 中已经记录了确切的转储状态（"full" 或 "partial"），则直接沿用。
+    3. 文本推断：如果前两者未知，则根据 LLM 的原始推理文本 `original_reasoning` 中的关键词
+       （如包含 "[partial dump]" 或 "dump is complete"）来倒推状态。
+    4. 回退处理：如果都不满足，则返回 "unknown"。
+
+    Args:
+        partial_dump: 本次分析步骤中直接指定的转储状态。
+        state: 当前分析的全局状态，其中可能包含此前确定的 `current_partial_dump`。
+        original_reasoning: 引发本次状态更新的原始模型推理分析文本串，用于辅助文本匹配。
+
+    Returns:
+        PartialDumpStatus: 解析出的最准确的转储状态（"full", "partial", 或 "unknown"）。
+    """
     if partial_dump != "unknown":
         return partial_dump
 
@@ -124,14 +142,32 @@ def _build_managed_hypotheses(
     root_cause_class: Optional[RootCauseClass],
     prior_hypotheses: Optional[List[Hypothesis]],
 ) -> Optional[List[Hypothesis]]:
+    """
+    构建受管理的假设（Hypotheses）列表。
+
+    根据当前的根因类 (root_cause_class) 或签名类 (signature_class)，确定主导的假设标签，
+    并将其放在假设列表的首位 (H1)。原有列表中的其他假设会被作为备选降级或挂起状态追加到后面。
+
+    Args:
+        signature_class: 当前分析确定的崩溃签名类别。
+        root_cause_class: 当前分析确定的崩溃根因类别（优先级高于签名类别）。
+        prior_hypotheses: 此前已经存在的（历史）假设列表。
+
+    Returns:
+        重新排序和整合后的假设列表。如果未能确定有效的签名或根因类别，则直接返回原列表。
+    """
+    # 确定主导标签：优先使用根因类，若无明确根因则使用签名类
     leading_label = (
         root_cause_class
         if root_cause_class and root_cause_class != "unknown"
         else signature_class
     )
+
+    # 若无法得出有效的主导标签，则直接返回先前的假设列表，不作修改
     if leading_label is None or leading_label == "unknown":
         return prior_hypotheses
 
+    # 初始化受管理假设列表，并将主导标签作为首个假设 (H1)，状态设为 "leading" (主导)
     managed: List[Hypothesis] = [
         Hypothesis(
             id="H1",
@@ -146,14 +182,19 @@ def _build_managed_hypotheses(
         )
     ]
 
+    # 遍历之前的假设列表，处理旧的假设
     for prior in prior_hypotheses or []:
+        # 若历史假设的标签与当前主导标签相同，则跳过（因为上面已作为 H1 添加）
         if prior.label == leading_label:
             continue
+
+        # 将其他历史假设追加到列表中，并重新分配 id 和 rank
         managed.append(
             Hypothesis(
                 id=f"H{len(managed) + 1}",
                 label=prior.label,
                 rank=len(managed) + 1,
+                # 若先前的状态也是 "leading"，在此处降级为 "candidate"（备选）；否则保留原状态
                 status="candidate" if prior.status == "leading" else prior.status,
                 evidence=prior.evidence,
             )

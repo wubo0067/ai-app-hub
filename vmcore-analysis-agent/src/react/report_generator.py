@@ -307,7 +307,7 @@ def generate_markdown_report(state: AgentState) -> str:
         '*This report was jointly created by <span style="color: red;">**CalmWU and his AI agent.**</span>*'
     )
     lines.append("")
-    lines.append("*🐶 xeon*")  # Navigator Oracle Explorer X-ray
+    lines.append('*<span style="color: gray;">zhao qiang and xeon are two 🐶s</span>*')
     lines.append("")
 
     return "\n".join(lines)
