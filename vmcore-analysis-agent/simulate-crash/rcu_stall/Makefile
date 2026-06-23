@@ -1,7 +1,13 @@
+# Ma:efile for RCU Stall Simulator kernel module
+# Build: make
+# Clean: make clean
 obj-m += rcu_stall_mod.o
+
 ccflags-y := -g -O0 -fno-inline -fno-inline-functions \
                 -fno-inline-small-functions -fno-optimize-sibling-calls \
                 -DDEBUG
+
+.PHONY: all clean
 
 all:
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules V=1

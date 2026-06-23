@@ -32,6 +32,7 @@ from .action_guard import (
     build_fingerprint_from_lines,
     extract_struct_layouts,
     extract_command_lines,
+    maybe_rewrite_module_symbol_tool_call,
     validate_tool_call_request,
 )
 
@@ -416,6 +417,19 @@ async def call_crash_tool(state: AgentState) -> dict:
                 name = tool_call["name"]
                 args = tool_call.get("args", {})
 
+                rewritten_call = maybe_rewrite_module_symbol_tool_call(
+                    name,
+                    args,
+                    debug_symbol_paths=state.get("debug_symbol_paths"),
+                )
+                if rewritten_call is not None:
+                    name, args = rewritten_call
+                    logger.info(
+                        "Auto-rewrote tool call %s (ID: %s) to run_script with mod -s prelude.",
+                        tool_call.get("name"),
+                        tool_call_id,
+                    )
+
                 # 拼接命令：假设 args 的值即为参数，按顺序拼接
                 args_str = (
                     " ".join(str(v) for v in args.values())
@@ -457,6 +471,7 @@ async def call_crash_tool(state: AgentState) -> dict:
                     allow_bt_a=allow_bt_a,
                     observed_struct_offsets=crash_path_struct_offsets,
                     struct_layout_cache=struct_layout_cache,
+                    debug_symbol_paths=state.get("debug_symbol_paths"),
                 )
                 if validation_error is not None:
                     tool_messages.append(

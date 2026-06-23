@@ -4,6 +4,7 @@ from src.react.prompts import (
     analysis_crash_prompt,
     build_structure_reasoning_force_conclusion,
     build_minimal_schema_enum_contract,
+    crash_init_data_prompt,
     simplified_structure_reasoning_prompt,
 )
 from src.react.schema import (
@@ -214,6 +215,40 @@ class PromptContractTests(unittest.TestCase):
         )
         self.assertIn("sym -l <module> | grep -i <keyword>", prompt)
         self.assertIn("Load module symbols with mod -s first", prompt)
+
+    def test_crash_init_prompt_requires_mod_s_before_third_party_symbol_queries(
+        self,
+    ) -> None:
+        prompt = crash_init_data_prompt()
+
+        self.assertIn("Mandatory Third-Party Module Symbol Loading", prompt)
+        self.assertIn("mod -s <module> <path>", prompt)
+        self.assertIn("This applies to `dis -l`, `dis -s`, `sym`", prompt)
+
+    def test_crash_init_prompt_requires_source_level_deepening_after_mod_s(
+        self,
+    ) -> None:
+        prompt = crash_init_data_prompt()
+
+        self.assertIn("Mandatory Source-Level Deepening After Symbol Resolution", prompt)
+        self.assertIn("do NOT stop at naming the function or high-level mechanism", prompt)
+        self.assertIn("identify which state variables, struct fields, arguments, or task flags", prompt)
+
+    def test_analysis_prompt_requires_source_level_follow_through_for_third_party_module(
+        self,
+    ) -> None:
+        prompt = analysis_crash_prompt(signature_class="rcu_stall")
+
+        self.assertIn("When dis -l or dis -s resolves concrete file:line information for a third-party module", prompt)
+        self.assertIn("continue with source-level reasoning", prompt)
+        self.assertIn("validate the controlling runtime values", prompt)
+
+    def test_rcu_stall_playbook_requires_source_side_predicate_validation(self) -> None:
+        prompt = analysis_crash_prompt(signature_class="rcu_stall")
+
+        self.assertIn("continue from source instead of stopping at the stall symptom", prompt)
+        self.assertIn("holding `rcu_read_lock()` across a blocking call", prompt)
+        self.assertIn("task -R rcu_read_lock_nesting", prompt)
 
     def test_analysis_prompt_allows_bounded_log_t_and_log_a(self) -> None:
         prompt = analysis_crash_prompt()

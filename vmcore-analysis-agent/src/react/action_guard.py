@@ -1,9 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3,,,,
 # -*- coding: utf-8 -*-
 # action_guard.py - crash action executor 校验与规范化模块
 # 本模块用于验证和规范化 crash 调试工具的命令执行请求，防止危险操作和错误用法
 
 import re
+from pathlib import Path
 from typing import Any, Iterable, List, Optional
 
 # 匹配 head/tail 管道后缀的正则表达式，用于清理命令输出过滤操作
@@ -26,11 +27,11 @@ _ADDRESS_ARITHMETIC_RE = re.compile(
 _KMEM_S_CACHE_NAME_RE = re.compile(r"^kmem\s+-S\s+[A-Za-z_][A-Za-z0-9_-]*$")
 # 模块相关符号的前缀列表，用于检测是否需要先加载模块符号表
 _MODULE_SYMBOL_PREFIXES = (
-    "mlx5_",  # Mellanox 网卡驱动
-    "nvme_",  # NVMe 存储驱动
-    "pqi_",  # PQI 存储控制器驱动
-    "qla2xxx_",  # QLogic 光纤通道驱动
-    "mpt3sas_",  # LSI SAS 控制器驱动
+    "mlx5",  # Mellanox 网卡驱动
+    "nvme",  # NVMe 存储驱动
+    "pqi",  # PQI 存储控制器驱动
+    "qla2xxx",  # QLogic 光纤通道驱动
+    "mpt3sas",  # LSI SAS 控制器驱动
 )
 # 反汇编行匹配：提取指令部分
 _DISASM_LINE_RE = re.compile(r"^\s*0x[0-9a-fA-F]+\s+<[^>]+>:\s+(?P<inst>.+)$")
@@ -189,6 +190,36 @@ def build_fingerprint_from_lines(lines: Iterable[str]) -> str:
     return "\n".join(substantive_lines)
 
 
+def maybe_rewrite_module_symbol_tool_call(
+    tool_name: str,
+    args: Any,
+    *,
+    debug_symbol_paths: Optional[Iterable[str]] = None,
+) -> tuple[str, Any] | None:
+    """
+    将单条第三方模块符号查询自动改写为 run_script，并前置 mod -s。
+
+    仅处理非 run_script 的单条命令；如果命令不涉及第三方模块私有符号，返回 None。
+    """
+    if tool_name == "run_script" or not debug_symbol_paths:
+        return None
+
+    lines = extract_command_lines(tool_name, args)
+    if not lines or not _uses_module_specific_symbol(
+        lines, debug_symbol_paths=debug_symbol_paths
+    ):
+        return None
+
+    module_spec = _select_module_debug_spec(lines, debug_symbol_paths)
+    if module_spec is None:
+        return None
+
+    module_name, module_path = module_spec
+    normalized_lines = [canonicalize_command_line(line) for line in lines if line.strip()]
+    script = "\n".join([f"mod -s {module_name} {module_path}", *normalized_lines])
+    return "run_script", {"script": script}
+
+
 def validate_tool_call_request(
     tool_name: str,
     args: Any,
@@ -196,6 +227,7 @@ def validate_tool_call_request(
     allow_bt_a: bool = False,
     observed_struct_offsets: Optional[Iterable[int]] = None,
     struct_layout_cache: Optional[dict[str, dict[str, Any]]] = None,
+    debug_symbol_paths: Optional[Iterable[str]] = None,
 ) -> str | None:
     """
     验证工具调用请求的合法性。
@@ -229,6 +261,13 @@ def validate_tool_call_request(
                     "otherwise use sym <symbol>."
                 )
 
+        if _uses_module_specific_symbol(lines, debug_symbol_paths=debug_symbol_paths):
+            return (
+                "single crash commands that use third-party module symbols/types are forbidden; "
+                "use run_script starting with mod -s <module> <path> and then issue the dependent command "
+                "in the same crash session."
+            )
+
     # 检查 run_script 至少包含一条命令
     if tool_name == "run_script" and not lines:
         return "run_script must contain at least one command line."
@@ -252,7 +291,9 @@ def validate_tool_call_request(
             return "run_script cannot contain only mod -s; include at least one diagnostic command."
 
         # 如果使用模块相关符号，必须以 mod -s 开头
-        if _uses_module_specific_symbol(substantive_lines):
+        if _uses_module_specific_symbol(
+            substantive_lines, debug_symbol_paths=debug_symbol_paths
+        ):
             first_line = canonicalize_command_line(lines[0])
             if not first_line.startswith("mod -s "):
                 return "run_script uses module-specific symbols/types and must start with mod -s <module> <path>."
@@ -499,7 +540,73 @@ def _extract_rd_target_and_count(parts: list[str]) -> tuple[str | None, int | No
         return address, None
 
 
-def _uses_module_specific_symbol(lines: Iterable[str]) -> bool:
+def _strip_module_debug_suffixes(path: str) -> str:
+    """从调试符号路径中提取模块名主干。"""
+    name = Path(path).name
+    for suffix in (".ko.debug", ".ko", ".debug"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return name
+
+
+def _module_debug_candidates(path: str) -> set[str]:
+    """根据模块路径生成可匹配的模块名候选。"""
+    module_name = _strip_module_debug_suffixes(path).lower()
+    candidates: set[str] = {module_name}
+    if module_name.endswith("_mod"):
+        base_name = module_name[: -len("_mod")]
+        if base_name:
+            candidates.add(base_name)
+    if module_name.endswith("_module"):
+        base_name = module_name[: -len("_module")]
+        if base_name:
+            candidates.add(base_name)
+    return {candidate for candidate in candidates if candidate}
+
+
+def _line_matches_module_candidate(line: str, candidate: str) -> bool:
+    """按标识符边界匹配模块名或其私有符号前缀。"""
+    escaped = re.escape(candidate)
+    pattern = re.compile(rf"(?<![A-Za-z0-9_]){escaped}(?:_(?=[A-Za-z0-9_])|(?![A-Za-z0-9_]))")
+    return pattern.search(line) is not None
+
+
+def _derive_module_symbol_hints(debug_symbol_paths: Optional[Iterable[str]]) -> set[str]:
+    """根据第三方 ko 路径动态推导模块符号前缀/名称提示。"""
+    hints: set[str] = set(_MODULE_SYMBOL_PREFIXES)
+    if not debug_symbol_paths:
+        return hints
+
+    for path in debug_symbol_paths:
+        for candidate in _module_debug_candidates(str(path)):
+            hints.add(candidate)
+
+    return hints
+
+
+def _select_module_debug_spec(
+    lines: Iterable[str], debug_symbol_paths: Optional[Iterable[str]]
+) -> tuple[str, str] | None:
+    """从第三方 ko 列表中为当前命令选择最匹配的模块名与路径。"""
+    if not debug_symbol_paths:
+        return None
+
+    normalized_lines = [canonicalize_command_line(line).lower() for line in lines]
+    for path in debug_symbol_paths:
+        candidates = _module_debug_candidates(str(path))
+        for candidate in candidates:
+            if any(
+                _line_matches_module_candidate(line, candidate)
+                for line in normalized_lines
+            ):
+                return _strip_module_debug_suffixes(str(path)), str(path)
+    return None
+
+
+def _uses_module_specific_symbol(
+    lines: Iterable[str], *, debug_symbol_paths: Optional[Iterable[str]] = None
+) -> bool:
     """
     检测命令行是否使用了模块相关的符号或类型。
 
@@ -511,10 +618,12 @@ def _uses_module_specific_symbol(lines: Iterable[str]) -> bool:
     Returns:
         若使用模块符号返回 True，否则返回 False
     """
+    symbol_hints = _derive_module_symbol_hints(debug_symbol_paths)
+
     for line in lines:
         lowered = canonicalize_command_line(line).lower()
         # 检查是否包含任何模块符号前缀
-        if any(prefix in lowered for prefix in _MODULE_SYMBOL_PREFIXES):
+        if any(_line_matches_module_candidate(lowered, prefix) for prefix in symbol_hints):
             return True
     return False
 

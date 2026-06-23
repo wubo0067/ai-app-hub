@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bi,/en, python3
 # -*- coding: utf-8 -*-
 
 from .prompt_phrases import (
@@ -38,6 +38,9 @@ Use this guide as part of {S1_S5_DMA_GATE_RULE} In this file, S1 mainly covers i
 """.strip()
 
 
+# Shared prompt template for two signature classes whose first-pass triage is
+# instruction-centric: divide_error focuses on div/idiv with a zero divisor,
+# while invalid_opcode usually starts from ud2 or trap-style faulting opcodes.
 _DIVIDE_OR_OPCODE_PLAYBOOK = """
 ## 3.9 Divide-by-Zero / Invalid Opcode
 Pattern: divide error or invalid opcode.
@@ -55,6 +58,9 @@ _BUG_WARN_PLAYBOOK = """
 - Treat BUG_ON and WARN_ON as symptom sites that still require control-flow and data-state validation.
 - Read the triggering condition, correlate it with the active path, and decide whether it exposes the true root cause or downstream damage.
 - If the warning is adjacent to refcount, list, or lifetime logic, still verify object state before concluding.
+- If source-aware disassembly resolves the trap to concrete `file:line`, inspect the nearby source-side condition instead of stopping at `ud2` or the warning string alone.
+- For BUG/WARN reached from a third-party module path, identify which runtime state made the condition true: task flags, preempt/RCU nesting, lock state, function arguments, or struct fields read immediately before the trap.
+- Prefer proving the exact source-side predicate with concrete reads (`task -R`, `struct`, `rd`, `bt <pid>`, or `dis` around the mapped block) rather than reporting only the symbolic BUG site.
 """.strip()
 
 
@@ -83,6 +89,10 @@ Analysis:
 2. Inspect stalled-task backtrace for long-held rcu_read_lock sections.
 3. Check whether offline or online CPU operations delayed the grace period.
 4. If CONFIG_RCU_NOCB_CPU is present, consider callback backlog accumulation.
+5. If a third-party module is on the stalled task's path and `dis -l` or `dis -s` resolves source lines, continue from source instead of stopping at the stall symptom: inspect the exact sleep, loop, or lock-holding path in that function.
+6. For source-mapped third-party module code, identify the concrete source-side mistake: sleeping while atomic, holding `rcu_read_lock()` across a blocking call, missing unlock on an error path, wrong loop exit condition, or a state flag that never changes.
+7. Validate the source-side predicate with runtime values. Prefer reading the task state and the exact fields implied by the source line, such as `task -R preempt_count`, `task -R rcu_read_lock_nesting`, module-private state fields via `struct`, or the arguments/locals visible in adjacent disassembly.
+8. If a WARN/BUG precedes the final stall, treat the WARN/BUG trigger condition as a candidate primary cause and use source-level analysis to explain how it leads to the later RCU stall, rather than treating the stall as the only root cause signal.
 """.strip(),
     "use_after_free": """
 ## 3.4 Use-After-Free / Memory Corruption

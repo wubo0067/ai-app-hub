@@ -1,4 +1,4 @@
-/*,,,,?,
+/*,,,,?,,,
  * @Author: CALM.WU
  * @Date: 2026-03-17 18:03:16
  * @Last Modified by:   CALM.WU
@@ -27,7 +27,7 @@ module_param(cpu_number, int, S_IRUGO);
 MODULE_PARM_DESC(cpu_number,
                  "CPU number to run soft lockup on (-1 for any CPU)");
 
-static bool enable_soft_lockup = false;
+static atomic_t enable_soft_lockup = ATOMIC_INIT(0);
 module_param(enable_soft_lockup, bool, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(enable_soft_lockup,
                  "Enable soft lockup simulation (default: false)");
@@ -111,79 +111,78 @@ MODULE_PARM_DESC(enable_soft_lockup,
 //     无变化 → soft lockup    无增长 → hard lockup!
 //     panic("softlockup")    panic("hardlockup")
 
+/*
+ * soft_lockup_simulation - 内核线程主函数，用于模拟 soft lockup 场景
+ *
+ * @data: kthread_run 创建线程时传入的私有数据，本场景未使用（传 NULL）
+ *
+ * 工作原理：
+ *   1. 将当前线程绑定到指定 CPU（若 cpu_number 有效），确保 lockup 发生在目标核上
+ *   2. 主循环中检查 enable_soft_lockup 开关：
+ *      - 关闭时调用 schedule() 主动让出 CPU，线程处于可调度状态，不会触发 lockup
+ *      - 开启时进入"禁抢占 + 忙等"阶段，模拟 soft lockup
+ *   3. soft lockup 模拟阶段：
+ *      - preempt_disable() 使 preempt_count > 0，禁止内核抢占
+ *      - 内层 while 循环持续忙等（barrier() 防止编译器优化掉空循环）
+ *      - 此时硬件中断仍可响应，但调度器无法抢占该 CPU
+ *      - watchdog 机制（hrtimer 中断）检测到该 CPU 上任务长时间未调度，
+ *        超过 2 * watchdog_thresh（默认 40s）即判定为 soft lockup 并 panic
+ *   4. 当 enable_soft_lockup 被关闭或收到 kthread_stop() 请求时退出忙等，
+ *      preempt_enable() 恢复抢占，线程正常结束
+ *
+ * 返回值：固定返回 0
+ */
 static int soft_lockup_simulation(void *data)
 {
-    // Try to bind to specific CPU if requested
+    /* 若指定了有效的 CPU 编号，则将当前线程绑定到该 CPU，
+     * 使 soft lockup 精确发生在目标核上，便于后续 vmcore 分析定位 */
     if (cpu_number >= 0 && cpu_number < num_online_cpus()) {
-        if (set_cpus_allowed_ptr(current, cpumask_of(cpu_number))) {
-            printk(KERN_WARNING
-                   "Soft Lockup Module: Failed to bind to CPU %d, running on any CPU\n",
-                   cpu_number);
-        } else {
-            printk(KERN_INFO
-                   "Soft Lockup Module: Successfully bound to CPU %d\n",
-                   cpu_number);
-        }
+        if (set_cpus_allowed_ptr(current, cpumask_of(cpu_number)))
+            pr_warn("Failed to bind to CPU %d\n", cpu_number);
+        else
+            pr_info("Bound to CPU %d\n", cpu_number);
     }
 
-    printk(KERN_INFO
-           "Soft Lockup Module: Starting soft lockup simulation on CPU %d\n",
-           smp_processor_id());
+    /* 打印线程实际运行的 CPU，注意 smp_processor_id() 必须在禁止迁移后调用才有意义 */
+    pr_info("Starting on CPU %d\n", smp_processor_id());
 
-    // Disable preemption to keep this thread running continuously
-    while (!kthread_should_stop() && enable_soft_lockup) {
-        /*
-         * Busy-wait loop to consume CPU cycles without yielding.
-         * This will prevent other processes from running on this CPU.
-         *
-         * Note: In preempt_disable() state, the CPU still responds to hardware
-         * interrupts (e.g., timer interrupts, network interrupts, IPIs).
-         * When interrupt handlers finish execution, since preemption is disabled,
-         * the scheduler will NOT switch to other tasks but directly resume executing
-         * the current busy-wait thread.
-         */
-        preempt_disable(); // Disable preemption to trigger soft lockup but allow interrupts (IPIs)
+    /* 主循环：直到收到 kthread_stop() 信号才退出 */
+    while (!kthread_should_stop()) {
+        /* 开关未开启时，主动让出 CPU 进入睡眠，避免空转浪费资源 */
+        if (!atomic_read(&enable_soft_lockup)) {
+            schedule();
+            continue;
+        }
 
-        // Infinite loop that doesn't yield CPU control
-        while (enable_soft_lockup && !kthread_should_stop()) {
-            // Perform some dummy computation to keep CPU busy
-            volatile unsigned long counter = 0;
-            while (counter++ < 1000000) {
-                /*
-                 * Using barrier() instead of cpu_relax():
-                 * - cpu_relax() would reduce CPU load as it allows the CPU to save energy
-                 *   or optimize execution during busy-wait. This contradicts our goal of
-                 *   simulating soft lockup (keeping CPU continuously busy).
-                 *
-                 * - barrier() prevents compiler optimization without generating actual
-                 *   CPU instructions. It forces the compiler to keep this loop and consume
-                 *   CPU cycles. Without it, the compiler might optimize away the entire loop,
-                 *   making it impossible to simulate soft lockup.
-                 */
+        /* === soft lockup 模拟阶段开始 ===
+         * preempt_disable() 使 preempt_count 加 1，禁止抢占。
+         * 此后即使有更高优先级任务就绪，调度器也无法抢占当前 CPU，
+         * 这是触发 soft lockup 的关键条件 */
+        preempt_disable();
+
+        /* 在禁抢占状态下持续忙等，直到开关关闭或要求线程停止 */
+        while (atomic_read(&enable_soft_lockup) && !kthread_should_stop()) {
+            unsigned long counter = 0;
+            /* 内层忙等循环：barrier() 编译屏障，阻止编译器将循环优化掉，
+             * 保证 CPU 真实执行空转，占用 CPU 时间片 */
+            while (counter++ < 1000000)
                 barrier();
-            }
-
-            // Check periodically if we should stop
-            if (signal_pending(current))
-                break;
         }
 
-        preempt_enable(); // Re-enable preemption
+        /* 恢复抢占，preempt_count 减 1，调度器重新获得对该 CPU 的控制权 */
+        preempt_enable();
     }
 
-    printk(KERN_INFO "Soft Lockup Module: Stopping soft lockup simulation\n");
+    pr_info("Stopping\n");
     return 0;
 }
 
 static int __init soft_lockup_init(void)
 {
-    printk(KERN_INFO
-           "Soft Lockup Module: Initializing soft lockup simulation module\n");
+    pr_info("Initializing soft lockup simulation module\n");
 
     if (!enable_soft_lockup) {
-        printk(KERN_WARNING
-               "Soft Lockup Module: Soft lockup disabled by default. Set "
-               "enable_soft_lockup=1 to activate.\n");
+        pr_warn("Soft lockup disabled by default. Set enable_soft_lockup=1 to activate.\n");
         return 0;
     }
 
@@ -191,13 +190,11 @@ static int __init soft_lockup_init(void)
     soft_lockup_task =
             kthread_run(soft_lockup_simulation, NULL, "soft_lockup_kthread");
     if (IS_ERR(soft_lockup_task)) {
-        printk(KERN_ERR "Soft Lockup Module: Failed to create kernel thread\n");
+        pr_err("Failed to create kernel thread\n");
         return PTR_ERR(soft_lockup_task);
     }
 
-    printk(KERN_INFO
-           "Soft Lockup Module: Loaded successfully. Soft lockup simulation "
-           "started.\n");
+    pr_info("Loaded successfully. Soft lockup simulation started.\n");
     return 0;
 }
 
@@ -211,7 +208,7 @@ static void __exit soft_lockup_exit(void)
         soft_lockup_task = NULL;
     }
 
-    printk(KERN_INFO "Soft Lockup Module: Unloaded successfully\n");
+    pr_info("Unloaded successfully\n");
 }
 
 module_init(soft_lockup_init);

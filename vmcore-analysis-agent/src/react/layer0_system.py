@@ -328,6 +328,7 @@ When conclusive, include crash type, panic string, faulting instruction, root ca
 - dis -l <func> 100: forward disassembly from function start
 - For focused forward disassembly near a function body, keep the target and span as separate operands, e.g. dis -l show_interrupts 100. Do not use comma-appended pseudo-syntax such as dis -l show_interrupts,0x150; crash treats that as a symbol name and fails to resolve it.
 - dis -s <func>: source-aware disassembly when debuginfo exists
+- When dis -l or dis -s resolves concrete file:line information for a third-party module, treat that as an obligation to continue with source-level reasoning: inspect the exact condition, branch, loop, or helper call at that source site and validate the controlling runtime values.
 - If dis -s fails on a module path, pivot to source correlation using function-pointer anchors, upstream source cross-reference, and offset reconstruction; do not stop at raw disassembly alone.
 
 ## 3.2 Memory and Structure

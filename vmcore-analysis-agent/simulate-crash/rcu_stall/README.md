@@ -75,5 +75,84 @@ sudo insmod rcu_stall_mod.ko
 
 ```bash
 sudo rmmod rcu_stall_mod
-clean
 ```
+
+## 4. 线程退出方式
+
+模块加载后会创建一个名为 `rcu_stall_thr` 的内核线程执行 RCU Stall 模拟。
+执行 `rmmod` 时，模块退出函数会调用 `wait_for_completion(&thread_done)` 阻塞等待该线程结束。
+线程有以下三种退出途径：
+
+### 退出途径总览
+
+| 退出方式 | 触发方法 | 响应速度 | 说明 |
+|---------|---------|---------|------|
+| **自然超时** | 等待 `stall_duration_ms` 到期 | 慢（默认 70 秒） | 线程倒计时结束，自动退出循环 |
+| **信号终止** | `kill -SIGINT <pid>` | 快（1 jiffy 内响应） | 线程从睡眠中被信号唤醒，提前退出 |
+| **kthread_stop** | `rmmod` 触发 | N/A | 在 `wait_for_completion` 之后才设置 stop 标志，此阶段不触发 |
+
+### 方式 1：等待自然超时（默认）
+
+`rmmod` 会阻塞，直到 `stall_duration_ms`（默认 70 秒）到期后线程自然完成。
+
+```bash
+# rmmod 会阻塞等待线程完成
+sudo rmmod rcu_stall_mod
+# 输出：Waiting for thread to finish...
+# （等待 70 秒...）
+# 输出：Thread stopped, module unloaded
+```
+
+### 方式 2：发送信号提前终止（推荐）
+
+如果不想等待完整的 `stall_duration_ms`，可以给 `rcu_stall_thr` 线程发送信号，
+线程会在 1 jiffy 内响应信号并退出，`rmmod` 随即解除阻塞。
+
+```bash
+# 1. 查找线程 PID
+ps -e | grep rcu_stall_thr
+# 输出示例：12345 ?        00:00:00 rcu_stall_thr
+
+# 2. 发送信号（SIGINT 或 SIGTERM 均可）
+sudo kill -SIGINT 12345
+# 或
+sudo kill -SIGTERM 12345
+
+# 3. 线程收到信号后立即退出循环，调用 complete()
+#    此时 rmmod 解除阻塞，完成卸载
+```
+
+### 信号触发退出的内部流程
+
+```
+用户执行: kill -SIGINT <pid>
+    │
+    ▼
+内核将 SIGINT 挂入线程的信号队列
+    │
+    ▼
+rcu_stall_thr 线程正在 schedule_timeout_interruptible(1) 中睡眠
+    │
+    ▼
+schedule_timeout_interruptible 检测到信号 → 提前唤醒返回
+    │
+    ▼
+signal_pending(current) == true  ← 检测到信号
+    │
+    ▼
+flush_signals(current)            ← 清除信号
+pr_info("Received signal, exiting early")
+break                             ← 退出 while 循环
+    │
+    ▼
+rcu_read_unlock()                 ← 释放 RCU 锁
+complete(&thread_done)            ← 通知 rmmod 可以继续
+    │
+    ▼
+rmmod 的 wait_for_completion 解除阻塞
+    │
+    ▼
+kthread_stop(tsk)                 ← 回收线程资源
+```
+
+> **提示**: 如果 `rmmod` 卡住不动，说明线程还在睡眠中。此时在另一个终端执行 `kill -SIGINT <pid>` 即可快速完成卸载。

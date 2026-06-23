@@ -16,6 +16,7 @@ from src.react.action_guard import (
     extract_command_lines,
     extract_crash_path_struct_offsets,
     extract_struct_layouts,
+    maybe_rewrite_module_symbol_tool_call,
     validate_tool_call_request,
 )
 
@@ -326,6 +327,56 @@ class ActionGuardTests(unittest.TestCase):
             {"script": "struct -o mpt3sas_reply_queue"},
         )
         self.assertIn("must start with mod -s", error)
+
+    def test_rejects_single_third_party_dis_l_without_mod_s(self) -> None:
+        error = validate_tool_call_request(
+            "dis",
+            {"command": "dis -l rcu_stall_thread"},
+            debug_symbol_paths=[
+                "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko"
+            ],
+        )
+        self.assertIn("single crash commands that use third-party module symbols/types are forbidden", error)
+
+    def test_allows_run_script_with_mod_s_for_dynamic_module_prefix(self) -> None:
+        error = validate_tool_call_request(
+            "run_script",
+            {
+                "script": "mod -s rcu_stall_mod /home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko\ndis -l rcu_stall_thread"
+            },
+            debug_symbol_paths=[
+                "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko"
+            ],
+        )
+        self.assertIsNone(error)
+
+    def test_rewrites_single_third_party_dis_l_to_run_script(self) -> None:
+        rewritten = maybe_rewrite_module_symbol_tool_call(
+            "dis",
+            {"command": "dis -l rcu_stall_thread"},
+            debug_symbol_paths=[
+                "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko"
+            ],
+        )
+
+        self.assertEqual(rewritten[0], "run_script")
+        self.assertEqual(
+            rewritten[1],
+            {
+                "script": "mod -s rcu_stall_mod /home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko\ndis -l rcu_stall_thread"
+            },
+        )
+
+    def test_does_not_rewrite_plain_kernel_symbol_query(self) -> None:
+        rewritten = maybe_rewrite_module_symbol_tool_call(
+            "dis",
+            {"command": "dis -l panic_on_rcu_stall"},
+            debug_symbol_paths=[
+                "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko"
+            ],
+        )
+
+        self.assertIsNone(rewritten)
 
     def test_extracts_crash_path_offsets_from_disassembly(self) -> None:
         output = """0xffffffffc051a2f3 <_base_process_reply_queue+19>:\tmovzbl 0x8(%rdi),%eax
