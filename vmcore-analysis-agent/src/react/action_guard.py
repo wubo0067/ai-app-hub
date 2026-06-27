@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3,,,,
 # -*- coding: utf-8 -*-
 # action_guard.py - crash action executor 校验与规范化模块
 # 本模块用于验证和规范化 crash 调试工具的命令执行请求，防止危险操作和错误用法
@@ -90,11 +90,6 @@ def canonicalize_command_line(command_line: str) -> str:
         normalized = " ".join(
             ["struct", "-o", *[part for part in parts[1:] if part != "-o"]]
         )
-
-    # 步骤 4: 修复使用不存在的 mod -l 选项
-    if parts[:2] == ["mod", "-l"]:
-        normalized = " ".join(["mod", *parts[2:]])
-
     return normalized
 
 
@@ -256,8 +251,8 @@ def validate_tool_call_request(
 
         if _uses_module_specific_symbol(lines, debug_symbol_paths=debug_symbol_paths):
             required = [
-                _strip_module_debug_suffixes(str(p))
-                for p in (debug_symbol_paths or [])
+                _strip_module_debug_suffixes(str(path))
+                for path in (debug_symbol_paths or [])
             ]
             mod_list = ", ".join(required)
             return (
@@ -292,11 +287,15 @@ def validate_tool_call_request(
         if _uses_module_specific_symbol(
             substantive_lines, debug_symbol_paths=debug_symbol_paths
         ):
-            first_line = canonicalize_command_line(lines[0])
-            if not first_line.startswith("mod -s "):
+            required_prelude = build_mod_s_prelude(debug_symbol_paths)
+            actual_prelude = [
+                canonicalize_command_line(line)
+                for line in lines[: len(required_prelude)]
+            ]
+            if actual_prelude != required_prelude:
                 required = [
-                    _strip_module_debug_suffixes(str(p))
-                    for p in (debug_symbol_paths or [])
+                    _strip_module_debug_suffixes(str(path))
+                    for path in (debug_symbol_paths or [])
                 ]
                 mod_list = ", ".join(required)
                 return (
@@ -579,13 +578,7 @@ def _line_matches_module_candidate(line: str, candidate: str) -> bool:
 
 
 def _derive_module_symbol_hints(debug_symbol_paths: Optional[Iterable[str]]) -> set[str]:
-    """
-    根据第三方 ko 路径动态推导模块符号前缀/名称提示。
-
-    设计意图：仅当客户端通过 --debug-symbols 显式传入调试符号路径时，
-    才启用模块符号检测并强制 run_script 以 mod -s 开头加载模块；
-    未传入时返回空集，不强制加载任何模块。
-    """
+    """根据第三方 ko 路径动态推导模块符号前缀/名称提示。"""
     if not debug_symbol_paths:
         return set()
 
@@ -598,27 +591,14 @@ def _derive_module_symbol_hints(debug_symbol_paths: Optional[Iterable[str]]) -> 
 
 
 def build_mod_s_prelude(debug_symbol_paths: Optional[Iterable[str]]) -> list[str]:
-    """
-    为 debug_symbol_paths 中的每个 ko 生成 mod -s 加载命令列表。
-
-    设计意图：当 debug_symbol_paths 不为空时，run_script 的 action 列表前部
-    必须依次 mod -s 加载所有 ko（每个 ko 一条），之后才能跟诊断命令。
-    本函数供 preflight 托底插入和 maybe_rewrite 改写复用。
-
-    Args:
-        debug_symbol_paths: 第三方模块调试符号路径列表
-
-    Returns:
-        mod -s 命令字符串列表，顺序与输入一致；输入为空时返回空列表
-    """
+    """为 debug_symbol_paths 中的每个 ko 生成按顺序加载的 mod -s 前导列表。"""
     if not debug_symbol_paths:
         return []
 
-    prelude: list[str] = []
-    for path in debug_symbol_paths:
-        module_name = _strip_module_debug_suffixes(str(path))
-        prelude.append(f"mod -s {module_name} {path}")
-    return prelude
+    return [
+        f"mod -s {_strip_module_debug_suffixes(str(path))} {path}"
+        for path in debug_symbol_paths
+    ]
 
 
 def _uses_module_specific_symbol(

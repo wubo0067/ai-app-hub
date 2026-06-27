@@ -3,8 +3,8 @@
 # output_parser.py - LLM 输出解析和修复模块
 # Author: CalmWU
 # Created: 2026-03-23
+
 import json
-from pathlib import Path
 import re
 import shlex
 from typing import Any, TypeVar
@@ -1212,56 +1212,43 @@ def _preflight_action_with_guard(
     if action is None:
         return analysis_step
 
-    # 托底：debug_symbol_paths 非空且 action 是 run_script 但首行非 mod -s 时，
-    # 在 arguments 头部插入所有 ko 的 mod -s 加载命令（设计目标 3）
     debug_symbol_paths = state.get("debug_symbol_paths")
     if (
         debug_symbol_paths
         and action.command_name == "run_script"
         and action.arguments
     ):
-        first_line = canonicalize_command_line(action.arguments[0])
-        if not first_line.startswith("mod -s "):
-            prelude = build_mod_s_prelude(debug_symbol_paths)
-            if prelude:
-                audit_note = (
-                    "Executor audit: debug_symbol_paths is non-empty but run_script did "
-                    f"not start with mod -s. Inserted {len(prelude)} mod -s prelude line(s) "
-                    "at the head of the action."
-                )
-                logger.warning("%s%s", prefix, audit_note)
-                action.arguments = [*prelude, *action.arguments]
-
-                if audit_note not in analysis_step.reasoning:
-                    analysis_step.reasoning = (
-                        f"{audit_note} {analysis_step.reasoning}".strip()
-                    )
-
-                if analysis_step.additional_notes:
-                    if audit_note not in analysis_step.additional_notes:
-                        analysis_step.additional_notes = (
-                            f"{analysis_step.additional_notes} {audit_note}"
-                        ).strip()
-                else:
-                    analysis_step.additional_notes = audit_note
-
-    suspect_module_audit = _build_missing_module_source_attempt_audit(
-        analysis_step, state
-    )
-    if suspect_module_audit is not None:
-        logger.warning("%s%s", prefix, suspect_module_audit)
-        if suspect_module_audit not in analysis_step.reasoning:
-            analysis_step.reasoning = (
-                f"{suspect_module_audit} {analysis_step.reasoning}".strip()
+        prelude = build_mod_s_prelude(debug_symbol_paths)
+        actual_prelude = [
+            canonicalize_command_line(line)
+            for line in action.arguments[: len(prelude)]
+        ]
+        if prelude and actual_prelude != prelude:
+            audit_note = (
+                "Executor audit: debug_symbol_paths is non-empty but run_script did "
+                f"not start with the required mod -s prelude. Inserted {len(prelude)} mod -s prelude line(s) "
+                "at the head of the action."
             )
+            logger.warning("%s%s", prefix, audit_note)
+            diagnostic_lines = [
+                line
+                for line in action.arguments
+                if not canonicalize_command_line(line).startswith("mod -s ")
+            ]
+            action.arguments = [*prelude, *diagnostic_lines]
 
-        if analysis_step.additional_notes:
-            if suspect_module_audit not in analysis_step.additional_notes:
-                analysis_step.additional_notes = (
-                    f"{analysis_step.additional_notes} {suspect_module_audit}"
-                ).strip()
-        else:
-            analysis_step.additional_notes = suspect_module_audit
+            if audit_note not in analysis_step.reasoning:
+                analysis_step.reasoning = (
+                    f"{audit_note} {analysis_step.reasoning}".strip()
+                )
+
+            if analysis_step.additional_notes:
+                if audit_note not in analysis_step.additional_notes:
+                    analysis_step.additional_notes = (
+                        f"{analysis_step.additional_notes} {audit_note}"
+                    ).strip()
+            else:
+                analysis_step.additional_notes = audit_note
 
     tool_args = (
         {"script": "\n".join(action.arguments)}
@@ -1307,50 +1294,6 @@ def _preflight_action_with_guard(
         analysis_step.confidence = "low"
 
     return analysis_step
-
-
-def _module_name_from_debug_path(path: str) -> str:
-    name = Path(path).name
-    for suffix in (".ko.debug", ".ko", ".debug"):
-        if name.endswith(suffix):
-            return name[: -len(suffix)].lower()
-    return name.lower()
-
-
-def _build_missing_module_source_attempt_audit(
-    analysis_step: VMCoreLLMAnalysisStep,
-    state: dict[str, Any],
-) -> str | None:
-    """当 reasoning 已点名第三方模块但 action 未尝试源码级闭环时，注入纠偏审计提示。"""
-    debug_symbol_paths = state.get("debug_symbol_paths") or []
-    if not debug_symbol_paths or analysis_step.action is None:
-        return None
-
-    reasoning = analysis_step.reasoning.lower()
-    suspect_modules = [
-        module_name
-        for module_name in (
-            _module_name_from_debug_path(str(path)) for path in debug_symbol_paths
-        )
-        if module_name and module_name in reasoning
-    ]
-    if not suspect_modules:
-        return None
-
-    rendered_action = _render_structured_action_text(analysis_step).lower()
-    if any(
-        token in rendered_action
-        for token in ("mod -s ", "dis -l ", "dis -s ", "sym ")
-    ):
-        return None
-
-    module_list = ", ".join(sorted(set(suspect_modules)))
-    return (
-        "Executor audit: reasoning already elevates third-party module(s) "
-        f"{module_list}, but the proposed action does not attempt module-symbol closure. "
-        "Before source-level blame, prefer a run_script that loads all required mod -s lines "
-        "and then performs a concrete dis -l, dis -s, or target-scoped sym lookup on the suspect driver path."
-    )
 
 
 def _extract_explicit_action_hint(reasoning: str) -> str | None:

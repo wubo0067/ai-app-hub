@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/en, python3,!
 # -*- coding: utf-8 -*-
 # prompts.py - VMCore 分析 Agent 提示词定义模块
 # Author: CalmWU
@@ -180,10 +180,6 @@ Q4 — Offset coverage:
 - run_script is for bundling multiple diagnostic commands, not for narration.
 - Before finalizing an action, remove any command line that does not gather new evidence or change diagnostic state.
 
-### Command Syntax Rules
-
-- The crash `mod` command does NOT have a `-l` option. If you need to list loaded kernel modules, emit `mod` directly without any options.
-
 ### Log Filtering Contract
 
 - If you need to search kernel logs after initial analysis, the emitted action itself MUST literally contain `| grep`.
@@ -287,33 +283,6 @@ def _select_prompt_playbook(
     return PLAYBOOKS.get(signature_class, "")
 
 
-def _has_driver_source_correlation_signal(recent_text: str) -> bool:
-    """判断最近上下文是否已经出现驱动源码关联的强信号。"""
-    lowered_recent_text = recent_text.lower()
-    return any(
-        token in lowered_recent_text
-        for token in (
-            "function pointer",
-            "_base_",
-            "mod -s",
-            "sym ",
-            "apic",
-            "fee0",
-            "list_head",
-            "self-referential",
-            "self reference",
-            "third-party",
-            "out-of-tree",
-            "irq_desc",
-            "msi_desc",
-            "irqaction",
-            "driver =",
-            "driven by",
-            "dma write",
-        )
-    )
-
-
 def _select_prompt_sop_fragments(
     *,
     signature_class: str | None,
@@ -372,6 +341,8 @@ def _select_prompt_sop_fragments(
     ):
         fragments.append(SOP_FRAGMENTS["address_search"])
 
+    driver_source_signal = _has_driver_source_correlation_signal(lowered_recent_text)
+
     # 4. 驱动源码关联检测：在分析深入到一定程度时，尝试寻找驱动程序相关的符号或函数指针特征
     if "driver_source_correlation" in enabled_gates or (
         signature_class
@@ -382,7 +353,7 @@ def _select_prompt_sop_fragments(
             "general_protection_fault",
         }
         and step_count >= 6
-        and _has_driver_source_correlation_signal(recent_text)
+        and driver_source_signal
     ):
         fragments.append(SOP_FRAGMENTS["driver_source_correlation"])
 
@@ -445,6 +416,7 @@ def _select_prompt_overlays(
     """
     overlays: list[str] = []
     lowered_recent_text = recent_text.lower()
+    driver_source_signal = _has_driver_source_correlation_signal(lowered_recent_text)
 
     # 如果检测到栈损坏，添加栈损坏相关的提示层，引导模型关注栈帧和返回地址
     if signature_class == "stack_corruption":
@@ -466,12 +438,39 @@ def _select_prompt_overlays(
             # 情况 2: 分析步数已足够多，可以考虑引入更复杂的驱动对象分析逻辑
             or step_count >= 6
             # 情况 3: 在最近的文本中发现了与驱动、模块或内核对象相关的敏感关键词
-            or _has_driver_source_correlation_signal(recent_text)
+            or driver_source_signal
         )
     ):
         overlays.append(DRIVER_OBJECT_OVERLAY)
 
     return overlays
+
+
+def _has_driver_source_correlation_signal(recent_text: str) -> bool:
+    """判断最近上下文是否已经出现驱动源码关联的强信号。"""
+    lowered_recent_text = recent_text.lower()
+    return any(
+        token in lowered_recent_text
+        for token in (
+            "function pointer",
+            "_base_",
+            "mod -s",
+            "sym ",
+            "apic",
+            "fee0",
+            "list_head",
+            "self-referential",
+            "self reference",
+            "third-party",
+            "out-of-tree",
+            "irq_desc",
+            "msi_desc",
+            "irqaction",
+            "driver =",
+            "driven by",
+            "dma write",
+        )
+    )
 
 
 def analysis_crash_prompt_legacy_deprecated(
@@ -576,7 +575,6 @@ The following is the User-Provided Initial Context for this Linux kernel crash a
 - **Clean vs Tainted Interpretation**: `TAINTED_MASK: 0` means no taint flags are set. This removes taint-based support barriers and keeps in-tree kernel code, workload-triggered behavior, firmware issues, and hardware faults all in scope. Do **NOT** overstate taint-free output as proof that the root cause must be a pure upstream kernel bug.
 - **Mandatory Third-Party Module Symbol Loading**: When the inventory includes any third-party module path with debug symbols (i.e. the `debug_symbol_paths` list is non-empty), the first action of any tool call that will touch module-private symbols MUST be a `run_script` whose leading lines load EVERY listed ko via `mod -s <module> <path>` (one `mod -s` line per ko, in the listed order), followed by the dependent diagnostic commands in the same crash session. This applies to `dis -l`, `dis -s`, `sym`, `sym -l | grep`, `struct`, `p`, and similar symbol-dependent commands. Never issue those commands as standalone single-tool actions against a third-party module before all `mod -s` lines.
 - **Mandatory Source-Level Deepening After Symbol Resolution**: If `mod -s` succeeds and `dis -l` or `dis -s` resolves a third-party module function to concrete `file:line` source locations, do NOT stop at naming the function or high-level mechanism. Continue with source-level closure: inspect the exact branch, BUG/WARN site, loop, or sleep path in source; identify which state variables, struct fields, arguments, or task flags make that path fire; and validate those values from vmcore with concrete follow-up commands such as `task -R`, `struct`, `rd`, `bt <pid>`, or targeted disassembly around the source-mapped block.
-- **Mandatory Module-Suspect Escalation**: If your reasoning elevates a specific third-party module to a leading suspect via `irq_desc`, `msi_desc`, `struct device.driver`, callback/function-pointer anchoring, taint-plus-log correlation, or equivalent driver ownership evidence, you MUST attempt module-symbol closure before giving a source-level blame statement. When the matching module appears in `debug_symbol_paths`, emit a `run_script` that starts with all required `mod -s` lines and then performs a concrete `dis -l`, `dis -s`, or target-scoped `sym` lookup on the suspect driver path. If the needed module debug path is absent, say that explicitly and keep the attribution bounded/provisional rather than presenting a closed source-level diagnosis.
 - **Third-Party Module Signal**: Flags such as `P`, `O`, and `E` indicate proprietary, externally built, or unsigned modules. Treat these as a strong cue to inspect third-party modules early, especially when the backtrace crosses those modules or the failing subsystem is tightly adjacent to them. This changes supportability and hypothesis ranking, but it is still not proof unless the crash path or other diagnostic evidence points there.
 - **Warning and Hardware Signal**: `W` means the kernel recorded a warning before or during the failure sequence; check whether that warning is the trigger, an earlier symptom, or unrelated noise by correlating it with the `vmcore-dmesg` timeline and the panic path. `M` elevates hardware-error or machine-check validation and should trigger explicit hardware-oriented checks rather than immediate software-only blame.
 - **Reliability Caveat**: Taint flags affect how to interpret later evidence. Out-of-tree or private modules may limit symbol visibility and debuginfo quality. A prior warning may mean the fatal crash is downstream from earlier damage. Do not map taint letters mechanically to a crash type, and do not infer deadlock, ownership, or temporal causality from taint flags alone.

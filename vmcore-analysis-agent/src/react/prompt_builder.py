@@ -561,8 +561,12 @@ def _extract_canonical_commands_from_ai_message(message: AIMessage) -> list[str]
         return commands
 
     # --- 路径 B: 回退到 JSON content 中解析传统 action 字段 ---
+    content = message.content
+    if not isinstance(content, str):
+        return []
+
     try:
-        parsed_content = json.loads(message.content)
+        parsed_content = json.loads(content)
     except (TypeError, json.JSONDecodeError):
         # content 为空或非 JSON 格式，无法解析
         return []
@@ -625,8 +629,12 @@ def _extract_command_types_from_ai_message(message: AIMessage) -> list[str]:
     if command_types:
         return command_types
 
+    content = message.content
+    if not isinstance(content, str):
+        return []
+
     try:
-        parsed_content = json.loads(message.content)
+        parsed_content = json.loads(content)
     except (TypeError, json.JSONDecodeError):
         return []
 
@@ -684,8 +692,12 @@ def _extract_commands_from_ai_message(message: AIMessage) -> list[str]:
     if commands:
         return commands
 
+    content = message.content
+    if not isinstance(content, str):
+        return []
+
     try:
-        parsed_content = json.loads(message.content)
+        parsed_content = json.loads(content)
     except (TypeError, json.JSONDecodeError):
         return []
 

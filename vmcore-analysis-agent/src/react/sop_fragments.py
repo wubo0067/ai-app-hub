@@ -374,11 +374,6 @@ validate the following:
 
 Use this SOP when the crash path is inside a driver, struct -o cannot validate the private type, or offset-only reasoning is stalling.
 
-### Step 0: Mandatory module-symbol closure before blame
-- If irq ownership, msi_desc->dev, struct device.driver, callback anchoring, taint-plus-log correlation, or equivalent evidence elevates a specific third-party module to a leading suspect, attempt module-symbol closure before presenting a source-level blame statement.
-- When a matching module debug path is available, emit a run_script that starts with all required mod -s lines and then performs a concrete dis -l, dis -s, or target-scoped sym lookup on the suspect driver path.
-- If the needed module debug path is missing or mod -s fails, say that explicitly and keep the attribution bounded/provisional. Do not present a closed source-level diagnosis while skipping the symbol-loading attempt.
-
 ### Step 1: Function-pointer anchor
 - If an object dump contains a pointer inside the active module text range, resolve it with sym.
 - Treat the resolved function name as a structural anchor and infer which runtime object type would legally store that callback at the observed offset.

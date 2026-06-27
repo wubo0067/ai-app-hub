@@ -531,7 +531,7 @@ class PromptBuilderTests(unittest.TestCase):
             layered_prompt,
         )
 
-    def test_null_deref_runtime_prompt_still_injects_driver_source_guidance(self) -> None:
+    def test_null_deref_runtime_prompt_injects_driver_source_guidance(self) -> None:
         state = {
             "step_count": 7,
             "current_signature_class": "null_deref",
@@ -552,7 +552,6 @@ class PromptBuilderTests(unittest.TestCase):
         layered_prompt = build_analysis_system_prompt(state, is_last_step=False)
 
         self.assertIn("## 3.13 Driver Source Correlation", layered_prompt)
-        self.assertIn("Mandatory module-symbol closure before blame", layered_prompt)
         self.assertIn("## Driver-Private Object Overlay", layered_prompt)
 
 
