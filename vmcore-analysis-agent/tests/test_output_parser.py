@@ -877,6 +877,137 @@ class OutputParserAuditTests(unittest.TestCase):
             "structured action dropped the pipeline", audited.additional_notes
         )
 
+    def test_preflight_inserts_mod_s_prelude_when_missing(self) -> None:
+        # 设计目标 3：debug_symbol_paths 非空 + run_script 缺 mod -s 时，托底插入
+        state = {
+            "debug_symbol_paths": [
+                "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko",
+                "/tmp/mpt3sas.ko.debug",
+            ]
+        }
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 30,
+                "reasoning": "Need to disassemble a third-party module function.",
+                "action": {
+                    "command_name": "run_script",
+                    "arguments": ["dis -l rcu_stall_thread"],
+                },
+                "is_conclusive": False,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": None,
+                "partial_dump": "partial",
+            }
+        )
+
+        audited = apply_executor_consistency_audit(llm_step, state)
+
+        self.assertEqual(audited.action.command_name, "run_script")
+        # 头部应插入两条 mod -s，顺序与 debug_symbol_paths 一致
+        self.assertEqual(
+            audited.action.arguments[0],
+            "mod -s rcu_stall_mod /home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko",
+        )
+        self.assertEqual(
+            audited.action.arguments[1], "mod -s mpt3sas /tmp/mpt3sas.ko.debug"
+        )
+        # 原命令保留在末尾
+        self.assertEqual(audited.action.arguments[-1], "dis -l rcu_stall_thread")
+        self.assertIn("Inserted 2 mod -s prelude line(s)", audited.additional_notes)
+
+    def test_preflight_skips_insertion_when_mod_s_already_present(self) -> None:
+        # LLM 已正确前置 mod -s 时，不应重复插入
+        state = {
+            "debug_symbol_paths": [
+                "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko"
+            ]
+        }
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 31,
+                "reasoning": "Load module symbols then disassemble.",
+                "action": {
+                    "command_name": "run_script",
+                    "arguments": [
+                        "mod -s rcu_stall_mod /home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko",
+                        "dis -l rcu_stall_thread",
+                    ],
+                },
+                "is_conclusive": False,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": None,
+                "partial_dump": "partial",
+            }
+        )
+
+        audited = apply_executor_consistency_audit(llm_step, state)
+
+        self.assertEqual(len(audited.action.arguments), 2)
+        self.assertEqual(
+            audited.action.arguments[0],
+            "mod -s rcu_stall_mod /home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko",
+        )
+        self.assertIsNone(audited.additional_notes)
+
+    def test_preflight_skips_insertion_when_no_debug_symbols(self) -> None:
+        # 未传 --debug-symbols 时，不强制插入 mod -s
+        state: dict = {}
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 32,
+                "reasoning": "Disassemble a kernel function.",
+                "action": {
+                    "command_name": "run_script",
+                    "arguments": ["dis -l panic_on_rcu_stall"],
+                },
+                "is_conclusive": False,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": None,
+                "partial_dump": "partial",
+            }
+        )
+
+        audited = apply_executor_consistency_audit(llm_step, state)
+
+        self.assertEqual(audited.action.arguments, ["dis -l panic_on_rcu_stall"])
+        self.assertIsNone(audited.additional_notes)
+
+    def test_preflight_adds_audit_when_reasoning_names_module_without_source_attempt(
+        self,
+    ) -> None:
+        state = {
+            "debug_symbol_paths": [
+                "/tmp/mlx5_core.ko.debug",
+                "/tmp/mpt3sas.ko.debug",
+            ]
+        }
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 33,
+                "reasoning": (
+                    "The victim device is driven by mlx5_core, so mlx5_core is now a leading suspect. "
+                    "I want one more ownership check before source-level blame."
+                ),
+                "action": {
+                    "command_name": "struct",
+                    "arguments": ["device", "ff292187955ae0b8"],
+                },
+                "is_conclusive": False,
+                "signature_class": "null_deref",
+                "root_cause_class": None,
+                "partial_dump": "partial",
+            }
+        )
+
+        audited = apply_executor_consistency_audit(llm_step, state)
+
+        assert audited.additional_notes is not None
+        self.assertIn(
+            "does not attempt module-symbol closure",
+            audited.additional_notes,
+        )
+        self.assertIn("mlx5_core", audited.additional_notes)
+
 
 if __name__ == "__main__":
     unittest.main()

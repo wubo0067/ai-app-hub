@@ -234,27 +234,19 @@ def _select_sop_fragments(state: AgentState, recent_text: str) -> list[str]:
     if any(token in lowered_recent_text for token in ("search", "ptov", "kmem -p")):
         fragments.append(SOP_FRAGMENTS["address_search"])
 
+    driver_source_signal = _has_driver_source_correlation_signal(lowered_recent_text)
+
     # 指针/链表损坏线索出现后，增强驱动源码关联排查指导。
     if (
-        signature_class in {"pointer_corruption", "use_after_free"}
-        and step_count >= 8
-        # any() 函数：接收一个可迭代对象，如果其中任一元素为 True 则返回 True，全部为 False 则返回 False
-        # 遍历元组中的每个关键词，检查每个关键词是否存在于 lowered_recent_text 文本中
-        # 如果有任何一个关键词存在，整个表达式返回 True，否则返回 False
-        and any(
-            token in lowered_recent_text
-            for token in (
-                "function pointer",
-                "_base_",
-                "mod -s",
-                "sym ",
-                "apic",
-                "fee0",
-                "list_head",
-                "self-referential",
-                "self reference",
-            )
-        )
+        signature_class
+        in {
+            "pointer_corruption",
+            "use_after_free",
+            "null_deref",
+            "general_protection_fault",
+        }
+        and step_count >= 6
+        and driver_source_signal
     ):
         fragments.append(SOP_FRAGMENTS["driver_source_correlation"])
 
@@ -311,6 +303,7 @@ def _select_context_overlays(state: AgentState, recent_text: str) -> list[str]:
     lowered_recent_text = recent_text.lower()
     # 检查是否为栈保护案例
     stack_protector_case = _is_stack_protector_case(signature_class, recent_text)
+    driver_source_signal = _has_driver_source_correlation_signal(lowered_recent_text)
 
     # 如果崩溃签名是栈损坏，添加栈损坏覆盖层。
     # 注意：stack_protector_case 时跳过，因为 stack_protector_canary playbook +
@@ -322,29 +315,20 @@ def _select_context_overlays(state: AgentState, recent_text: str) -> list[str]:
     # 如果崩溃签名是指针损坏或使用后释放，且满足特定条件，添加驱动对象覆盖层
     if (
         # 检查签名类别是否为指针损坏或使用后释放
-        signature_class in {"pointer_corruption", "use_after_free"}
+        signature_class
+        in {
+            "pointer_corruption",
+            "use_after_free",
+            "null_deref",
+            "general_protection_fault",
+        }
         and (
             # 根本原因是 DMA 损坏
             root_cause_class == "dma_corruption"
-            # 或者步骤计数大于等于 8
-            or step_count >= 8
+            # 或者步骤计数已足够深
+            or step_count >= 6
             # 或者最近文本中包含特定关键词
-            or any(
-                token in lowered_recent_text
-                for token in (
-                    "function pointer",
-                    "_base_",
-                    "mod -s",
-                    "sym ",
-                    "apic",
-                    "fee0",
-                    "list_head",
-                    "self-referential",
-                    "self reference",
-                    "third-party",
-                    "out-of-tree",
-                )
-            )
+            or driver_source_signal
         )
         # 并且不是栈保护案例
         and not stack_protector_case
@@ -375,6 +359,32 @@ def _is_stack_protector_case(
             "stack-protector",
             "__stack_chk_fail",
             "kernel stack is corrupted in",
+        )
+    )
+
+
+def _has_driver_source_correlation_signal(lowered_recent_text: str) -> bool:
+    """判断最近文本是否已经出现驱动源码级归因的强信号。"""
+    return any(
+        token in lowered_recent_text
+        for token in (
+            "function pointer",
+            "_base_",
+            "mod -s",
+            "sym ",
+            "apic",
+            "fee0",
+            "list_head",
+            "self-referential",
+            "self reference",
+            "third-party",
+            "out-of-tree",
+            "irq_desc",
+            "msi_desc",
+            "irqaction",
+            "driver =",
+            "driven by",
+            "dma write",
         )
     )
 

@@ -71,6 +71,8 @@ static int rcu_stall_thread(void *data)
             "TGID: %d, running on CPU: %d\n",
             stall_duration_ms, pid, tgid, smp_processor_id());
 
+    pr_info("rcu_stall_mod: Simulating RCU stall by holding rcu_read_lock()...\n");
+
     /* 进入 RCU 临界区：
      * rcu_read_lock() 标记当前 CPU 进入 RCU 读侧临界区，
      * 此时该 CPU 不能报告 quiescent state，
@@ -113,6 +115,7 @@ static int rcu_stall_thread(void *data)
          *     返回值 = 剩余 jiffies
          */
         schedule_timeout_interruptible(1);
+        // 每次循环递减计数器
         time_out_jiffies--;
 
         /* 检查是否有待处理的信号（如 SIGINT、SIGTERM），

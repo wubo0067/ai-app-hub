@@ -1,4 +1,4 @@
-#!/usr/bin/env python3,,,,
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # action_guard.py - crash action executor 校验与规范化模块
 # 本模块用于验证和规范化 crash 调试工具的命令执行请求，防止危险操作和错误用法
@@ -25,14 +25,6 @@ _ADDRESS_ARITHMETIC_RE = re.compile(
     r"(?:0x[0-9A-Fa-f]+|\d+|[A-Za-z_][A-Za-z0-9_]*)"
 )
 _KMEM_S_CACHE_NAME_RE = re.compile(r"^kmem\s+-S\s+[A-Za-z_][A-Za-z0-9_-]*$")
-# 模块相关符号的前缀列表，用于检测是否需要先加载模块符号表
-_MODULE_SYMBOL_PREFIXES = (
-    "mlx5",  # Mellanox 网卡驱动
-    "nvme",  # NVMe 存储驱动
-    "pqi",  # PQI 存储控制器驱动
-    "qla2xxx",  # QLogic 光纤通道驱动
-    "mpt3sas",  # LSI SAS 控制器驱动
-)
 # 反汇编行匹配：提取指令部分
 _DISASM_LINE_RE = re.compile(r"^\s*0x[0-9a-fA-F]+\s+<[^>]+>:\s+(?P<inst>.+)$")
 # 寄存器间 mov 指令匹配：追踪寄存器别名关系
@@ -98,6 +90,11 @@ def canonicalize_command_line(command_line: str) -> str:
         normalized = " ".join(
             ["struct", "-o", *[part for part in parts[1:] if part != "-o"]]
         )
+
+    # 步骤 4: 修复使用不存在的 mod -l 选项
+    if parts[:2] == ["mod", "-l"]:
+        normalized = " ".join(["mod", *parts[2:]])
+
     return normalized
 
 
@@ -210,13 +207,9 @@ def maybe_rewrite_module_symbol_tool_call(
     ):
         return None
 
-    module_spec = _select_module_debug_spec(lines, debug_symbol_paths)
-    if module_spec is None:
-        return None
-
-    module_name, module_path = module_spec
     normalized_lines = [canonicalize_command_line(line) for line in lines if line.strip()]
-    script = "\n".join([f"mod -s {module_name} {module_path}", *normalized_lines])
+    prelude = build_mod_s_prelude(debug_symbol_paths)
+    script = "\n".join([*prelude, *normalized_lines])
     return "run_script", {"script": script}
 
 
@@ -262,10 +255,15 @@ def validate_tool_call_request(
                 )
 
         if _uses_module_specific_symbol(lines, debug_symbol_paths=debug_symbol_paths):
+            required = [
+                _strip_module_debug_suffixes(str(p))
+                for p in (debug_symbol_paths or [])
+            ]
+            mod_list = ", ".join(required)
             return (
                 "single crash commands that use third-party module symbols/types are forbidden; "
-                "use run_script starting with mod -s <module> <path> and then issue the dependent command "
-                "in the same crash session."
+                f"use run_script starting with one or more mod -s <module> <path> lines (required: {mod_list}) "
+                "and then issue the dependent command in the same crash session."
             )
 
     # 检查 run_script 至少包含一条命令
@@ -296,7 +294,15 @@ def validate_tool_call_request(
         ):
             first_line = canonicalize_command_line(lines[0])
             if not first_line.startswith("mod -s "):
-                return "run_script uses module-specific symbols/types and must start with mod -s <module> <path>."
+                required = [
+                    _strip_module_debug_suffixes(str(p))
+                    for p in (debug_symbol_paths or [])
+                ]
+                mod_list = ", ".join(required)
+                return (
+                    "run_script uses third-party module symbols/types and must start with one or more "
+                    f"mod -s <module> <path> lines (required: {mod_list})."
+                )
 
         # 验证 struct 查询与已知偏移量的兼容性
         struct_error = _validate_struct_requests(
@@ -573,11 +579,17 @@ def _line_matches_module_candidate(line: str, candidate: str) -> bool:
 
 
 def _derive_module_symbol_hints(debug_symbol_paths: Optional[Iterable[str]]) -> set[str]:
-    """根据第三方 ko 路径动态推导模块符号前缀/名称提示。"""
-    hints: set[str] = set(_MODULE_SYMBOL_PREFIXES)
-    if not debug_symbol_paths:
-        return hints
+    """
+    根据第三方 ko 路径动态推导模块符号前缀/名称提示。
 
+    设计意图：仅当客户端通过 --debug-symbols 显式传入调试符号路径时，
+    才启用模块符号检测并强制 run_script 以 mod -s 开头加载模块；
+    未传入时返回空集，不强制加载任何模块。
+    """
+    if not debug_symbol_paths:
+        return set()
+
+    hints: set[str] = set()
     for path in debug_symbol_paths:
         for candidate in _module_debug_candidates(str(path)):
             hints.add(candidate)
@@ -585,23 +597,28 @@ def _derive_module_symbol_hints(debug_symbol_paths: Optional[Iterable[str]]) -> 
     return hints
 
 
-def _select_module_debug_spec(
-    lines: Iterable[str], debug_symbol_paths: Optional[Iterable[str]]
-) -> tuple[str, str] | None:
-    """从第三方 ko 列表中为当前命令选择最匹配的模块名与路径。"""
-    if not debug_symbol_paths:
-        return None
+def build_mod_s_prelude(debug_symbol_paths: Optional[Iterable[str]]) -> list[str]:
+    """
+    为 debug_symbol_paths 中的每个 ko 生成 mod -s 加载命令列表。
 
-    normalized_lines = [canonicalize_command_line(line).lower() for line in lines]
+    设计意图：当 debug_symbol_paths 不为空时，run_script 的 action 列表前部
+    必须依次 mod -s 加载所有 ko（每个 ko 一条），之后才能跟诊断命令。
+    本函数供 preflight 托底插入和 maybe_rewrite 改写复用。
+
+    Args:
+        debug_symbol_paths: 第三方模块调试符号路径列表
+
+    Returns:
+        mod -s 命令字符串列表，顺序与输入一致；输入为空时返回空列表
+    """
+    if not debug_symbol_paths:
+        return []
+
+    prelude: list[str] = []
     for path in debug_symbol_paths:
-        candidates = _module_debug_candidates(str(path))
-        for candidate in candidates:
-            if any(
-                _line_matches_module_candidate(line, candidate)
-                for line in normalized_lines
-            ):
-                return _strip_module_debug_suffixes(str(path)), str(path)
-    return None
+        module_name = _strip_module_debug_suffixes(str(path))
+        prelude.append(f"mod -s {module_name} {path}")
+    return prelude
 
 
 def _uses_module_specific_symbol(

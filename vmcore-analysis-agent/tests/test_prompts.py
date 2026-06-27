@@ -234,6 +234,13 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("do NOT stop at naming the function or high-level mechanism", prompt)
         self.assertIn("identify which state variables, struct fields, arguments, or task flags", prompt)
 
+    def test_crash_init_prompt_requires_module_suspect_escalation(self) -> None:
+        prompt = crash_init_data_prompt()
+
+        self.assertIn("Mandatory Module-Suspect Escalation", prompt)
+        self.assertIn("struct device.driver", prompt)
+        self.assertIn("keep the attribution bounded/provisional", prompt)
+
     def test_analysis_prompt_requires_source_level_follow_through_for_third_party_module(
         self,
     ) -> None:
