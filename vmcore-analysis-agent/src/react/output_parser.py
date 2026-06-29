@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bi,/,,v p,thon3
 # -*- coding: utf-8 -*-
 # output_parser.py - LLM 输出解析和修复模块
 # Author: CalmWU
@@ -472,7 +472,7 @@ def apply_executor_consistency_audit(
     *,
     log_prefix: str = "",
 ) -> VMCoreLLMAnalysisStep:
-    """在 structured output 落地前执行额外的一致性审计。
+    """在 structured output 落地前执行额外的一致性审计管线。
 
     Args:
         analysis_step: LLM 分析步骤
@@ -482,15 +482,23 @@ def apply_executor_consistency_audit(
     Returns:
         VMCoreLLMAnalysisStep: 审计修正后的分析步骤
 
-    审计内容：
-        1. 基于故障上下文标准化 signature_class
-        2. 基于故障上下文标准化 final_diagnosis
-        3. 检测页面错误访问类型不匹配
+    审计管线（按执行顺序）：
+        [阶段 1] 故障上下文归一化 —— 修正签名/诊断术语与 Oops 类型一致
+        [阶段 2] Action 形态归一化 —— 提升 MCP 工具、对齐提示词、预检命令
+        [阶段 3] 根因语义审计 —— slab OOB 方向、已分配槽 UAF、前缀覆盖、DMA 证据门槛
+        [阶段 4] 页面错误访问类型矛盾检测 —— 对比错误码方向与指令类型
 
     用途：
-        确保 LLM 输出与实际 vmcore 上下文保持一致，防止幻觉
+        确保 LLM 输出与实际 vmcore 上下文保持一致，发现并修正逻辑矛盾
     """
     prefix = f"{log_prefix}: " if log_prefix else ""
+
+    # ------------------------------------------------------------
+    # 阶段 1：故障上下文归一化
+    # 目标：确保 signature_class / final_diagnosis 中的术语与
+    #       vmcore 中实际的 Oops 错误类型（page fault vs GPF）一致，
+    #       防止 LLM 在所有场景下泛化地输出 "general protection fault"。
+    # ------------------------------------------------------------
     analysis_step = _normalize_signature_class_from_fault_context(
         analysis_step,
         state,
@@ -501,6 +509,18 @@ def apply_executor_consistency_audit(
         state,
         log_prefix=log_prefix,
     )
+
+    # ------------------------------------------------------------
+    # 阶段 2：Action 形态归一化
+    # 目标：
+    #   2a. 将 LLM 误装入 run_script 的独立 MCP 工具调用提升为
+    #       真正的工具调用（避免被当作 crash 脚本执行）。
+    #   2b. 如果 reasoning 中有显式的 Action: 提示词但结构化 action
+    #       丢失了管道符等信息，则用提示词重建 action。
+    #   2c. 在 tool_calls 构造前执行动作预检：检查命令合法性、
+    #       是否需要 mod -s prelude、是否为管道式 crash 命令等，
+    #       如果验证失败则直接置 action=None 以避免无效执行。
+    # ------------------------------------------------------------
     analysis_step = _lift_standalone_mcp_tool_out_of_run_script(
         analysis_step,
         log_prefix=log_prefix,
@@ -514,6 +534,22 @@ def apply_executor_consistency_audit(
         state,
         log_prefix=log_prefix,
     )
+
+    # ------------------------------------------------------------
+    # 阶段 3：根因语义审计
+    # 目标：基于 vmcore 中的客观证据（slab 分配状态、对象覆盖模式、
+    #       DMA 证据族等）对 LLM 的根因归因做交叉验证，发现并修正
+    #       LLM 可能产生的逻辑矛盾。
+    #
+    #   3a. reverse_slab_oob：拦截"高地址 OOB 写低地址"的反向归因
+    #       （标准 kmalloc OOB 只能从低向高延伸）。
+    #   3b. allocated_slot_uaf：如果 kmem -S 显示 slot 当前已分配，
+    #       则反对"已释放/野指针 UAF"归因（除非有独立生命周期证据）。
+    #   3c. prefix_overwrite：当对象 dump 显示前缀密集非零 + 尾部
+    #       大面积为零时，优先归因于原位置写覆盖而非 UAF/OOB。
+    #   3d. dma_promotion_gate：判定 DMA 破坏需要至少 2 个独立的
+    #       设备侧证据族，否则降级为 unknown。
+    # ------------------------------------------------------------
     analysis_step = _audit_reverse_slab_oob_claim(
         analysis_step,
         log_prefix=log_prefix,
@@ -532,10 +568,19 @@ def apply_executor_consistency_audit(
         analysis_step,
         log_prefix=log_prefix,
     )
+
+    # ------------------------------------------------------------
+    # 阶段 4：x86 页面错误访问类型矛盾检测
+    # 目标：对比 Oops 错误码解码的访问方向（读/写/执行）与 RIP 指令
+    #       的实际访问类型。如果不一致（例如错误码=写但指令是读），
+    #       则不能接受 LLM 当前的结论，需要降低置信度并标记为 unknown。
+    # ------------------------------------------------------------
     mismatch = _detect_page_fault_access_mismatch(state)
+    # 未检测到矛盾，直接通过审计
     if mismatch is None:
         return analysis_step
 
+    # 如果 LLM 已经在 reasoning 中讨论了这个矛盾，不需要重复注入
     if _mentions_access_type_mismatch(analysis_step, mismatch):
         logger.debug(
             "%sExecutor audit found an access-type mismatch, but the model already referenced it.",
@@ -543,6 +588,17 @@ def apply_executor_consistency_audit(
         )
         return analysis_step
 
+    # ------------------------------------------------------------
+    # 矛盾处理：将审计结论注入分析结果的各个字段
+    #
+    # 策略：
+    #   1. 将矛盾详情追加到 reasoning 开头，确保下游可见
+    #   2. 同时记入 additional_notes 作为元数据留存
+    #   3. 降级根因归因 -> unknown（访问类型矛盾意味着
+    #      LLM 对故障指令的分析与硬件信号不匹配，结论不可靠）
+    #   4. 清除 conclusive 状态（矛盾未解决前不能定论）
+    #   5. 降低置信度至 low
+    # ------------------------------------------------------------
     audit_note = (
         "Executor audit: unresolved x86 page-fault access-type contradiction. "
         f"{mismatch['summary']}"
@@ -560,14 +616,17 @@ def apply_executor_consistency_audit(
     else:
         analysis_step.additional_notes = audit_note
 
+    # 根因降级：硬件信号与 LLM 分析不一致时不可信任当前归因
     if analysis_step.root_cause_class not in {None, "unknown"}:
         analysis_step.root_cause_class = "unknown"
 
+    # 撤销定论状态：矛盾未澄清前不能下最终结论
     if analysis_step.is_conclusive:
         analysis_step.is_conclusive = False
         analysis_step.final_diagnosis = None
         analysis_step.fix_suggestion = None
 
+    # 置信度压制：存在未解决的矛盾时最高只能为 low
     if analysis_step.confidence not in {None, "low"}:
         analysis_step.confidence = "low"
 
@@ -1180,7 +1239,46 @@ def _preflight_action_with_guard(
     *,
     log_prefix: str = "",
 ) -> VMCoreLLMAnalysisStep:
-    """在构造 tool_calls 前执行一次动作预检与归一化。"""
+    """在构造 tool_calls 前执行一次动作预检与归一化。
+
+    Args:
+        analysis_step: LLM 分析步骤，包含待执行的 action
+        state: 当前状态，包含 debug_symbol_paths、struct 缓存等上下文
+        log_prefix: 日志前缀，用于调试追踪
+
+    Returns:
+        VMCoreLLMAnalysisStep: 预检/归一化后的分析步骤
+
+    功能说明：
+        这是 LLM 输出的 action 落地到实际工具调用前的最后一道闸门。
+        它执行以下 3 层检查，每一层发现问题都会注入 audit_note 到
+        reasoning 中，方便下游追踪决策链路：
+
+        第 1 层 — 管道命令归一化：
+          crash 的管道操作（如 "bt | grep foo"）不能以普通命令形式
+          执行，必须包裹在 run_script 中。如果 LLM 以非 run_script
+          格式输出管道命令，自动修正。
+
+        第 2 层 — mod -s prelude 注入：
+          当系统已加载 debug symbol（debug_symbol_paths 非空）时，
+          所有 run_script 开头的 mod -s 行是必需的。如果 LLM 生成
+          的脚本缺少 prelude，自动插入。
+
+        第 3 层 — 命令级验证（validate_tool_call_request）：
+          调用 action_guard 模块对最终命令做完备性校验，包括：
+          - 命令名是否合法
+          - 参数是否完整
+          - struct 请求是否覆盖了已观测的偏移量
+          - 符号路径是否正确
+
+    失败处理：
+        如果任意一层验证失败：
+        - 将 analysis_step.action 置为 None，阻止无效工具调用
+        - 撤销 conclusive 状态（结论不可信）
+        - 降低置信度至 low
+        - 将拒绝原因写入 reasoning 供 LLM 下一轮重试时参考
+    """
+    # ── 第 0 步：快速路径 — 没有 action 则无需预检 ──
     action = analysis_step.action
     if action is None:
         return analysis_step
@@ -1188,6 +1286,11 @@ def _preflight_action_with_guard(
     prefix = f"{log_prefix}: " if log_prefix else ""
     rendered_action = _render_structured_action_text(analysis_step)
 
+    # ── 第 1 步：管道命令归一化 ──
+    # 场景：LLM 以 "bt -l | grep func" 的形式输出管道命令，
+    #       但结构化的 command_name 仍是单个命令名（如 "bt"）。
+    #       管道操作必须由 run_script 包装才能正确执行。
+    # 检测条件：command_name 不是 run_script，但渲染文本中含管道符 "|"
     if action.command_name != "run_script" and "|" in rendered_action:
         audit_note = (
             "Executor audit: piped crash actions must use run_script. "
@@ -1208,10 +1311,17 @@ def _preflight_action_with_guard(
         else:
             analysis_step.additional_notes = audit_note
 
+    # 重新获取 action（第 1 步可能修改了它）
     action = analysis_step.action
     if action is None:
         return analysis_step
 
+    # ── 第 2 步：debug symbol prelude 注入 ──
+    # 场景：系统配置了额外的内核模块 debug symbol 路径。
+    #       此时所有脚本必须在开头执行 mod -s <path> 来加载符号，
+    #       否则 crash 工具无法解析模块内的符号地址。
+    # 修复方式：对比 action 开头的 n 行与 build_mod_s_prelude 的
+    #           输出，如果不一致则插入正确的 prelude 行。
     debug_symbol_paths = state.get("debug_symbol_paths")
     if (
         debug_symbol_paths
@@ -1230,6 +1340,7 @@ def _preflight_action_with_guard(
                 "at the head of the action."
             )
             logger.warning("%s%s", prefix, audit_note)
+            # 分离出已有命令中非 mod -s 的诊断行，保留在原顺序中
             diagnostic_lines = [
                 line
                 for line in action.arguments
@@ -1250,6 +1361,10 @@ def _preflight_action_with_guard(
             else:
                 analysis_step.additional_notes = audit_note
 
+    # ── 第 3 步：调用 action_guard 的完整命令验证 ──
+    # 根据命令类型构造不同的参数字典格式：
+    #   - run_script：整个脚本作为 "script" 参数传入
+    #   - 普通命令：渲染后的命令行作为 "command" 参数传入
     tool_args = (
         {"script": "\n".join(action.arguments)}
         if action.command_name == "run_script"
@@ -1258,20 +1373,26 @@ def _preflight_action_with_guard(
     validation_error = validate_tool_call_request(
         action.command_name,
         tool_args,
+        # hard_lockup 场景允许 bt -a 跳过某些安全检查
         allow_bt_a=analysis_step.signature_class == "hard_lockup",
+        # 传递 crash path 中已观测到的 struct 偏移量，用于验证
         observed_struct_offsets=state.get("crash_path_struct_offsets"),
         struct_layout_cache=dict(state.get("struct_layout_cache", {})),
         debug_symbol_paths=debug_symbol_paths,
     )
+    # 验证通过 → 直接返回，无需降级
     if validation_error is None:
         return analysis_step
 
+    # ── 失败处理：验证被拒绝 ──
+    # 记录被拒绝的具体 action 文本和验证错误供调试和重试参考
     rejected_action = _render_structured_action_text(analysis_step)
     audit_note = (
         "Executor preflight rejected the proposed action before tool dispatch: "
         f"{validation_error}. Replan with a compliant command. Rejected action: {rejected_action}"
     )
     logger.warning("%s%s", prefix, audit_note)
+    # 关键操作：置 action=None 以阻止无效工具调用被发送到 crash 工具
     analysis_step.action = None
 
     if audit_note not in analysis_step.reasoning:
@@ -1285,6 +1406,8 @@ def _preflight_action_with_guard(
     else:
         analysis_step.additional_notes = audit_note
 
+    # 降级策略：action 被拒意味着 LLM 当前轮次的输出不可用，
+    # 因此需要连带撤销定论状态并降低置信度
     if analysis_step.is_conclusive:
         analysis_step.is_conclusive = False
         analysis_step.final_diagnosis = None

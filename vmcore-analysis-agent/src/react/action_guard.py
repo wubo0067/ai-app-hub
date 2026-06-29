@@ -233,6 +233,7 @@ def validate_tool_call_request(
         allow_bt_a: 是否允许使用 bt -a（默认禁止，除非 hard_lockup 场景）
         observed_struct_offsets: 已观察到的 struct 偏移量集合（来自反汇编分析）
         struct_layout_cache: struct 布局缓存字典
+        debug_symbol_paths: 调试符号路径集合
 
     Returns:
         若验证失败返回错误信息字符串，成功返回 None
@@ -241,6 +242,10 @@ def validate_tool_call_request(
 
     if tool_name != "run_script":
         for line in lines:
+            # 【规范化处理】：调用 canonicalize_command_line 将原始命令行行转换为标准化格式。
+            # 作用：消除因空格数量差异、缩进不一致或字符大小写问题导致的匹配失败。
+            # 例如：将 "  mod -s  driver " 统一转换为 "mod -s driver"，
+            # 这样后续的 .startswith("mod -s ") 或字符串比对逻辑才能在语义上实现精确匹配。
             normalized = canonicalize_command_line(line)
             parts = normalized.split()
             if parts[:2] == ["sym", "-l"]:
@@ -267,6 +272,11 @@ def validate_tool_call_request(
 
     # 逐条验证命令合法性
     for line in lines:
+        # 【核心语义校验】：调用内部校验器对单行指令进行深度审计。
+        # 该步骤不仅仅检查 shell 语法是否正确，还会根据内核上下文的规则进行校验。
+        # 例如：检查指令中涉及的偏移量（offset）是否在结构体定义的合法范围内，
+        # 或者在执行 'bt' 命令时，是否允许携带特定的参数 (allow_bt_a)。
+        # 如果校验失败，error 将包含具体的错误描述（如 "struct size mismatch"），用于反馈给 LLM。
         error = _validate_command_line(line, allow_bt_a=allow_bt_a)
         if error:
             return error

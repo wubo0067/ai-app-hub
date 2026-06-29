@@ -437,34 +437,10 @@ async def call_crash_tool(state: AgentState) -> dict:
                     else str(args)
                 )
                 full_cmd = f"{name} {args_str}".strip()
-                """
-                它主要校验几类事情：
 
-                1. 基本合法性
-                    比如 run_script 不能为空，命令不能是空的，某些命令必须带必要参数。
-
-                2. 危险或高成本命令
-                    具体规则在 action_guard.py:229。
-                    会拦住这类情况：
-                    sym -l 这种输出过大的命令；
-                    bt -a，除非当前 signature_class 是 hard_lockup，这个开关来源于 nodes.py:335；
-                    单独跑 log，或者某些 log 变体不带 grep；
-                    裸 kmem、裸 rd、裸 ptov、裸 vtop、裸 sym 之类不完整请求；
-                    包含 shell 变量、寄存器表达式、未解析地址算术的命令。
-
-                3. run_script 的结构约束
-                    如果脚本里用了模块相关符号，必须先有 mod -s 加载模块符号；
-                    脚本不能只做 mod -s 而没有真正诊断命令。
-
-                4. struct 查询是否和当前已知上下文一致
-                    这部分在 action_guard.py:460。
-                    它会结合你这里传进去的 observed_struct_offsets 和 struct_layout_cache，检查：
-                    当前想查的 struct 类型，是否覆盖了前面从反汇编里观察到的偏移；
-                    是否把第一次 struct -o 类型查询 和 struct 类型 地址实例查询 混在一起；
-                    缓存里已知的 struct 大小是否足够容纳观察到的偏移。
-
-                所以一句话概括：这里调用 validate_tool_call_request 的目的，是在执行 crash 命令前做“安全校验 + 上下文一致性校验 + 命令规范化约束”，避免 LLM 发出危险、不完整、无意义或和当前分析上下文矛盾的工具调用。
-                """
+                # 1. 【核心校验步骤】：调用工具调用请求验证器 (Validator)
+                # 此函数会检查 LLM 生成的参数是否与当前 crash 上下文中的结构体布局、调试符号等信息冲突。
+                # 例如：如果 LLM 试图访问一个偏移量为 0x200 的成员，但校验器发现目标结构体总大小仅为 0x80，则会返回错误字符串。
                 validation_error = validate_tool_call_request(
                     name,
                     args,
@@ -473,20 +449,30 @@ async def call_crash_tool(state: AgentState) -> dict:
                     struct_layout_cache=struct_layout_cache,
                     debug_symbol_paths=state.get("debug_symbol_paths"),
                 )
+                # 2. 【拦截逻辑】：如果校验器返回了非空错误 (validation_error != None)
                 if validation_error is not None:
+                    # A. 构建一个“拒绝通知”的消息对象 (ToolMessage)
+                    # 我们不直接丢弃这个请求，而是将其包装成一个 ToolMessage 返回给 LLM。
+                    # 这样做的目的是：让 LLM 明确知道它的指令为什么失败了（即 [executor-guard] 错误信息），
+                    # 从而驱动它进行“重规划”（Replan），尝试生成一个新的、符合逻辑的命令。
                     tool_messages.append(
                         ToolMessage(
                             content=f"[executor-guard] Rejected action: {validation_error}",
-                            tool_call_id=tool_call_id,
-                            name=name,
+                            tool_call_id=tool_call_id, # 关联原始的 tool_call_id，确保消息链条完整
+                            name=name,                  # 指明是哪个工具请求被拒绝了
                         )
                     )
+                    # B. 记录系统日志
+                    # 在服务端日志中打印警告，方便开发者追踪 LLM 的错误决策路径和系统的拦截逻辑。
                     logger.warning(
                         "Executor guard rejected tool call %s (ID: %s): %s",
                         name,
                         tool_call_id,
                         validation_error,
                     )
+                    # C. 终止当前循环迭代 (Continue)
+                    # 【关键点】：通过 continue 跳过后续的真正的工具执行逻辑 (如 subprocess.run 或 mcp 调用)。
+                    # 这确保了错误的、可能导致分析幻觉或系统崩溃的指令永远不会到达真实的 Executor。
                     continue
 
                 # ---- 去重检测 ----
