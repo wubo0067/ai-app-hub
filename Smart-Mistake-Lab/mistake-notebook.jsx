@@ -1,0 +1,981 @@
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { X, Plus, Search, Loader2, Sparkles, Trash2, BookOpen, AlertCircle, RefreshCw, FolderOpen, Settings, Edit3, Check } from 'lucide-react';
+
+// ============== API HELPERS ==============
+
+async function apiFetch(url, options = {}) {
+  const method = options.method || 'GET';
+  console.log(`[API] ${method} ${url}`, options.body ? JSON.parse(options.body) : '');
+  const r = await fetch(url, options);
+  console.log(`[API] ${method} ${url} → ${r.status} ${r.statusText}`);
+  if (!r.ok) {
+    const errBody = await r.text().catch(() => '(无法读取响应体)');
+    console.error(`[API] ${method} ${url} 错误响应:`, errBody);
+    let detail = `HTTP ${r.status}`;
+    try { const j = JSON.parse(errBody); detail = j.detail || j.message || detail; } catch (e) { /* ignore */ }
+    throw new Error(detail);
+  }
+  return r;
+}
+
+const API = {
+  async getConfig() {
+    return (await apiFetch('/api/config')).json();
+  },
+  async saveImageDir(dir) {
+    return (await apiFetch('/api/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image_dir: dir })
+    })).json();
+  },
+  async scan() {
+    return (await apiFetch('/api/scan')).json();
+  },
+  async indexImage(filePath, title, summary, tags) {
+    return (await apiFetch('/api/images/index', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file_path: filePath, title, summary, tags })
+    })).json();
+  },
+  async updateImage(filePath, title, summary, tags) {
+    return (await apiFetch('/api/images/update', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file_path: filePath, title, summary, tags })
+    })).json();
+  },
+  async deleteImage(filePath) {
+    return (await apiFetch(`/api/images/delete?file_path=${encodeURIComponent(filePath)}`, { method: 'DELETE' })).json();
+  },
+  async getAllImages() {
+    return (await apiFetch('/api/images/all')).json();
+  },
+  imageUrl(filePath) {
+    return `/api/image-file?path=${encodeURIComponent(filePath)}`;
+  }
+};
+
+// ============== CSS ==============
+
+const CSS = `
+.mnb {
+  --paper: #FBF8F0;
+  --grid: #DCE7F2;
+  --margin: #C74B4B;
+  --ink: #253654;
+  --ink-soft: #57648A;
+  --pencil: #9098A6;
+  --accent: #E3B341;
+  --accent-2: #4C9A8E;
+  --card: #FFFFFF;
+  --shadow: rgba(37, 54, 84, 0.10);
+  font-family: "PingFang SC", "Microsoft YaHei", -apple-system, sans-serif;
+  color: var(--ink);
+  background:
+    linear-gradient(90deg, transparent 0 55px, var(--grid) 55px 56px, transparent 56px),
+    repeating-linear-gradient(var(--paper) 0 27px, var(--grid) 27px 28px);
+  background-color: var(--paper);
+  min-height: 100%;
+  padding: 28px 20px 60px;
+  position: relative;
+  box-sizing: border-box;
+}
+.mnb *, .mnb *::before, .mnb *::after { box-sizing: border-box; }
+.mnb .holes {
+  position: absolute; left: 22px; top: 90px;
+  display: flex; flex-direction: column; gap: 46px;
+}
+.mnb .hole {
+  width: 12px; height: 12px; border-radius: 50%;
+  background: var(--paper);
+  box-shadow: inset 0 1px 3px rgba(37,54,84,0.35), 0 0 0 1px var(--grid);
+}
+.mnb .shell { max-width: 960px; margin: 0 auto; padding-left: 40px; }
+.mnb .margin-rule {
+  position: absolute; left: 56px; top: 0; bottom: 0;
+  width: 2px; background: var(--margin); opacity: 0.55;
+}
+.mnb .header {
+  display: flex; align-items: baseline; justify-content: space-between;
+  flex-wrap: wrap; gap: 12px; margin-bottom: 22px;
+}
+.mnb h1 {
+  font-family: "Songti SC", "STSong", "Noto Serif SC", serif;
+  font-size: 30px; font-weight: 700; margin: 0; letter-spacing: 1px;
+  position: relative; display: inline-block;
+}
+.mnb h1 .hl { background: linear-gradient(transparent 60%, var(--accent) 60%); padding: 0 2px; }
+.mnb .subtitle { color: var(--ink-soft); font-size: 13px; margin-top: 4px; }
+.mnb .tabs { display: flex; gap: 6px; }
+.mnb .tab-btn {
+  font-family: "Songti SC", "STSong", serif;
+  font-size: 14px; padding: 9px 18px; border-radius: 8px 8px 0 0;
+  border: 1.5px solid var(--ink); border-bottom: none;
+  background: var(--paper); color: var(--ink-soft); cursor: pointer;
+  position: relative; top: 1.5px; transition: all .15s ease;
+}
+.mnb .tab-btn.active {
+  background: var(--card); color: var(--ink); font-weight: 700;
+  box-shadow: 0 -2px 8px var(--shadow);
+}
+.mnb .tab-btn:not(.active):hover { color: var(--ink); }
+.mnb .panel {
+  background: var(--card); border: 1.5px solid var(--ink);
+  border-radius: 0 10px 10px 10px; padding: 24px;
+  box-shadow: 0 4px 18px var(--shadow);
+}
+.mnb .config-box {
+  border: 1.5px dashed var(--grid); border-radius: 10px; padding: 16px;
+  margin-bottom: 18px; background: rgba(255, 255, 255, 0.72);
+}
+.mnb .config-title {
+  font-family: "Songti SC", "STSong", serif;
+  font-size: 16px; font-weight: 700; margin: 0 0 6px;
+}
+.mnb .config-hint {
+  color: var(--ink-soft); font-size: 12.5px; line-height: 1.6; margin: 0 0 12px;
+}
+.mnb .field-label {
+  font-size: 12px; color: var(--ink-soft); font-weight: 700;
+  letter-spacing: .5px; margin-bottom: 6px; display: block;
+}
+.mnb input[type="text"], .mnb input[type="password"], .mnb textarea {
+  width: 100%; border: none; border-bottom: 1.5px solid var(--grid);
+  background: transparent; padding: 7px 2px;
+  font-size: 14px; color: var(--ink); font-family: inherit; outline: none;
+}
+.mnb textarea { resize: vertical; }
+.mnb input[type="text"]:focus, .mnb input[type="password"]:focus, .mnb textarea:focus {
+  border-bottom-color: var(--margin);
+}
+.mnb .field { margin-bottom: 16px; }
+.mnb .save-btn {
+  margin-top: 18px; padding: 10px 22px; border-radius: 7px;
+  border: 1.5px solid var(--accent-2); background: var(--accent-2);
+  color: #fff; font-weight: 700; font-size: 14px; cursor: pointer;
+}
+.mnb .save-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.mnb .save-btn.secondary {
+  background: var(--paper); color: var(--ink); border-color: var(--ink);
+}
+.mnb .save-msg { font-size: 12.5px; color: var(--accent-2); margin-top: 8px; font-weight: 600; }
+.mnb .save-msg.error { color: var(--margin); }
+.mnb .error-msg {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12.5px; color: var(--margin); margin-top: 8px; font-weight: 600;
+}
+.mnb .tag-pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  background: #FFF6E0; border: 1px solid var(--accent); color: #6B5314;
+  border-radius: 999px; padding: 4px 10px 4px 12px;
+  font-size: 12.5px; font-weight: 600;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  cursor: default;
+}
+.mnb .tag-pill.editable { cursor: pointer; }
+.mnb .tag-pill.editable:hover { background: #FFEDB0; }
+.mnb .tag-pill button {
+  background: none; border: none; cursor: pointer;
+  color: #8A7020; display: flex; padding: 0;
+}
+.mnb .tag-pill input {
+  border: none; background: transparent; font: inherit; color: inherit;
+  width: auto; min-width: 40px; outline: none; padding: 0;
+  border-bottom: 1px dashed var(--accent);
+}
+.mnb .tag-list { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.mnb .tag-add-row { display: flex; gap: 8px; align-items: center; }
+.mnb .tag-add-row input {
+  border: 1.5px dashed var(--grid); border-radius: 999px;
+  padding: 5px 12px; font-size: 12.5px; flex: 1;
+}
+.mnb .tag-add-row button {
+  border: 1.5px solid var(--ink); background: var(--paper);
+  border-radius: 999px; width: 28px; height: 28px;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; flex-shrink: 0;
+}
+
+/* Scan tab */
+.mnb .scan-header {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 18px;
+}
+.mnb .scan-dir {
+  font-size: 13px; color: var(--ink-soft);
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  background: var(--paper); padding: 4px 10px; border-radius: 4px;
+  border: 1px solid var(--grid);
+}
+.mnb .refresh-btn {
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 16px; border-radius: 7px;
+  border: 1.5px solid var(--ink); background: var(--paper);
+  color: var(--ink); font-weight: 700; font-size: 13px; cursor: pointer;
+  transition: all .15s ease;
+}
+.mnb .refresh-btn:hover { background: var(--ink); color: var(--paper); }
+.mnb .refresh-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.mnb .scan-stats {
+  font-size: 13px; color: var(--ink-soft); margin-left: auto;
+}
+.mnb .section-title {
+  font-family: "Songti SC", "STSong", serif;
+  font-size: 16px; font-weight: 700; margin: 0 0 12px;
+  display: flex; align-items: center; gap: 8px;
+}
+.mnb .section-title .badge {
+  font-size: 12px; background: var(--margin); color: #fff;
+  border-radius: 999px; padding: 1px 8px; font-family: inherit;
+}
+.mnb .section-title .badge.green { background: var(--accent-2); }
+
+.mnb .scan-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 12px;
+  margin-bottom: 24px;
+}
+.mnb .scan-card {
+  background: var(--card); border: 1.5px solid var(--grid);
+  border-radius: 8px; overflow: hidden; cursor: pointer;
+  transition: transform .15s, box-shadow .15s;
+}
+.mnb .scan-card:hover { transform: translateY(-2px); box-shadow: 0 4px 12px var(--shadow); }
+.mnb .scan-card.unindexed { border-color: var(--accent); }
+.mnb .scan-card .thumb {
+  height: 100px; overflow: hidden; background: var(--grid);
+  display: flex; align-items: center; justify-content: center;
+}
+.mnb .scan-card .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.mnb .scan-card .info {
+  padding: 8px 10px; font-size: 11px; color: var(--ink-soft);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mnb .scan-card .info .status { font-weight: 600; font-size: 10.5px; }
+.mnb .scan-card .info .status.new { color: var(--margin); }
+.mnb .scan-card .info .status.indexed { color: var(--accent-2); }
+
+/* Library */
+.mnb .library-toolbar {
+  display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 16px;
+}
+.mnb .search-box {
+  display: flex; align-items: center; gap: 6px;
+  border-bottom: 1.5px solid var(--grid); padding: 6px 4px;
+  flex: 1 1 220px; min-width: 180px;
+}
+.mnb .search-box input { border: none; }
+.mnb .tag-filter-bar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
+.mnb .filter-pill {
+  border: 1.5px solid var(--pencil); background: var(--paper); color: var(--ink-soft);
+  border-radius: 999px; padding: 5px 13px; font-size: 12.5px; font-weight: 600;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  cursor: pointer; transition: all .12s;
+}
+.mnb .filter-pill.active {
+  border-color: var(--margin); background: var(--margin); color: #fff;
+}
+.mnb .count-badge { opacity: 0.65; font-weight: 400; margin-left: 3px; }
+.mnb .grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 16px;
+}
+.mnb .card {
+  background: var(--card); border: 1.5px solid var(--ink); border-radius: 8px;
+  overflow: hidden; cursor: pointer; transition: transform .15s, box-shadow .15s;
+  display: flex; flex-direction: column;
+}
+.mnb .card:hover { transform: translateY(-3px); box-shadow: 0 8px 18px var(--shadow); }
+.mnb .card-thumb {
+  height: 130px; overflow: hidden; border-bottom: 1.5px solid var(--grid);
+  background: var(--grid);
+}
+.mnb .card-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.mnb .card-body { padding: 10px 12px 12px; flex: 1; display: flex; flex-direction: column; }
+.mnb .card-title {
+  font-weight: 700; font-size: 13.5px; margin: 0 0 6px;
+  overflow: hidden; text-overflow: ellipsis; display: -webkit-box;
+  -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+}
+.mnb .card-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: auto; }
+.mnb .card-tags span {
+  font-size: 10.5px; font-family: ui-monospace, monospace;
+  background: #FFF6E0; border: 1px solid var(--accent); color: #6B5314;
+  border-radius: 999px; padding: 2px 7px;
+}
+
+/* Analysis overlay */
+.mnb .analyze-overlay {
+  margin-top: 16px; padding: 16px;
+  border: 1.5px dashed var(--grid); border-radius: 10px;
+  background: rgba(255, 255, 255, 0.72);
+}
+.mnb .analyze-img {
+  width: 100%; max-height: 300px; object-fit: contain;
+  border-radius: 8px; border: 1.5px solid var(--grid); margin-bottom: 14px;
+}
+.mnb .analyze-btn {
+  width: 100%; padding: 10px 14px; border-radius: 7px;
+  border: 1.5px solid var(--ink); background: var(--ink); color: var(--paper);
+  font-weight: 700; font-size: 14px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  transition: opacity .15s;
+}
+.mnb .analyze-btn:hover { opacity: 0.85; }
+.mnb .analyze-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.mnb .empty { text-align: center; padding: 50px 20px; color: var(--ink-soft); }
+.mnb .empty svg { opacity: 0.4; margin-bottom: 10px; }
+
+/* Modal */
+.mnb .modal-overlay {
+  position: fixed; inset: 0; background: rgba(37,54,84,0.45);
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px; z-index: 50;
+}
+.mnb .modal {
+  background: var(--card); border: 1.5px solid var(--ink); border-radius: 10px;
+  max-width: 640px; width: 100%; max-height: 88vh; overflow-y: auto;
+  padding: 22px; position: relative;
+}
+.mnb .modal-close {
+  position: absolute; top: 14px; right: 14px;
+  width: 30px; height: 30px; border-radius: 50%;
+  border: 1.5px solid var(--ink); background: var(--paper);
+  display: flex; align-items: center; justify-content: center; cursor: pointer;
+}
+.mnb .modal img {
+  width: 100%; border-radius: 8px; border: 1.5px solid var(--grid); margin-bottom: 14px;
+}
+.mnb .modal h2 {
+  font-family: "Songti SC", "STSong", serif;
+  font-size: 19px; margin: 0 0 10px; padding-right: 30px;
+}
+.mnb .modal .summary { font-size: 13.5px; line-height: 1.7; color: var(--ink-soft); margin-bottom: 14px; }
+.mnb .modal .tag-list { margin-bottom: 18px; }
+.mnb .modal-actions {
+  display: flex; justify-content: flex-end; gap: 10px;
+  border-top: 1px dashed var(--grid); padding-top: 14px;
+}
+.mnb .del-btn {
+  display: flex; align-items: center; gap: 6px;
+  border: 1.5px solid var(--margin); background: none; color: var(--margin);
+  padding: 7px 14px; border-radius: 7px; font-size: 13px; font-weight: 600; cursor: pointer;
+}
+.mnb .spin { animation: mnbspin 0.9s linear infinite; }
+@keyframes mnbspin { to { transform: rotate(360deg); } }
+
+/* Inline tag edit */
+.mnb .tag-edit-input {
+  width: 80px; border: none; background: transparent;
+  font-size: 12.5px; font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  color: #6B5314; font-weight: 600; outline: none; padding: 0;
+  border-bottom: 1px dashed var(--accent);
+}
+
+@media (max-width: 520px) {
+  .mnb .shell { padding-left: 24px; }
+  .mnb .margin-rule { left: 40px; }
+  .mnb .holes { display: none; }
+  .mnb h1 { font-size: 24px; }
+  .mnb .panel { padding: 16px; }
+  .mnb .scan-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); }
+}
+`;
+
+// ============== TAG PILL (with inline editing) ==============
+
+function TagPill({ tag, onDelete, onEdit }) {
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState(tag);
+  const inputRef = useRef(null);
+
+  useEffect(() => {
+    if (editing && inputRef.current) inputRef.current.focus();
+  }, [editing]);
+
+  function commit() {
+    const v = value.trim();
+    if (v && v !== tag) onEdit(tag, v);
+    else setValue(tag);
+    setEditing(false);
+  }
+
+  if (editing) {
+    return (
+      <span className="tag-pill">
+        <input
+          ref={inputRef}
+          className="tag-edit-input"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') commit();
+            if (e.key === 'Escape') { setValue(tag); setEditing(false); }
+          }}
+          onBlur={commit}
+        />
+        <button onClick={commit} title="确认"><Check size={11} /></button>
+      </span>
+    );
+  }
+
+  return (
+    <span className="tag-pill editable" onDoubleClick={() => setEditing(true)}>
+      {tag}
+      <button onClick={() => setEditing(true)} title="编辑"><Edit3 size={10} /></button>
+      <button onClick={() => onDelete(tag)} title="删除"><X size={11} /></button>
+    </span>
+  );
+}
+
+// ============== PROBLEM CARD ==============
+
+function ProblemCard({ problem, imageUrl, onClick }) {
+  return (
+    <div className="card" onClick={onClick}>
+      <div className="card-thumb">
+        <img src={imageUrl} alt={problem.title} loading="lazy" />
+      </div>
+      <div className="card-body">
+        <p className="card-title">{problem.title}</p>
+        <div className="card-tags">
+          {(problem.tags || []).slice(0, 4).map((t) => (
+            <span key={t}>{t}</span>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============== MAIN APP ==============
+
+export default function App() {
+  const [tab, setTab] = useState('scan');
+
+  // --- Config state ---
+  const [imageDir, setImageDir] = useState('');
+  const [dirInput, setDirInput] = useState('');
+  const [dirSaving, setDirSaving] = useState(false);
+  const [dirMsg, setDirMsg] = useState('');
+
+  // --- Scan state ---
+  const [scanData, setScanData] = useState(null);
+  const [scanning, setScanning] = useState(false);
+  const [scanError, setScanError] = useState(null);
+
+  // --- Analysis state (for unindexed image) ---
+  const [analyzingFile, setAnalyzingFile] = useState(null);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analysisError, setAnalysisError] = useState(null);
+  const [draft, setDraft] = useState(null);
+  const [tagInput, setTagInput] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [saveMsg, setSaveMsg] = useState('');
+
+  // --- Library state ---
+  const [allIndexed, setAllIndexed] = useState([]);
+  const [libLoaded, setLibLoaded] = useState(false);
+  const [query, setQuery] = useState('');
+  const [selectedTags, setSelectedTags] = useState([]);
+
+  // --- Detail modal ---
+  const [detail, setDetail] = useState(null);
+  const [detailTagInput, setDetailTagInput] = useState('');
+  const [detailSaving, setDetailSaving] = useState(false);
+
+  // --- Load configs on mount ---
+  useEffect(() => {
+    API.getConfig().then((c) => {
+      if (c.image_dir) {
+        setImageDir(c.image_dir);
+        setDirInput(c.image_dir);
+      }
+    }).catch(() => { });
+  }, []);
+
+  // --- Load library when tab changes ---
+  useEffect(() => {
+    if (tab === 'library' && !libLoaded) {
+      loadLibrary();
+    }
+  }, [tab]);
+
+  async function loadLibrary() {
+    try {
+      const images = await API.getAllImages();
+      setAllIndexed(images);
+    } catch (e) {
+      console.error('load library failed', e);
+    } finally {
+      setLibLoaded(true);
+    }
+  }
+
+  // --- Config actions ---
+  async function saveImageDir() {
+    setDirSaving(true);
+    setDirMsg('');
+    try {
+      await API.saveImageDir(dirInput.trim());
+      setImageDir(dirInput.trim());
+      setDirMsg('目录已保存');
+    } catch (e) {
+      setDirMsg(e.message || '保存失败');
+    } finally {
+      setDirSaving(false);
+    }
+  }
+
+  // --- Scan ---
+  async function doScan() {
+    if (!imageDir) return;
+    console.log('[扫描] 开始扫描目录：', imageDir);
+    setScanning(true);
+    setScanError(null);
+    setAnalyzingFile(null);
+    setDraft(null);
+    try {
+      const data = await API.scan();
+      console.log('[扫描] 结果：共', data.total, '张，已索引', data.indexed_count, '待索引', data.unindexed_count);
+      setScanData(data);
+    } catch (e) {
+      console.error('[扫描] 失败：', e.message, e);
+      setScanError(e.message || '扫描失败');
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  // --- Analysis (calls server-side AI) ---
+  async function startAnalyze(filePath) {
+    console.group('[Analysis] start:', filePath);
+    setAnalyzingFile(filePath);
+    setDraft(null);
+    setAnalysisError(null);
+    setSaveMsg('');
+    setAnalyzing(true);
+    try {
+      console.log('[Analysis] calling server /api/analyze');
+      const resp = await fetch('/api/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file_path: filePath })
+      });
+
+      if (!resp.ok) {
+        const errData = await resp.json().catch(() => ({}));
+        const errMsg = errData.detail || `HTTP ${resp.status}`;
+        console.error('[Analysis] server error:', errMsg);
+        throw new Error(errMsg);
+      }
+
+      const result = await resp.json();
+      console.log('[Analysis] server result:', result);
+      setDraft({
+        title: '',
+        summary: '',
+        tags: Array.isArray(result.tags) ? result.tags : []
+      });
+      console.groupEnd();
+    } catch (e) {
+      console.error('[Analysis] exception:', e.message, e);
+      console.groupEnd();
+      setAnalysisError(e.message || 'AI analysis failed');
+      setDraft({ title: '', summary: '', tags: [] });
+    } finally {
+      setAnalyzing(false);
+    }
+  }
+
+  function addTag() {
+    const t = tagInput.trim();
+    if (!t || !draft) return;
+    if (!draft.tags.includes(t)) setDraft({ ...draft, tags: [...draft.tags, t] });
+    setTagInput('');
+  }
+
+  function removeTag(t) {
+    if (!draft) return;
+    setDraft({ ...draft, tags: draft.tags.filter((x) => x !== t) });
+  }
+
+  function editTag(oldTag, newTag) {
+    if (!draft) return;
+    const newTags = draft.tags.map((t) => (t === oldTag ? newTag : t));
+    setDraft({ ...draft, tags: newTags });
+  }
+
+  async function saveIndex() {
+    if (!analyzingFile || !draft) return;
+    console.log('[保存] 开始保存索引：', analyzingFile, draft);
+    setSaving(true);
+    setSaveMsg('');
+    try {
+      await API.indexImage(analyzingFile, draft.title || '未命名题目', draft.summary || '', draft.tags || []);
+      console.log('[保存] 索引保存成功，重新扫描目录');
+      setSaveMsg('已保存索引');
+      const data = await API.scan();
+      setScanData(data);
+      setLibLoaded(false);
+      setTimeout(() => {
+        setAnalyzingFile(null);
+        setDraft(null);
+        setSaveMsg('');
+      }, 600);
+    } catch (e) {
+      console.error('[保存] 失败：', e.message, e);
+      setSaveMsg('保存失败，请重试');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  // --- Library ---
+  const allTags = useMemo(() => {
+    const map = new Map();
+    allIndexed.forEach((p) => (p.tags || []).forEach((t) => map.set(t, (map.get(t) || 0) + 1)));
+    return Array.from(map.entries()).sort((a, b) => b[1] - a[1]);
+  }, [allIndexed]);
+
+  const filtered = useMemo(() => {
+    return allIndexed.filter((p) => {
+      if (selectedTags.length && !selectedTags.every((t) => (p.tags || []).includes(t))) return false;
+      if (query.trim()) {
+        const q = query.trim().toLowerCase();
+        const hay = (p.title + ' ' + p.summary + ' ' + (p.tags || []).join(' ')).toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [allIndexed, selectedTags, query]);
+
+  function toggleTag(t) {
+    setSelectedTags((prev) => (prev.includes(t) ? prev.filter((x) => x !== t) : [...prev, t]));
+  }
+
+  // --- Detail modal ---
+  function openDetail(p) {
+    setDetail(p);
+    setDetailTagInput('');
+  }
+
+  async function deleteFromIndex(filePath) {
+    try {
+      await API.deleteImage(filePath);
+      setAllIndexed((prev) => prev.filter((p) => p.file_path !== filePath));
+    } catch (e) {
+      console.error('delete failed', e);
+    }
+    setDetail(null);
+  }
+
+  async function updateDetailTags(newTags) {
+    if (!detail) return;
+    setDetailSaving(true);
+    const updated = { ...detail, tags: newTags };
+    setDetail(updated);
+    try {
+      await API.updateImage(detail.file_path, updated.title, updated.summary, newTags);
+      setAllIndexed((prev) => prev.map((p) => (p.file_path === detail.file_path ? updated : p)));
+    } catch (e) {
+      console.error('update failed', e);
+    } finally {
+      setDetailSaving(false);
+    }
+  }
+
+  function addDetailTag() {
+    const t = detailTagInput.trim();
+    if (!t || !detail) return;
+    if (!(detail.tags || []).includes(t)) updateDetailTags([...(detail.tags || []), t]);
+    setDetailTagInput('');
+  }
+
+  function removeDetailTag(t) {
+    if (!detail) return;
+    updateDetailTags((detail.tags || []).filter((x) => x !== t));
+  }
+
+  function editDetailTag(oldTag, newTag) {
+    if (!detail) return;
+    const newTags = (detail.tags || []).map((t) => (t === oldTag ? newTag : t));
+    updateDetailTags(newTags);
+  }
+
+  // --- Render ---
+  return (
+    <div className="mnb">
+      <style>{CSS}</style>
+      <div className="holes">
+        <div className="hole" /><div className="hole" /><div className="hole" /><div className="hole" />
+      </div>
+      <div className="margin-rule" />
+      <div className="shell">
+        <div className="header">
+          <div>
+            <h1>错题<span className="hl">本</span></h1>
+            <div className="subtitle">目录扫描 · AI 打标签 · 按考点查题</div>
+          </div>
+          <div className="tabs">
+            <button className={'tab-btn' + (tab === 'scan' ? ' active' : '')} onClick={() => setTab('scan')}>
+              <FolderOpen size={14} style={{ marginRight: 4, verticalAlign: -2 }} />扫描
+            </button>
+            <button className={'tab-btn' + (tab === 'library' ? ' active' : '')} onClick={() => setTab('library')}>
+              <BookOpen size={14} style={{ marginRight: 4, verticalAlign: -2 }} />
+              错题库 {allIndexed.length > 0 ? `(${allIndexed.length})` : ''}
+            </button>
+            <button className={'tab-btn' + (tab === 'config' ? ' active' : '')} onClick={() => setTab('config')}>
+              <Settings size={14} style={{ marginRight: 4, verticalAlign: -2 }} />配置
+            </button>
+          </div>
+        </div>
+
+        {/* ============ CONFIG TAB ============ */}
+        {tab === 'config' && (
+          <div className="panel">
+            <div className="config-box">
+              <h2 className="config-title">图片目录</h2>
+              <p className="config-hint">
+                设置存放错题图片的本地文件夹路径。程序将扫描该目录下的所有图片文件（支持 jpg / png / gif / webp / bmp）。
+              </p>
+              <div className="field">
+                <label className="field-label">目录路径</label>
+                <input type="text" value={dirInput}
+                  onChange={(e) => setDirInput(e.target.value)}
+                  placeholder="例如：C:\Users\me\Pictures\错题" />
+              </div>
+              <button className="save-btn" style={{ marginTop: 0 }} onClick={saveImageDir} disabled={dirSaving}>
+                {dirSaving ? '保存中…' : '保存目录'}
+              </button>
+              {dirMsg && <div className={'save-msg' + (dirMsg.includes('失败') ? ' error' : '')}>{dirMsg}</div>}
+            </div>
+          </div>
+        )}
+
+        {/* ============ SCAN TAB ============ */}
+        {tab === 'scan' && (
+          <div className="panel">
+            <div className="scan-header">
+              {imageDir ? (
+                <span className="scan-dir">{imageDir}</span>
+              ) : (
+                <span style={{ color: 'var(--margin)', fontSize: 13 }}>请先在"配置"页面设置图片目录</span>
+              )}
+              <button className="refresh-btn" onClick={doScan} disabled={scanning || !imageDir}>
+                {scanning ? <Loader2 size={15} className="spin" /> : <RefreshCw size={15} />}
+                {scanning ? '扫描中…' : '刷新扫描'}
+              </button>
+              {scanData && (
+                <span className="scan-stats">
+                  共 {scanData.total} 张 · 已索引 {scanData.indexed_count} · 待索引 {scanData.unindexed_count}
+                </span>
+              )}
+            </div>
+            {scanError && <div className="error-msg"><AlertCircle size={13} /> {scanError}</div>}
+
+            {/* Analyzing overlay */}
+            {analyzingFile && (
+              <div className="analyze-overlay">
+                <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+                  <div style={{ flex: '0 0 240px' }}>
+                    <img className="analyze-img" src={API.imageUrl(analyzingFile)} alt="分析中" />
+                    {!draft && (
+                      <button className="analyze-btn" onClick={() => startAnalyze(analyzingFile)} disabled={analyzing}>
+                        {analyzing ? <Loader2 size={16} className="spin" /> : <Sparkles size={16} />}
+                        {analyzing ? 'AI 分析中…' : 'AI 分析知识点'}
+                      </button>
+                    )}
+                    {analysisError && <div className="error-msg"><AlertCircle size={13} /> {analysisError}</div>}
+                    {draft && (
+                      <button className="analyze-btn"
+                        style={{ background: 'var(--paper)', color: 'var(--ink)', marginTop: 8 }}
+                        onClick={() => startAnalyze(analyzingFile)} disabled={analyzing}>
+                        {analyzing ? <Loader2 size={16} className="spin" /> : <Sparkles size={16} />}重新分析
+                      </button>
+                    )}
+                  </div>
+                  {draft && (
+                    <div style={{ flex: '1 1 280px' }}>
+                      <div className="field">
+                        <label className="field-label">题目标题</label>
+                        <input type="text" value={draft.title}
+                          onChange={(e) => setDraft({ ...draft, title: e.target.value })}
+                          placeholder="例如：相似三角形与中位线综合题" />
+                      </div>
+                      <div className="field">
+                        <label className="field-label">题目复述</label>
+                        <textarea rows={4} value={draft.summary}
+                          onChange={(e) => setDraft({ ...draft, summary: e.target.value })}
+                          placeholder="题目的文字描述，方便以后搜索" />
+                      </div>
+                      <div className="field">
+                        <label className="field-label">知识点标签（双击编辑，点击 × 删除）</label>
+                        <div className="tag-list">
+                          {draft.tags.map((t) => (
+                            <TagPill key={t} tag={t} onDelete={removeTag} onEdit={editTag} />
+                          ))}
+                          {draft.tags.length === 0 && (
+                            <span style={{ fontSize: 12.5, color: 'var(--ink-soft)' }}>还没有标签</span>
+                          )}
+                        </div>
+                        <div className="tag-add-row">
+                          <input type="text" placeholder="添加知识点，回车确认" value={tagInput}
+                            onChange={(e) => setTagInput(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addTag(); } }} />
+                          <button onClick={addTag}><Plus size={14} /></button>
+                        </div>
+                      </div>
+                      <button className="save-btn" onClick={saveIndex} disabled={saving}>
+                        {saving ? '保存中…' : '保存索引'}
+                      </button>
+                      <button className="save-btn secondary" style={{ marginLeft: 8 }}
+                        onClick={() => { setAnalyzingFile(null); setDraft(null); setAnalysisError(null); }}>
+                        取消
+                      </button>
+                      {saveMsg && <div className="save-msg">{saveMsg}</div>}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Empty / No scan */}
+            {!scanData && !scanning && !analyzingFile && imageDir && (
+              <div className="empty"><RefreshCw size={36} /><p>点击"刷新扫描"查看目录中的图片</p></div>
+            )}
+            {!imageDir && (
+              <div className="empty"><FolderOpen size={36} /><p>请先在"配置"页面设置图片存放目录</p></div>
+            )}
+
+            {/* Unindexed images */}
+            {scanData && scanData.unindexed.length > 0 && !analyzingFile && (
+              <div style={{ marginBottom: 24 }}>
+                <div className="section-title">待索引 <span className="badge">{scanData.unindexed.length}</span></div>
+                <div className="scan-grid">
+                  {scanData.unindexed.map((img) => (
+                    <div key={img.file_path} className="scan-card unindexed"
+                      onClick={() => startAnalyze(img.file_path)}>
+                      <div className="thumb">
+                        <img src={API.imageUrl(img.file_path)} alt={img.file_name} loading="lazy" />
+                      </div>
+                      <div className="info">
+                        <span className="status new">● 待索引</span>
+                        <div style={{ fontSize: 10.5, marginTop: 2 }}>{img.file_name}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Indexed images */}
+            {scanData && scanData.indexed.length > 0 && !analyzingFile && (
+              <div>
+                <div className="section-title">已索引 <span className="badge green">{scanData.indexed.length}</span></div>
+                <div className="scan-grid">
+                  {scanData.indexed.map((img) => (
+                    <div key={img.file_path} className="scan-card"
+                      onClick={() => openDetail(img)}>
+                      <div className="thumb">
+                        <img src={API.imageUrl(img.file_path)} alt={img.title} loading="lazy" />
+                      </div>
+                      <div className="info">
+                        <span className="status indexed">● 已索引</span>
+                        <div style={{ fontSize: 10.5, marginTop: 2, fontWeight: 600 }}>{img.title}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ============ LIBRARY TAB ============ */}
+        {tab === 'library' && (
+          <div className="panel">
+            {!libLoaded ? (
+              <div className="empty"><Loader2 size={28} className="spin" /><p>加载中…</p></div>
+            ) : allIndexed.length === 0 ? (
+              <div className="empty"><BookOpen size={40} /><p>还没有索引任何错题，去"扫描"页面导入吧</p></div>
+            ) : (
+              <>
+                <div className="library-toolbar">
+                  <div className="search-box">
+                    <Search size={15} color="#57648A" />
+                    <input type="text" placeholder="搜索标题、内容或标签" value={query}
+                      onChange={(e) => setQuery(e.target.value)} />
+                  </div>
+                </div>
+                {allTags.length > 0 && (
+                  <div className="tag-filter-bar">
+                    {allTags.map(([t, count]) => (
+                      <button key={t}
+                        className={'filter-pill' + (selectedTags.includes(t) ? ' active' : '')}
+                        onClick={() => toggleTag(t)}>
+                        {t}<span className="count-badge">{count}</span>
+                      </button>
+                    ))}
+                    {selectedTags.length > 0 && (
+                      <button className="filter-pill" onClick={() => setSelectedTags([])}
+                        style={{ borderStyle: 'dashed' }}>清除筛选 ×</button>
+                    )}
+                  </div>
+                )}
+                {filtered.length === 0 ? (
+                  <div className="empty"><Search size={32} /><p>没有匹配的题目</p></div>
+                ) : (
+                  <div className="grid">
+                    {filtered.map((p) => (
+                      <ProblemCard key={p.file_path} problem={p}
+                        imageUrl={API.imageUrl(p.file_path)}
+                        onClick={() => openDetail(p)} />
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* ============ DETAIL MODAL ============ */}
+      {detail && (
+        <div className="modal-overlay" onClick={() => setDetail(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-close" onClick={() => setDetail(null)}><X size={16} /></div>
+            <img src={API.imageUrl(detail.file_path)} alt={detail.title} />
+            <h2>{detail.title}</h2>
+            <div className="summary">{detail.summary}</div>
+            <label className="field-label">知识点标签（双击编辑，点击 × 删除）</label>
+            <div className="tag-list">
+              {(detail.tags || []).map((t) => (
+                <TagPill key={t} tag={t} onDelete={removeDetailTag} onEdit={editDetailTag} />
+              ))}
+              {(detail.tags || []).length === 0 && (
+                <span style={{ fontSize: 12.5, color: 'var(--ink-soft)' }}>还没有标签</span>
+              )}
+            </div>
+            <div className="tag-add-row" style={{ marginBottom: 18 }}>
+              <input type="text" placeholder="添加知识点，回车确认" value={detailTagInput}
+                onChange={(e) => setDetailTagInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addDetailTag(); } }} />
+              <button onClick={addDetailTag}><Plus size={14} /></button>
+            </div>
+            {detailSaving && <div className="save-msg" style={{ marginTop: -10, marginBottom: 12 }}>保存中…</div>}
+            <div className="modal-actions">
+              <button className="del-btn" onClick={() => deleteFromIndex(detail.file_path)}>
+                <Trash2 size={14} /> 从索引中移除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

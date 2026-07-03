@@ -1,0 +1,11 @@
+[project]
+name = "smart-mistake-lab-server"
+version = "0.1.0"
+description = "智能错题本后端服务"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.23.0",
+    "httpx>=0.25.0",
+    "python-dotenv>=1.0.0",
+]

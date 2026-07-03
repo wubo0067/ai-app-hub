@@ -9,3 +9,4 @@ rag-preprocessing/data/md/ssl/*.md
 rag-preprocessing/data/md/*.md
 *.xml
 *.log
+Smart-Mistake-Lab/.env
