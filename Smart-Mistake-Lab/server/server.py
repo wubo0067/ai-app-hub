@@ -33,6 +33,36 @@ app.add_middleware(
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
 
 
+def _infer_subject(file_path: str) -> str:
+    """从文件路径推断学科：取 image_dir 下的第一级子目录名"""
+    image_dir = db.get_config_value("image_dir") or ""
+    if not image_dir:
+        return ""
+    try:
+        rel = os.path.relpath(file_path, image_dir)
+        parts = rel.replace("\\", "/").split("/")
+        return parts[0] if len(parts) > 1 else ""
+    except ValueError:
+        return ""
+
+
+def _scan_images_in_dir(directory: str, indexed_paths: set) -> list:
+    """扫描单个目录下的所有图片文件，返回 [{file_path, file_name}...]"""
+    result = []
+    if not os.path.isdir(directory):
+        return result
+    try:
+        for f in sorted(os.listdir(directory)):
+            ext = os.path.splitext(f)[1].lower()
+            if ext in IMAGE_EXTENSIONS:
+                full_path = os.path.normpath(os.path.join(directory, f))
+                if os.path.isfile(full_path) and not os.path.basename(full_path).startswith('.'):
+                    result.append(full_path)
+    except Exception:
+        pass
+    return result
+
+
 @app.on_event("startup")
 def startup():
     db.init_db()
@@ -79,45 +109,107 @@ def scan_directory():
 
     indexed_paths = db.get_all_indexed_paths()
 
-    all_images = []
+    by_subject = {}
+    total_count = 0
+    total_indexed = 0
+    total_unindexed = 0
+
+    # 扫描 image_dir 下的第一级子目录（每个 = 一个学科）
     try:
-        for f in sorted(os.listdir(image_dir)):
-            ext = os.path.splitext(f)[1].lower()
-            if ext in IMAGE_EXTENSIONS:
-                full_path = os.path.normpath(os.path.join(image_dir, f))
-                all_images.append(full_path)
+        entries = sorted(os.listdir(image_dir))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"读取目录失败：{e}")
 
-    unindexed = []
-    indexed = []
-    for fp in all_images:
-        meta = db.get_image_by_path(fp)
-        if meta:
-            indexed.append(meta)
-        else:
-            unindexed.append({
-                "file_path": fp,
-                "file_name": os.path.basename(fp),
-                "title": "",
-                "summary": "",
-                "content": "",
-                "tags": [],
-                "notes": "",
-                "mastery": "",
-                "practice_count": 0,
-                "last_practiced_at": None,
-                "solution": "{}",
-                "indexed": False,
-            })
+    for entry in entries:
+        sub_path = os.path.join(image_dir, entry)
+        if not os.path.isdir(sub_path):
+            continue
+        if entry.startswith('.'):
+            continue
+        subject = entry
+        all_images = _scan_images_in_dir(sub_path, indexed_paths)
+
+        indexed = []
+        unindexed = []
+        for fp in all_images:
+            meta = db.get_image_by_path(fp)
+            if meta:
+                indexed.append(meta)
+            else:
+                unindexed.append({
+                    "file_path": fp,
+                    "file_name": os.path.basename(fp),
+                    "title": "",
+                    "summary": "",
+                    "content": "",
+                    "tags": [],
+                    "notes": "",
+                    "mastery": "",
+                    "practice_count": 0,
+                    "last_practiced_at": None,
+                    "solution": "{}",
+                    "indexed": False,
+                })
+
+        by_subject[subject] = {"indexed": indexed, "unindexed": unindexed}
+        total_count += len(all_images)
+        total_indexed += len(indexed)
+        total_unindexed += len(unindexed)
+
+    # 也处理根目录下的图片（不属于任何学科）
+    root_images = [
+        os.path.normpath(os.path.join(image_dir, f))
+        for f in sorted(os.listdir(image_dir))
+        if os.path.isfile(os.path.join(image_dir, f))
+        and os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS
+        and not f.startswith('.')
+    ]
+    if root_images:
+        indexed = []
+        unindexed = []
+        for fp in root_images:
+            meta = db.get_image_by_path(fp)
+            if meta:
+                indexed.append(meta)
+            else:
+                unindexed.append({
+                    "file_path": fp,
+                    "file_name": os.path.basename(fp),
+                    "title": "",
+                    "summary": "",
+                    "content": "",
+                    "tags": [],
+                    "notes": "",
+                    "mastery": "",
+                    "practice_count": 0,
+                    "last_practiced_at": None,
+                    "solution": "{}",
+                    "indexed": False,
+                })
+        by_subject["未分类"] = {"indexed": indexed, "unindexed": unindexed}
+        total_count += len(root_images)
+        total_indexed += len(indexed)
+        total_unindexed += len(unindexed)
+
+    # 预设学科顺序 + 剩余按名称 + 未分类垫底
+    preset = ['数学', '物理', '化学', '英语', '语文']
+    subject_order = [s for s in preset if s in by_subject]
+    remaining = sorted(
+        [s for s in by_subject if s not in preset and s != '未分类']
+    )
+    subject_order.extend(remaining)
+    if '未分类' in by_subject:
+        subject_order.append('未分类')
 
     return {
         "image_dir": image_dir,
-        "total": len(all_images),
-        "indexed_count": len(indexed),
-        "unindexed_count": len(unindexed),
-        "unindexed": unindexed,
-        "indexed": indexed,
+        "total": total_count,
+        "indexed_count": total_indexed,
+        "unindexed_count": total_unindexed,
+        "unindexed": sum((g["unindexed"] for g in by_subject.values()), []),
+        "indexed": sum((g["indexed"] for g in by_subject.values()), []),
+        "by_subject": by_subject,
+        "subject_order": subject_order,
     }
 
 
@@ -150,7 +242,8 @@ def index_image(data: dict):
     if not file_path:
         raise HTTPException(status_code=400, detail="file_path 不能为空")
 
-    db.mark_indexed(file_path, title, summary, content, tags, notes, mastery, practice_count, last_practiced_at, solution)
+    subject = _infer_subject(file_path)
+    db.mark_indexed(file_path, title, summary, content, tags, notes, mastery, practice_count, last_practiced_at, solution, subject)
     return {"status": "ok"}
 
 
@@ -188,12 +281,15 @@ def delete_image(file_path: str = Query(..., description="图片文件路径")):
 @app.get("/api/images/all")
 def get_all_images(
     query: str = Query("", description="关键字搜索词"),
+    subject: str = Query("", description="学科筛选"),
     date_enabled: bool = Query(False, description="是否启用日期范围筛选"),
     start_date: str | None = Query(None, description="开始日期，格式 YYYY-MM-DD"),
     end_date: str | None = Query(None, description="结束日期，格式 YYYY-MM-DD"),
 ):
+    subject_param = subject.strip() or None
+
     # 错题库总数（不受筛选条件影响）
-    total_count = db.get_total_image_count()
+    total_count = db.get_total_image_count(subject=subject_param)
 
     # 构造日期时间字符串：开始日 00:00:00，结束日 23:59:59
     start_datetime = None
@@ -211,14 +307,18 @@ def get_all_images(
             query=query.strip() or None,
             start_datetime=start_datetime,
             end_datetime=end_datetime,
+            subject=subject_param,
         )
     else:
-        items = db.get_all_images()
+        items = db.get_all_images(subject=subject_param)
+
+    subjects = db.get_subject_counts()
 
     return {
         "items": items,
         "total_count": total_count,
         "filtered_count": len(items),
+        "subjects": subjects,
     }
 
 
@@ -324,10 +424,11 @@ async def analyze(data: dict):
         max_tokens=cfg["max_tokens"],
     )
 
-    logger.info(f'[API] 收到分析请求：{file_path}')
+    subject = _infer_subject(file_path)
+    logger.info(f'[API] 收到分析请求：{file_path}, subject={subject}')
 
     try:
-        result = await analyze_image(file_path, ai_config)
+        result = await analyze_image(file_path, ai_config, subject=subject)
         logger.info(f'[API] 分析完成：{file_path} -> tags={result.get("tags", [])}')
         return result
     except FileNotFoundError as e:

@@ -24,6 +24,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             file_path TEXT UNIQUE NOT NULL,
             file_name TEXT NOT NULL,
+            subject TEXT DEFAULT '',
             title TEXT DEFAULT '',
             summary TEXT DEFAULT '',
             content TEXT DEFAULT '',
@@ -66,6 +67,15 @@ def init_db():
         pass
     try:
         conn.execute('ALTER TABLE images ADD COLUMN content TEXT DEFAULT ""')
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute('ALTER TABLE images ADD COLUMN subject TEXT DEFAULT ""')
+    except sqlite3.OperationalError:
+        pass
+    # 为 subject 建索引以加速按学科查询
+    try:
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_images_subject ON images(subject)')
     except sqlite3.OperationalError:
         pass
     conn.commit()
@@ -112,17 +122,64 @@ def get_image_by_path(file_path: str) -> dict | None:
     return None
 
 
-def get_total_image_count() -> int:
-    """返回已索引错题总数（不受任何筛选条件影响）"""
+def get_total_image_count(subject: str | None = None) -> int:
+    """返回已索引错题总数，可按学科筛选"""
     conn = get_db()
-    row = conn.execute('SELECT COUNT(*) FROM images').fetchone()
+    if subject:
+        row = conn.execute('SELECT COUNT(*) FROM images WHERE subject = ?', (subject,)).fetchone()
+    else:
+        row = conn.execute('SELECT COUNT(*) FROM images').fetchone()
     conn.close()
     return row[0]
 
 
-def get_all_images() -> list[dict]:
+def get_all_subjects_from_images() -> list[str]:
+    """返回数据库中已有的所有学科名"""
     conn = get_db()
-    rows = conn.execute('SELECT * FROM images ORDER BY indexed_at DESC').fetchall()
+    rows = conn.execute(
+        'SELECT DISTINCT subject FROM images WHERE subject != "" ORDER BY subject'
+    ).fetchall()
+    conn.close()
+    return [r['subject'] for r in rows]
+
+
+def get_subject_counts() -> list[dict]:
+    """返回每个学科的已索引数量，预设学科优先、未分类垫底、其余按名称排序"""
+    conn = get_db()
+    rows = conn.execute(
+        'SELECT subject, COUNT(*) AS cnt FROM images WHERE subject != "" GROUP BY subject'
+    ).fetchall()
+    conn.close()
+
+    preset_order = {'数学': 0, '物理': 1, '化学': 2, '英语': 3, '语文': 4}
+    result = []
+    uncategorized = None
+    others = []
+    for r in rows:
+        entry = {'name': r['subject'], 'total_count': r['cnt']}
+        if r['subject'] == '未分类':
+            uncategorized = entry
+        elif r['subject'] in preset_order:
+            result.append((preset_order[r['subject']], entry))
+        else:
+            others.append(entry)
+    result.sort(key=lambda x: x[0])
+    sorted_result = [entry for _, entry in result]
+    others.sort(key=lambda x: x['name'])
+    sorted_result.extend(others)
+    if uncategorized:
+        sorted_result.append(uncategorized)
+    return sorted_result
+
+
+def get_all_images(subject: str | None = None) -> list[dict]:
+    conn = get_db()
+    if subject:
+        rows = conn.execute(
+            'SELECT * FROM images WHERE subject = ? ORDER BY indexed_at DESC', (subject,)
+        ).fetchall()
+    else:
+        rows = conn.execute('SELECT * FROM images ORDER BY indexed_at DESC').fetchall()
     conn.close()
     result = []
     for r in rows:
@@ -135,11 +192,16 @@ def get_all_images() -> list[dict]:
 
 def search_images(query: str | None = None,
                   start_datetime: str | None = None,
-                  end_datetime: str | None = None) -> list[dict]:
-    """按关键字、日期范围筛选错题，所有条件为 AND 关系"""
+                  end_datetime: str | None = None,
+                  subject: str | None = None) -> list[dict]:
+    """按关键字、日期范围、学科筛选错题，所有条件为 AND 关系"""
     conn = get_db()
     conditions = []
     params = []
+
+    if subject:
+        conditions.append('subject = ?')
+        params.append(subject)
 
     if query:
         like_q = f'%{query}%'
@@ -175,7 +237,8 @@ def search_images(query: str | None = None,
 
 def mark_indexed(file_path: str, title: str, summary: str, content: str, tags: list[str],
                  notes: str = '', mastery: str = '', practice_count: int = 0,
-                      last_practiced_at: str | None = None, solution: str = ''):
+                      last_practiced_at: str | None = None, solution: str = '',
+                      subject: str = ''):
     conn = get_db()
     # 如果已存在记录，保留原来的 created_at
     old = conn.execute(
@@ -185,9 +248,9 @@ def mark_indexed(file_path: str, title: str, summary: str, content: str, tags: l
 
     conn.execute(
         '''INSERT OR REPLACE INTO images
-          (file_path, file_name, title, summary, content, tags, notes, mastery, practice_count, last_practiced_at, solution, indexed_at, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-      (file_path, os.path.basename(file_path), title, summary, content,
+          (file_path, file_name, subject, title, summary, content, tags, notes, mastery, practice_count, last_practiced_at, solution, indexed_at, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+      (file_path, os.path.basename(file_path), subject, title, summary, content,
             json.dumps(tags, ensure_ascii=False), notes, mastery, practice_count, last_practiced_at, solution, _now(), original_created_at)
     )
     conn.commit()

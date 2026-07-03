@@ -59,6 +59,7 @@ const API = {
   async getAllImages(params = {}) {
     const qs = new URLSearchParams();
     if (params.query) qs.set('query', params.query);
+    if (params.subject) qs.set('subject', params.subject);
     if (params.dateEnabled) qs.set('date_enabled', '1');
     if (params.startDate) qs.set('start_date', params.startDate);
     if (params.endDate) qs.set('end_date', params.endDate);
@@ -272,6 +273,20 @@ const CSS = `
 .mnb .scan-card .info .status { font-weight: 600; font-size: 10.5px; }
 .mnb .scan-card .info .status.new { color: var(--margin); }
 .mnb .scan-card .info .status.indexed { color: var(--accent-2); }
+
+/* Subject page header */
+.mnb .subject-page-header {
+  display: flex; align-items: baseline; gap: 16px;
+  margin-bottom: 16px; padding-bottom: 12px;
+  border-bottom: 2px solid var(--grid);
+}
+.mnb .subject-page-title {
+  margin: 0; font-size: 20px; font-weight: 800; color: var(--ink);
+}
+.mnb .subject-page-stats {
+  font-size: 13px; color: var(--ink-soft); font-weight: 500;
+}
+.mnb .subject-filtered-hint { color: var(--margin); font-weight: 600; }
 
 /* Library */
 .mnb .library-toolbar {
@@ -618,6 +633,11 @@ export default function App() {
   const [dateFilterEnabled, setDateFilterEnabled] = useState(false);
   const [startDate, setStartDate] = useState('');
   const [endDate, setEndDate] = useState('');
+  const [activeSubject, setActiveSubject] = useState(() => {
+    try { return localStorage.getItem('mnb_active_subject') || 'all'; } catch { return 'all'; }
+  });
+  const [subjects, setSubjects] = useState([]);
+  const pendingSubjectRef = useRef(null);
 
   // --- Detail modal ---
   const [detail, setDetail] = useState(null);
@@ -651,9 +671,19 @@ export default function App() {
     }).catch(() => { });
   }, []);
 
+  // persist activeSubject
+  useEffect(() => {
+    try { localStorage.setItem('mnb_active_subject', activeSubject); } catch { }
+  }, [activeSubject]);
+
   // --- Load library when tab changes ---
   useEffect(() => {
     if (tab === 'library' && !libLoaded) {
+      // 若扫描页设置了 pending subject，则跳转到对应学科页
+      if (pendingSubjectRef.current) {
+        setActiveSubject(pendingSubjectRef.current);
+        pendingSubjectRef.current = null;
+      }
       loadLibrary();
     }
   }, [tab]);
@@ -663,14 +693,13 @@ export default function App() {
   async function loadLibrary(filterParams = {}) {
     try {
       const data = await API.getAllImages(filterParams);
-      // 后端已改为 { items, total_count, filtered_count }
-      // 兼容旧格式（纯数组）
       if (Array.isArray(data)) {
         setAllIndexed(data);
         setTotalIndexedCount(data.length);
       } else {
         setAllIndexed(data.items || []);
         setTotalIndexedCount(data.total_count ?? 0);
+        if (data.subjects) setSubjects(data.subjects);
       }
     } catch (e) {
       console.error('load library failed', e);
@@ -688,13 +717,14 @@ export default function App() {
       if (dateFilterEnabled && startDate && endDate && startDate > endDate) return;
       loadLibrary({
         query,
+        subject: activeSubject === 'all' ? '' : activeSubject,
         dateEnabled: dateFilterEnabled,
         startDate: dateFilterEnabled ? startDate : '',
         endDate: dateFilterEnabled ? endDate : '',
       });
     }, 300);
     return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
-  }, [query, dateFilterEnabled, startDate, endDate]);
+  }, [query, dateFilterEnabled, startDate, endDate, activeSubject]);
 
   // --- Config actions ---
   async function saveImageDir() {
@@ -722,6 +752,14 @@ export default function App() {
     try {
       const data = await API.scan();
       console.log('[扫描] 结果：共', data.total, '张，已索引', data.indexed_count, '待索引', data.unindexed_count);
+      // 兼容旧格式：若无 by_subject，从 flat lists 构造
+      if (!data.by_subject) {
+        data.by_subject = { '未分类': { indexed: data.indexed || [], unindexed: data.unindexed || [] } };
+      }
+      // 使用后端返回的 subject_order，否则按 key 排序
+      if (!data.subject_order) {
+        data.subject_order = Object.keys(data.by_subject);
+      }
       setScanData(data);
     } catch (e) {
       console.error('[扫描] 失败：', e.message, e);
@@ -800,7 +838,17 @@ export default function App() {
       await API.indexImage(analyzingFile, draft.title || '未命名题目', draft.summary || '', draft.content || '', draft.tags || [], '', '', 0);
       console.log('[保存] 索引保存成功，重新扫描目录');
       setSaveMsg('已保存索引');
+      // 记住当前分析的图片所属学科，以便后续跳转
       const data = await API.scan();
+      // 从新扫描结果中推断当前图片的学科
+      if (data.by_subject) {
+        for (const [subj, group] of Object.entries(data.by_subject)) {
+          if ((group.indexed || []).some((img) => img.file_path === analyzingFile)) {
+            pendingSubjectRef.current = subj;
+            break;
+          }
+        }
+      }
       setScanData(data);
       setLibLoaded(false);
       setTimeout(() => {
@@ -830,6 +878,16 @@ export default function App() {
     });
   }, [allIndexed, selectedTags]);
 
+  function switchSubject(subj) {
+    setActiveSubject(subj);
+    setSelectedTags([]);
+  }
+
+  function getSubjectLabel() {
+    if (activeSubject === 'all') return '全部错题库';
+    return `${activeSubject}错题库`;
+  }
+
   function toggleTag(t) {
     setSelectedTags((prev) => (prev.includes(t) ? prev.filter((x) => x !== t) : [...prev, t]));
   }
@@ -840,6 +898,7 @@ export default function App() {
     setDateFilterEnabled(false);
     setStartDate('');
     setEndDate('');
+    setActiveSubject('all');
   }
 
   // --- Detail modal ---
@@ -1096,7 +1155,7 @@ export default function App() {
             </button>
             <button className={'tab-btn' + (tab === 'library' ? ' active' : '')} onClick={() => setTab('library')}>
               <BookOpen size={14} style={{ marginRight: 4, verticalAlign: -2 }} />
-              错题库 {allIndexed.length > 0 ? `(${allIndexed.length})` : ''}
+              错题库 {totalIndexedCount > 0 ? `(${totalIndexedCount})` : ''}
             </button>
             <button className={'tab-btn' + (tab === 'config' ? ' active' : '')} onClick={() => setTab('config')}>
               <Settings size={14} style={{ marginRight: 4, verticalAlign: -2 }} />配置
@@ -1229,114 +1288,167 @@ export default function App() {
               <div className="empty"><FolderOpen size={36} /><p>请先在"配置"页面设置图片存放目录</p></div>
             )}
 
-            {/* Unindexed images */}
-            {scanData && scanData.unindexed.length > 0 && !analyzingFile && (
-              <div style={{ marginBottom: 24 }}>
-                <div className="section-title">待索引 <span className="badge">{scanData.unindexed.length}</span></div>
-                <div className="scan-grid">
-                  {scanData.unindexed.map((img) => (
-                    <div key={img.file_path} className="scan-card unindexed"
-                      onClick={() => startAnalyze(img.file_path)}>
-                      <div className="thumb">
-                        <img src={API.imageUrl(img.file_path)} alt={img.file_name} loading="lazy" />
-                      </div>
-                      <div className="info">
-                        <span className="status new">● 待索引</span>
-                        <div style={{ fontSize: 10.5, marginTop: 2 }}>{img.file_name}</div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Indexed images */}
-            {scanData && scanData.indexed.length > 0 && !analyzingFile && (
-              <div>
-                <div className="section-title">已索引 <span className="badge green">{scanData.indexed.length}</span></div>
-                <div className="scan-grid">
-                  {scanData.indexed.map((img) => (
-                    <div key={img.file_path} className="scan-card"
-                      onClick={() => openDetail(img)}>
-                      <div className="thumb">
-                        <img src={API.imageUrl(img.file_path)} alt={img.title} loading="lazy" />
-                      </div>
-                      <div className="info">
-                        <span className="status indexed">● 已索引</span>
-                        <div style={{ fontSize: 10.5, marginTop: 2, fontWeight: 600 }}>{img.title}</div>
+            {/* Subject-grouped scan results (use subject_order from backend) */}
+            {scanData && !analyzingFile && (scanData.subject_order || Object.keys(scanData.by_subject || {})).map((subject) => {
+              const group = scanData.by_subject[subject]; if (!group) return null;
+              return (
+                <div key={subject} style={{ marginBottom: 24 }}>
+                  <div className="section-title">{subject || '未分类'} <span className="badge" style={{ marginLeft: 8, fontSize: 11 }}>{((group.indexed || []).length + (group.unindexed || []).length)} 张</span></div>
+                  {/* Unindexed in this subject */}
+                  {(group.unindexed || []).length > 0 && (
+                    <div style={{ marginBottom: 16 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--margin)', marginBottom: 8 }}>待索引 <span className="badge">{group.unindexed.length}</span></div>
+                      <div className="scan-grid">
+                        {group.unindexed.map((img) => (
+                          <div key={img.file_path} className="scan-card unindexed"
+                            onClick={() => startAnalyze(img.file_path)}>
+                            <div className="thumb">
+                              <img src={API.imageUrl(img.file_path)} alt={img.file_name} loading="lazy" />
+                            </div>
+                            <div className="info">
+                              <span className="status new">● 待索引</span>
+                              <div style={{ fontSize: 10.5, marginTop: 2 }}>{img.file_name}</div>
+                            </div>
+                          </div>
+                        ))}
                       </div>
                     </div>
-                  ))}
+                  )}
+                  {/* Indexed in this subject */}
+                  {(group.indexed || []).length > 0 && (
+                    <div>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--accent-2)', marginBottom: 8 }}>已索引 <span className="badge green">{group.indexed.length}</span></div>
+                      <div className="scan-grid">
+                        {group.indexed.map((img) => (
+                          <div key={img.file_path} className="scan-card"
+                            onClick={() => openDetail(img)}>
+                            <div className="thumb">
+                              <img src={API.imageUrl(img.file_path)} alt={img.title} loading="lazy" />
+                            </div>
+                            <div className="info">
+                              <span className="status indexed">● 已索引</span>
+                              <div style={{ fontSize: 10.5, marginTop: 2, fontWeight: 600 }}>{img.title}</div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {(!group.indexed || group.indexed.length === 0) && (!group.unindexed || group.unindexed.length === 0) && (
+                    <div style={{ fontSize: 12.5, color: 'var(--ink-soft)', padding: '8px 0' }}>该学科暂无图片</div>
+                  )}
                 </div>
-              </div>
-            )}
+              );
+            })}
           </div>
         )}
 
         {/* ============ LIBRARY TAB ============ */}
-        {tab === 'library' && (
-          <div className="panel">
-            {!libLoaded ? (
-              <div className="empty"><Loader2 size={28} className="spin" /><p>加载中…</p></div>
-            ) : totalIndexedCount === 0 ? (
-              <div className="empty"><BookOpen size={40} /><p>还没有索引任何错题，去"扫描"页面导入吧</p></div>
-            ) : (
-              <>
-                <div className="library-toolbar">
-                  <div className="search-box">
-                    <Search size={15} color="#57648A" />
-                    <input type="text" placeholder="搜索标题、内容或标签" value={query}
-                      onChange={(e) => setQuery(e.target.value)} />
+        {tab === 'library' && (() => {
+          const globalTotal = activeSubject === 'all'
+            ? totalIndexedCount
+            : subjects.reduce((sum, s) => sum + (s.total_count || 0), 0);
+          return (
+            <div className="panel">
+              {!libLoaded ? (
+                <div className="empty"><Loader2 size={28} className="spin" /><p>加载中…</p></div>
+              ) : globalTotal === 0 ? (
+                /* 空状态①：整个错题库没有任何已索引的错题 */
+                <div className="empty"><BookOpen size={40} /><p>还没有索引任何错题，去"扫描"页面导入吧</p></div>
+              ) : (
+                <>
+                  {/* ---- 学科标题 + 统计 ---- */}
+                  <div className="subject-page-header">
+                    <h2 className="subject-page-title">{getSubjectLabel()}</h2>
+                    <span className="subject-page-stats">
+                      共 {totalIndexedCount} 题
+                      {filtered.length !== totalIndexedCount && (
+                        <span className="subject-filtered-hint">，当前筛出 {filtered.length} 题</span>
+                      )}
+                    </span>
                   </div>
-                  <label className="date-filter-check">
-                    <input type="checkbox" checked={dateFilterEnabled}
-                      onChange={(e) => setDateFilterEnabled(e.target.checked)} />
-                    按添加时间筛选
-                  </label>
-                  <input type="date" className="date-input" value={startDate}
-                    onChange={(e) => setStartDate(e.target.value)}
-                    disabled={!dateFilterEnabled} title="开始日期" />
-                  <span className="date-sep">—</span>
-                  <input type="date" className="date-input" value={endDate}
-                    onChange={(e) => setEndDate(e.target.value)}
-                    disabled={!dateFilterEnabled} title="结束日期" />
-                  {(query || selectedTags.length > 0 || dateFilterEnabled) && (
-                    <button className="clear-filter-btn" onClick={clearAllFilters}>清空筛选</button>
-                  )}
-                  {dateFilterEnabled && startDate && endDate && startDate > endDate && (
-                    <span className="date-error">开始日期不能大于结束日期</span>
-                  )}
-                </div>
-                {allTags.length > 0 && (
-                  <div className="tag-filter-bar">
-                    {allTags.map(([t, count]) => (
-                      <button key={t}
-                        className={'filter-pill' + (selectedTags.includes(t) ? ' active' : '')}
-                        onClick={() => toggleTag(t)}>
-                        {t}<span className="count-badge">{count}</span>
-                      </button>
-                    ))}
-                    {selectedTags.length > 0 && (
-                      <button className="filter-pill" onClick={() => setSelectedTags([])}
-                        style={{ borderStyle: 'dashed' }}>清除标签 ×</button>
+
+                  <div className="library-toolbar">
+                    <div className="search-box">
+                      <Search size={15} color="#57648A" />
+                      <input type="text" placeholder="搜索标题、内容或标签" value={query}
+                        onChange={(e) => setQuery(e.target.value)} />
+                    </div>
+                    <label className="date-filter-check">
+                      <input type="checkbox" checked={dateFilterEnabled}
+                        onChange={(e) => setDateFilterEnabled(e.target.checked)} />
+                      按添加时间筛选
+                    </label>
+                    <input type="date" className="date-input" value={startDate}
+                      onChange={(e) => setStartDate(e.target.value)}
+                      disabled={!dateFilterEnabled} title="开始日期" />
+                    <span className="date-sep">—</span>
+                    <input type="date" className="date-input" value={endDate}
+                      onChange={(e) => setEndDate(e.target.value)}
+                      disabled={!dateFilterEnabled} title="结束日期" />
+                    {(query || selectedTags.length > 0 || dateFilterEnabled || activeSubject !== 'all') && (
+                      <button className="clear-filter-btn" onClick={clearAllFilters}>清空筛选</button>
+                    )}
+                    {dateFilterEnabled && startDate && endDate && startDate > endDate && (
+                      <span className="date-error">开始日期不能大于结束日期</span>
                     )}
                   </div>
-                )}
-                {filtered.length === 0 ? (
-                  <div className="empty"><Search size={32} /><p>没有匹配的题目</p></div>
-                ) : (
-                  <div className="grid">
-                    {filtered.map((p) => (
-                      <ProblemCard key={p.file_path} problem={p}
-                        imageUrl={API.imageUrl(p.file_path)}
-                        onClick={() => openDetail(p)} />
+
+                  {/* 学科页签（始终显示） */}
+                  <div className="tag-filter-bar" style={{ marginBottom: 12 }}>
+                    <button
+                      className={'filter-pill' + (activeSubject === 'all' ? ' active' : '')}
+                      onClick={() => switchSubject('all')}>
+                      全部<span className="count-badge">{globalTotal}</span>
+                    </button>
+                    {subjects.map((s) => (
+                      <button key={s.name || s}
+                        className={'filter-pill' + (activeSubject === (s.name || s) ? ' active' : '')}
+                        onClick={() => switchSubject(s.name || s)}>
+                        {s.name || s}<span className="count-badge">{s.total_count ?? s.count ?? ''}</span>
+                      </button>
                     ))}
                   </div>
-                )}
-              </>
-            )}
-          </div>
-        )}
+
+                  {/* 空状态②：当前学科有题但没筛出来 */}
+                  {totalIndexedCount === 0 ? (
+                    <div className="empty"><BookOpen size={36} /><p>该学科暂无已索引的错题</p></div>
+                  ) : (
+                    <>
+                      {allTags.length > 0 && (
+                        <div className="tag-filter-bar">
+                          {allTags.map(([t, count]) => (
+                            <button key={t}
+                              className={'filter-pill' + (selectedTags.includes(t) ? ' active' : '')}
+                              onClick={() => toggleTag(t)}>
+                              {t}<span className="count-badge">{count}</span>
+                            </button>
+                          ))}
+                          {selectedTags.length > 0 && (
+                            <button className="filter-pill" onClick={() => setSelectedTags([])}
+                              style={{ borderStyle: 'dashed' }}>清除标签 ×</button>
+                          )}
+                        </div>
+                      )}
+                      {/* 空状态③：有题但筛出来为空 */}
+                      {filtered.length === 0 ? (
+                        <div className="empty"><Search size={32} /><p>没有匹配的题目，试试调整筛选条件</p></div>
+                      ) : (
+                        <div className="grid">
+                          {filtered.map((p) => (
+                            <ProblemCard key={p.file_path} problem={p}
+                              imageUrl={API.imageUrl(p.file_path)}
+                              onClick={() => openDetail(p)} />
+                          ))}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </>
+              )}
+            </div>
+          );
+        })()}
       </div>
 
       {/* ============ DETAIL MODAL ============ */}
