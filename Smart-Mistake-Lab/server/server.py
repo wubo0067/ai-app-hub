@@ -94,6 +94,10 @@ def scan_directory():
                 "title": "",
                 "summary": "",
                 "tags": [],
+                "notes": "",
+                "mastery": "",
+                "practice_count": 0,
+                "last_practiced_at": None,
                 "indexed": False,
             })
 
@@ -124,11 +128,15 @@ def index_image(data: dict):
     title = data.get("title", "")
     summary = data.get("summary", "")
     tags = data.get("tags", [])
+    notes = data.get("notes", "")
+    mastery = data.get("mastery", "")
+    practice_count = data.get("practice_count", 0)
+    last_practiced_at = data.get("last_practiced_at")
 
     if not file_path:
         raise HTTPException(status_code=400, detail="file_path 不能为空")
 
-    db.mark_indexed(file_path, title, summary, tags)
+    db.mark_indexed(file_path, title, summary, tags, notes, mastery, practice_count, last_practiced_at)
     return {"status": "ok"}
 
 
@@ -143,6 +151,10 @@ def update_image(data: dict):
         title=data.get("title"),
         summary=data.get("summary"),
         tags=data.get("tags"),
+        notes=data.get("notes"),
+        mastery=data.get("mastery"),
+        practice_count=data.get("practice_count"),
+        last_practiced_at=data.get("last_practiced_at"),
     )
     return {"status": "ok"}
 

@@ -1,6 +1,13 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { X, Plus, Search, Loader2, Sparkles, Trash2, BookOpen, AlertCircle, RefreshCw, FolderOpen, Settings, Edit3, Check } from 'lucide-react';
 
+function formatTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 // ============== API HELPERS ==============
 
 async function apiFetch(url, options = {}) {
@@ -32,18 +39,18 @@ const API = {
   async scan() {
     return (await apiFetch('/api/scan')).json();
   },
-  async indexImage(filePath, title, summary, tags) {
+  async indexImage(filePath, title, summary, tags, notes, mastery, practiceCount, lastPracticedAt) {
     return (await apiFetch('/api/images/index', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ file_path: filePath, title, summary, tags })
+      body: JSON.stringify({ file_path: filePath, title, summary, tags, notes, mastery, practice_count: practiceCount, last_practiced_at: lastPracticedAt })
     })).json();
   },
-  async updateImage(filePath, title, summary, tags) {
+  async updateImage(filePath, title, summary, tags, notes, mastery, practiceCount, lastPracticedAt) {
     return (await apiFetch('/api/images/update', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ file_path: filePath, title, summary, tags })
+      body: JSON.stringify({ file_path: filePath, title, summary, tags, notes, mastery, practice_count: practiceCount, last_practiced_at: lastPracticedAt })
     })).json();
   },
   async deleteImage(filePath) {
@@ -186,6 +193,8 @@ const CSS = `
   border-bottom: 1px dashed var(--accent);
 }
 .mnb .tag-list { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.mnb .tag-list-vertical { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.mnb .tag-row { display: flex; align-items: center; }
 .mnb .tag-add-row { display: flex; gap: 8px; align-items: center; }
 .mnb .tag-add-row input {
   border: 1.5px dashed var(--grid); border-radius: 999px;
@@ -306,6 +315,12 @@ const CSS = `
   background: #FFF6E0; border: 1px solid var(--accent); color: #6B5314;
   border-radius: 999px; padding: 2px 7px;
 }
+.mnb .card-meta {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-top: 6px; gap: 6px;
+}
+.mnb .card-mastery { font-size: 10.5px; color: var(--accent-2); }
+.mnb .card-practice { font-size: 10.5px; color: var(--ink-soft); }
 
 /* Analysis overlay */
 .mnb .analyze-overlay {
@@ -355,6 +370,13 @@ const CSS = `
   font-size: 19px; margin: 0 0 10px; padding-right: 30px;
 }
 .mnb .modal .summary { font-size: 13.5px; line-height: 1.7; color: var(--ink-soft); margin-bottom: 14px; }
+.mnb .timestamp-row {
+  display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 14px;
+}
+.mnb .timestamp {
+  font-size: 12px; color: var(--pencil);
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+}
 .mnb .modal .tag-list { margin-bottom: 18px; }
 .mnb .modal-actions {
   display: flex; justify-content: flex-end; gap: 10px;
@@ -367,6 +389,30 @@ const CSS = `
 }
 .mnb .spin { animation: mnbspin 0.9s linear infinite; }
 @keyframes mnbspin { to { transform: rotate(360deg); } }
+
+/* Mastery & Practice */
+.mnb .mastery-group { display: flex; flex-wrap: wrap; gap: 8px; }
+.mnb .mastery-option {
+  display: flex; align-items: center; gap: 5px;
+  padding: 6px 12px; border-radius: 7px;
+  border: 1.5px solid var(--grid); cursor: pointer;
+  font-size: 13px; transition: all .15s;
+}
+.mnb .mastery-option:hover { border-color: var(--ink-soft); }
+.mnb .mastery-option.active { border-color: var(--accent-2); background: #E8F5F2; }
+.mnb .mastery-option input[type="radio"] { display: none; }
+.mnb .practice-count {
+  font-size: 28px; font-weight: 700; color: var(--ink);
+  font-family: "Songti SC", "STSong", serif;
+  min-width: 36px; text-align: center;
+}
+.mnb .practice-btn {
+  padding: 8px 14px; border-radius: 7px;
+  border: 1.5px solid var(--accent-2); background: var(--accent-2);
+  color: #fff; font-weight: 700; font-size: 14px; cursor: pointer;
+  transition: opacity .15s;
+}
+.mnb .practice-btn:hover { opacity: 0.85; }
 
 /* Inline tag edit */
 .mnb .tag-edit-input {
@@ -434,6 +480,12 @@ function TagPill({ tag, onDelete, onEdit }) {
 
 // ============== PROBLEM CARD ==============
 
+const MASTERY_LABELS = {
+  mastered: '✅ 已掌握',
+  unfamiliar: '⚠️ 不熟悉',
+  practice: '🔄 继续练习',
+};
+
 function ProblemCard({ problem, imageUrl, onClick }) {
   return (
     <div className="card" onClick={onClick}>
@@ -441,11 +493,19 @@ function ProblemCard({ problem, imageUrl, onClick }) {
         <img src={imageUrl} alt={problem.title} loading="lazy" />
       </div>
       <div className="card-body">
-        <p className="card-title">{problem.title}</p>
+        <p className="card-title">{problem.title || '未命名题目'}</p>
         <div className="card-tags">
           {(problem.tags || []).slice(0, 4).map((t) => (
             <span key={t}>{t}</span>
           ))}
+        </div>
+        <div className="card-meta">
+          {problem.mastery && (
+            <span className="card-mastery">{MASTERY_LABELS[problem.mastery] || problem.mastery}</span>
+          )}
+          {(problem.practice_count > 0) && (
+            <span className="card-practice">练习 {problem.practice_count} 次</span>
+          )}
         </div>
       </div>
     </div>
@@ -487,6 +547,11 @@ export default function App() {
   const [detail, setDetail] = useState(null);
   const [detailTagInput, setDetailTagInput] = useState('');
   const [detailSaving, setDetailSaving] = useState(false);
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [editTitleValue, setEditTitleValue] = useState('');
+  const [detailNotes, setDetailNotes] = useState('');
+  const [detailMastery, setDetailMastery] = useState('');
+  const [detailPracticeCount, setDetailPracticeCount] = useState(0);
 
   // --- Load configs on mount ---
   useEffect(() => {
@@ -616,7 +681,7 @@ export default function App() {
     setSaving(true);
     setSaveMsg('');
     try {
-      await API.indexImage(analyzingFile, draft.title || '未命名题目', draft.summary || '', draft.tags || []);
+      await API.indexImage(analyzingFile, draft.title || '未命名题目', draft.summary || '', draft.tags || [], '', '', 0);
       console.log('[保存] 索引保存成功，重新扫描目录');
       setSaveMsg('已保存索引');
       const data = await API.scan();
@@ -647,7 +712,7 @@ export default function App() {
       if (selectedTags.length && !selectedTags.every((t) => (p.tags || []).includes(t))) return false;
       if (query.trim()) {
         const q = query.trim().toLowerCase();
-        const hay = (p.title + ' ' + p.summary + ' ' + (p.tags || []).join(' ')).toLowerCase();
+        const hay = (p.title + ' ' + p.summary + ' ' + (p.tags || []).join(' ') + ' ' + (p.notes || '')).toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
@@ -662,6 +727,11 @@ export default function App() {
   function openDetail(p) {
     setDetail(p);
     setDetailTagInput('');
+    setEditingTitle(false);
+    setEditTitleValue(p.title || '');
+    setDetailNotes(p.notes || '');
+    setDetailMastery(p.mastery || '');
+    setDetailPracticeCount(p.practice_count || 0);
   }
 
   async function deleteFromIndex(filePath) {
@@ -674,19 +744,64 @@ export default function App() {
     setDetail(null);
   }
 
-  async function updateDetailTags(newTags) {
+  async function updateDetail(updates) {
     if (!detail) return;
     setDetailSaving(true);
-    const updated = { ...detail, tags: newTags };
+    const updated = { ...detail, ...updates };
     setDetail(updated);
     try {
-      await API.updateImage(detail.file_path, updated.title, updated.summary, newTags);
+      await API.updateImage(
+        detail.file_path,
+        updates.title !== undefined ? updates.title : detail.title,
+        updates.summary !== undefined ? updates.summary : detail.summary,
+        updates.tags !== undefined ? updates.tags : detail.tags,
+        updates.notes !== undefined ? updates.notes : detail.notes,
+        updates.mastery !== undefined ? updates.mastery : detail.mastery,
+        updates.practice_count !== undefined ? updates.practice_count : detail.practice_count,
+        updates.last_practiced_at !== undefined ? updates.last_practiced_at : detail.last_practiced_at,
+      );
       setAllIndexed((prev) => prev.map((p) => (p.file_path === detail.file_path ? updated : p)));
     } catch (e) {
       console.error('update failed', e);
     } finally {
       setDetailSaving(false);
     }
+  }
+
+  function updateDetailTags(newTags) {
+    updateDetail({ tags: newTags });
+  }
+
+  function saveDetailTitle() {
+    const v = editTitleValue.trim();
+    if (v) {
+      updateDetail({ title: v });
+    } else {
+      setEditTitleValue(detail.title || '');
+    }
+    setEditingTitle(false);
+  }
+
+  function saveDetailNotes() {
+    updateDetail({ notes: detailNotes });
+  }
+
+  function saveDetailMastery(val) {
+    setDetailMastery(val);
+    updateDetail({ mastery: val });
+  }
+
+  function incrementPractice() {
+    const newCount = detailPracticeCount + 1;
+    const now = new Date();
+    const local = now.getFullYear() + '-' +
+      String(now.getMonth() + 1).padStart(2, '0') + '-' +
+      String(now.getDate()).padStart(2, '0') + ' ' +
+      String(now.getHours()).padStart(2, '0') + ':' +
+      String(now.getMinutes()).padStart(2, '0') + ':' +
+      String(now.getSeconds()).padStart(2, '0');
+    setDetailPracticeCount(newCount);
+    updateDetail({ practice_count: newCount, last_practiced_at: local });
   }
 
   function addDetailTag() {
@@ -815,9 +930,11 @@ export default function App() {
                       </div>
                       <div className="field">
                         <label className="field-label">知识点标签（双击编辑，点击 × 删除）</label>
-                        <div className="tag-list">
+                        <div className="tag-list-vertical">
                           {draft.tags.map((t) => (
-                            <TagPill key={t} tag={t} onDelete={removeTag} onEdit={editTag} />
+                            <div key={t} className="tag-row">
+                              <TagPill tag={t} onDelete={removeTag} onEdit={editTag} />
+                            </div>
                           ))}
                           {draft.tags.length === 0 && (
                             <span style={{ fontSize: 12.5, color: 'var(--ink-soft)' }}>还没有标签</span>
@@ -950,12 +1067,46 @@ export default function App() {
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-close" onClick={() => setDetail(null)}><X size={16} /></div>
             <img src={API.imageUrl(detail.file_path)} alt={detail.title} />
-            <h2>{detail.title}</h2>
+
+            {/* 可编辑标题 */}
+            {editingTitle ? (
+              <div className="field" style={{ marginBottom: 10 }}>
+                <input type="text" value={editTitleValue}
+                  onChange={(e) => setEditTitleValue(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') saveDetailTitle();
+                    if (e.key === 'Escape') { setEditTitleValue(detail.title || ''); setEditingTitle(false); }
+                  }}
+                  onBlur={saveDetailTitle}
+                  autoFocus
+                  style={{ fontSize: 19, fontWeight: 700, fontFamily: '"Songti SC", "STSong", serif' }} />
+              </div>
+            ) : (
+              <h2 onClick={() => { setEditingTitle(true); setEditTitleValue(detail.title || ''); }}
+                style={{ cursor: 'pointer' }} title="点击编辑标题">
+                {detail.title || '未命名题目'} <Edit3 size={13} style={{ opacity: 0.4, verticalAlign: 'middle' }} />
+              </h2>
+            )}
+
             <div className="summary">{detail.summary}</div>
-            <label className="field-label">知识点标签（双击编辑，点击 × 删除）</label>
-            <div className="tag-list">
+
+            {/* 时间信息 */}
+            <div className="timestamp-row">
+              {detail.created_at && (
+                <span className="timestamp">📅 添加于 {formatTime(detail.created_at)}</span>
+              )}
+              {detail.last_practiced_at && (
+                <span className="timestamp">🕐 最近练习 {formatTime(detail.last_practiced_at)}</span>
+              )}
+            </div>
+
+            {/* 标签列表 - 一行一个 */}
+            <label className="field-label">知识点标签</label>
+            <div className="tag-list-vertical">
               {(detail.tags || []).map((t) => (
-                <TagPill key={t} tag={t} onDelete={removeDetailTag} onEdit={editDetailTag} />
+                <div key={t} className="tag-row">
+                  <TagPill tag={t} onDelete={removeDetailTag} onEdit={editDetailTag} />
+                </div>
               ))}
               {(detail.tags || []).length === 0 && (
                 <span style={{ fontSize: 12.5, color: 'var(--ink-soft)' }}>还没有标签</span>
@@ -967,6 +1118,45 @@ export default function App() {
                 onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addDetailTag(); } }} />
               <button onClick={addDetailTag}><Plus size={14} /></button>
             </div>
+
+            {/* 备注栏 */}
+            <div className="field">
+              <label className="field-label">备注</label>
+              <textarea rows={3} value={detailNotes}
+                onChange={(e) => setDetailNotes(e.target.value)}
+                onBlur={saveDetailNotes}
+                placeholder="人工备注，记录解题思路或易错点…" />
+            </div>
+
+            {/* 掌握程度 + 练习计数 */}
+            <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-end', marginBottom: 14 }}>
+              <div className="field" style={{ flex: '1 1 200px', marginBottom: 0 }}>
+                <label className="field-label">掌握程度</label>
+                <div className="mastery-group">
+                  {[
+                    { val: '', label: '未设置' },
+                    { val: 'mastered', label: '✅ 已掌握' },
+                    { val: 'unfamiliar', label: '⚠️ 不熟悉' },
+                    { val: 'practice', label: '🔄 继续练习' },
+                  ].map((opt) => (
+                    <label key={opt.val} className={'mastery-option' + (detailMastery === opt.val ? ' active' : '')}>
+                      <input type="radio" name="mastery" value={opt.val}
+                        checked={detailMastery === opt.val}
+                        onChange={() => saveDetailMastery(opt.val)} />
+                      <span>{opt.label}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <div className="field" style={{ flex: '0 0 auto', marginBottom: 0, textAlign: 'center' }}>
+                <label className="field-label">练习次数</label>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span className="practice-count">{detailPracticeCount}</span>
+                  <button className="practice-btn" onClick={incrementPractice} title="练习 +1">+1</button>
+                </div>
+              </div>
+            </div>
+
             {detailSaving && <div className="save-msg" style={{ marginTop: -10, marginBottom: 12 }}>保存中…</div>}
             <div className="modal-actions">
               <button className="del-btn" onClick={() => deleteFromIndex(detail.file_path)}>

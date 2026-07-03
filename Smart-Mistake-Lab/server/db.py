@@ -1,6 +1,11 @@
 import sqlite3
 import json
 import os
+from datetime import datetime
+
+def _now() -> str:
+    """返回本地时间的 ISO 格式字符串"""
+    return datetime.now().isoformat(sep=' ', timespec='seconds')
 
 DB_PATH = os.path.join(os.path.dirname(__file__), 'data.db')
 
@@ -21,8 +26,12 @@ def init_db():
             title TEXT DEFAULT '',
             summary TEXT DEFAULT '',
             tags TEXT DEFAULT '[]',
+            notes TEXT DEFAULT '',
+            mastery TEXT DEFAULT '',
+            practice_count INTEGER DEFAULT 0,
+            last_practiced_at TIMESTAMP,
             indexed_at TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP
         )
     ''')
     conn.execute('''
@@ -31,6 +40,23 @@ def init_db():
             value TEXT NOT NULL
         )
     ''')
+    # 为已有数据库添加新字段（如果不存在）
+    try:
+        conn.execute('ALTER TABLE images ADD COLUMN notes TEXT DEFAULT ""')
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute('ALTER TABLE images ADD COLUMN mastery TEXT DEFAULT ""')
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute('ALTER TABLE images ADD COLUMN practice_count INTEGER DEFAULT 0')
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute('ALTER TABLE images ADD COLUMN last_practiced_at TIMESTAMP')
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -86,20 +112,26 @@ def get_all_images() -> list[dict]:
     return result
 
 
-def mark_indexed(file_path: str, title: str, summary: str, tags: list[str]):
+def mark_indexed(file_path: str, title: str, summary: str, tags: list[str],
+                 notes: str = '', mastery: str = '', practice_count: int = 0,
+                 last_practiced_at: str | None = None):
     conn = get_db()
     conn.execute(
         '''INSERT OR REPLACE INTO images
-           (file_path, file_name, title, summary, tags, indexed_at)
-           VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)''',
-        (file_path, os.path.basename(file_path), title, summary, json.dumps(tags, ensure_ascii=False))
+           (file_path, file_name, title, summary, tags, notes, mastery, practice_count, last_practiced_at, indexed_at, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+        (file_path, os.path.basename(file_path), title, summary,
+         json.dumps(tags, ensure_ascii=False), notes, mastery, practice_count, last_practiced_at, _now(), _now())
     )
     conn.commit()
     conn.close()
 
 
 def update_image_meta(file_path: str, title: str | None = None,
-                      summary: str | None = None, tags: list[str] | None = None):
+                      summary: str | None = None, tags: list[str] | None = None,
+                      notes: str | None = None, mastery: str | None = None,
+                      practice_count: int | None = None,
+                      last_practiced_at: str | None = None):
     conn = get_db()
     updates = []
     params = []
@@ -112,8 +144,21 @@ def update_image_meta(file_path: str, title: str | None = None,
     if tags is not None:
         updates.append('tags = ?')
         params.append(json.dumps(tags, ensure_ascii=False))
+    if notes is not None:
+        updates.append('notes = ?')
+        params.append(notes)
+    if mastery is not None:
+        updates.append('mastery = ?')
+        params.append(mastery)
+    if practice_count is not None:
+        updates.append('practice_count = ?')
+        params.append(practice_count)
+    if last_practiced_at is not None:
+        updates.append('last_practiced_at = ?')
+        params.append(last_practiced_at)
     if updates:
-        updates.append('indexed_at = CURRENT_TIMESTAMP')
+        updates.append('indexed_at = ?')
+        params.append(_now())
         params.append(file_path)
         conn.execute(
             f'UPDATE images SET {", ".join(updates)} WHERE file_path = ?',
