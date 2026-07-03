@@ -36,17 +36,19 @@ MATH_KNOWLEDGE_POINTS = [
 ]
 
 ANALYSIS_PROMPT = (
-    '你是一位经验丰富的初中数学老师。请分析图片中的这道数学题，识别其所涉及的知识点。\n'
+    '你是一位经验丰富的初中数学老师。请读取图片中的题目文字，并识别题目涉及的知识点。\n'
     '\n'
     '【规则】\n'
-    '1. 优先从以下候选知识点列表中选择最匹配的标签：\n'
+    '1. 先提取题目中的文字内容，只保留题干、条件、问题本身，不要描述图形，不要补充推理，不要解释。\n'
+    '2. 如果图片里同时有图形和文字，只提取可见的题目文字内容，忽略图形关系本身。\n'
+    '3. 优先从以下候选知识点列表中选择最匹配的标签：\n'
     f'[{", ".join(MATH_KNOWLEDGE_POINTS)}]\n'
-    '2. 如果候选列表无法完全覆盖该题的全部考点，可以在结果中补充你自己推理出的知识点（命名风格与候选列表保持一致：简洁、具体、专业）。\n'
-    '3. 最多给出 5 个知识点，不要过于笼统（避免只写"几何""代数"这种大类）。\n'
+    '4. 如果候选列表无法完全覆盖该题的全部考点，可以在结果中补充你自己推理出的知识点（命名风格与候选列表保持一致：简洁、具体、专业）。\n'
+    '5. 最多给出 5 个知识点，不要过于笼统（避免只写"几何""代数"这种大类）。\n'
     '\n'
     '【输出格式】\n'
-    '只输出一个 JSON 数组，不要有任何其他文字，不要用 markdown 代码块包裹：\n'
-    '["知识点 1", "知识点 2", "知识点 3"]'
+    '只输出一个 JSON 对象，不要有任何其他文字，不要用 markdown 代码块包裹：\n'
+    '{"content": "题目文字内容", "tags": ["知识点 1", "知识点 2", "知识点 3"]}'
 )
 
 
@@ -201,7 +203,7 @@ def format_ai_error(detail: str) -> str:
 
 
 def parse_analysis_result(raw_text: str) -> dict:
-    """解析 AI 返回的 JSON 文本，提取 title/summary/tags"""
+    """解析 AI 返回的 JSON 文本，提取 content/tags"""
     cleaned = raw_text.strip()
     cleaned = re.sub(r'^```json\s*', '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'^```\s*', '', cleaned)
@@ -222,14 +224,15 @@ def parse_analysis_result(raw_text: str) -> dict:
                 continue
         if parsed is None:
             raise
-    # 支持两种格式：直接返回数组 ["tag1", "tag2"] 或 {"tags": [...]}
+    content = ''
     if isinstance(parsed, list):
         tags = parsed
     elif isinstance(parsed, dict):
         tags = parsed.get('tags') if isinstance(parsed.get('tags'), list) else []
+        content = parsed.get('content', '') if isinstance(parsed.get('content'), str) else ''
     else:
         tags = []
-    return {'tags': tags}
+    return {'content': content.strip(), 'tags': tags}
 
 
 # ============== 核心分析函数 ==============

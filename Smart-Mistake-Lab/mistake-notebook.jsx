@@ -39,18 +39,18 @@ const API = {
   async scan() {
     return (await apiFetch('/api/scan')).json();
   },
-  async indexImage(filePath, title, summary, tags, notes, mastery, practiceCount, lastPracticedAt) {
+  async indexImage(filePath, title, summary, content, tags, notes, mastery, practiceCount, lastPracticedAt) {
     return (await apiFetch('/api/images/index', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ file_path: filePath, title, summary, tags, notes, mastery, practice_count: practiceCount, last_practiced_at: lastPracticedAt })
+      body: JSON.stringify({ file_path: filePath, title, summary, content, tags, notes, mastery, practice_count: practiceCount, last_practiced_at: lastPracticedAt })
     })).json();
   },
-  async updateImage(filePath, title, summary, tags, notes, mastery, practiceCount, lastPracticedAt, solution) {
+  async updateImage(filePath, title, summary, content, tags, notes, mastery, practiceCount, lastPracticedAt, solution) {
     return (await apiFetch('/api/images/update', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ file_path: filePath, title, summary, tags, notes, mastery, practice_count: practiceCount, last_practiced_at: lastPracticedAt, solution })
+      body: JSON.stringify({ file_path: filePath, title, summary, content, tags, notes, mastery, practice_count: practiceCount, last_practiced_at: lastPracticedAt, solution })
     })).json();
   },
   async deleteImage(filePath) {
@@ -589,6 +589,7 @@ export default function App() {
   const [editingTitle, setEditingTitle] = useState(false);
   const [editTitleValue, setEditTitleValue] = useState('');
   const [detailNotes, setDetailNotes] = useState('');
+  const [detailContent, setDetailContent] = useState('');
   const [detailMastery, setDetailMastery] = useState('');
   const [detailPracticeCount, setDetailPracticeCount] = useState(0);
   const [solutionText, setSolutionText] = useState('');
@@ -687,6 +688,7 @@ export default function App() {
       setDraft({
         title: '',
         summary: '',
+        content: result.content || '',
         tags: Array.isArray(result.tags) ? result.tags : []
       });
       console.groupEnd();
@@ -694,7 +696,7 @@ export default function App() {
       console.error('[Analysis] exception:', e.message, e);
       console.groupEnd();
       setAnalysisError(e.message || 'AI analysis failed');
-      setDraft({ title: '', summary: '', tags: [] });
+      setDraft({ title: '', summary: '', content: '', tags: [] });
     } finally {
       setAnalyzing(false);
     }
@@ -724,7 +726,7 @@ export default function App() {
     setSaving(true);
     setSaveMsg('');
     try {
-      await API.indexImage(analyzingFile, draft.title || '未命名题目', draft.summary || '', draft.tags || [], '', '', 0);
+      await API.indexImage(analyzingFile, draft.title || '未命名题目', draft.summary || '', draft.content || '', draft.tags || [], '', '', 0);
       console.log('[保存] 索引保存成功，重新扫描目录');
       setSaveMsg('已保存索引');
       const data = await API.scan();
@@ -755,7 +757,7 @@ export default function App() {
       if (selectedTags.length && !selectedTags.every((t) => (p.tags || []).includes(t))) return false;
       if (query.trim()) {
         const q = query.trim().toLowerCase();
-        const hay = (p.title + ' ' + p.summary + ' ' + (p.tags || []).join(' ') + ' ' + (p.notes || '')).toLowerCase();
+        const hay = (p.title + ' ' + p.summary + ' ' + (p.content || '') + ' ' + (p.tags || []).join(' ') + ' ' + (p.notes || '')).toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
@@ -775,6 +777,7 @@ export default function App() {
     setEditingTitle(false);
     setEditTitleValue(p.title || '');
     setDetailNotes(p.notes || '');
+    setDetailContent(p.content || '');
     setDetailMastery(p.mastery || '');
     setDetailPracticeCount(p.practice_count || 0);
     setSolutionText(sol.text || '');
@@ -803,6 +806,7 @@ export default function App() {
         detail.file_path,
         updates.title !== undefined ? updates.title : detail.title,
         updates.summary !== undefined ? updates.summary : detail.summary,
+        updates.content !== undefined ? updates.content : detail.content,
         updates.tags !== undefined ? updates.tags : detail.tags,
         updates.notes !== undefined ? updates.notes : detail.notes,
         updates.mastery !== undefined ? updates.mastery : detail.mastery,
@@ -843,6 +847,10 @@ export default function App() {
 
   function saveDetailNotes() {
     updateDetail({ notes: detailNotes });
+  }
+
+  function saveDetailContent() {
+    updateDetail({ content: detailContent });
   }
 
   function getSolutionFullPath(filename) {
@@ -1065,6 +1073,12 @@ export default function App() {
                           placeholder="题目的文字描述，方便以后搜索" />
                       </div>
                       <div className="field">
+                        <label className="field-label">题目内容</label>
+                        <textarea rows={6} value={draft.content}
+                          onChange={(e) => setDraft({ ...draft, content: e.target.value })}
+                          placeholder="AI 从图片中提取的题目文字内容，可手动修正" />
+                      </div>
+                      <div className="field">
                         <label className="field-label">知识点标签（双击编辑，点击 × 删除）</label>
                         <div className="tag-list-vertical">
                           {draft.tags.map((t) => (
@@ -1225,6 +1239,14 @@ export default function App() {
             )}
 
             <div className="summary">{detail.summary}</div>
+
+            <div className="field" style={{ marginBottom: 14 }}>
+              <label className="field-label">题目内容</label>
+              <textarea rows={6} value={detailContent}
+                onChange={(e) => setDetailContent(e.target.value)}
+                onBlur={saveDetailContent}
+                placeholder="题目文字内容" />
+            </div>
 
             {/* 时间信息 */}
             <div className="timestamp-row">

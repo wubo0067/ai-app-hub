@@ -25,6 +25,7 @@ def init_db():
             file_name TEXT NOT NULL,
             title TEXT DEFAULT '',
             summary TEXT DEFAULT '',
+            content TEXT DEFAULT '',
             tags TEXT DEFAULT '[]',
             notes TEXT DEFAULT '',
             mastery TEXT DEFAULT '',
@@ -60,6 +61,10 @@ def init_db():
         pass
     try:
         conn.execute('ALTER TABLE images ADD COLUMN solution TEXT DEFAULT ""')
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute('ALTER TABLE images ADD COLUMN content TEXT DEFAULT ""')
     except sqlite3.OperationalError:
         pass
     conn.commit()
@@ -119,15 +124,15 @@ def get_all_images() -> list[dict]:
     return result
 
 
-def mark_indexed(file_path: str, title: str, summary: str, tags: list[str],
+def mark_indexed(file_path: str, title: str, summary: str, content: str, tags: list[str],
                  notes: str = '', mastery: str = '', practice_count: int = 0,
                       last_practiced_at: str | None = None, solution: str = ''):
     conn = get_db()
     conn.execute(
         '''INSERT OR REPLACE INTO images
-              (file_path, file_name, title, summary, tags, notes, mastery, practice_count, last_practiced_at, solution, indexed_at, created_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-        (file_path, os.path.basename(file_path), title, summary,
+          (file_path, file_name, title, summary, content, tags, notes, mastery, practice_count, last_practiced_at, solution, indexed_at, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+      (file_path, os.path.basename(file_path), title, summary, content,
             json.dumps(tags, ensure_ascii=False), notes, mastery, practice_count, last_practiced_at, solution, _now(), _now())
     )
     conn.commit()
@@ -135,7 +140,8 @@ def mark_indexed(file_path: str, title: str, summary: str, tags: list[str],
 
 
 def update_image_meta(file_path: str, title: str | None = None,
-                      summary: str | None = None, tags: list[str] | None = None,
+                      summary: str | None = None, content: str | None = None,
+                      tags: list[str] | None = None,
                       notes: str | None = None, mastery: str | None = None,
                       practice_count: int | None = None,
                       last_practiced_at: str | None = None,
@@ -149,6 +155,9 @@ def update_image_meta(file_path: str, title: str | None = None,
     if summary is not None:
         updates.append('summary = ?')
         params.append(summary)
+    if content is not None:
+        updates.append('content = ?')
+        params.append(content)
     if tags is not None:
         updates.append('tags = ?')
         params.append(json.dumps(tags, ensure_ascii=False))
