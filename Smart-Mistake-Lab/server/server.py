@@ -1,4 +1,5 @@
 import os
+import json
 import base64
 import re
 from pathlib import Path
@@ -143,6 +144,8 @@ def index_image(data: dict):
     practice_count = data.get("practice_count", 0)
     last_practiced_at = data.get("last_practiced_at")
     solution = data.get("solution", "")
+    if isinstance(solution, dict):
+        solution = json.dumps(solution, ensure_ascii=False)
 
     if not file_path:
         raise HTTPException(status_code=400, detail="file_path 不能为空")
@@ -157,6 +160,10 @@ def update_image(data: dict):
     if not file_path:
         raise HTTPException(status_code=400, detail="file_path 不能为空")
 
+    solution = data.get("solution")
+    if isinstance(solution, dict):
+        solution = json.dumps(solution, ensure_ascii=False)
+
     db.update_image_meta(
         file_path,
         title=data.get("title"),
@@ -167,7 +174,7 @@ def update_image(data: dict):
         mastery=data.get("mastery"),
         practice_count=data.get("practice_count"),
         last_practiced_at=data.get("last_practiced_at"),
-        solution=data.get("solution"),
+        solution=solution,
     )
     return {"status": "ok"}
 

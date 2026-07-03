@@ -585,15 +585,20 @@ export default function App() {
   const [detailTagInput, setDetailTagInput] = useState('');
   const [detailSaving, setDetailSaving] = useState(false);
   const [detailError, setDetailError] = useState(null);
+  const [detailDirty, setDetailDirty] = useState(false);
   const titleSavingRef = useRef(false);
   const [editingTitle, setEditingTitle] = useState(false);
   const [editTitleValue, setEditTitleValue] = useState('');
   const [detailNotes, setDetailNotes] = useState('');
+  const detailNotesRef = useRef('');
   const [detailContent, setDetailContent] = useState('');
+  const detailContentRef = useRef('');
   const [detailMastery, setDetailMastery] = useState('');
   const [detailPracticeCount, setDetailPracticeCount] = useState(0);
   const [solutionText, setSolutionText] = useState('');
+  const solutionTextRef = useRef('');
   const [solutionImages, setSolutionImages] = useState([]);
+  const solutionImagesRef = useRef([]);
   const solutionFileInputRef = useRef(null);
   const solutionTextareaRef = useRef(null);
 
@@ -774,14 +779,19 @@ export default function App() {
     setDetail(p);
     setDetailTagInput('');
     setDetailError(null);
+    setDetailDirty(false);
     setEditingTitle(false);
     setEditTitleValue(p.title || '');
     setDetailNotes(p.notes || '');
+    detailNotesRef.current = p.notes || '';
     setDetailContent(p.content || '');
+    detailContentRef.current = p.content || '';
     setDetailMastery(p.mastery || '');
     setDetailPracticeCount(p.practice_count || 0);
     setSolutionText(sol.text || '');
+    solutionTextRef.current = sol.text || '';
     setSolutionImages(Array.isArray(sol.images) ? sol.images : []);
+    solutionImagesRef.current = Array.isArray(sol.images) ? sol.images : [];
   }
 
   async function deleteFromIndex(filePath) {
@@ -794,30 +804,59 @@ export default function App() {
     setDetail(null);
   }
 
-  async function updateDetail(updates) {
+  function closeDetailModal() {
+    if (detailSaving) return;
+    if (detailDirty) {
+      setDetailError('当前有未保存修改，请先点击“保存修改”');
+      return;
+    }
+    setDetail(null);
+  }
+
+  function applyDetailDraft(updates) {
+    if (!detail) return;
+    setDetail((prev) => ({ ...prev, ...updates }));
+    setDetailDirty(true);
+  }
+
+  async function saveDetail() {
     if (!detail) return;
     setDetailError(null);
     setDetailSaving(true);
-    const prev = detail;
-    const updated = { ...detail, ...updates };
-    setDetail(updated);
     try {
+      const title = editTitleValue.trim() || '未命名题目';
+      const content = detailContentRef.current;
+      const notes = detailNotesRef.current;
+      const solution = JSON.stringify({
+        text: solutionTextRef.current,
+        images: solutionImagesRef.current,
+      });
       await API.updateImage(
         detail.file_path,
-        updates.title !== undefined ? updates.title : detail.title,
-        updates.summary !== undefined ? updates.summary : detail.summary,
-        updates.content !== undefined ? updates.content : detail.content,
-        updates.tags !== undefined ? updates.tags : detail.tags,
-        updates.notes !== undefined ? updates.notes : detail.notes,
-        updates.mastery !== undefined ? updates.mastery : detail.mastery,
-        updates.practice_count !== undefined ? updates.practice_count : detail.practice_count,
-        updates.last_practiced_at !== undefined ? updates.last_practiced_at : detail.last_practiced_at,
-        updates.solution !== undefined ? updates.solution : (detail.solution || '{}'),
+        title,
+        detail.summary,
+        content,
+        detail.tags || [],
+        notes,
+        detailMastery,
+        detailPracticeCount,
+        detail.last_practiced_at,
+        solution,
       );
+      const updated = {
+        ...detail,
+        title,
+        content,
+        notes,
+        mastery: detailMastery,
+        practice_count: detailPracticeCount,
+        solution,
+      };
+      setDetail(updated);
       setAllIndexed((prev) => prev.map((p) => (p.file_path === detail.file_path ? updated : p)));
+      setDetailDirty(false);
     } catch (e) {
       console.error('update failed', e);
-      setDetail(prev);
       setDetailError('保存失败 ' + (e.message || '未知错误'));
     } finally {
       setDetailSaving(false);
@@ -825,7 +864,7 @@ export default function App() {
   }
 
   function updateDetailTags(newTags) {
-    updateDetail({ tags: newTags });
+    applyDetailDraft({ tags: newTags });
   }
 
   async function saveDetailTitle() {
@@ -835,7 +874,8 @@ export default function App() {
       const v = editTitleValue.trim();
       if (v) {
         setEditingTitle(false);
-        await updateDetail({ title: v });
+        setEditTitleValue(v);
+        applyDetailDraft({ title: v });
       } else {
         setEditTitleValue(detail.title || '');
         setEditingTitle(false);
@@ -846,11 +886,11 @@ export default function App() {
   }
 
   function saveDetailNotes() {
-    updateDetail({ notes: detailNotes });
+    applyDetailDraft({ notes: detailNotesRef.current });
   }
 
   function saveDetailContent() {
-    updateDetail({ content: detailContent });
+    applyDetailDraft({ content: detailContentRef.current });
   }
 
   function getSolutionFullPath(filename) {
@@ -862,12 +902,11 @@ export default function App() {
   }
 
   function saveSolution(text, images) {
-    const data = JSON.stringify({ text, images });
-    updateDetail({ solution: data });
+    applyDetailDraft({ solution: JSON.stringify({ text, images }) });
   }
 
   function saveSolutionText() {
-    saveSolution(solutionText, solutionImages);
+    saveSolution(solutionTextRef.current, solutionImagesRef.current);
   }
 
   async function uploadSolutionImage(base64Data, ext = 'png') {
@@ -883,9 +922,10 @@ export default function App() {
         throw new Error(err.detail || `HTTP ${resp.status}`);
       }
       const result = await resp.json();
-      const newImages = [...solutionImages, result.filename];
+      const newImages = [...solutionImagesRef.current, result.filename];
       setSolutionImages(newImages);
-      saveSolution(solutionText, newImages);
+      solutionImagesRef.current = newImages;
+      saveSolution(solutionTextRef.current, newImages);
     } catch (e) {
       console.error('upload solution image failed', e);
       setDetailError('解答图片上传失败 ' + (e.message || '未知错误'));
@@ -900,9 +940,10 @@ export default function App() {
         const err = await resp.json().catch(() => ({}));
         throw new Error(err.detail || `HTTP ${resp.status}`);
       }
-      const newImages = solutionImages.filter((f) => f !== filename);
+      const newImages = solutionImagesRef.current.filter((f) => f !== filename);
       setSolutionImages(newImages);
-      saveSolution(solutionText, newImages);
+      solutionImagesRef.current = newImages;
+      saveSolution(solutionTextRef.current, newImages);
     } catch (e) {
       console.error('delete solution image failed', e);
       setDetailError('解答图片删除失败 ' + (e.message || '未知错误'));
@@ -932,7 +973,7 @@ export default function App() {
 
   function saveDetailMastery(val) {
     setDetailMastery(val);
-    updateDetail({ mastery: val });
+    applyDetailDraft({ mastery: val });
   }
 
   function incrementPractice() {
@@ -945,7 +986,7 @@ export default function App() {
       String(now.getMinutes()).padStart(2, '0') + ':' +
       String(now.getSeconds()).padStart(2, '0');
     setDetailPracticeCount(newCount);
-    updateDetail({ practice_count: newCount, last_practiced_at: local });
+    applyDetailDraft({ practice_count: newCount, last_practiced_at: local });
   }
 
   function addDetailTag() {
@@ -1213,9 +1254,9 @@ export default function App() {
 
       {/* ============ DETAIL MODAL ============ */}
       {detail && (
-        <div className="modal-overlay" onClick={() => setDetail(null)}>
+        <div className="modal-overlay" onClick={closeDetailModal}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-close" onClick={() => setDetail(null)}><X size={16} /></div>
+            <div className="modal-close" onClick={closeDetailModal}><X size={16} /></div>
             <img src={API.imageUrl(detail.file_path)} alt={detail.title} />
 
             {/* 可编辑标题 */}
@@ -1243,7 +1284,7 @@ export default function App() {
             <div className="field" style={{ marginBottom: 14 }}>
               <label className="field-label">题目内容</label>
               <textarea rows={6} value={detailContent}
-                onChange={(e) => setDetailContent(e.target.value)}
+                onChange={(e) => { setDetailContent(e.target.value); detailContentRef.current = e.target.value; }}
                 onBlur={saveDetailContent}
                 placeholder="题目文字内容" />
             </div>
@@ -1281,7 +1322,7 @@ export default function App() {
             <div className="field">
               <label className="field-label">备注</label>
               <textarea rows={3} value={detailNotes}
-                onChange={(e) => setDetailNotes(e.target.value)}
+                onChange={(e) => { setDetailNotes(e.target.value); detailNotesRef.current = e.target.value; }}
                 onBlur={saveDetailNotes}
                 placeholder="人工备注，记录解题思路或易错点…" />
             </div>
@@ -1292,7 +1333,7 @@ export default function App() {
                 ref={solutionTextareaRef}
                 rows={5}
                 value={solutionText}
-                onChange={(e) => setSolutionText(e.target.value)}
+                onChange={(e) => { setSolutionText(e.target.value); solutionTextRef.current = e.target.value; }}
                 onBlur={saveSolutionText}
                 onPaste={handleSolutionPaste}
                 placeholder="输入解题思路，或直接在这里粘贴截图…"
@@ -1351,6 +1392,9 @@ export default function App() {
             {detailError && <div className="save-msg error" style={{ marginTop: -10, marginBottom: 12 }}>{detailError}</div>}
             {detailSaving && <div className="save-msg" style={{ marginTop: -10, marginBottom: 12 }}>保存中…</div>}
             <div className="modal-actions">
+              <button className="save-btn" style={{ marginTop: 0 }} onClick={saveDetail} disabled={detailSaving || !detailDirty}>
+                {detailSaving ? '保存中…' : '保存修改'}
+              </button>
               <button className="del-btn" onClick={() => deleteFromIndex(detail.file_path)}>
                 <Trash2 size={14} /> 从索引中移除
               </button>

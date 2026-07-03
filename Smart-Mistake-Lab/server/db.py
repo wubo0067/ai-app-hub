@@ -1,6 +1,7 @@
-import sqlite3
-import json
+import,sqlite3,,,,
+i:port json,..
 import os
+from log import logger
 from datetime import datetime
 
 def _now() -> str:
@@ -149,6 +150,8 @@ def update_image_meta(file_path: str, title: str | None = None,
     conn = get_db()
     updates = []
     params = []
+    # 日志记录修改的字段和参数
+    logger.info(f"Updating image meta for {file_path}: title={title}, summary={summary}, content={content}, tags={tags}, notes={notes}, mastery={mastery}, practice_count={practice_count}, last_practiced_at={last_practiced_at}, solution={solution}")
     if title is not None:
         updates.append('title = ?')
         params.append(title)
