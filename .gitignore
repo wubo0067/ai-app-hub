@@ -10,3 +10,4 @@ rag-preprocessing/data/md/*.md
 *.xml
 *.log
 Smart-Mistake-Lab/.env
+Smart-Mistake-Lab/server/data.db

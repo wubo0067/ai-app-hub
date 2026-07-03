@@ -547,6 +547,8 @@ export default function App() {
   const [detail, setDetail] = useState(null);
   const [detailTagInput, setDetailTagInput] = useState('');
   const [detailSaving, setDetailSaving] = useState(false);
+  const [detailError, setDetailError] = useState(null);
+  const titleSavingRef = useRef(false);
   const [editingTitle, setEditingTitle] = useState(false);
   const [editTitleValue, setEditTitleValue] = useState('');
   const [detailNotes, setDetailNotes] = useState('');
@@ -727,6 +729,7 @@ export default function App() {
   function openDetail(p) {
     setDetail(p);
     setDetailTagInput('');
+    setDetailError(null);
     setEditingTitle(false);
     setEditTitleValue(p.title || '');
     setDetailNotes(p.notes || '');
@@ -746,7 +749,9 @@ export default function App() {
 
   async function updateDetail(updates) {
     if (!detail) return;
+    setDetailError(null);
     setDetailSaving(true);
+    const prev = detail;
     const updated = { ...detail, ...updates };
     setDetail(updated);
     try {
@@ -763,6 +768,8 @@ export default function App() {
       setAllIndexed((prev) => prev.map((p) => (p.file_path === detail.file_path ? updated : p)));
     } catch (e) {
       console.error('update failed', e);
+      setDetail(prev);
+      setDetailError('保存失败 ' + (e.message || '未知错误'));
     } finally {
       setDetailSaving(false);
     }
@@ -772,14 +779,21 @@ export default function App() {
     updateDetail({ tags: newTags });
   }
 
-  function saveDetailTitle() {
-    const v = editTitleValue.trim();
-    if (v) {
-      updateDetail({ title: v });
-    } else {
-      setEditTitleValue(detail.title || '');
+  async function saveDetailTitle() {
+    if (titleSavingRef.current) return;
+    titleSavingRef.current = true;
+    try {
+      const v = editTitleValue.trim();
+      if (v) {
+        setEditingTitle(false);
+        await updateDetail({ title: v });
+      } else {
+        setEditTitleValue(detail.title || '');
+        setEditingTitle(false);
+      }
+    } finally {
+      titleSavingRef.current = false;
     }
-    setEditingTitle(false);
   }
 
   function saveDetailNotes() {
@@ -1157,6 +1171,7 @@ export default function App() {
               </div>
             </div>
 
+            {detailError && <div className="save-msg error" style={{ marginTop: -10, marginBottom: 12 }}>{detailError}</div>}
             {detailSaving && <div className="save-msg" style={{ marginTop: -10, marginBottom: 12 }}>保存中…</div>}
             <div className="modal-actions">
               <button className="del-btn" onClick={() => deleteFromIndex(detail.file_path)}>
