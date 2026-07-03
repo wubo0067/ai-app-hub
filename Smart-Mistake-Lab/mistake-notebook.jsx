@@ -56,8 +56,15 @@ const API = {
   async deleteImage(filePath) {
     return (await apiFetch(`/api/images/delete?file_path=${encodeURIComponent(filePath)}`, { method: 'DELETE' })).json();
   },
-  async getAllImages() {
-    return (await apiFetch('/api/images/all')).json();
+  async getAllImages(params = {}) {
+    const qs = new URLSearchParams();
+    if (params.query) qs.set('query', params.query);
+    if (params.dateEnabled) qs.set('date_enabled', '1');
+    if (params.startDate) qs.set('start_date', params.startDate);
+    if (params.endDate) qs.set('end_date', params.endDate);
+    const qsStr = qs.toString();
+    const url = '/api/images/all' + (qsStr ? '?' + qsStr : '');
+    return (await apiFetch(url)).json();
   },
   imageUrl(filePath) {
     return `/api/image-file?path=${encodeURIComponent(filePath)}`;
@@ -276,6 +283,34 @@ const CSS = `
   flex: 1 1 220px; min-width: 180px;
 }
 .mnb .search-box input { border: none; }
+.mnb .date-filter-check {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 12.5px; color: var(--ink-soft); font-weight: 600;
+  white-space: nowrap; cursor: pointer; user-select: none;
+}
+.mnb .date-filter-check input[type="checkbox"] {
+  width: 15px; height: 15px; cursor: pointer; accent-color: var(--accent-2);
+}
+.mnb .date-input {
+  border: 1.5px solid var(--grid); border-radius: 6px;
+  padding: 5px 8px; font-size: 12.5px; color: var(--ink);
+  background: var(--paper); font-family: inherit;
+  outline: none; width: 135px;
+}
+.mnb .date-input:focus { border-color: var(--accent-2); }
+.mnb .date-input:disabled { opacity: 0.4; cursor: not-allowed; }
+.mnb .date-sep {
+  font-size: 12.5px; color: var(--pencil); font-weight: 600;
+}
+.mnb .clear-filter-btn {
+  border: 1.5px dashed var(--margin); background: none; color: var(--margin);
+  border-radius: 999px; padding: 5px 13px; font-size: 12.5px; font-weight: 600;
+  cursor: pointer; white-space: nowrap; transition: all .12s;
+}
+.mnb .clear-filter-btn:hover { background: var(--margin); color: #fff; }
+.mnb .date-error {
+  font-size: 12px; color: var(--margin); font-weight: 600; white-space: nowrap;
+}
 .mnb .tag-filter-bar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
 .mnb .filter-pill {
   border: 1.5px solid var(--pencil); background: var(--paper); color: var(--ink-soft);
@@ -576,9 +611,13 @@ export default function App() {
 
   // --- Library state ---
   const [allIndexed, setAllIndexed] = useState([]);
+  const [totalIndexedCount, setTotalIndexedCount] = useState(0);
   const [libLoaded, setLibLoaded] = useState(false);
   const [query, setQuery] = useState('');
   const [selectedTags, setSelectedTags] = useState([]);
+  const [dateFilterEnabled, setDateFilterEnabled] = useState(false);
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
 
   // --- Detail modal ---
   const [detail, setDetail] = useState(null);
@@ -619,16 +658,43 @@ export default function App() {
     }
   }, [tab]);
 
-  async function loadLibrary() {
+  const debounceRef = useRef(null);
+
+  async function loadLibrary(filterParams = {}) {
     try {
-      const images = await API.getAllImages();
-      setAllIndexed(images);
+      const data = await API.getAllImages(filterParams);
+      // 后端已改为 { items, total_count, filtered_count }
+      // 兼容旧格式（纯数组）
+      if (Array.isArray(data)) {
+        setAllIndexed(data);
+        setTotalIndexedCount(data.length);
+      } else {
+        setAllIndexed(data.items || []);
+        setTotalIndexedCount(data.total_count ?? 0);
+      }
     } catch (e) {
       console.error('load library failed', e);
     } finally {
       setLibLoaded(true);
     }
   }
+
+  // 搜索条件变化时带防抖重新请求后端
+  useEffect(() => {
+    if (tab !== 'library' || !libLoaded) return;
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => {
+      // 前端校验：开始日期大于结束日期时不发请求
+      if (dateFilterEnabled && startDate && endDate && startDate > endDate) return;
+      loadLibrary({
+        query,
+        dateEnabled: dateFilterEnabled,
+        startDate: dateFilterEnabled ? startDate : '',
+        endDate: dateFilterEnabled ? endDate : '',
+      });
+    }, 300);
+    return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
+  }, [query, dateFilterEnabled, startDate, endDate]);
 
   // --- Config actions ---
   async function saveImageDir() {
@@ -760,17 +826,20 @@ export default function App() {
   const filtered = useMemo(() => {
     return allIndexed.filter((p) => {
       if (selectedTags.length && !selectedTags.every((t) => (p.tags || []).includes(t))) return false;
-      if (query.trim()) {
-        const q = query.trim().toLowerCase();
-        const hay = (p.title + ' ' + p.summary + ' ' + (p.content || '') + ' ' + (p.tags || []).join(' ') + ' ' + (p.notes || '')).toLowerCase();
-        if (!hay.includes(q)) return false;
-      }
       return true;
     });
-  }, [allIndexed, selectedTags, query]);
+  }, [allIndexed, selectedTags]);
 
   function toggleTag(t) {
     setSelectedTags((prev) => (prev.includes(t) ? prev.filter((x) => x !== t) : [...prev, t]));
+  }
+
+  function clearAllFilters() {
+    setQuery('');
+    setSelectedTags([]);
+    setDateFilterEnabled(false);
+    setStartDate('');
+    setEndDate('');
   }
 
   // --- Detail modal ---
@@ -1209,7 +1278,7 @@ export default function App() {
           <div className="panel">
             {!libLoaded ? (
               <div className="empty"><Loader2 size={28} className="spin" /><p>加载中…</p></div>
-            ) : allIndexed.length === 0 ? (
+            ) : totalIndexedCount === 0 ? (
               <div className="empty"><BookOpen size={40} /><p>还没有索引任何错题，去"扫描"页面导入吧</p></div>
             ) : (
               <>
@@ -1219,6 +1288,24 @@ export default function App() {
                     <input type="text" placeholder="搜索标题、内容或标签" value={query}
                       onChange={(e) => setQuery(e.target.value)} />
                   </div>
+                  <label className="date-filter-check">
+                    <input type="checkbox" checked={dateFilterEnabled}
+                      onChange={(e) => setDateFilterEnabled(e.target.checked)} />
+                    按添加时间筛选
+                  </label>
+                  <input type="date" className="date-input" value={startDate}
+                    onChange={(e) => setStartDate(e.target.value)}
+                    disabled={!dateFilterEnabled} title="开始日期" />
+                  <span className="date-sep">—</span>
+                  <input type="date" className="date-input" value={endDate}
+                    onChange={(e) => setEndDate(e.target.value)}
+                    disabled={!dateFilterEnabled} title="结束日期" />
+                  {(query || selectedTags.length > 0 || dateFilterEnabled) && (
+                    <button className="clear-filter-btn" onClick={clearAllFilters}>清空筛选</button>
+                  )}
+                  {dateFilterEnabled && startDate && endDate && startDate > endDate && (
+                    <span className="date-error">开始日期不能大于结束日期</span>
+                  )}
                 </div>
                 {allTags.length > 0 && (
                   <div className="tag-filter-bar">
@@ -1231,7 +1318,7 @@ export default function App() {
                     ))}
                     {selectedTags.length > 0 && (
                       <button className="filter-pill" onClick={() => setSelectedTags([])}
-                        style={{ borderStyle: 'dashed' }}>清除筛选 ×</button>
+                        style={{ borderStyle: 'dashed' }}>清除标签 ×</button>
                     )}
                   </div>
                 )}

@@ -1,5 +1,5 @@
-import,sqlite3,,,,
-i:port json,..
+import sqlite3
+import json
 import os
 from log import logger
 from datetime import datetime
@@ -112,6 +112,14 @@ def get_image_by_path(file_path: str) -> dict | None:
     return None
 
 
+def get_total_image_count() -> int:
+    """返回已索引错题总数（不受任何筛选条件影响）"""
+    conn = get_db()
+    row = conn.execute('SELECT COUNT(*) FROM images').fetchone()
+    conn.close()
+    return row[0]
+
+
 def get_all_images() -> list[dict]:
     conn = get_db()
     rows = conn.execute('SELECT * FROM images ORDER BY indexed_at DESC').fetchall()
@@ -125,16 +133,62 @@ def get_all_images() -> list[dict]:
     return result
 
 
+def search_images(query: str | None = None,
+                  start_datetime: str | None = None,
+                  end_datetime: str | None = None) -> list[dict]:
+    """按关键字、日期范围筛选错题，所有条件为 AND 关系"""
+    conn = get_db()
+    conditions = []
+    params = []
+
+    if query:
+        like_q = f'%{query}%'
+        conditions.append(
+            '(title LIKE ? OR summary LIKE ? OR content LIKE ? OR notes LIKE ? OR tags LIKE ?)'
+        )
+        params.extend([like_q, like_q, like_q, like_q, like_q])
+
+    if start_datetime:
+        conditions.append('created_at >= ?')
+        params.append(start_datetime)
+
+    if end_datetime:
+        conditions.append('created_at <= ?')
+        params.append(end_datetime)
+
+    where_clause = ''
+    if conditions:
+        where_clause = 'WHERE ' + ' AND '.join(conditions)
+
+    sql = f'SELECT * FROM images {where_clause} ORDER BY indexed_at DESC'
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+
+    result = []
+    for r in rows:
+        d = dict(r)
+        d['tags'] = json.loads(d['tags'])
+        d['solution'] = json.loads(d.get('solution') or '{}')
+        result.append(d)
+    return result
+
+
 def mark_indexed(file_path: str, title: str, summary: str, content: str, tags: list[str],
                  notes: str = '', mastery: str = '', practice_count: int = 0,
                       last_practiced_at: str | None = None, solution: str = ''):
     conn = get_db()
+    # 如果已存在记录，保留原来的 created_at
+    old = conn.execute(
+        'SELECT created_at FROM images WHERE file_path = ?', (file_path,)
+    ).fetchone()
+    original_created_at = old['created_at'] if old else _now()
+
     conn.execute(
         '''INSERT OR REPLACE INTO images
           (file_path, file_name, title, summary, content, tags, notes, mastery, practice_count, last_practiced_at, solution, indexed_at, created_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
       (file_path, os.path.basename(file_path), title, summary, content,
-            json.dumps(tags, ensure_ascii=False), notes, mastery, practice_count, last_practiced_at, solution, _now(), _now())
+            json.dumps(tags, ensure_ascii=False), notes, mastery, practice_count, last_practiced_at, solution, _now(), original_created_at)
     )
     conn.commit()
     conn.close()

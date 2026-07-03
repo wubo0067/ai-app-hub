@@ -186,8 +186,40 @@ def delete_image(file_path: str = Query(..., description="图片文件路径")):
 
 
 @app.get("/api/images/all")
-def get_all_images():
-    return db.get_all_images()
+def get_all_images(
+    query: str = Query("", description="关键字搜索词"),
+    date_enabled: bool = Query(False, description="是否启用日期范围筛选"),
+    start_date: str | None = Query(None, description="开始日期，格式 YYYY-MM-DD"),
+    end_date: str | None = Query(None, description="结束日期，格式 YYYY-MM-DD"),
+):
+    # 错题库总数（不受筛选条件影响）
+    total_count = db.get_total_image_count()
+
+    # 构造日期时间字符串：开始日 00:00:00，结束日 23:59:59
+    start_datetime = None
+    end_datetime = None
+
+    if date_enabled:
+        if start_date:
+            start_datetime = f"{start_date} 00:00:00"
+        if end_date:
+            end_datetime = f"{end_date} 23:59:59"
+
+    # 如果有筛选条件则走 search_images，否则全量返回
+    if query.strip() or start_datetime or end_datetime:
+        items = db.search_images(
+            query=query.strip() or None,
+            start_datetime=start_datetime,
+            end_datetime=end_datetime,
+        )
+    else:
+        items = db.get_all_images()
+
+    return {
+        "items": items,
+        "total_count": total_count,
+        "filtered_count": len(items),
+    }
 
 
 @app.post("/api/solution-image")
