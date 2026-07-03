@@ -30,6 +30,7 @@ def init_db():
             mastery TEXT DEFAULT '',
             practice_count INTEGER DEFAULT 0,
             last_practiced_at TIMESTAMP,
+            solution TEXT DEFAULT '',
             indexed_at TIMESTAMP,
             created_at TIMESTAMP
         )
@@ -55,6 +56,10 @@ def init_db():
         pass
     try:
         conn.execute('ALTER TABLE images ADD COLUMN last_practiced_at TIMESTAMP')
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute('ALTER TABLE images ADD COLUMN solution TEXT DEFAULT ""')
     except sqlite3.OperationalError:
         pass
     conn.commit()
@@ -96,6 +101,7 @@ def get_image_by_path(file_path: str) -> dict | None:
     if row:
         d = dict(row)
         d['tags'] = json.loads(d['tags'])
+        d['solution'] = json.loads(d.get('solution') or '{}')
         return d
     return None
 
@@ -108,20 +114,21 @@ def get_all_images() -> list[dict]:
     for r in rows:
         d = dict(r)
         d['tags'] = json.loads(d['tags'])
+        d['solution'] = json.loads(d.get('solution') or '{}')
         result.append(d)
     return result
 
 
 def mark_indexed(file_path: str, title: str, summary: str, tags: list[str],
                  notes: str = '', mastery: str = '', practice_count: int = 0,
-                 last_practiced_at: str | None = None):
+                      last_practiced_at: str | None = None, solution: str = ''):
     conn = get_db()
     conn.execute(
         '''INSERT OR REPLACE INTO images
-           (file_path, file_name, title, summary, tags, notes, mastery, practice_count, last_practiced_at, indexed_at, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+              (file_path, file_name, title, summary, tags, notes, mastery, practice_count, last_practiced_at, solution, indexed_at, created_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
         (file_path, os.path.basename(file_path), title, summary,
-         json.dumps(tags, ensure_ascii=False), notes, mastery, practice_count, last_practiced_at, _now(), _now())
+            json.dumps(tags, ensure_ascii=False), notes, mastery, practice_count, last_practiced_at, solution, _now(), _now())
     )
     conn.commit()
     conn.close()
@@ -131,7 +138,8 @@ def update_image_meta(file_path: str, title: str | None = None,
                       summary: str | None = None, tags: list[str] | None = None,
                       notes: str | None = None, mastery: str | None = None,
                       practice_count: int | None = None,
-                      last_practiced_at: str | None = None):
+                      last_practiced_at: str | None = None,
+                      solution: str | None = None):
     conn = get_db()
     updates = []
     params = []
@@ -156,6 +164,9 @@ def update_image_meta(file_path: str, title: str | None = None,
     if last_practiced_at is not None:
         updates.append('last_practiced_at = ?')
         params.append(last_practiced_at)
+    if solution is not None:
+        updates.append('solution = ?')
+        params.append(solution)
     if updates:
         updates.append('indexed_at = ?')
         params.append(_now())

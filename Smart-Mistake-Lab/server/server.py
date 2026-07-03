@@ -1,4 +1,6 @@
 import os
+import base64
+import re
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -12,6 +14,11 @@ from fastapi.responses import FileResponse
 import db
 from log import logger
 from llm import AiConfig, analyze_image
+
+
+def _generate_solution_filename(original_path: str, index: int, ext: str) -> str:
+    stem = Path(original_path).stem
+    return f"{stem}_sol_{index}.{ext}"
 
 app = FastAPI(title="Smart Mistake Lab Server")
 
@@ -98,6 +105,7 @@ def scan_directory():
                 "mastery": "",
                 "practice_count": 0,
                 "last_practiced_at": None,
+                "solution": "{}",
                 "indexed": False,
             })
 
@@ -132,11 +140,12 @@ def index_image(data: dict):
     mastery = data.get("mastery", "")
     practice_count = data.get("practice_count", 0)
     last_practiced_at = data.get("last_practiced_at")
+    solution = data.get("solution", "")
 
     if not file_path:
         raise HTTPException(status_code=400, detail="file_path 不能为空")
 
-    db.mark_indexed(file_path, title, summary, tags, notes, mastery, practice_count, last_practiced_at)
+    db.mark_indexed(file_path, title, summary, tags, notes, mastery, practice_count, last_practiced_at, solution)
     return {"status": "ok"}
 
 
@@ -155,6 +164,7 @@ def update_image(data: dict):
         mastery=data.get("mastery"),
         practice_count=data.get("practice_count"),
         last_practiced_at=data.get("last_practiced_at"),
+        solution=data.get("solution"),
     )
     return {"status": "ok"}
 
@@ -168,6 +178,50 @@ def delete_image(file_path: str = Query(..., description="图片文件路径")):
 @app.get("/api/images/all")
 def get_all_images():
     return db.get_all_images()
+
+
+@app.post("/api/solution-image")
+def upload_solution_image(data: dict):
+    file_path = data.get("file_path", "")
+    image_data = data.get("image_data", "")
+    ext = (data.get("ext") or "png").lower().lstrip('.')
+
+    if not file_path or not image_data:
+        raise HTTPException(status_code=400, detail="file_path 和 image_data 不能为空")
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="原题图片不存在")
+
+    directory = os.path.dirname(file_path)
+    stem = Path(file_path).stem
+    existing_indexes = []
+    pattern = re.compile(rf'^{re.escape(stem)}_sol_(\d+)\.\w+$', re.IGNORECASE)
+    for name in os.listdir(directory):
+        match = pattern.match(name)
+        if match:
+            existing_indexes.append(int(match.group(1)))
+    new_index = (max(existing_indexes) + 1) if existing_indexes else 1
+
+    filename = _generate_solution_filename(file_path, new_index, ext)
+    save_path = os.path.join(directory, filename)
+    base64_str = re.sub(r'^data:image/\w+;base64,', '', image_data.strip())
+
+    try:
+        raw = base64.b64decode(base64_str)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"无效图片数据：{exc}")
+
+    with open(save_path, 'wb') as f:
+        f.write(raw)
+
+    return {"filename": filename, "path": save_path}
+
+
+@app.delete("/api/solution-image")
+def delete_solution_image(path: str = Query(..., description="解答图片的绝对路径")):
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="文件不存在")
+    os.remove(path)
+    return {"status": "ok"}
 
 
 # --- AI Config ---

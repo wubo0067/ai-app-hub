@@ -46,11 +46,11 @@ const API = {
       body: JSON.stringify({ file_path: filePath, title, summary, tags, notes, mastery, practice_count: practiceCount, last_practiced_at: lastPracticedAt })
     })).json();
   },
-  async updateImage(filePath, title, summary, tags, notes, mastery, practiceCount, lastPracticedAt) {
+  async updateImage(filePath, title, summary, tags, notes, mastery, practiceCount, lastPracticedAt, solution) {
     return (await apiFetch('/api/images/update', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ file_path: filePath, title, summary, tags, notes, mastery, practice_count: practiceCount, last_practiced_at: lastPracticedAt })
+      body: JSON.stringify({ file_path: filePath, title, summary, tags, notes, mastery, practice_count: practiceCount, last_practiced_at: lastPracticedAt, solution })
     })).json();
   },
   async deleteImage(filePath) {
@@ -414,6 +414,43 @@ const CSS = `
 }
 .mnb .practice-btn:hover { opacity: 0.85; }
 
+/* Solution section */
+.mnb .solution-section textarea {
+  background: #FAFAF5; border: 1.5px dashed var(--grid);
+  border-radius: 8px; padding: 10px 12px;
+  font-size: 13.5px; min-height: 80px;
+}
+.mnb .solution-images {
+  display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px;
+}
+.mnb .solution-img-wrapper {
+  position: relative; width: 100px; height: 80px;
+  border: 1.5px solid var(--grid); border-radius: 6px;
+  overflow: hidden; background: var(--grid);
+}
+.mnb .solution-img-wrapper img {
+  width: 100%; height: 100%; object-fit: cover; display: block;
+  margin-bottom: 0; border: none; border-radius: 0;
+}
+.mnb .solution-img-delete {
+  position: absolute; top: 2px; right: 2px;
+  width: 20px; height: 20px; border-radius: 50%;
+  border: none; background: rgba(199,75,75,0.85); color: #fff;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; font-size: 10px; padding: 0;
+}
+.mnb .solution-img-delete:hover { background: var(--margin); }
+.mnb .solution-add-btn {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 6px 14px; border-radius: 7px;
+  border: 1.5px dashed var(--pencil); background: var(--paper);
+  color: var(--ink-soft); font-size: 12.5px; font-weight: 600;
+  cursor: pointer; transition: all .15s;
+}
+.mnb .solution-add-btn:hover {
+  border-color: var(--accent-2); color: var(--accent-2);
+}
+
 /* Inline tag edit */
 .mnb .tag-edit-input {
   width: 80px; border: none; background: transparent;
@@ -554,6 +591,10 @@ export default function App() {
   const [detailNotes, setDetailNotes] = useState('');
   const [detailMastery, setDetailMastery] = useState('');
   const [detailPracticeCount, setDetailPracticeCount] = useState(0);
+  const [solutionText, setSolutionText] = useState('');
+  const [solutionImages, setSolutionImages] = useState([]);
+  const solutionFileInputRef = useRef(null);
+  const solutionTextareaRef = useRef(null);
 
   // --- Load configs on mount ---
   useEffect(() => {
@@ -727,6 +768,7 @@ export default function App() {
 
   // --- Detail modal ---
   function openDetail(p) {
+    const sol = (typeof p.solution === 'string' ? JSON.parse(p.solution || '{}') : (p.solution || {}));
     setDetail(p);
     setDetailTagInput('');
     setDetailError(null);
@@ -735,6 +777,8 @@ export default function App() {
     setDetailNotes(p.notes || '');
     setDetailMastery(p.mastery || '');
     setDetailPracticeCount(p.practice_count || 0);
+    setSolutionText(sol.text || '');
+    setSolutionImages(Array.isArray(sol.images) ? sol.images : []);
   }
 
   async function deleteFromIndex(filePath) {
@@ -764,6 +808,7 @@ export default function App() {
         updates.mastery !== undefined ? updates.mastery : detail.mastery,
         updates.practice_count !== undefined ? updates.practice_count : detail.practice_count,
         updates.last_practiced_at !== undefined ? updates.last_practiced_at : detail.last_practiced_at,
+        updates.solution !== undefined ? updates.solution : (detail.solution || '{}'),
       );
       setAllIndexed((prev) => prev.map((p) => (p.file_path === detail.file_path ? updated : p)));
     } catch (e) {
@@ -798,6 +843,83 @@ export default function App() {
 
   function saveDetailNotes() {
     updateDetail({ notes: detailNotes });
+  }
+
+  function getSolutionFullPath(filename) {
+    if (!detail || !filename) return '';
+    const normalized = detail.file_path.replace(/\\/g, '/');
+    const idx = normalized.lastIndexOf('/');
+    if (idx === -1) return filename;
+    return `${detail.file_path.slice(0, idx + 1)}${filename}`;
+  }
+
+  function saveSolution(text, images) {
+    const data = JSON.stringify({ text, images });
+    updateDetail({ solution: data });
+  }
+
+  function saveSolutionText() {
+    saveSolution(solutionText, solutionImages);
+  }
+
+  async function uploadSolutionImage(base64Data, ext = 'png') {
+    if (!detail) return;
+    try {
+      const resp = await fetch('/api/solution-image', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file_path: detail.file_path, image_data: base64Data, ext })
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${resp.status}`);
+      }
+      const result = await resp.json();
+      const newImages = [...solutionImages, result.filename];
+      setSolutionImages(newImages);
+      saveSolution(solutionText, newImages);
+    } catch (e) {
+      console.error('upload solution image failed', e);
+      setDetailError('解答图片上传失败 ' + (e.message || '未知错误'));
+    }
+  }
+
+  async function deleteSolutionImage(filename) {
+    try {
+      const filePath = getSolutionFullPath(filename);
+      const resp = await fetch(`/api/solution-image?path=${encodeURIComponent(filePath)}`, { method: 'DELETE' });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${resp.status}`);
+      }
+      const newImages = solutionImages.filter((f) => f !== filename);
+      setSolutionImages(newImages);
+      saveSolution(solutionText, newImages);
+    } catch (e) {
+      console.error('delete solution image failed', e);
+      setDetailError('解答图片删除失败 ' + (e.message || '未知错误'));
+    }
+  }
+
+  function handleSolutionPaste(e) {
+    const items = Array.from(e.clipboardData?.items || []);
+    const imageItem = items.find((item) => item.type.startsWith('image/'));
+    if (!imageItem) return;
+    e.preventDefault();
+    const file = imageItem.getAsFile();
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => uploadSolutionImage(reader.result, file.type.split('/')[1] || 'png');
+    reader.readAsDataURL(file);
+  }
+
+  function handleSolutionFileSelect(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => uploadSolutionImage(reader.result, file.type.split('/')[1] || 'png');
+    reader.readAsDataURL(file);
+    e.target.value = '';
   }
 
   function saveDetailMastery(val) {
@@ -1140,6 +1262,39 @@ export default function App() {
                 onChange={(e) => setDetailNotes(e.target.value)}
                 onBlur={saveDetailNotes}
                 placeholder="人工备注，记录解题思路或易错点…" />
+            </div>
+
+            <div className="field solution-section">
+              <label className="field-label">解答</label>
+              <textarea
+                ref={solutionTextareaRef}
+                rows={5}
+                value={solutionText}
+                onChange={(e) => setSolutionText(e.target.value)}
+                onBlur={saveSolutionText}
+                onPaste={handleSolutionPaste}
+                placeholder="输入解题思路，或直接在这里粘贴截图…"
+              />
+              {solutionImages.length > 0 && (
+                <div className="solution-images">
+                  {solutionImages.map((filename) => (
+                    <div key={filename} className="solution-img-wrapper">
+                      <img src={API.imageUrl(getSolutionFullPath(filename))} alt={filename} />
+                      <button className="solution-img-delete"
+                        onClick={() => deleteSolutionImage(filename)}
+                        title="删除解答图片">
+                        <X size={10} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <input type="file" accept="image/*" ref={solutionFileInputRef}
+                onChange={handleSolutionFileSelect} style={{ display: 'none' }} />
+              <button className="solution-add-btn"
+                onClick={() => solutionFileInputRef.current?.click()}>
+                <Plus size={13} /> 添加图片
+              </button>
             </div>
 
             {/* 掌握程度 + 练习计数 */}
