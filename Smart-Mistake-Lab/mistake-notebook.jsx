@@ -56,6 +56,9 @@ const API = {
   async deleteImage(filePath) {
     return (await apiFetch(`/api/images/delete?file_path=${encodeURIComponent(filePath)}`, { method: 'DELETE' })).json();
   },
+  async purgeImage(filePath) {
+    return (await apiFetch(`/api/images/purge?file_path=${encodeURIComponent(filePath)}`, { method: 'DELETE' })).json();
+  },
   async getAllImages(params = {}) {
     const qs = new URLSearchParams();
     if (params.query) qs.set('query', params.query);
@@ -661,6 +664,11 @@ export default function App() {
   const solutionFileInputRef = useRef(null);
   const solutionTextareaRef = useRef(null);
 
+  // --- Delete confirmation ---
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [deleteMode, setDeleteMode] = useState('index'); // 'index' | 'purge'
+  const [deleting, setDeleting] = useState(false);
+
   // --- Load configs on mount ---
   useEffect(() => {
     API.getConfig().then((c) => {
@@ -930,6 +938,27 @@ export default function App() {
       console.error('delete failed', e);
     }
     setDetail(null);
+    setShowDeleteConfirm(false);
+  }
+
+  async function purgeImage(filePath) {
+    setDeleting(true);
+    try {
+      await API.purgeImage(filePath);
+      setAllIndexed((prev) => prev.filter((p) => p.file_path !== filePath));
+      setDetail(null);
+      setShowDeleteConfirm(false);
+    } catch (e) {
+      console.error('purge failed', e);
+      setDetailError('彻底删除失败：' + (e.message || '未知错误'));
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  function openDeleteConfirm() {
+    setDetailError(null);
+    setShowDeleteConfirm(true);
   }
 
   function closeDetailModal() {
@@ -1594,9 +1623,91 @@ export default function App() {
               <button className="save-btn" style={{ marginTop: 0 }} onClick={saveDetail} disabled={detailSaving || !detailDirty}>
                 {detailSaving ? '保存中…' : '保存修改'}
               </button>
-              <button className="del-btn" onClick={() => deleteFromIndex(detail.file_path)}>
-                <Trash2 size={14} /> 从索引中移除
+              <button className="del-btn" onClick={openDeleteConfirm}>
+                <Trash2 size={14} /> 删除
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 删除确认弹窗 */}
+      {showDeleteConfirm && (
+        <div className="modal-overlay" onClick={() => { if (!deleting) setShowDeleteConfirm(false); }}>
+          <div className="modal" style={{ maxWidth: 420 }} onClick={(e) => e.stopPropagation()}>
+            <button className="modal-close" onClick={() => { if (!deleting) setShowDeleteConfirm(false); }}>
+              <X size={16} />
+            </button>
+            <h2 style={{ fontSize: 17, marginBottom: 8 }}>确认删除</h2>
+            <p style={{ fontSize: 13, color: 'var(--ink-soft)', lineHeight: 1.7, marginBottom: 16 }}>
+              请选择删除方式：
+            </p>
+
+            <label className="delete-option" style={{
+              display: 'flex', alignItems: 'flex-start', gap: 12, padding: '12px 14px',
+              border: `1.5px solid ${deleteMode === 'index' ? 'var(--accent-2)' : 'var(--grid)'}`,
+              borderRadius: 8, marginBottom: 10, cursor: deleting ? 'not-allowed' : 'pointer',
+              background: deleteMode === 'index' ? '#E8F5F2' : 'var(--card)',
+              transition: 'all .15s', opacity: deleting ? 0.6 : 1,
+            }} onClick={() => { if (!deleting) setDeleteMode('index'); }}>
+              <input type="radio" name="deleteMode" value="index"
+                checked={deleteMode === 'index'}
+                onChange={() => setDeleteMode('index')}
+                disabled={deleting}
+                style={{ marginTop: 2, accentColor: 'var(--accent-2)' }} />
+              <div>
+                <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 4 }}>仅移除索引</div>
+                <div style={{ fontSize: 12, color: 'var(--ink-soft)', lineHeight: 1.6 }}>
+                  只删除错题库中的索引记录<br />
+                  保留原题图片、解答图片和其他资源<br />
+                  删除后可在扫描页再次看到并重新索引
+                </div>
+              </div>
+            </label>
+
+            <label className="delete-option" style={{
+              display: 'flex', alignItems: 'flex-start', gap: 12, padding: '12px 14px',
+              border: `1.5px solid ${deleteMode === 'purge' ? 'var(--margin)' : 'var(--grid)'}`,
+              borderRadius: 8, marginBottom: 16, cursor: deleting ? 'not-allowed' : 'pointer',
+              background: deleteMode === 'purge' ? '#FDF0F0' : 'var(--card)',
+              transition: 'all .15s', opacity: deleting ? 0.6 : 1,
+            }} onClick={() => { if (!deleting) setDeleteMode('purge'); }}>
+              <input type="radio" name="deleteMode" value="purge"
+                checked={deleteMode === 'purge'}
+                onChange={() => setDeleteMode('purge')}
+                disabled={deleting}
+                style={{ marginTop: 2, accentColor: 'var(--margin)' }} />
+              <div>
+                <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 4, color: 'var(--margin)' }}>彻底删除</div>
+                <div style={{ fontSize: 12, color: 'var(--ink-soft)', lineHeight: 1.6 }}>
+                  删除索引记录<br />
+                  删除原题图片<br />
+                  删除该题关联的解答图片等资源<br />
+                  删除后不会再出现在扫描页<br />
+                  <span style={{ color: 'var(--margin)', fontWeight: 600 }}>不可恢复</span>
+                </div>
+              </div>
+            </label>
+
+            <div className="modal-actions" style={{ borderTop: 'none', paddingTop: 0 }}>
+              <button className="save-btn secondary" style={{ marginTop: 0 }}
+                onClick={() => { if (!deleting) setShowDeleteConfirm(false); }}
+                disabled={deleting}>
+                取消
+              </button>
+              {deleteMode === 'index' ? (
+                <button className="save-btn" style={{ marginTop: 0, background: 'var(--accent-2)', borderColor: 'var(--accent-2)' }}
+                  onClick={() => deleteFromIndex(detail.file_path)}
+                  disabled={deleting}>
+                  仅移除索引
+                </button>
+              ) : (
+                <button className="save-btn" style={{ marginTop: 0, background: 'var(--margin)', borderColor: 'var(--margin)' }}
+                  onClick={() => purgeImage(detail.file_path)}
+                  disabled={deleting}>
+                  {deleting ? '删除中…' : '彻底删除'}
+                </button>
+              )}
             </div>
           </div>
         </div>

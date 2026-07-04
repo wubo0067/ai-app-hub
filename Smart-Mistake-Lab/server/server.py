@@ -47,6 +47,15 @@ def _infer_subject(file_path: str) -> str:
         return ""
 
 
+# 解答图片文件名模式，用于在扫描时排除（避免解答图被当成错题扫出来）
+_SOLUTION_IMAGE_PATTERN = re.compile(r'_sol_\d+\.\w+$', re.IGNORECASE)
+
+
+def _is_solution_image(filename: str) -> bool:
+    """判断文件名是否属于解答图片"""
+    return bool(_SOLUTION_IMAGE_PATTERN.search(filename))
+
+
 def _scan_images_in_dir(directory: str, indexed_paths: set) -> list:
     """扫描单个目录下的所有图片文件，返回 [{file_path, file_name}...]"""
     result = []
@@ -58,6 +67,9 @@ def _scan_images_in_dir(directory: str, indexed_paths: set) -> list:
             if ext in IMAGE_EXTENSIONS:
                 full_path = os.path.normpath(os.path.join(directory, f))
                 if os.path.isfile(full_path) and not os.path.basename(full_path).startswith('.'):
+                    # 跳过解答图片（如 xxx_sol_1.png）
+                    if _is_solution_image(f):
+                        continue
                     result.append(full_path)
     except Exception:
         pass
@@ -275,8 +287,93 @@ def update_image(data: dict):
 
 @app.delete("/api/images/delete")
 def delete_image(file_path: str = Query(..., description="图片文件路径")):
+    """仅移除索引，不删除任何文件"""
     db.delete_image(file_path)
+    logger.info(f"[API] 已移除索引: {file_path}")
     return {"status": "ok"}
+
+
+@app.delete("/api/images/purge")
+def purge_image(file_path: str = Query(..., description="图片文件路径")):
+    """彻底删除：删除索引 + 原题图片 + 解答图片等所有关联资源"""
+    if not file_path:
+        raise HTTPException(status_code=400, detail="file_path 不能为空")
+
+    image_dir = db.get_config_value("image_dir") or ""
+    if not image_dir:
+        raise HTTPException(status_code=400, detail="图片目录未配置")
+
+    # 1. 先读取数据库记录，获取解答图片列表
+    meta = db.get_image_by_path(file_path)
+    if not meta:
+        # 没有索引记录，但仍可尝试删除文件（兼容无索引但有文件的场景）
+        logger.warning(f"[purge] 数据库中无记录: {file_path}，将仅尝试删除文件")
+        meta = {"file_path": file_path, "solution": {}}
+
+    solution = meta.get("solution", {})
+    if isinstance(solution, str):
+        try:
+            solution = json.loads(solution)
+        except Exception:
+            solution = {}
+    solution_images = solution.get("images", []) if isinstance(solution, dict) else []
+
+    # 2. 组装待删除文件列表
+    files_to_delete: list[str] = [file_path]  # 原题图片
+    for img_name in solution_images:
+        if img_name:
+            sol_path = os.path.join(os.path.dirname(file_path), img_name)
+            files_to_delete.append(os.path.normpath(sol_path))
+
+    # 3. 安全检查：所有待删除文件必须在 image_dir 下
+    norm_image_dir = os.path.normpath(image_dir)
+    for fp in files_to_delete:
+        if os.path.normpath(fp) != os.path.normpath(os.path.join(norm_image_dir, os.path.relpath(fp, norm_image_dir))):
+            raise HTTPException(status_code=403, detail=f"安全限制：不允许删除 image_dir 之外的路径: {fp}")
+
+    logger.info(f"[purge] 将彻底删除 {len(files_to_delete)} 个文件: {files_to_delete}")
+
+    # 4. 先删解答图片，再删原题图片，最后删数据库
+    deleted = []
+    missing = []
+    failed = []
+
+    for fp in files_to_delete:
+        try:
+            if os.path.isfile(fp):
+                os.remove(fp)
+                deleted.append(fp)
+                logger.info(f"[purge] 已删除文件: {fp}")
+            else:
+                missing.append(fp)
+                logger.info(f"[purge] 文件不存在（跳过）: {fp}")
+        except Exception as exc:
+            failed.append(fp)
+            logger.error(f"[purge] 删除文件失败: {fp}, 错误: {exc}")
+
+    # 5. 只要有原题图片删除失败，就不删数据库记录
+    if file_path in failed:
+        raise HTTPException(
+            status_code=500,
+            detail=f"原题图片删除失败: {file_path}，索引未删除。已删除: {deleted}, 失败: {failed}"
+        )
+
+    # 如果解答图片有删除失败，也不删数据库（保持完整性）
+    if failed:
+        raise HTTPException(
+            status_code=500,
+            detail=f"部分文件删除失败，索引未删除。已删除: {deleted}, 失败: {failed}"
+        )
+
+    # 6. 删除数据库记录
+    db.delete_image(file_path)
+    logger.info(f"[purge] 彻底删除完成: {file_path}, 删除文件数: {len(deleted)}")
+
+    return {
+        "status": "ok",
+        "deleted_files": deleted,
+        "missing_files": missing,
+    }
 
 
 @app.get("/api/images/all")
