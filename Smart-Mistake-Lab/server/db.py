@@ -78,6 +78,11 @@ def init_db():
         conn.execute('CREATE INDEX IF NOT EXISTS idx_images_subject ON images(subject)')
     except sqlite3.OperationalError:
         pass
+    # 为 mastery 建索引以加速按掌握程度筛选
+    try:
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_images_mastery ON images(mastery)')
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -122,11 +127,20 @@ def get_image_by_path(file_path: str) -> dict | None:
     return None
 
 
-def get_total_image_count(subject: str | None = None) -> int:
-    """返回已索引错题总数，可按学科筛选"""
+def get_total_image_count(subject: str | None = None, mastery: str | None = None) -> int:
+    """返回已索引错题总数，可按学科和掌握程度筛选"""
     conn = get_db()
+    conditions = []
+    params = []
     if subject:
-        row = conn.execute('SELECT COUNT(*) FROM images WHERE subject = ?', (subject,)).fetchone()
+        conditions.append('subject = ?')
+        params.append(subject)
+    if mastery:
+        conditions.append('mastery = ?')
+        params.append(mastery)
+    if conditions:
+        sql = 'SELECT COUNT(*) FROM images WHERE ' + ' AND '.join(conditions)
+        row = conn.execute(sql, params).fetchone()
     else:
         row = conn.execute('SELECT COUNT(*) FROM images').fetchone()
     conn.close()
@@ -172,12 +186,19 @@ def get_subject_counts() -> list[dict]:
     return sorted_result
 
 
-def get_all_images(subject: str | None = None) -> list[dict]:
+def get_all_images(subject: str | None = None, mastery: str | None = None) -> list[dict]:
     conn = get_db()
+    conditions = []
+    params = []
     if subject:
-        rows = conn.execute(
-            'SELECT * FROM images WHERE subject = ? ORDER BY indexed_at DESC', (subject,)
-        ).fetchall()
+        conditions.append('subject = ?')
+        params.append(subject)
+    if mastery:
+        conditions.append('mastery = ?')
+        params.append(mastery)
+    if conditions:
+        sql = 'SELECT * FROM images WHERE ' + ' AND '.join(conditions) + ' ORDER BY indexed_at DESC'
+        rows = conn.execute(sql, params).fetchall()
     else:
         rows = conn.execute('SELECT * FROM images ORDER BY indexed_at DESC').fetchall()
     conn.close()
@@ -193,8 +214,9 @@ def get_all_images(subject: str | None = None) -> list[dict]:
 def search_images(query: str | None = None,
                   start_datetime: str | None = None,
                   end_datetime: str | None = None,
-                  subject: str | None = None) -> list[dict]:
-    """按关键字、日期范围、学科筛选错题，所有条件为 AND 关系"""
+                  subject: str | None = None,
+                  mastery: str | None = None) -> list[dict]:
+    """按关键字、日期范围、学科、掌握程度筛选错题，所有条件为 AND 关系"""
     conn = get_db()
     conditions = []
     params = []
@@ -202,6 +224,10 @@ def search_images(query: str | None = None,
     if subject:
         conditions.append('subject = ?')
         params.append(subject)
+
+    if mastery:
+        conditions.append('mastery = ?')
+        params.append(mastery)
 
     if query:
         like_q = f'%{query}%'

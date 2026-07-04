@@ -63,6 +63,7 @@ const API = {
     const qs = new URLSearchParams();
     if (params.query) qs.set('query', params.query);
     if (params.subject) qs.set('subject', params.subject);
+    if (params.mastery) qs.set('mastery', params.mastery);
     if (params.dateEnabled) qs.set('date_enabled', '1');
     if (params.startDate) qs.set('start_date', params.startDate);
     if (params.endDate) qs.set('end_date', params.endDate);
@@ -642,6 +643,9 @@ export default function App() {
   const [subjects, setSubjects] = useState([]);
   const pendingSubjectRef = useRef(null);
 
+  // --- Mastery filter ---
+  const [masteryFilter, setMasteryFilter] = useState('');
+
   // --- Detail modal ---
   const [detail, setDetail] = useState(null);
   const [detailTagInput, setDetailTagInput] = useState('');
@@ -729,10 +733,11 @@ export default function App() {
         dateEnabled: dateFilterEnabled,
         startDate: dateFilterEnabled ? startDate : '',
         endDate: dateFilterEnabled ? endDate : '',
+        mastery: masteryFilter,
       });
     }, 300);
     return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
-  }, [query, dateFilterEnabled, startDate, endDate, activeSubject]);
+  }, [query, dateFilterEnabled, startDate, endDate, activeSubject, masteryFilter]);
 
   // --- Config actions ---
   async function saveImageDir() {
@@ -907,6 +912,7 @@ export default function App() {
     setStartDate('');
     setEndDate('');
     setActiveSubject('all');
+    setMasteryFilter('');
   }
 
   // --- Detail modal ---
@@ -1415,7 +1421,14 @@ export default function App() {
                     <input type="date" className="date-input" value={endDate}
                       onChange={(e) => setEndDate(e.target.value)}
                       disabled={!dateFilterEnabled} title="结束日期" />
-                    {(query || selectedTags.length > 0 || dateFilterEnabled || activeSubject !== 'all') && (
+                    <select className="mastery-select" value={masteryFilter}
+                      onChange={(e) => setMasteryFilter(e.target.value)} title="按掌握程度筛选">
+                      <option value="">全部掌握程度</option>
+                      <option value="mastered">已掌握</option>
+                      <option value="unfamiliar">不熟悉</option>
+                      <option value="practice">需练习</option>
+                    </select>
+                    {(query || selectedTags.length > 0 || dateFilterEnabled || activeSubject !== 'all' || masteryFilter) && (
                       <button className="clear-filter-btn" onClick={clearAllFilters}>清空筛选</button>
                     )}
                     {dateFilterEnabled && startDate && endDate && startDate > endDate && (

@@ -380,14 +380,16 @@ def purge_image(file_path: str = Query(..., description="图片文件路径")):
 def get_all_images(
     query: str = Query("", description="关键字搜索词"),
     subject: str = Query("", description="学科筛选"),
+    mastery: str = Query("", description="掌握程度筛选"),
     date_enabled: bool = Query(False, description="是否启用日期范围筛选"),
     start_date: str | None = Query(None, description="开始日期，格式 YYYY-MM-DD"),
     end_date: str | None = Query(None, description="结束日期，格式 YYYY-MM-DD"),
 ):
     subject_param = subject.strip() or None
+    mastery_param = mastery.strip() or None
 
-    # 错题库总数（不受筛选条件影响）
-    total_count = db.get_total_image_count(subject=subject_param)
+    # 错题库总数（按当前学科 + 掌握程度条件统计）
+    total_count = db.get_total_image_count(subject=subject_param, mastery=mastery_param)
 
     # 构造日期时间字符串：开始日 00:00:00，结束日 23:59:59
     start_datetime = None
@@ -400,15 +402,17 @@ def get_all_images(
             end_datetime = f"{end_date} 23:59:59"
 
     # 如果有筛选条件则走 search_images，否则全量返回
-    if query.strip() or start_datetime or end_datetime:
+    has_search_filter = bool(query.strip() or start_datetime or end_datetime or mastery_param)
+    if has_search_filter:
         items = db.search_images(
             query=query.strip() or None,
             start_datetime=start_datetime,
             end_datetime=end_datetime,
             subject=subject_param,
+            mastery=mastery_param,
         )
     else:
-        items = db.get_all_images(subject=subject_param)
+        items = db.get_all_images(subject=subject_param, mastery=mastery_param)
 
     subjects = db.get_subject_counts()
 
