@@ -252,11 +252,19 @@ def index_image(data: dict):
     if isinstance(solution, dict):
         solution = json.dumps(solution, ensure_ascii=False)
 
+    difficulty = data.get("difficulty", 3)
+    try:
+        difficulty = int(difficulty)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="difficulty 必须是整数")
+    if difficulty < 1 or difficulty > 5:
+        raise HTTPException(status_code=400, detail="difficulty 必须在 1 到 5 之间")
+
     if not file_path:
         raise HTTPException(status_code=400, detail="file_path 不能为空")
 
     subject = _infer_subject(file_path)
-    db.mark_indexed(file_path, title, summary, content, tags, notes, mastery, practice_count, last_practiced_at, solution, subject)
+    db.mark_indexed(file_path, title, summary, content, tags, notes, mastery, practice_count, last_practiced_at, solution, subject, difficulty)
     return {"status": "ok"}
 
 
@@ -265,6 +273,15 @@ def update_image(data: dict):
     file_path = data.get("file_path", "")
     if not file_path:
         raise HTTPException(status_code=400, detail="file_path 不能为空")
+
+    difficulty = data.get("difficulty")
+    if difficulty is not None:
+        try:
+            difficulty = int(difficulty)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="difficulty 必须是整数")
+        if difficulty < 1 or difficulty > 5:
+            raise HTTPException(status_code=400, detail="difficulty 必须在 1 到 5 之间")
 
     solution = data.get("solution")
     if isinstance(solution, dict):
@@ -281,6 +298,7 @@ def update_image(data: dict):
         practice_count=data.get("practice_count"),
         last_practiced_at=data.get("last_practiced_at"),
         solution=solution,
+        difficulty=difficulty,
     )
     return {"status": "ok"}
 

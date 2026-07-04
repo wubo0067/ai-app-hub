@@ -39,18 +39,18 @@ const API = {
   async scan() {
     return (await apiFetch('/api/scan')).json();
   },
-  async indexImage(filePath, title, summary, content, tags, notes, mastery, practiceCount, lastPracticedAt) {
+  async indexImage(filePath, title, summary, content, tags, notes, mastery, practiceCount, lastPracticedAt, difficulty) {
     return (await apiFetch('/api/images/index', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ file_path: filePath, title, summary, content, tags, notes, mastery, practice_count: practiceCount, last_practiced_at: lastPracticedAt })
+      body: JSON.stringify({ file_path: filePath, title, summary, content, tags, notes, mastery, practice_count: practiceCount, last_practiced_at: lastPracticedAt, difficulty })
     })).json();
   },
-  async updateImage(filePath, title, summary, content, tags, notes, mastery, practiceCount, lastPracticedAt, solution) {
+  async updateImage(filePath, title, summary, content, tags, notes, mastery, practiceCount, lastPracticedAt, solution, difficulty) {
     return (await apiFetch('/api/images/update', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ file_path: filePath, title, summary, content, tags, notes, mastery, practice_count: practiceCount, last_practiced_at: lastPracticedAt, solution })
+      body: JSON.stringify({ file_path: filePath, title, summary, content, tags, notes, mastery, practice_count: practiceCount, last_practiced_at: lastPracticedAt, solution, difficulty })
     })).json();
   },
   async deleteImage(filePath) {
@@ -376,6 +376,12 @@ const CSS = `
 .mnb .card-mastery { font-size: 10.5px; color: var(--accent-2); }
 .mnb .card-practice { font-size: 10.5px; color: var(--ink-soft); }
 
+/* Star Rating */
+.mnb .star-rating { display: inline-flex; gap: 2px; align-items: center; vertical-align: middle; }
+.mnb .star-rating-star { color: #d4d4d4; transition: color 0.15s; }
+.mnb .star-rating-star.filled { color: #f5a623; }
+.mnb .star-rating-star.clickable:hover { color: #f5a623; }
+
 /* Analysis overlay */
 .mnb .analyze-overlay {
   margin-top: 16px; padding: 16px;
@@ -569,6 +575,28 @@ function TagPill({ tag, onDelete, onEdit }) {
   );
 }
 
+// 五星难度评分组件
+function StarRating({ value, onChange, readonly = false, size = 18 }) {
+  const [hover, setHover] = useState(0);
+  const stars = [];
+  for (let i = 1; i <= 5; i++) {
+    const filled = i <= (hover || value || 0);
+    stars.push(
+      <span
+        key={i}
+        className={`star-rating-star${filled ? ' filled' : ''}${!readonly ? ' clickable' : ''}`}
+        style={{ fontSize: size, cursor: readonly ? 'default' : 'pointer' }}
+        onMouseEnter={() => !readonly && setHover(i)}
+        onMouseLeave={() => !readonly && setHover(0)}
+        onClick={() => !readonly && onChange && onChange(i)}
+      >
+        ★
+      </span>
+    );
+  }
+  return <span className="star-rating">{stars}</span>;
+}
+
 // ============== PROBLEM CARD ==============
 
 const MASTERY_LABELS = {
@@ -594,6 +622,7 @@ function ProblemCard({ problem, imageUrl, onClick }) {
           {problem.mastery && (
             <span className="card-mastery">{MASTERY_LABELS[problem.mastery] || problem.mastery}</span>
           )}
+          <StarRating value={problem.difficulty} readonly size={14} />
           {(problem.practice_count > 0) && (
             <span className="card-practice">练习 {problem.practice_count} 次</span>
           )}
@@ -660,6 +689,7 @@ export default function App() {
   const [detailContent, setDetailContent] = useState('');
   const detailContentRef = useRef('');
   const [detailMastery, setDetailMastery] = useState('');
+  const [detailDifficulty, setDetailDifficulty] = useState(3);
   const [detailPracticeCount, setDetailPracticeCount] = useState(0);
   const [solutionText, setSolutionText] = useState('');
   const solutionTextRef = useRef('');
@@ -811,14 +841,15 @@ export default function App() {
         title: '',
         summary: '',
         content: result.content || '',
-        tags: Array.isArray(result.tags) ? result.tags : []
+        tags: Array.isArray(result.tags) ? result.tags : [],
+        difficulty: 3
       });
       console.groupEnd();
     } catch (e) {
       console.error('[Analysis] exception:', e.message, e);
       console.groupEnd();
       setAnalysisError(e.message || 'AI analysis failed');
-      setDraft({ title: '', summary: '', content: '', tags: [] });
+      setDraft({ title: '', summary: '', content: '', tags: [], difficulty: 3 });
     } finally {
       setAnalyzing(false);
     }
@@ -848,7 +879,7 @@ export default function App() {
     setSaving(true);
     setSaveMsg('');
     try {
-      await API.indexImage(analyzingFile, draft.title || '未命名题目', draft.summary || '', draft.content || '', draft.tags || [], '', '', 0);
+      await API.indexImage(analyzingFile, draft.title || '未命名题目', draft.summary || '', draft.content || '', draft.tags || [], '', '', 0, null, draft.difficulty || 3);
       console.log('[保存] 索引保存成功，重新扫描目录');
       setSaveMsg('已保存索引');
       // 记住当前分析的图片所属学科，以便后续跳转
@@ -929,6 +960,7 @@ export default function App() {
     setDetailContent(p.content || '');
     detailContentRef.current = p.content || '';
     setDetailMastery(p.mastery || '');
+    setDetailDifficulty(typeof p.difficulty === 'number' ? p.difficulty : 3);
     setDetailPracticeCount(p.practice_count || 0);
     setSolutionText(sol.text || '');
     solutionTextRef.current = sol.text || '';
@@ -1005,6 +1037,7 @@ export default function App() {
         detailPracticeCount,
         detail.last_practiced_at,
         solution,
+        detailDifficulty,
       );
       const updated = {
         ...detail,
@@ -1012,6 +1045,7 @@ export default function App() {
         content,
         notes,
         mastery: detailMastery,
+        difficulty: detailDifficulty,
         practice_count: detailPracticeCount,
         solution,
       };
@@ -1281,6 +1315,10 @@ export default function App() {
                         <textarea rows={6} value={draft.content}
                           onChange={(e) => setDraft({ ...draft, content: e.target.value })}
                           placeholder="AI 从图片中提取的题目文字内容，可手动修正" />
+                      </div>
+                      <div className="field">
+                        <label className="field-label">难度评分</label>
+                        <StarRating value={draft.difficulty} onChange={(v) => setDraft({ ...draft, difficulty: v })} />
                       </div>
                       <div className="field">
                         <label className="field-label">知识点标签（双击编辑，点击 × 删除）</label>
@@ -1620,6 +1658,10 @@ export default function App() {
                     </label>
                   ))}
                 </div>
+              </div>
+              <div className="field">
+                <label className="field-label">难度评分</label>
+                <StarRating value={detailDifficulty} onChange={setDetailDifficulty} />
               </div>
               <div className="field" style={{ flex: '0 0 auto', marginBottom: 0, textAlign: 'center' }}>
                 <label className="field-label">练习次数</label>

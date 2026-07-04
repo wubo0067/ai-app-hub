@@ -34,6 +34,7 @@ def init_db():
             practice_count INTEGER DEFAULT 0,
             last_practiced_at TIMESTAMP,
             solution TEXT DEFAULT '',
+            difficulty INTEGER DEFAULT 3,
             indexed_at TIMESTAMP,
             created_at TIMESTAMP
         )
@@ -73,6 +74,10 @@ def init_db():
         conn.execute('ALTER TABLE images ADD COLUMN subject TEXT DEFAULT ""')
     except sqlite3.OperationalError:
         pass
+    try:
+        conn.execute('ALTER TABLE images ADD COLUMN difficulty INTEGER DEFAULT 3')
+    except sqlite3.OperationalError:
+        pass
     # 为 subject 建索引以加速按学科查询
     try:
         conn.execute('CREATE INDEX IF NOT EXISTS idx_images_subject ON images(subject)')
@@ -83,6 +88,8 @@ def init_db():
         conn.execute('CREATE INDEX IF NOT EXISTS idx_images_mastery ON images(mastery)')
     except sqlite3.OperationalError:
         pass
+    # 修复旧数据：difficulty 为空或非法时统一设为 3
+    conn.execute('UPDATE images SET difficulty = 3 WHERE difficulty IS NULL OR difficulty < 1 OR difficulty > 5')
     conn.commit()
     conn.close()
 
@@ -264,7 +271,7 @@ def search_images(query: str | None = None,
 def mark_indexed(file_path: str, title: str, summary: str, content: str, tags: list[str],
                  notes: str = '', mastery: str = '', practice_count: int = 0,
                       last_practiced_at: str | None = None, solution: str = '',
-                      subject: str = ''):
+                      subject: str = '', difficulty: int = 3):
     conn = get_db()
     # 如果已存在记录，保留原来的 created_at
     old = conn.execute(
@@ -274,10 +281,10 @@ def mark_indexed(file_path: str, title: str, summary: str, content: str, tags: l
 
     conn.execute(
         '''INSERT OR REPLACE INTO images
-          (file_path, file_name, subject, title, summary, content, tags, notes, mastery, practice_count, last_practiced_at, solution, indexed_at, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+          (file_path, file_name, subject, title, summary, content, tags, notes, mastery, practice_count, last_practiced_at, solution, difficulty, indexed_at, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
       (file_path, os.path.basename(file_path), subject, title, summary, content,
-            json.dumps(tags, ensure_ascii=False), notes, mastery, practice_count, last_practiced_at, solution, _now(), original_created_at)
+            json.dumps(tags, ensure_ascii=False), notes, mastery, practice_count, last_practiced_at, solution, difficulty, _now(), original_created_at)
     )
     conn.commit()
     conn.close()
@@ -289,12 +296,13 @@ def update_image_meta(file_path: str, title: str | None = None,
                       notes: str | None = None, mastery: str | None = None,
                       practice_count: int | None = None,
                       last_practiced_at: str | None = None,
-                      solution: str | None = None):
+                      solution: str | None = None,
+                      difficulty: int | None = None):
     conn = get_db()
     updates = []
     params = []
     # 日志记录修改的字段和参数
-    logger.info(f"Updating image meta for {file_path}: title={title}, summary={summary}, content={content}, tags={tags}, notes={notes}, mastery={mastery}, practice_count={practice_count}, last_practiced_at={last_practiced_at}, solution={solution}")
+    logger.info(f"Updating image meta for {file_path}: title={title}, summary={summary}, content={content}, tags={tags}, notes={notes}, mastery={mastery}, practice_count={practice_count}, last_practiced_at={last_practiced_at}, solution={solution}, difficulty={difficulty}")
     if title is not None:
         updates.append('title = ?')
         params.append(title)
@@ -322,6 +330,9 @@ def update_image_meta(file_path: str, title: str | None = None,
     if solution is not None:
         updates.append('solution = ?')
         params.append(solution)
+    if difficulty is not None:
+        updates.append('difficulty = ?')
+        params.append(difficulty)
     if updates:
         updates.append('indexed_at = ?')
         params.append(_now())
