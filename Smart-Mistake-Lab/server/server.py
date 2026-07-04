@@ -12,6 +12,7 @@ load_dotenv(Path(__file__).parent.parent / '.env')
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 import db
 from log import logger
 from llm import AiConfig, analyze_image
@@ -441,6 +442,16 @@ async def analyze(data: dict):
         logger.exception(f'[API] 分析异常：{file_path}')
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# --- Serve frontend static files (production build from dist/) ---
+# 必须在所有 API 路由之后挂载，避免覆盖 API
+dist_dir = Path(__file__).parent.parent / "dist"
+if dist_dir.is_dir():
+    app.mount("/", StaticFiles(directory=str(dist_dir), html=True), name="frontend")
+    logger.info(f"前端静态文件已挂载：{dist_dir}")
+else:
+    logger.warning(f"未找到前端构建目录 {dist_dir}，请先执行 npm run build")
+    logger.info("开发模式下请确保 Vite dev server (npm run dev) 正在运行")
 
 if __name__ == "__main__":
     import uvicorn
