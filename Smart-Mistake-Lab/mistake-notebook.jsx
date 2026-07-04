@@ -447,6 +447,27 @@ const CSS = `
   border: 1.5px solid var(--margin); background: none; color: var(--margin);
   padding: 7px 14px; border-radius: 7px; font-size: 13px; font-weight: 600; cursor: pointer;
 }
+
+/* Image preview overlay (modal-over-modal) */
+.mnb .image-preview-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.65);
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px; z-index: 60;
+}
+.mnb .image-preview-modal {
+  position: relative; max-width: 90vw; max-height: 90vh;
+  padding: 12px; background: var(--card); border-radius: 10px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+}
+.mnb .image-preview-modal img {
+  max-width: 90vw;
+  max-height: calc(90vh - 40px);
+  width: auto; height: auto;
+  object-fit: contain; display: block;
+  border-radius: 6px;
+  margin-bottom: 0; border: none;
+}
+
 .mnb .spin { animation: mnbspin 0.9s linear infinite; }
 @keyframes mnbspin { to { transform: rotate(360deg); } }
 
@@ -698,6 +719,8 @@ export default function App() {
   const solutionFileInputRef = useRef(null);
   const solutionTextareaRef = useRef(null);
 
+  const [previewSolutionImage, setPreviewSolutionImage] = useState(null);
+
   // --- Delete confirmation ---
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleteMode, setDeleteMode] = useState('index'); // 'index' | 'purge'
@@ -768,6 +791,14 @@ export default function App() {
     }, 300);
     return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
   }, [query, dateFilterEnabled, startDate, endDate, activeSubject, masteryFilter]);
+
+  // Esc 关闭解答图片预览
+  useEffect(() => {
+    if (!previewSolutionImage) return;
+    const handler = (e) => { if (e.key === 'Escape') setPreviewSolutionImage(null); };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [previewSolutionImage]);
 
   // --- Config actions ---
   async function saveImageDir() {
@@ -1006,6 +1037,7 @@ export default function App() {
       return;
     }
     setDetail(null);
+    setPreviewSolutionImage(null);
   }
 
   function applyDetailDraft(updates) {
@@ -1141,6 +1173,10 @@ export default function App() {
       setSolutionImages(newImages);
       solutionImagesRef.current = newImages;
       saveSolution(solutionTextRef.current, newImages);
+      // 如果删除的正是当前预览的图片，关闭预览
+      if (previewSolutionImage && getSolutionFullPath(filename) === previewSolutionImage) {
+        setPreviewSolutionImage(null);
+      }
     } catch (e) {
       console.error('delete solution image failed', e);
       setDetailError('解答图片删除失败 ' + (e.message || '未知错误'));
@@ -1621,9 +1657,11 @@ export default function App() {
                 <div className="solution-images">
                   {solutionImages.map((filename) => (
                     <div key={filename} className="solution-img-wrapper">
-                      <img src={API.imageUrl(getSolutionFullPath(filename))} alt={filename} />
+                      <img src={API.imageUrl(getSolutionFullPath(filename))} alt={filename}
+                        onDoubleClick={() => setPreviewSolutionImage(getSolutionFullPath(filename))}
+                        title="双击查看原图" />
                       <button className="solution-img-delete"
-                        onClick={() => deleteSolutionImage(filename)}
+                        onClick={(e) => { e.stopPropagation(); deleteSolutionImage(filename); }}
                         title="删除解答图片">
                         <X size={10} />
                       </button>
@@ -1764,6 +1802,16 @@ export default function App() {
                 </button>
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* 解答图片预览 */}
+      {previewSolutionImage && (
+        <div className="image-preview-overlay" onClick={() => setPreviewSolutionImage(null)}>
+          <div className="image-preview-modal" onClick={(e) => e.stopPropagation()}>
+            <button className="modal-close" onClick={() => setPreviewSolutionImage(null)}><X size={16} /></button>
+            <img src={API.imageUrl(previewSolutionImage)} alt="解答图片预览" />
           </div>
         </div>
       )}
