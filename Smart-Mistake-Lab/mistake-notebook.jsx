@@ -111,7 +111,7 @@ const CSS = `
   background: var(--paper);
   box-shadow: inset 0 1px 3px rgba(37,54,84,0.35), 0 0 0 1px var(--grid);
 }
-.mnb .shell { max-width: 960px; margin: 0 auto; padding-left: 40px; }
+.mnb .shell { max-width: 1600px; margin: 0 auto; padding-left: 40px; }
 .mnb .margin-rule {
   position: absolute; left: 56px; top: 0; bottom: 0;
   width: 2px; background: var(--margin); opacity: 0.55;
@@ -343,7 +343,7 @@ const CSS = `
 .mnb .count-badge { opacity: 0.65; font-weight: 400; margin-left: 3px; }
 .mnb .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   gap: 16px;
 }
 .mnb .card {
@@ -548,6 +548,80 @@ const CSS = `
   .mnb .panel { padding: 16px; }
   .mnb .scan-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); }
 }
+
+/* Subject tab bar */
+.mnb .subject-tab-bar {
+  display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px;
+  padding-bottom: 14px; border-bottom: 2px solid var(--grid);
+}
+
+/* Library layout: sidebar + main */
+.mnb .library-layout { display: flex; gap: 24px; align-items: flex-start; }
+
+/* Tag sidebar */
+.mnb .tag-sidebar {
+  flex: 0 0 240px; max-height: calc(100vh - 260px);
+  overflow-y: auto; position: sticky; top: 0;
+  border: 1.5px solid var(--grid); border-radius: 10px;
+  padding: 16px; background: rgba(255,255,255,0.6);
+}
+.mnb .tag-sidebar-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 12px; padding-bottom: 8px;
+  border-bottom: 1px solid var(--grid);
+}
+.mnb .tag-sidebar-title {
+  font-family: "Songti SC", "STSong", serif;
+  font-size: 15px; font-weight: 700; color: var(--ink);
+}
+.mnb .tag-sidebar-clear {
+  border: 1px dashed var(--pencil); background: none; color: var(--pencil);
+  border-radius: 999px; padding: 3px 10px; font-size: 11.5px; font-weight: 600;
+  cursor: pointer; transition: all .12s;
+}
+.mnb .tag-sidebar-clear:hover { border-color: var(--margin); color: var(--margin); }
+.mnb .tag-sidebar-list { display: flex; flex-direction: column; gap: 5px; }
+.mnb .sidebar-tag {
+  display: flex; align-items: center; justify-content: space-between;
+  width: 100%; padding: 7px 10px; border-radius: 7px;
+  border: 1px solid transparent; background: none;
+  cursor: pointer; text-align: left; transition: all .12s;
+  font-family: inherit; font-size: 13px; color: var(--ink-soft);
+}
+.mnb .sidebar-tag:hover { background: #F5F3EC; border-color: var(--grid); }
+.mnb .sidebar-tag.active {
+  background: var(--margin); color: #fff; border-color: var(--margin); font-weight: 600;
+}
+.mnb .sidebar-tag.active .sidebar-tag-count { color: rgba(255,255,255,0.75); }
+.mnb .sidebar-tag-name {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 12.5px;
+}
+.mnb .sidebar-tag-count {
+  font-size: 11px; color: var(--pencil); font-weight: 400; margin-left: 6px; flex-shrink: 0;
+}
+.mnb .tag-sidebar-empty {
+  font-size: 12.5px; color: var(--pencil); text-align: center; padding: 20px 0;
+}
+
+/* Library main area */
+.mnb .library-main { flex: 1; min-width: 0; }
+
+/* mastery select */
+.mnb .mastery-select {
+  border: 1.5px solid var(--grid); border-radius: 6px;
+  padding: 5px 8px; font-size: 12.5px; color: var(--ink);
+  background: var(--paper); font-family: inherit; outline: none;
+}
+.mnb .mastery-select:focus { border-color: var(--accent-2); }
+
+/* responsive: sidebar collapses on narrow screens */
+@media (max-width: 860px) {
+  .mnb .library-layout { flex-direction: column; }
+  .mnb .tag-sidebar { flex: none; width: 100%; max-height: none; position: static; }
+  .mnb .tag-sidebar-list { flex-direction: row; flex-wrap: wrap; gap: 6px; }
+  .mnb .sidebar-tag { width: auto; }
+}
 `;
 
 // ============== TAG PILL (with inline editing) ==============
@@ -687,9 +761,7 @@ export default function App() {
   const [dateFilterEnabled, setDateFilterEnabled] = useState(false);
   const [startDate, setStartDate] = useState('');
   const [endDate, setEndDate] = useState('');
-  const [activeSubject, setActiveSubject] = useState(() => {
-    try { return localStorage.getItem('mnb_active_subject') || 'all'; } catch { return 'all'; }
-  });
+  const [activeSubject, setActiveSubject] = useState('数学');
   const [subjects, setSubjects] = useState([]);
   const pendingSubjectRef = useRef(null);
 
@@ -736,10 +808,14 @@ export default function App() {
     }).catch(() => { });
   }, []);
 
-  // persist activeSubject
+  // Auto-correct activeSubject when subjects load (default to 数学, fallback to first)
   useEffect(() => {
-    try { localStorage.setItem('mnb_active_subject', activeSubject); } catch { }
-  }, [activeSubject]);
+    if (subjects.length === 0) return;
+    if (!subjects.some(s => s.name === activeSubject)) {
+      const hasMath = subjects.some(s => s.name === '数学');
+      setActiveSubject(hasMath ? '数学' : subjects[0].name);
+    }
+  }, [subjects]);
 
   // --- Load library when tab changes ---
   useEffect(() => {
@@ -749,7 +825,7 @@ export default function App() {
         setActiveSubject(pendingSubjectRef.current);
         pendingSubjectRef.current = null;
       }
-      loadLibrary();
+      loadLibrary({ subject: activeSubject });
     }
   }, [tab]);
 
@@ -782,7 +858,7 @@ export default function App() {
       if (dateFilterEnabled && startDate && endDate && startDate > endDate) return;
       loadLibrary({
         query,
-        subject: activeSubject === 'all' ? '' : activeSubject,
+        subject: activeSubject,
         dateEnabled: dateFilterEnabled,
         startDate: dateFilterEnabled ? startDate : '',
         endDate: dateFilterEnabled ? endDate : '',
@@ -959,7 +1035,6 @@ export default function App() {
   }
 
   function getSubjectLabel() {
-    if (activeSubject === 'all') return '全部错题库';
     return `${activeSubject}错题库`;
   }
 
@@ -973,7 +1048,6 @@ export default function App() {
     setDateFilterEnabled(false);
     setStartDate('');
     setEndDate('');
-    setActiveSubject('all');
     setMasteryFilter('');
   }
 
@@ -1454,15 +1528,12 @@ export default function App() {
 
         {/* ============ LIBRARY TAB ============ */}
         {tab === 'library' && (() => {
-          const globalTotal = activeSubject === 'all'
-            ? totalIndexedCount
-            : subjects.reduce((sum, s) => sum + (s.total_count || 0), 0);
           return (
             <div className="panel">
               {!libLoaded ? (
                 <div className="empty"><Loader2 size={28} className="spin" /><p>加载中…</p></div>
-              ) : globalTotal === 0 ? (
-                /* 空状态①：整个错题库没有任何已索引的错题 */
+              ) : subjects.length === 0 ? (
+                /* 空状态：整个错题库没有任何已索引的错题 */
                 <div className="empty"><BookOpen size={40} /><p>还没有索引任何错题，去"扫描"页面导入吧</p></div>
               ) : (
                 <>
@@ -1470,84 +1541,92 @@ export default function App() {
                   <div className="subject-page-header">
                     <h2 className="subject-page-title">{getSubjectLabel()}</h2>
                     <span className="subject-page-stats">
-                      共 {totalIndexedCount} 题
-                      {filtered.length !== totalIndexedCount && (
+                      共 {allIndexed.length} 题
+                      {filtered.length !== allIndexed.length && (
                         <span className="subject-filtered-hint">，当前筛出 {filtered.length} 题</span>
                       )}
                     </span>
                   </div>
 
-                  <div className="library-toolbar">
-                    <div className="search-box">
-                      <Search size={15} color="#57648A" />
-                      <input type="text" placeholder="搜索标题、内容或标签" value={query}
-                        onChange={(e) => setQuery(e.target.value)} />
-                    </div>
-                    <label className="date-filter-check">
-                      <input type="checkbox" checked={dateFilterEnabled}
-                        onChange={(e) => setDateFilterEnabled(e.target.checked)} />
-                      按添加时间筛选
-                    </label>
-                    <input type="date" className="date-input" value={startDate}
-                      onChange={(e) => setStartDate(e.target.value)}
-                      disabled={!dateFilterEnabled} title="开始日期" />
-                    <span className="date-sep">—</span>
-                    <input type="date" className="date-input" value={endDate}
-                      onChange={(e) => setEndDate(e.target.value)}
-                      disabled={!dateFilterEnabled} title="结束日期" />
-                    <select className="mastery-select" value={masteryFilter}
-                      onChange={(e) => setMasteryFilter(e.target.value)} title="按掌握程度筛选">
-                      <option value="">全部掌握程度</option>
-                      <option value="mastered">已掌握</option>
-                      <option value="unfamiliar">不熟悉</option>
-                      <option value="practice">需练习</option>
-                    </select>
-                    {(query || selectedTags.length > 0 || dateFilterEnabled || activeSubject !== 'all' || masteryFilter) && (
-                      <button className="clear-filter-btn" onClick={clearAllFilters}>清空筛选</button>
-                    )}
-                    {dateFilterEnabled && startDate && endDate && startDate > endDate && (
-                      <span className="date-error">开始日期不能大于结束日期</span>
-                    )}
-                  </div>
-
-                  {/* 学科页签（始终显示） */}
-                  <div className="tag-filter-bar" style={{ marginBottom: 12 }}>
-                    <button
-                      className={'filter-pill' + (activeSubject === 'all' ? ' active' : '')}
-                      onClick={() => switchSubject('all')}>
-                      全部<span className="count-badge">{globalTotal}</span>
-                    </button>
+                  {/* 学科主标签行 */}
+                  <div className="subject-tab-bar">
                     {subjects.map((s) => (
-                      <button key={s.name || s}
-                        className={'filter-pill' + (activeSubject === (s.name || s) ? ' active' : '')}
-                        onClick={() => switchSubject(s.name || s)}>
-                        {s.name || s}<span className="count-badge">{s.total_count ?? s.count ?? ''}</span>
+                      <button key={s.name}
+                        className={'filter-pill' + (activeSubject === s.name ? ' active' : '')}
+                        onClick={() => switchSubject(s.name)}>
+                        {s.name}<span className="count-badge">{s.total_count}</span>
                       </button>
                     ))}
                   </div>
 
-                  {/* 空状态②：当前学科有题但没筛出来 */}
-                  {totalIndexedCount === 0 ? (
-                    <div className="empty"><BookOpen size={36} /><p>该学科暂无已索引的错题</p></div>
-                  ) : (
-                    <>
-                      {allTags.length > 0 && (
-                        <div className="tag-filter-bar">
-                          {allTags.map(([t, count]) => (
+                  {/* 左右布局：左侧知识点侧栏 + 右侧主区 */}
+                  <div className="library-layout">
+                    {/* 左侧知识点侧栏 */}
+                    <div className="tag-sidebar">
+                      <div className="tag-sidebar-header">
+                        <span className="tag-sidebar-title">知识点</span>
+                        {selectedTags.length > 0 && (
+                          <button className="tag-sidebar-clear" onClick={() => setSelectedTags([])}>
+                            清除 ×
+                          </button>
+                        )}
+                      </div>
+                      <div className="tag-sidebar-list">
+                        {allTags.length > 0 ? (
+                          allTags.map(([t, count]) => (
                             <button key={t}
-                              className={'filter-pill' + (selectedTags.includes(t) ? ' active' : '')}
+                              className={'sidebar-tag' + (selectedTags.includes(t) ? ' active' : '')}
                               onClick={() => toggleTag(t)}>
-                              {t}<span className="count-badge">{count}</span>
+                              <span className="sidebar-tag-name">{t}</span>
+                              <span className="sidebar-tag-count">{count}</span>
                             </button>
-                          ))}
-                          {selectedTags.length > 0 && (
-                            <button className="filter-pill" onClick={() => setSelectedTags([])}
-                              style={{ borderStyle: 'dashed' }}>清除标签 ×</button>
-                          )}
+                          ))
+                        ) : (
+                          <div className="tag-sidebar-empty">暂无知识点标签</div>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* 右侧主区 */}
+                    <div className="library-main">
+                      {/* 搜索和筛选工具栏 */}
+                      <div className="library-toolbar">
+                        <div className="search-box">
+                          <Search size={15} color="#57648A" />
+                          <input type="text" placeholder="搜索标题、内容或标签" value={query}
+                            onChange={(e) => setQuery(e.target.value)} />
                         </div>
-                      )}
-                      {/* 空状态③：有题但筛出来为空 */}
-                      {filtered.length === 0 ? (
+                        <label className="date-filter-check">
+                          <input type="checkbox" checked={dateFilterEnabled}
+                            onChange={(e) => setDateFilterEnabled(e.target.checked)} />
+                          按添加时间筛选
+                        </label>
+                        <input type="date" className="date-input" value={startDate}
+                          onChange={(e) => setStartDate(e.target.value)}
+                          disabled={!dateFilterEnabled} title="开始日期" />
+                        <span className="date-sep">—</span>
+                        <input type="date" className="date-input" value={endDate}
+                          onChange={(e) => setEndDate(e.target.value)}
+                          disabled={!dateFilterEnabled} title="结束日期" />
+                        <select className="mastery-select" value={masteryFilter}
+                          onChange={(e) => setMasteryFilter(e.target.value)} title="按掌握程度筛选">
+                          <option value="">全部掌握程度</option>
+                          <option value="mastered">已掌握</option>
+                          <option value="unfamiliar">不熟悉</option>
+                          <option value="practice">需练习</option>
+                        </select>
+                        {(query || selectedTags.length > 0 || dateFilterEnabled || masteryFilter) && (
+                          <button className="clear-filter-btn" onClick={clearAllFilters}>清空筛选</button>
+                        )}
+                        {dateFilterEnabled && startDate && endDate && startDate > endDate && (
+                          <span className="date-error">开始日期不能大于结束日期</span>
+                        )}
+                      </div>
+
+                      {/* 题目网格 */}
+                      {allIndexed.length === 0 ? (
+                        <div className="empty"><BookOpen size={36} /><p>该学科暂无已索引的错题</p></div>
+                      ) : filtered.length === 0 ? (
                         <div className="empty"><Search size={32} /><p>没有匹配的题目，试试调整筛选条件</p></div>
                       ) : (
                         <div className="grid">
@@ -1558,8 +1637,8 @@ export default function App() {
                           ))}
                         </div>
                       )}
-                    </>
-                  )}
+                    </div>
+                  </div>
                 </>
               )}
             </div>
