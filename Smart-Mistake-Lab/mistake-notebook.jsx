@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { X, Plus, Search, Loader2, Sparkles, Trash2, BookOpen, AlertCircle, RefreshCw, FolderOpen, Settings, Edit3, Check } from 'lucide-react';
+import { X, Plus, Search, Loader2, Sparkles, Trash2, BookOpen, AlertCircle, RefreshCw, FolderOpen, Settings, Edit3, Check, ChevronLeft, ChevronRight } from 'lucide-react';
 
 function formatTime(ts) {
   if (!ts) return '';
@@ -454,6 +454,31 @@ const CSS = `
   display: flex; align-items: center; justify-content: center;
   padding: 20px; z-index: 60;
 }
+/* Detail nav arrows */
+.mnb .detail-nav-btn {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  width: 44px; height: 44px; border-radius: 50%;
+  border: 1.5px solid var(--ink); background: var(--paper);
+  color: var(--ink); display: flex; align-items: center;
+  justify-content: center; cursor: pointer; z-index: 55;
+  transition: all .15s; box-shadow: 0 2px 8px var(--shadow);
+}
+.mnb .detail-nav-btn:hover { background: var(--ink); color: var(--paper); }
+.mnb .detail-nav-btn:disabled { opacity: 0.25; cursor: not-allowed; }
+.mnb .detail-nav-btn:disabled:hover { background: var(--paper); color: var(--ink); }
+.mnb .detail-nav-btn.left { left: -58px; }
+.mnb .detail-nav-btn.right { right: -58px; }
+.mnb .detail-position {
+  font-size: 12.5px; color: var(--pencil); font-weight: 600;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  margin-left: auto; white-space: nowrap;
+}
+@media (max-width: 860px) {
+  .mnb .detail-nav-btn.left { left: 6px; }
+  .mnb .detail-nav-btn.right { right: 6px; }
+  .mnb .detail-nav-btn { width: 36px; height: 36px; }
+}
+
 .mnb .image-preview-modal {
   position: relative; max-width: 90vw; max-height: 90vh;
   padding: 12px; background: var(--card); border-radius: 10px;
@@ -1029,6 +1054,39 @@ export default function App() {
     });
   }, [allIndexed, selectedTags]);
 
+  // --- Detail pagination derived state ---
+  const detailIndex = useMemo(() => {
+    if (!detail) return -1;
+    return filtered.findIndex((p) => p.file_path === detail.file_path);
+  }, [detail, filtered]);
+
+  const hasPrev = detailIndex > 0;
+  const hasNext = detailIndex >= 0 && detailIndex < filtered.length - 1;
+  const prevProblem = hasPrev ? filtered[detailIndex - 1] : null;
+  const nextProblem = hasNext ? filtered[detailIndex + 1] : null;
+  const detailPositionText = detailIndex >= 0 ? `第 ${detailIndex + 1} / ${filtered.length} 题` : '';
+
+  // Auto-close detail if current problem no longer in filtered
+  useEffect(() => {
+    if (detail && detailIndex === -1) {
+      setDetail(null);
+      setPreviewSolutionImage(null);
+    }
+  }, [detailIndex]);
+
+  // Keyboard navigation for detail modal (ArrowLeft/ArrowRight)
+  useEffect(() => {
+    if (!detail || previewSolutionImage || showDeleteConfirm) return;
+    const handler = (e) => {
+      const tag = document.activeElement?.tagName?.toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+      if (e.key === 'ArrowLeft') { e.preventDefault(); goToPrevProblem(); }
+      if (e.key === 'ArrowRight') { e.preventDefault(); goToNextProblem(); }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [detail, previewSolutionImage, showDeleteConfirm, hasPrev, hasNext, detailDirty]);
+
   function switchSubject(subj) {
     setActiveSubject(subj);
     setSelectedTags([]);
@@ -1080,8 +1138,7 @@ export default function App() {
     } catch (e) {
       console.error('delete failed', e);
     }
-    setDetail(null);
-    setShowDeleteConfirm(false);
+    navigateAfterDelete(filePath);
   }
 
   async function purgeImage(filePath) {
@@ -1089,8 +1146,7 @@ export default function App() {
     try {
       await API.purgeImage(filePath);
       setAllIndexed((prev) => prev.filter((p) => p.file_path !== filePath));
-      setDetail(null);
-      setShowDeleteConfirm(false);
+      navigateAfterDelete(filePath);
     } catch (e) {
       console.error('purge failed', e);
       setDetailError('彻底删除失败：' + (e.message || '未知错误'));
@@ -1112,6 +1168,34 @@ export default function App() {
     }
     setDetail(null);
     setPreviewSolutionImage(null);
+  }
+
+  function goToPrevProblem() {
+    if (!detail) return;
+    if (detailDirty) { setDetailError('当前有未保存修改，请先点击"保存修改"'); return; }
+    if (!hasPrev) return;
+    openDetail(prevProblem);
+  }
+
+  function goToNextProblem() {
+    if (!detail) return;
+    if (detailDirty) { setDetailError('当前有未保存修改，请先点击"保存修改"'); return; }
+    if (!hasNext) return;
+    openDetail(nextProblem);
+  }
+
+  function navigateAfterDelete(removedFilePath) {
+    if (!detail || detail.file_path !== removedFilePath) return;
+    setShowDeleteConfirm(false);
+    // Prefer next, fallback to prev, else close
+    if (hasNext) {
+      openDetail(nextProblem);
+    } else if (hasPrev) {
+      openDetail(prevProblem);
+    } else {
+      setDetail(null);
+      setPreviewSolutionImage(null);
+    }
   }
 
   function applyDetailDraft(updates) {
@@ -1650,8 +1734,23 @@ export default function App() {
       {detail && (
         <div className="modal-overlay" onClick={closeDetailModal}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
+            {/* 翻页箭头 */}
+            <button className="detail-nav-btn left" onClick={(e) => { e.stopPropagation(); goToPrevProblem(); }} disabled={!hasPrev} title="上一题 ←">
+              <ChevronLeft size={20} />
+            </button>
+            <button className="detail-nav-btn right" onClick={(e) => { e.stopPropagation(); goToNextProblem(); }} disabled={!hasNext} title="下一题 →">
+              <ChevronRight size={20} />
+            </button>
+
             <div className="modal-close" onClick={closeDetailModal}><X size={16} /></div>
             <img src={API.imageUrl(detail.file_path)} alt={detail.title} />
+
+            {/* 位置信息 */}
+            {detailPositionText && (
+              <div style={{ display: 'flex', alignItems: 'center', marginBottom: 6 }}>
+                <span className="detail-position">{detailPositionText}</span>
+              </div>
+            )}
 
             {/* 可编辑标题 */}
             {editingTitle ? (
