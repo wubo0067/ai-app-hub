@@ -411,10 +411,16 @@ const CSS = `
   display: flex; align-items: center; justify-content: center;
   padding: 20px; z-index: 50;
 }
+.mnb .modal-container {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
 .mnb .modal {
   background: var(--card); border: 1.5px solid var(--ink); border-radius: 10px;
-  max-width: 640px; width: 100%; max-height: 88vh; overflow-y: auto;
-  padding: 22px; position: relative;
+  max-width: 820px; width: 100%; max-height: 88vh; overflow-y: auto;
+  padding: 28px; position: relative;
 }
 .mnb .modal-close {
   position: absolute; top: 14px; right: 14px;
@@ -1733,8 +1739,8 @@ export default function App() {
       {/* ============ DETAIL MODAL ============ */}
       {detail && (
         <div className="modal-overlay" onClick={closeDetailModal}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            {/* 翻页箭头 */}
+          <div className="modal-container">
+            {/* 翻页箭头 - 放在 modal 外部，避免触发水平滚动条 */}
             <button className="detail-nav-btn left" onClick={(e) => { e.stopPropagation(); goToPrevProblem(); }} disabled={!hasPrev} title="上一题 ←">
               <ChevronLeft size={20} />
             </button>
@@ -1742,161 +1748,163 @@ export default function App() {
               <ChevronRight size={20} />
             </button>
 
-            <div className="modal-close" onClick={closeDetailModal}><X size={16} /></div>
-            <img src={API.imageUrl(detail.file_path)} alt={detail.title} />
+            <div className="modal" onClick={(e) => e.stopPropagation()}>
+              <div className="modal-close" onClick={closeDetailModal}><X size={16} /></div>
+              <img src={API.imageUrl(detail.file_path)} alt={detail.title} />
 
-            {/* 位置信息 */}
-            {detailPositionText && (
-              <div style={{ display: 'flex', alignItems: 'center', marginBottom: 6 }}>
-                <span className="detail-position">{detailPositionText}</span>
-              </div>
-            )}
-
-            {/* 可编辑标题 */}
-            {editingTitle ? (
-              <div className="field" style={{ marginBottom: 10 }}>
-                <input type="text" value={editTitleValue}
-                  onChange={(e) => setEditTitleValue(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') saveDetailTitle();
-                    if (e.key === 'Escape') { setEditTitleValue(detail.title || ''); setEditingTitle(false); }
-                  }}
-                  onBlur={saveDetailTitle}
-                  autoFocus
-                  style={{ fontSize: 19, fontWeight: 700, fontFamily: '"Songti SC", "STSong", serif' }} />
-              </div>
-            ) : (
-              <h2 onClick={() => { setEditingTitle(true); setEditTitleValue(detail.title || ''); }}
-                style={{ cursor: 'pointer' }} title="点击编辑标题">
-                {detail.title || '未命名题目'} <Edit3 size={13} style={{ opacity: 0.4, verticalAlign: 'middle' }} />
-              </h2>
-            )}
-
-            <div className="summary">{detail.summary}</div>
-
-            <div className="field" style={{ marginBottom: 14 }}>
-              <label className="field-label">题目内容</label>
-              <textarea rows={6} value={detailContent}
-                onChange={(e) => { setDetailContent(e.target.value); detailContentRef.current = e.target.value; }}
-                onBlur={saveDetailContent}
-                placeholder="题目文字内容" />
-            </div>
-
-            {/* 时间信息 */}
-            <div className="timestamp-row">
-              {detail.created_at && (
-                <span className="timestamp">📅 添加于 {formatTime(detail.created_at)}</span>
-              )}
-              {detail.last_practiced_at && (
-                <span className="timestamp">🕐 最近练习 {formatTime(detail.last_practiced_at)}</span>
-              )}
-            </div>
-
-            {/* 标签列表 - 一行一个 */}
-            <label className="field-label">知识点标签</label>
-            <div className="tag-list-vertical">
-              {(detail.tags || []).map((t) => (
-                <div key={t} className="tag-row">
-                  <TagPill tag={t} onDelete={removeDetailTag} onEdit={editDetailTag} />
-                </div>
-              ))}
-              {(detail.tags || []).length === 0 && (
-                <span style={{ fontSize: 12.5, color: 'var(--ink-soft)' }}>还没有标签</span>
-              )}
-            </div>
-            <div className="tag-add-row" style={{ marginBottom: 18 }}>
-              <input type="text" placeholder="添加知识点，回车确认" value={detailTagInput}
-                onChange={(e) => setDetailTagInput(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addDetailTag(); } }} />
-              <button onClick={addDetailTag}><Plus size={14} /></button>
-            </div>
-
-            {/* 备注栏 */}
-            <div className="field">
-              <label className="field-label">备注</label>
-              <textarea rows={3} value={detailNotes}
-                onChange={(e) => { setDetailNotes(e.target.value); detailNotesRef.current = e.target.value; }}
-                onBlur={saveDetailNotes}
-                placeholder="人工备注，记录解题思路或易错点…" />
-            </div>
-
-            <div className="field solution-section">
-              <label className="field-label">解答</label>
-              <textarea
-                ref={solutionTextareaRef}
-                rows={5}
-                value={solutionText}
-                onChange={(e) => { setSolutionText(e.target.value); solutionTextRef.current = e.target.value; }}
-                onBlur={saveSolutionText}
-                onPaste={handleSolutionPaste}
-                placeholder="输入解题思路，或直接在这里粘贴截图…"
-              />
-              {solutionImages.length > 0 && (
-                <div className="solution-images">
-                  {solutionImages.map((filename) => (
-                    <div key={filename} className="solution-img-wrapper">
-                      <img src={API.imageUrl(getSolutionFullPath(filename))} alt={filename}
-                        onDoubleClick={() => setPreviewSolutionImage(getSolutionFullPath(filename))}
-                        title="双击查看原图" />
-                      <button className="solution-img-delete"
-                        onClick={(e) => { e.stopPropagation(); deleteSolutionImage(filename); }}
-                        title="删除解答图片">
-                        <X size={10} />
-                      </button>
-                    </div>
-                  ))}
+              {/* 位置信息 */}
+              {detailPositionText && (
+                <div style={{ display: 'flex', alignItems: 'center', marginBottom: 6 }}>
+                  <span className="detail-position">{detailPositionText}</span>
                 </div>
               )}
-              <input type="file" accept="image/*" ref={solutionFileInputRef}
-                onChange={handleSolutionFileSelect} style={{ display: 'none' }} />
-              <button className="solution-add-btn"
-                onClick={() => solutionFileInputRef.current?.click()}>
-                <Plus size={13} /> 添加图片
-              </button>
-            </div>
 
-            {/* 掌握程度 + 练习计数 */}
-            <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-end', marginBottom: 14 }}>
-              <div className="field" style={{ flex: '1 1 200px', marginBottom: 0 }}>
-                <label className="field-label">掌握程度</label>
-                <div className="mastery-group">
-                  {[
-                    { val: '', label: '未设置' },
-                    { val: 'mastered', label: '✅ 已掌握' },
-                    { val: 'unfamiliar', label: '⚠️ 不熟悉' },
-                    { val: 'practice', label: '🔄 继续练习' },
-                  ].map((opt) => (
-                    <label key={opt.val} className={'mastery-option' + (detailMastery === opt.val ? ' active' : '')}>
-                      <input type="radio" name="mastery" value={opt.val}
-                        checked={detailMastery === opt.val}
-                        onChange={() => saveDetailMastery(opt.val)} />
-                      <span>{opt.label}</span>
-                    </label>
-                  ))}
+              {/* 可编辑标题 */}
+              {editingTitle ? (
+                <div className="field" style={{ marginBottom: 10 }}>
+                  <input type="text" value={editTitleValue}
+                    onChange={(e) => setEditTitleValue(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') saveDetailTitle();
+                      if (e.key === 'Escape') { setEditTitleValue(detail.title || ''); setEditingTitle(false); }
+                    }}
+                    onBlur={saveDetailTitle}
+                    autoFocus
+                    style={{ fontSize: 19, fontWeight: 700, fontFamily: '"Songti SC", "STSong", serif' }} />
                 </div>
+              ) : (
+                <h2 onClick={() => { setEditingTitle(true); setEditTitleValue(detail.title || ''); }}
+                  style={{ cursor: 'pointer' }} title="点击编辑标题">
+                  {detail.title || '未命名题目'} <Edit3 size={13} style={{ opacity: 0.4, verticalAlign: 'middle' }} />
+                </h2>
+              )}
+
+              <div className="summary">{detail.summary}</div>
+
+              <div className="field" style={{ marginBottom: 14 }}>
+                <label className="field-label">题目内容</label>
+                <textarea rows={6} value={detailContent}
+                  onChange={(e) => { setDetailContent(e.target.value); detailContentRef.current = e.target.value; }}
+                  onBlur={saveDetailContent}
+                  placeholder="题目文字内容" />
               </div>
+
+              {/* 时间信息 */}
+              <div className="timestamp-row">
+                {detail.created_at && (
+                  <span className="timestamp">📅 添加于 {formatTime(detail.created_at)}</span>
+                )}
+                {detail.last_practiced_at && (
+                  <span className="timestamp">🕐 最近练习 {formatTime(detail.last_practiced_at)}</span>
+                )}
+              </div>
+
+              {/* 标签列表 - 一行一个 */}
+              <label className="field-label">知识点标签</label>
+              <div className="tag-list-vertical">
+                {(detail.tags || []).map((t) => (
+                  <div key={t} className="tag-row">
+                    <TagPill tag={t} onDelete={removeDetailTag} onEdit={editDetailTag} />
+                  </div>
+                ))}
+                {(detail.tags || []).length === 0 && (
+                  <span style={{ fontSize: 12.5, color: 'var(--ink-soft)' }}>还没有标签</span>
+                )}
+              </div>
+              <div className="tag-add-row" style={{ marginBottom: 18 }}>
+                <input type="text" placeholder="添加知识点，回车确认" value={detailTagInput}
+                  onChange={(e) => setDetailTagInput(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addDetailTag(); } }} />
+                <button onClick={addDetailTag}><Plus size={14} /></button>
+              </div>
+
+              {/* 备注栏 */}
               <div className="field">
-                <label className="field-label">难度评分</label>
-                <StarRating value={detailDifficulty} onChange={setDetailDifficulty} />
+                <label className="field-label">备注</label>
+                <textarea rows={3} value={detailNotes}
+                  onChange={(e) => { setDetailNotes(e.target.value); detailNotesRef.current = e.target.value; }}
+                  onBlur={saveDetailNotes}
+                  placeholder="人工备注，记录解题思路或易错点…" />
               </div>
-              <div className="field" style={{ flex: '0 0 auto', marginBottom: 0, textAlign: 'center' }}>
-                <label className="field-label">练习次数</label>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <span className="practice-count">{detailPracticeCount}</span>
-                  <button className="practice-btn" onClick={incrementPractice} title="练习 +1">+1</button>
+
+              <div className="field solution-section">
+                <label className="field-label">解答</label>
+                <textarea
+                  ref={solutionTextareaRef}
+                  rows={5}
+                  value={solutionText}
+                  onChange={(e) => { setSolutionText(e.target.value); solutionTextRef.current = e.target.value; }}
+                  onBlur={saveSolutionText}
+                  onPaste={handleSolutionPaste}
+                  placeholder="输入解题思路，或直接在这里粘贴截图…"
+                />
+                {solutionImages.length > 0 && (
+                  <div className="solution-images">
+                    {solutionImages.map((filename) => (
+                      <div key={filename} className="solution-img-wrapper">
+                        <img src={API.imageUrl(getSolutionFullPath(filename))} alt={filename}
+                          onDoubleClick={() => setPreviewSolutionImage(getSolutionFullPath(filename))}
+                          title="双击查看原图" />
+                        <button className="solution-img-delete"
+                          onClick={(e) => { e.stopPropagation(); deleteSolutionImage(filename); }}
+                          title="删除解答图片">
+                          <X size={10} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <input type="file" accept="image/*" ref={solutionFileInputRef}
+                  onChange={handleSolutionFileSelect} style={{ display: 'none' }} />
+                <button className="solution-add-btn"
+                  onClick={() => solutionFileInputRef.current?.click()}>
+                  <Plus size={13} /> 添加图片
+                </button>
+              </div>
+
+              {/* 掌握程度 + 练习计数 */}
+              <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-end', marginBottom: 14 }}>
+                <div className="field" style={{ flex: '1 1 200px', marginBottom: 0 }}>
+                  <label className="field-label">掌握程度</label>
+                  <div className="mastery-group">
+                    {[
+                      { val: '', label: '未设置' },
+                      { val: 'mastered', label: '✅ 已掌握' },
+                      { val: 'unfamiliar', label: '⚠️ 不熟悉' },
+                      { val: 'practice', label: '🔄 继续练习' },
+                    ].map((opt) => (
+                      <label key={opt.val} className={'mastery-option' + (detailMastery === opt.val ? ' active' : '')}>
+                        <input type="radio" name="mastery" value={opt.val}
+                          checked={detailMastery === opt.val}
+                          onChange={() => saveDetailMastery(opt.val)} />
+                        <span>{opt.label}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+                <div className="field">
+                  <label className="field-label">难度评分</label>
+                  <StarRating value={detailDifficulty} onChange={setDetailDifficulty} />
+                </div>
+                <div className="field" style={{ flex: '0 0 auto', marginBottom: 0, textAlign: 'center' }}>
+                  <label className="field-label">练习次数</label>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span className="practice-count">{detailPracticeCount}</span>
+                    <button className="practice-btn" onClick={incrementPractice} title="练习 +1">+1</button>
+                  </div>
                 </div>
               </div>
-            </div>
 
-            {detailError && <div className="save-msg error" style={{ marginTop: -10, marginBottom: 12 }}>{detailError}</div>}
-            {detailSaving && <div className="save-msg" style={{ marginTop: -10, marginBottom: 12 }}>保存中…</div>}
-            <div className="modal-actions">
-              <button className="save-btn" style={{ marginTop: 0 }} onClick={saveDetail} disabled={detailSaving || !detailDirty}>
-                {detailSaving ? '保存中…' : '保存修改'}
-              </button>
-              <button className="del-btn" onClick={openDeleteConfirm}>
-                <Trash2 size={14} /> 删除
-              </button>
+              {detailError && <div className="save-msg error" style={{ marginTop: -10, marginBottom: 12 }}>{detailError}</div>}
+              {detailSaving && <div className="save-msg" style={{ marginTop: -10, marginBottom: 12 }}>保存中…</div>}
+              <div className="modal-actions">
+                <button className="save-btn" style={{ marginTop: 0 }} onClick={saveDetail} disabled={detailSaving || !detailDirty}>
+                  {detailSaving ? '保存中…' : '保存修改'}
+                </button>
+                <button className="del-btn" onClick={openDeleteConfirm}>
+                  <Trash2 size={14} /> 删除
+                </button>
+              </div>
             </div>
           </div>
         </div>
