@@ -442,6 +442,36 @@ def get_all_images(
     }
 
 
+# --- Focus Practice ---
+
+FOCUS_MAX_COUNT = 5
+
+
+@app.get("/api/images/focus")
+def get_focus_practice():
+    items = db.get_focus_practice_images()
+    return {
+        "items": items,
+        "count": len(items),
+        "max_count": FOCUS_MAX_COUNT,
+    }
+
+
+@app.put("/api/images/focus")
+def toggle_focus_practice(data: dict):
+    file_path = data.get("file_path", "")
+    enabled = data.get("enabled", True)
+    if not file_path:
+        raise HTTPException(status_code=400, detail="file_path 不能为空")
+
+    result = db.set_focus_practice(file_path, enabled)
+    if not result["success"]:
+        status_code = 409 if "最多" in result["reason"] else 400
+        raise HTTPException(status_code=status_code, detail=result["reason"])
+
+    return {"status": "ok", "count": result["count"], "max_count": result["max_count"]}
+
+
 @app.post("/api/solution-image")
 def upload_solution_image(data: dict):
     file_path = data.get("file_path", "")

@@ -78,6 +78,14 @@ def init_db():
         conn.execute('ALTER TABLE images ADD COLUMN difficulty INTEGER DEFAULT 3')
     except sqlite3.OperationalError:
         pass
+    try:
+        conn.execute('ALTER TABLE images ADD COLUMN is_focus_practice INTEGER DEFAULT 0')
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute('ALTER TABLE images ADD COLUMN focus_marked_at TIMESTAMP')
+    except sqlite3.OperationalError:
+        pass
     # 为 subject 建索引以加速按学科查询
     try:
         conn.execute('CREATE INDEX IF NOT EXISTS idx_images_subject ON images(subject)')
@@ -86,6 +94,11 @@ def init_db():
     # 为 mastery 建索引以加速按掌握程度筛选
     try:
         conn.execute('CREATE INDEX IF NOT EXISTS idx_images_mastery ON images(mastery)')
+    except sqlite3.OperationalError:
+        pass
+    # 为重点练建索引
+    try:
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_images_focus_practice ON images(is_focus_practice)')
     except sqlite3.OperationalError:
         pass
     # 修复旧数据：difficulty 为空或非法时统一设为 3
@@ -343,6 +356,89 @@ def update_image_meta(file_path: str, title: str | None = None,
         )
         conn.commit()
     conn.close()
+
+
+def get_focus_practice_images() -> list[dict]:
+    """返回所有 is_focus_practice=1 的题目，按 focus_marked_at DESC 排序"""
+    conn = get_db()
+    rows = conn.execute(
+        'SELECT * FROM images WHERE is_focus_practice = 1 ORDER BY focus_marked_at DESC'
+    ).fetchall()
+    conn.close()
+    result = []
+    for r in rows:
+        d = dict(r)
+        d['tags'] = json.loads(d['tags'])
+        d['solution'] = json.loads(d.get('solution') or '{}')
+        result.append(d)
+    return result
+
+
+def get_focus_practice_count() -> int:
+    """返回当前重点练题目数量"""
+    conn = get_db()
+    row = conn.execute(
+        'SELECT COUNT(*) FROM images WHERE is_focus_practice = 1'
+    ).fetchone()
+    conn.close()
+    return row[0]
+
+
+def set_focus_practice(file_path: str, enabled: bool) -> dict:
+    """
+    设置/取消重点练标记。
+    返回: {"success": True/False, "reason": str, "count": int, "max_count": 5}
+    """
+    from datetime import datetime
+    conn = get_db()
+    try:
+        # 检查题目是否存在
+        row = conn.execute(
+            'SELECT is_focus_practice FROM images WHERE file_path = ?',
+            (file_path,)
+        ).fetchone()
+        if not row:
+            return {"success": False, "reason": "题目不存在", "count": 0, "max_count": 5}
+
+        current = row['is_focus_practice']
+
+        if enabled:
+            if current == 1:
+                # 已是重点练，幂等返回
+                count_row = conn.execute(
+                    'SELECT COUNT(*) FROM images WHERE is_focus_practice = 1'
+                ).fetchone()
+                conn.close()
+                return {"success": True, "reason": "already_set", "count": count_row[0], "max_count": 5}
+
+            # 检查数量限制
+            count_row = conn.execute(
+                'SELECT COUNT(*) FROM images WHERE is_focus_practice = 1'
+            ).fetchone()
+            if count_row[0] >= 5:
+                conn.close()
+                return {"success": False, "reason": "重点练题目最多只能保留 5 道", "count": count_row[0], "max_count": 5}
+
+            now_str = datetime.now().isoformat(sep=' ', timespec='seconds')
+            conn.execute(
+                'UPDATE images SET is_focus_practice = 1, focus_marked_at = ? WHERE file_path = ?',
+                (now_str, file_path)
+            )
+        else:
+            conn.execute(
+                'UPDATE images SET is_focus_practice = 0, focus_marked_at = NULL WHERE file_path = ?',
+                (file_path,)
+            )
+
+        conn.commit()
+        final_count = conn.execute(
+            'SELECT COUNT(*) FROM images WHERE is_focus_practice = 1'
+        ).fetchone()[0]
+        conn.close()
+        return {"success": True, "reason": "", "count": final_count, "max_count": 5}
+    except Exception as e:
+        conn.close()
+        return {"success": False, "reason": str(e), "count": 0, "max_count": 5}
 
 
 def delete_image(file_path: str):

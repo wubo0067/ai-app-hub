@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { X, Plus, Search, Loader2, Sparkles, Trash2, BookOpen, AlertCircle, RefreshCw, FolderOpen, Settings, Edit3, Check, ChevronLeft, ChevronRight } from 'lucide-react';
+import { X, Plus, Search, Loader2, Sparkles, Trash2, BookOpen, AlertCircle, RefreshCw, FolderOpen, Settings, Edit3, Check, ChevronLeft, ChevronRight, Target } from 'lucide-react';
 
 function formatTime(ts) {
   if (!ts) return '';
@@ -70,6 +70,16 @@ const API = {
     const qsStr = qs.toString();
     const url = '/api/images/all' + (qsStr ? '?' + qsStr : '');
     return (await apiFetch(url)).json();
+  },
+  async getFocusImages() {
+    return (await apiFetch('/api/images/focus')).json();
+  },
+  async toggleFocusPractice(filePath, enabled) {
+    return (await apiFetch('/api/images/focus', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file_path: filePath, enabled })
+    })).json();
   },
   imageUrl(filePath) {
     return `/api/image-file?path=${encodeURIComponent(filePath)}`;
@@ -349,7 +359,7 @@ const CSS = `
 .mnb .card {
   background: var(--card); border: 1.5px solid var(--ink); border-radius: 8px;
   overflow: hidden; cursor: pointer; transition: transform .15s, box-shadow .15s;
-  display: flex; flex-direction: column;
+  display: flex; flex-direction: column; position: relative;
 }
 .mnb .card:hover { transform: translateY(-3px); box-shadow: 0 8px 18px var(--shadow); }
 .mnb .card-thumb {
@@ -676,6 +686,103 @@ const CSS = `
   .mnb .tag-sidebar-list { flex-direction: row; flex-wrap: wrap; gap: 6px; }
   .mnb .sidebar-tag { width: auto; }
 }
+
+/* ========= Focus Practice ========= */
+.mnb .card-focus-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 2;
+  background: linear-gradient(135deg, #f59e0b, #d97706);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 4px;
+  box-shadow: 0 1px 4px rgba(245, 158, 11, .35);
+  line-height: 1.5;
+  letter-spacing: .5px;
+}
+
+.mnb .focus-page { padding: 0 4px; }
+
+.mnb .focus-page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 20px;
+  gap: 16px;
+}
+
+.mnb .focus-page-title {
+  font-size: 20px;
+  font-weight: 700;
+  margin: 0 0 6px;
+  color: var(--ink);
+}
+
+.mnb .focus-page-desc {
+  font-size: 13px;
+  color: var(--ink-soft);
+  margin: 0;
+  line-height: 1.6;
+}
+
+.mnb .focus-count-badge {
+  display: flex;
+  align-items: baseline;
+  gap: 2px;
+  flex-shrink: 0;
+  padding: 8px 14px;
+  background: var(--bg-3);
+  border-radius: 10px;
+  border: 1px solid var(--border);
+}
+
+.mnb .focus-count-num {
+  font-size: 26px;
+  font-weight: 800;
+  color: var(--accent-1);
+  line-height: 1;
+}
+.mnb .focus-count-num.full { color: #ef4444; }
+
+.mnb .focus-count-sep {
+  font-size: 18px;
+  color: var(--ink-soft);
+}
+
+.mnb .focus-count-max {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+
+.mnb .focus-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-2);
+  color: var(--ink);
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: all .15s;
+  white-space: nowrap;
+}
+.mnb .focus-btn:hover { border-color: #f59e0b; color: #f59e0b; }
+.mnb .focus-btn.active {
+  background: #fef3c7;
+  border-color: #f59e0b;
+  color: #d97706;
+}
+.mnb .focus-btn.active:hover {
+  background: #fde68a;
+  border-color: #d97706;
+  color: #b45309;
+}
 `;
 
 // ============== TAG PILL (with inline editing) ==============
@@ -800,6 +907,9 @@ const MASTERY_LABELS = {
 function ProblemCard({ problem, imageUrl, onClick }) {
   return (
     <div className="card" onClick={onClick}>
+      {problem.is_focus_practice === 1 && (
+        <div className="card-focus-badge">重点练</div>
+      )}
       <div className="card-thumb">
         <img src={imageUrl} alt={problem.title} loading="lazy" />
       </div>
@@ -866,6 +976,12 @@ export default function App() {
   // --- Mastery filter ---
   const [masteryFilter, setMasteryFilter] = useState('');
 
+  // --- Focus practice state ---
+  const [focusItems, setFocusItems] = useState([]);
+  const [focusCount, setFocusCount] = useState(0);
+  const [focusLoaded, setFocusLoaded] = useState(false);
+  const [focusError, setFocusError] = useState('');
+
   // --- Detail modal ---
   const [detail, setDetail] = useState(null);
   const [detailTagInput, setDetailTagInput] = useState('');
@@ -927,6 +1043,13 @@ export default function App() {
     }
   }, [tab]);
 
+  // --- Load focus practice when tab changes ---
+  useEffect(() => {
+    if (tab === 'focus' && !focusLoaded) {
+      loadFocusItems();
+    }
+  }, [tab]);
+
   const debounceRef = useRef(null);
 
   async function loadLibrary(filterParams = {}) {
@@ -944,6 +1067,52 @@ export default function App() {
       console.error('load library failed', e);
     } finally {
       setLibLoaded(true);
+    }
+  }
+
+  async function loadFocusItems() {
+    try {
+      const data = await API.getFocusImages();
+      setFocusItems(data.items || []);
+      setFocusCount(data.count ?? 0);
+      setFocusError('');
+    } catch (e) {
+      console.error('load focus practice failed', e);
+      setFocusError('加载重点练失败');
+    } finally {
+      setFocusLoaded(true);
+    }
+  }
+
+  async function toggleFocusPractice(filePath, enabled) {
+    if (!filePath) return;
+    try {
+      const result = await API.toggleFocusPractice(filePath, enabled);
+      // 刷新重点练列表
+      const focusData = await API.getFocusImages();
+      setFocusItems(focusData.items || []);
+      setFocusCount(focusData.count ?? 0);
+      // 同步更新错题库中该题的 is_focus_practice 状态
+      setAllIndexed((prev) =>
+        prev.map((p) =>
+          p.file_path === filePath
+            ? { ...p, is_focus_practice: enabled ? 1 : 0 }
+            : p
+        )
+      );
+      // 更新详情状态
+      setDetail((prev) =>
+        prev && prev.file_path === filePath
+          ? { ...prev, is_focus_practice: enabled ? 1 : 0 }
+          : prev
+      );
+      setFocusError('');
+      return result;
+    } catch (e) {
+      console.error('toggle focus practice failed', e);
+      const msg = e.message || '操作失败';
+      setFocusError(msg);
+      throw e;
     }
   }
 
@@ -1152,17 +1321,22 @@ export default function App() {
     return groupedFiltered.flatMap(g => g.items);
   }, [groupedFiltered]);
 
-  // --- Detail pagination derived state ---
+  // --- Detail pagination derived state (source depends on current tab) ---
+  const detailPaginationSource = useMemo(() => {
+    if (tab === 'focus') return focusItems;
+    return flattenedGrouped;
+  }, [tab, focusItems, flattenedGrouped]);
+
   const detailIndex = useMemo(() => {
     if (!detail) return -1;
-    return flattenedGrouped.findIndex((p) => p.file_path === detail.file_path);
-  }, [detail, flattenedGrouped]);
+    return detailPaginationSource.findIndex((p) => p.file_path === detail.file_path);
+  }, [detail, detailPaginationSource]);
 
   const hasPrev = detailIndex > 0;
-  const hasNext = detailIndex >= 0 && detailIndex < flattenedGrouped.length - 1;
-  const prevProblem = hasPrev ? flattenedGrouped[detailIndex - 1] : null;
-  const nextProblem = hasNext ? flattenedGrouped[detailIndex + 1] : null;
-  const detailPositionText = detailIndex >= 0 ? `第 ${detailIndex + 1} / ${flattenedGrouped.length} 题` : '';
+  const hasNext = detailIndex >= 0 && detailIndex < detailPaginationSource.length - 1;
+  const prevProblem = hasPrev ? detailPaginationSource[detailIndex - 1] : null;
+  const nextProblem = hasNext ? detailPaginationSource[detailIndex + 1] : null;
+  const detailPositionText = detailIndex >= 0 ? `第 ${detailIndex + 1} / ${detailPaginationSource.length} 题` : '';
 
   // Auto-close detail if current problem no longer in filtered
   useEffect(() => {
@@ -1206,6 +1380,11 @@ export default function App() {
     setEndDate('');
     setMasteryFilter('');
     // dateViewType 是展示偏好，不清除
+  }
+
+  function switchToFocus() {
+    setTab('focus');
+    if (!focusLoaded) loadFocusItems();
   }
 
   // --- Detail modal ---
@@ -1518,6 +1697,10 @@ export default function App() {
             <button className={'tab-btn' + (tab === 'library' ? ' active' : '')} onClick={() => setTab('library')}>
               <BookOpen size={14} style={{ marginRight: 4, verticalAlign: -2 }} />
               错题库 {totalIndexedCount > 0 ? `(${totalIndexedCount})` : ''}
+            </button>
+            <button className={'tab-btn' + (tab === 'focus' ? ' active' : '')} onClick={() => switchToFocus()}>
+              <Target size={14} style={{ marginRight: 4, verticalAlign: -2 }} />
+              重点练{/* 重点练数量只在当前 tab 显示，但计数在加载后可获取 */}
             </button>
             <button className={'tab-btn' + (tab === 'config' ? ' active' : '')} onClick={() => setTab('config')}>
               <Settings size={14} style={{ marginRight: 4, verticalAlign: -2 }} />配置
@@ -1841,6 +2024,48 @@ export default function App() {
             </div>
           );
         })()}
+
+        {/* ============ FOCUS PRACTICE TAB ============ */}
+        {tab === 'focus' && (() => {
+          return (
+            <div className="panel">
+              <div className="focus-page">
+                <div className="focus-page-header">
+                  <div>
+                    <h2 className="focus-page-title">📌 重点练</h2>
+                    <p className="focus-page-desc">
+                      从错题库中标记需要重点练习的题目，集中攻克薄弱环节。
+                      <br />最多同时标记 <strong>5</strong> 道题为重点练。
+                    </p>
+                  </div>
+                  <div className="focus-count-badge">
+                    <span className={`focus-count-num ${focusCount >= 5 ? 'full' : ''}`}>{focusCount}</span>
+                    <span className="focus-count-sep">/</span>
+                    <span className="focus-count-max">5</span>
+                  </div>
+                </div>
+
+                {!focusLoaded ? (
+                  <div className="empty"><Loader2 size={28} className="spin" /><p>加载中…</p></div>
+                ) : focusError ? (
+                  <div className="empty"><AlertCircle size={32} /><p>{focusError}</p></div>
+                ) : focusItems.length === 0 ? (
+                  <div className="empty"><BookOpen size={40} /><p>还没有重点练题目</p>
+                    <p style={{ fontSize: 13, color: 'var(--ink-soft)' }}>在错题库中打开任意错题，点击「设为重点练」即可加入</p>
+                  </div>
+                ) : (
+                  <div className="grid">
+                    {focusItems.map((p) => (
+                      <ProblemCard key={p.file_path} problem={p}
+                        imageUrl={API.imageUrl(p.file_path)}
+                        onClick={() => openDetail(p)} />
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })()}
       </div>
 
       {/* ============ DETAIL MODAL ============ */}
@@ -2008,10 +2233,24 @@ export default function App() {
                 <button className="save-btn" style={{ marginTop: 0 }} onClick={saveDetail} disabled={detailSaving || !detailDirty}>
                   {detailSaving ? '保存中…' : '保存修改'}
                 </button>
+                <button className={'focus-btn' + (detail.is_focus_practice === 1 ? ' active' : '')}
+                  style={{ marginTop: 0 }}
+                  onClick={async () => {
+                    const isFocus = detail.is_focus_practice === 1;
+                    try {
+                      await toggleFocusPractice(detail.file_path, !isFocus);
+                    } catch (e) {
+                      // 错误已由 toggleFocusPractice 设置到 focusError
+                    }
+                  }}
+                  title={detail.is_focus_practice === 1 ? '取消重点练标识' : '将该题加入重点练（最多 5 道）'}>
+                  {detail.is_focus_practice === 1 ? '⭐ 取消重点练' : '⚡ 设为重点练'}
+                </button>
                 <button className="del-btn" onClick={openDeleteConfirm}>
                   <Trash2 size={14} /> 删除
                 </button>
               </div>
+              {focusError && <div className="save-msg error" style={{ marginTop: 8 }}>{focusError}</div>}
             </div>
           </div>
         </div>
