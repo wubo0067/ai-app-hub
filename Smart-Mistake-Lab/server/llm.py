@@ -77,6 +77,8 @@ MATH_KNOWLEDGE_POINTS = [
     "相似三角形面积的比等于相似比的平方",
     "坐标法/参数法表示线段，转化为函数最值问题",
     "翻折图形，同步信息，连接对称点",
+    "遇到梯形想平移",
+    "遇到中线想倍长"
 ]
 
 PHYSICS_KNOWLEDGE_POINTS = [
@@ -471,3 +473,114 @@ async def analyze_image(
     except json.JSONDecodeError as e:
         logger.error(f'[LLM] JSON 解析失败：{e}, raw={response_text[:300]}')
         raise RuntimeError(f'AI 返回的不是有效 JSON: {e}')
+
+
+# ============== 鼓励语生成 ==============
+
+ENCOURAGEMENT_PROMPT = """你是一名学习督促助手。
+
+以下是用户错题本中多道超时未练习的题目信息，请为每道题生成一句 20 字以内的鼓励语。
+
+要求：
+- 每句不超过 20 个汉字
+- 鼓励但不说教，不要用"加油""你可以的"这类空话
+- 结合题目信息和超时情况，让建议具体
+- 不要输出序号或多余解释
+- 只输出 JSON 数组，格式：[{"file_path": "...", "message": "..."}]
+"""
+
+
+def parse_encouragement_result(raw_text: str) -> list[dict]:
+    """解析鼓励语 AI 响应，返回 [{file_path, message}, ...]"""
+    cleaned = raw_text.strip()
+    cleaned = re.sub(r'^```json\s*', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'^```\s*', '', cleaned)
+    cleaned = re.sub(r'```\s*$', '', cleaned)
+    cleaned = cleaned.strip()
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        start = cleaned.find('[')
+        if start == -1:
+            raise
+        parsed, _ = decoder.raw_decode(cleaned[start:])
+    if not isinstance(parsed, list):
+        raise ValueError(f"期望 JSON 数组，得到 {type(parsed).__name__}")
+    return parsed
+
+
+async def generate_encouragements(items: list[dict]) -> dict:
+    """
+    批量生成超时题目的鼓励语。
+    items: [{title, subject, tags, inactive_hours, is_focus_overdue, file_path}, ...]
+    返回: {file_path: message, ...}
+    """
+    from_env = AiConfig.from_env()
+    cfg = {
+        "api_url": os.environ.get("AI_API_URL") or from_env.api_url,
+        "model": os.environ.get("AI_MODEL") or from_env.model,
+        "api_key": os.environ.get("AI_API_KEY") or from_env.api_key,
+    }
+    ai_config = AiConfig(
+        api_url=cfg["api_url"],
+        model=cfg["model"],
+        api_key=cfg["api_key"],
+        timeout=120.0,
+        max_tokens=1024,
+    )
+    api_url = normalize_api_url(ai_config.api_url)
+    if not api_url or not ai_config.model.strip():
+        logger.warning("[Encourage] AI 未配置，跳过鼓励语生成")
+        return {}
+
+    # 构建题目标题摘要
+    lines = []
+    for it in items:
+        title = it.get("title", "未命名") or "未命名"
+        subject = it.get("subject", "") or ""
+        tags_str = ", ".join((it.get("tags", []) or [])[:3])
+        days = round((it.get("inactive_hours", 0) or 0) / 24, 1)
+        lines.append(f"- 题目：{title}（{subject}）标签：{tags_str}，已 {days} 天未练习")
+    items_text = "\n".join(lines)
+    prompt = ENCOURAGEMENT_PROMPT + "\n\n" + items_text + "\n\n请输出 JSON 数组："
+
+    logger.info(f"[Encourage] 调用 AI 生成鼓励语，items={len(items)}")
+
+    headers = {'Content-Type': 'application/json'}
+    if ai_config.api_key:
+        headers['Authorization'] = f'Bearer {ai_config.api_key}'
+
+    body = {
+        'model': ai_config.model,
+        'max_tokens': ai_config.max_tokens,
+        'messages': [
+            {'role': 'user', 'content': prompt}
+        ],
+    }
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(ai_config.timeout), trust_env=False) as client:
+        resp = await client.post(api_url, headers=headers, json=body)
+
+    if not resp.is_success:
+        logger.error(f"[Encourage] AI 调用失败: HTTP {resp.status_code}")
+        return {}
+
+    response_text = extract_text_from_response(resp.json(), api_url)
+    if not response_text:
+        logger.warning("[Encourage] AI 返回空文本")
+        return {}
+
+    try:
+        parsed = parse_encouragement_result(response_text)
+        result = {}
+        for entry in parsed:
+            fp = entry.get("file_path", "")
+            msg = (entry.get("message", "") or "").strip()
+            if fp and msg:
+                result[fp] = msg
+        logger.info(f"[Encourage] 成功生成 {len(result)} 条鼓励语")
+        return result
+    except Exception as e:
+        logger.error(f"[Encourage] 解析失败: {e}, raw={response_text[:200]}")
+        return {}

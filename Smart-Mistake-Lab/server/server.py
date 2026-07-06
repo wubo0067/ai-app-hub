@@ -2,6 +2,7 @@ import os
 import json
 import base64
 import re
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -15,7 +16,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 import db
 from log import logger
-from llm import AiConfig, analyze_image
+from llm import AiConfig, analyze_image, generate_encouragements
 
 
 def _generate_solution_filename(original_path: str, index: int, ext: str) -> str:
@@ -99,6 +100,7 @@ def health():
 def get_config():
     return {
         "image_dir": db.get_config_value("image_dir") or "",
+        "focus_timeout_hours": db.get_focus_timeout_hours(),
     }
 
 
@@ -106,8 +108,20 @@ def get_config():
 def update_config(data: dict):
     if "image_dir" in data:
         db.set_config_value("image_dir", data["image_dir"])
-        # 记录日志
         logger.info(f"图片目录已更新：{data['image_dir']}")
+    if "focus_timeout_hours" in data:
+        val = data["focus_timeout_hours"]
+        if val is not None and val != "":
+            try:
+                num = int(val)
+                if num < 1:
+                    num = 1
+                if num > 720:
+                    num = 720
+                db.set_config_value("focus_timeout_hours", str(num))
+                logger.info(f"重点练超时阈值已更新：{num} 小时")
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail="focus_timeout_hours 必须为有效数字")
     return get_config()
 
 
@@ -447,14 +461,80 @@ def get_all_images(
 FOCUS_MAX_COUNT = 5
 
 
+def _calc_overdue_fields(item: dict, timeout_hours: int, now_dt: datetime = None):
+    """为单个重点练题目计算超时相关派生字段，原地修改 item"""
+    if now_dt is None:
+        now_dt = datetime.now()
+    # 基准时间：last_practiced_at 优先，否则用 focus_marked_at
+    ref_str = item.get("last_practiced_at") or item.get("focus_marked_at")
+    if ref_str:
+        try:
+            ref_dt = datetime.strptime(ref_str, "%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            ref_dt = now_dt
+    else:
+        ref_dt = now_dt
+    inactive = (now_dt - ref_dt).total_seconds() / 3600.0
+    if inactive < 0:
+        inactive = 0.0
+    item["focus_reference_at"] = ref_str or ""
+    item["inactive_hours"] = round(inactive, 1)
+    item["inactive_days_text"] = f"{round(inactive / 24, 1)} 天"
+    item["is_focus_overdue"] = inactive > timeout_hours
+    item["reminder_message"] = ""
+
+
 @app.get("/api/images/focus")
 def get_focus_practice():
+    now_dt = datetime.now()
+    timeout_hours = db.get_focus_timeout_hours()
     items = db.get_focus_practice_images()
+    for it in items:
+        _calc_overdue_fields(it, timeout_hours, now_dt)
+    # 排序：超时优先，再按超时程度降序，未超时按 focus_marked_at 降序
+    def sort_key(it):
+        od = it.get("is_focus_overdue", False)
+        ih = it.get("inactive_hours", 0)
+        # focus_marked_at 转时间戳取反实现降序
+        fma_str = it.get("focus_marked_at") or ""
+        if fma_str:
+            try:
+                fma_key = -datetime.fromisoformat(fma_str).timestamp()
+            except Exception:
+                fma_key = 0
+        else:
+            fma_key = 0
+        return (0 if od else 1, -ih if od else 0, fma_key)
+    items.sort(key=sort_key)
+    overdue_count = sum(1 for it in items if it.get("is_focus_overdue"))
     return {
         "items": items,
         "count": len(items),
         "max_count": FOCUS_MAX_COUNT,
+        "timeout_hours": timeout_hours,
+        "overdue_count": overdue_count,
     }
+
+
+@app.post("/api/images/focus/reminders")
+async def get_focus_reminders(data: dict):
+    """
+    批量生成超时题目的鼓励语。
+    请求体: {"items": [{title, subject, tags, inactive_hours, is_focus_overdue, file_path}, ...]}
+    返回: {"reminders": {file_path: message, ...}}
+    """
+    if not data or "items" not in data:
+        return {"reminders": {}}
+    overdue_items = [it for it in data["items"] if it.get("is_focus_overdue")]
+    if not overdue_items:
+        return {"reminders": {}}
+    try:
+        reminders = await generate_encouragements(overdue_items)
+        return {"reminders": reminders}
+    except Exception as e:
+        logger.error(f"生成鼓励语失败: {e}")
+        # 兜底：返回空，前端用固定文案
+        return {"reminders": {}}
 
 
 @app.put("/api/images/focus")

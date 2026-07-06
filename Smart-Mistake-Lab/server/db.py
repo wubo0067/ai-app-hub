@@ -441,6 +441,17 @@ def set_focus_practice(file_path: str, enabled: bool) -> dict:
         return {"success": False, "reason": str(e), "count": 0, "max_count": 5}
 
 
+def get_focus_timeout_hours() -> int:
+    """从 config 表获取重点练超时阈值（小时），默认 48"""
+    val = get_config_value("focus_timeout_hours")
+    if val is not None:
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            pass
+    return 48
+
+
 def delete_image(file_path: str):
     conn = get_db()
     conn.execute('DELETE FROM images WHERE file_path = ?', (file_path,))

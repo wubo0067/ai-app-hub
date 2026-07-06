@@ -36,6 +36,13 @@ const API = {
       body: JSON.stringify({ image_dir: dir })
     })).json();
   },
+  async saveConfig(config) {
+    return (await apiFetch('/api/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config)
+    })).json();
+  },
   async scan() {
     return (await apiFetch('/api/scan')).json();
   },
@@ -79,6 +86,13 @@ const API = {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ file_path: filePath, enabled })
+    })).json();
+  },
+  async getFocusReminders(items) {
+    return (await apiFetch('/api/images/focus/reminders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items })
     })).json();
   },
   imageUrl(filePath) {
@@ -783,6 +797,79 @@ const CSS = `
   border-color: #d97706;
   color: #b45309;
 }
+
+/* ========= Focus Reminder Banner ========= */
+.mnb .focus-reminder-banner {
+  background: #fef2f2;
+  border: 1.5px solid #fca5a5;
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 20px;
+}
+
+.mnb .focus-reminder-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #b91c1c;
+  margin-bottom: 10px;
+}
+
+.mnb .focus-reminder-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.mnb .focus-reminder-item {
+  font-size: 13px;
+  color: #7f1d1d;
+  line-height: 1.5;
+}
+
+.mnb .focus-reminder-name {
+  font-weight: 600;
+}
+
+.mnb .focus-reminder-days {
+  color: #b91c1c;
+  font-weight: 500;
+}
+
+.mnb .focus-reminder-msg {
+  color: #991b1b;
+  font-style: italic;
+}
+.mnb .focus-reminder-msg.loading {
+  color: #9ca3af;
+  font-style: normal;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: .4; }
+  50% { opacity: 1; }
+}
+
+/* ========= Overdue Card ========= */
+.mnb .card-overdue {
+  border-color: #ef4444 !important;
+  box-shadow: 0 0 0 1.5px #ef4444, 0 4px 12px rgba(239, 68, 68, .15) !important;
+}
+.mnb .card-overdue:hover {
+  box-shadow: 0 0 0 2px #dc2626, 0 8px 18px rgba(239, 68, 68, .25) !important;
+}
+
+.mnb .card-overdue-info {
+  margin-top: 6px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #dc2626;
+  line-height: 1.4;
+}
+
+.mnb .card-focus-context .card-body {
+  padding-bottom: 8px;
+}
 `;
 
 // ============== TAG PILL (with inline editing) ==============
@@ -904,9 +991,10 @@ const MASTERY_LABELS = {
   practice: '🔄 继续练习',
 };
 
-function ProblemCard({ problem, imageUrl, onClick }) {
+function ProblemCard({ problem, imageUrl, onClick, showOverdue }) {
+  const isOverdue = showOverdue && problem.is_focus_overdue;
   return (
-    <div className="card" onClick={onClick}>
+    <div className={'card' + (isOverdue ? ' card-overdue' : '') + (showOverdue ? ' card-focus-context' : '')} onClick={onClick}>
       {problem.is_focus_practice === 1 && (
         <div className="card-focus-badge">重点练</div>
       )}
@@ -929,6 +1017,11 @@ function ProblemCard({ problem, imageUrl, onClick }) {
             <span className="card-practice">练习 {problem.practice_count} 次</span>
           )}
         </div>
+        {isOverdue && (
+          <div className="card-overdue-info">
+            ⏰ {problem.inactive_days_text || '0 天'}未练习
+          </div>
+        )}
       </div>
     </div>
   );
@@ -944,6 +1037,8 @@ export default function App() {
   const [dirInput, setDirInput] = useState('');
   const [dirSaving, setDirSaving] = useState(false);
   const [dirMsg, setDirMsg] = useState('');
+  const [focusTimeoutHours, setFocusTimeoutHours] = useState(48);
+  const [focusTimeoutInput, setFocusTimeoutInput] = useState('48');
 
   // --- Scan state ---
   const [scanData, setScanData] = useState(null);
@@ -981,6 +1076,10 @@ export default function App() {
   const [focusCount, setFocusCount] = useState(0);
   const [focusLoaded, setFocusLoaded] = useState(false);
   const [focusError, setFocusError] = useState('');
+  const [focusTimeoutCfg, setFocusTimeoutCfg] = useState(48);
+  const [focusOverdueCount, setFocusOverdueCount] = useState(0);
+  const [focusReminders, setFocusReminders] = useState({});
+  const [focusRemindersLoading, setFocusRemindersLoading] = useState(false);
 
   // --- Detail modal ---
   const [detail, setDetail] = useState(null);
@@ -1018,6 +1117,13 @@ export default function App() {
       if (c.image_dir) {
         setImageDir(c.image_dir);
         setDirInput(c.image_dir);
+      }
+      if (c.focus_timeout_hours) {
+        const v = Number(c.focus_timeout_hours);
+        if (v > 0) {
+          setFocusTimeoutHours(v);
+          setFocusTimeoutInput(String(v));
+        }
       }
     }).catch(() => { });
   }, []);
@@ -1075,12 +1181,31 @@ export default function App() {
       const data = await API.getFocusImages();
       setFocusItems(data.items || []);
       setFocusCount(data.count ?? 0);
+      setFocusTimeoutCfg(data.timeout_hours ?? 48);
+      setFocusOverdueCount(data.overdue_count ?? 0);
       setFocusError('');
+      // 如果有超时题目，异步加载鼓励语
+      if ((data.overdue_count ?? 0) > 0 && (data.items ?? []).length > 0) {
+        loadReminders(data.items);
+      }
     } catch (e) {
       console.error('load focus practice failed', e);
       setFocusError('加载重点练失败');
     } finally {
       setFocusLoaded(true);
+    }
+  }
+
+  async function loadReminders(items) {
+    setFocusRemindersLoading(true);
+    try {
+      const result = await API.getFocusReminders(items);
+      setFocusReminders(result.reminders || {});
+    } catch (e) {
+      console.error('load reminders failed', e);
+      setFocusReminders({});
+    } finally {
+      setFocusRemindersLoading(false);
     }
   }
 
@@ -1092,6 +1217,12 @@ export default function App() {
       const focusData = await API.getFocusImages();
       setFocusItems(focusData.items || []);
       setFocusCount(focusData.count ?? 0);
+      setFocusOverdueCount(focusData.overdue_count ?? 0);
+      // 清除旧提醒，重新加载
+      setFocusReminders({});
+      if ((focusData.overdue_count ?? 0) > 0) {
+        loadReminders(focusData.items);
+      }
       // 同步更新错题库中该题的 is_focus_practice 状态
       setAllIndexed((prev) =>
         prev.map((p) =>
@@ -1148,9 +1279,18 @@ export default function App() {
     setDirSaving(true);
     setDirMsg('');
     try {
-      await API.saveImageDir(dirInput.trim());
+      const payload = { image_dir: dirInput.trim() };
+      // 同时保存重点练超时阈值
+      const timeoutVal = parseInt(focusTimeoutInput, 10);
+      if (!isNaN(timeoutVal) && timeoutVal >= 1 && timeoutVal <= 720) {
+        payload.focus_timeout_hours = timeoutVal;
+      }
+      const result = await API.saveConfig(payload);
       setImageDir(dirInput.trim());
-      setDirMsg('目录已保存');
+      if (result.focus_timeout_hours) {
+        setFocusTimeoutHours(Number(result.focus_timeout_hours));
+      }
+      setDirMsg('配置已保存');
     } catch (e) {
       setDirMsg(e.message || '保存失败');
     } finally {
@@ -1722,8 +1862,28 @@ export default function App() {
                   onChange={(e) => setDirInput(e.target.value)}
                   placeholder="例如：C:\Users\me\Pictures\错题" />
               </div>
+            </div>
+
+            <div className="config-box" style={{ marginTop: 20 }}>
+              <h2 className="config-title">重点练督促</h2>
+              <p className="config-hint">
+                设置重点练题目超时阈值。超过该时长未练习的题目将触发督促提醒，并用红色边框高亮。
+              </p>
+              <div className="field">
+                <label className="field-label">超时阈值（小时）</label>
+                <input type="number" value={focusTimeoutInput}
+                  min={1} max={720}
+                  onChange={(e) => setFocusTimeoutInput(e.target.value)}
+                  placeholder="默认 48（即 2 天）" />
+                <span style={{ fontSize: 12, color: 'var(--ink-soft)', marginTop: 4, display: 'block' }}>
+                  当前值：{focusTimeoutHours} 小时 = {Math.round(focusTimeoutHours / 24 * 10) / 10} 天
+                </span>
+              </div>
+            </div>
+
+            <div className="config-box" style={{ marginTop: 8 }}>
               <button className="save-btn" style={{ marginTop: 0 }} onClick={saveImageDir} disabled={dirSaving}>
-                {dirSaving ? '保存中…' : '保存目录'}
+                {dirSaving ? '保存中…' : '保存配置'}
               </button>
               {dirMsg && <div className={'save-msg' + (dirMsg.includes('失败') ? ' error' : '')}>{dirMsg}</div>}
             </div>
@@ -2036,6 +2196,9 @@ export default function App() {
                     <p className="focus-page-desc">
                       从错题库中标记需要重点练习的题目，集中攻克薄弱环节。
                       <br />最多同时标记 <strong>5</strong> 道题为重点练。
+                      {focusTimeoutCfg > 0 && (
+                        <span> 超 {focusTimeoutCfg} 小时（{Math.round(focusTimeoutCfg / 24 * 10) / 10} 天）未练即触发督促。</span>
+                      )}
                     </p>
                   </div>
                   <div className="focus-count-badge">
@@ -2044,6 +2207,30 @@ export default function App() {
                     <span className="focus-count-max">5</span>
                   </div>
                 </div>
+
+                {/* 督促提醒横幅 */}
+                {focusOverdueCount > 0 && (
+                  <div className="focus-reminder-banner">
+                    <div className="focus-reminder-title">
+                      ⏰ 你有 <strong>{focusOverdueCount}</strong> 道重点练题目待练习
+                    </div>
+                    <div className="focus-reminder-list">
+                      {focusItems.filter(p => p.is_focus_overdue).map(p => (
+                        <div key={p.file_path} className="focus-reminder-item">
+                          <span className="focus-reminder-name">{p.title || '未命名'}</span>
+                          <span className="focus-reminder-days">· {p.inactive_days_text || '0 天'}未练习</span>
+                          {focusRemindersLoading ? (
+                            <span className="focus-reminder-msg loading">生成鼓励语…</span>
+                          ) : focusReminders[p.file_path] ? (
+                            <span className="focus-reminder-msg">· {focusReminders[p.file_path]}</span>
+                          ) : (
+                            <span className="focus-reminder-msg">· 快去练一遍吧</span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
                 {!focusLoaded ? (
                   <div className="empty"><Loader2 size={28} className="spin" /><p>加载中…</p></div>
@@ -2058,7 +2245,8 @@ export default function App() {
                     {focusItems.map((p) => (
                       <ProblemCard key={p.file_path} problem={p}
                         imageUrl={API.imageUrl(p.file_path)}
-                        onClick={() => openDetail(p)} />
+                        onClick={() => openDetail(p)}
+                        showOverdue={true} />
                     ))}
                   </div>
                 )}
