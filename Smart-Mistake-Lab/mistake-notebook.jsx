@@ -628,6 +628,29 @@ const CSS = `
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;
   font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 12.5px;
 }
+
+/* View type select */
+.mnb .view-type-select {
+  border: 1.5px solid var(--grid); border-radius: 6px;
+  padding: 5px 8px; font-size: 12.5px; color: var(--ink);
+  background: var(--paper); font-family: inherit; outline: none;
+}
+.mnb .view-type-select:focus { border-color: var(--accent-2); }
+
+/* Date section grouping */
+.mnb .date-section { margin-bottom: 24px; }
+.mnb .date-section-header {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 6px 0 10px; margin-bottom: 6px;
+  border-bottom: 1.5px dashed var(--grid);
+}
+.mnb .date-section-label {
+  font-family: "Songti SC", "STSong", serif;
+  font-size: 15px; font-weight: 700; color: var(--ink);
+}
+.mnb .date-section-count {
+  font-size: 12px; color: var(--pencil); font-weight: 400;
+}
 .mnb .sidebar-tag-count {
   font-size: 11px; color: var(--pencil); font-weight: 400; margin-left: 6px; flex-shrink: 0;
 }
@@ -702,6 +725,49 @@ function TagPill({ tag, onDelete, onEdit }) {
 }
 
 // 五星难度评分组件
+// ============== DATE VIEW HELPERS ==============
+
+function getDateKey(dateStr, viewType) {
+  if (!dateStr) return null;
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return null;
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+
+  if (viewType === 'day') {
+    return { key: `${y}-${m}-${dd}`, label: `${y}-${m}-${dd}` };
+  }
+  if (viewType === 'month') {
+    return { key: `${y}-${m}`, label: `${y}-${m}` };
+  }
+  if (viewType === 'week') {
+    const day = d.getDay(); // 0=Sun, 1=Mon
+    const diff = day === 0 ? 6 : day - 1; // days back to Monday
+    const monday = new Date(d);
+    monday.setDate(d.getDate() - diff);
+    const sunday = new Date(monday);
+    sunday.setDate(monday.getDate() + 6);
+
+    const wy = monday.getFullYear();
+    const wm = String(monday.getMonth() + 1).padStart(2, '0');
+    const wmd = String(monday.getDate()).padStart(2, '0');
+    const wsd = String(sunday.getDate()).padStart(2, '0');
+
+    let label;
+    if (monday.getMonth() === sunday.getMonth()) {
+      label = `${wy}-${wm}-${wmd}-${wsd}`;
+    } else {
+      const wsm = String(sunday.getMonth() + 1).padStart(2, '0');
+      label = `${wy}-${wm}-${wmd} 至 ${wsm}-${wsd}`;
+    }
+    return { key: `${wy}-${wm}-${wmd}`, label };
+  }
+  return null;
+}
+
+// ============== STAR RATING ==============
+
 function StarRating({ value, onChange, readonly = false, size = 18 }) {
   const [hover, setHover] = useState(0);
   const stars = [];
@@ -792,6 +858,7 @@ export default function App() {
   const [dateFilterEnabled, setDateFilterEnabled] = useState(false);
   const [startDate, setStartDate] = useState('');
   const [endDate, setEndDate] = useState('');
+  const [dateViewType, setDateViewType] = useState('week');
   const [activeSubject, setActiveSubject] = useState('数学');
   const [subjects, setSubjects] = useState([]);
   const pendingSubjectRef = useRef(null);
@@ -1060,17 +1127,42 @@ export default function App() {
     });
   }, [allIndexed, selectedTags]);
 
+  // --- Date view grouping ---
+  const groupedFiltered = useMemo(() => {
+    const groups = new Map();
+    for (const p of filtered) {
+      const result = getDateKey(p.created_at, dateViewType);
+      const groupKey = result ? result.key : '__unknown__';
+      const groupLabel = result ? result.label : '未知日期';
+      if (!groups.has(groupKey)) {
+        groups.set(groupKey, { key: groupKey, label: groupLabel, items: [] });
+      }
+      groups.get(groupKey).items.push(p);
+    }
+    const sorted = Array.from(groups.values());
+    sorted.sort((a, b) => {
+      if (a.key === '__unknown__') return 1;
+      if (b.key === '__unknown__') return -1;
+      return b.key.localeCompare(a.key);
+    });
+    return sorted;
+  }, [filtered, dateViewType]);
+
+  const flattenedGrouped = useMemo(() => {
+    return groupedFiltered.flatMap(g => g.items);
+  }, [groupedFiltered]);
+
   // --- Detail pagination derived state ---
   const detailIndex = useMemo(() => {
     if (!detail) return -1;
-    return filtered.findIndex((p) => p.file_path === detail.file_path);
-  }, [detail, filtered]);
+    return flattenedGrouped.findIndex((p) => p.file_path === detail.file_path);
+  }, [detail, flattenedGrouped]);
 
   const hasPrev = detailIndex > 0;
-  const hasNext = detailIndex >= 0 && detailIndex < filtered.length - 1;
-  const prevProblem = hasPrev ? filtered[detailIndex - 1] : null;
-  const nextProblem = hasNext ? filtered[detailIndex + 1] : null;
-  const detailPositionText = detailIndex >= 0 ? `第 ${detailIndex + 1} / ${filtered.length} 题` : '';
+  const hasNext = detailIndex >= 0 && detailIndex < flattenedGrouped.length - 1;
+  const prevProblem = hasPrev ? flattenedGrouped[detailIndex - 1] : null;
+  const nextProblem = hasNext ? flattenedGrouped[detailIndex + 1] : null;
+  const detailPositionText = detailIndex >= 0 ? `第 ${detailIndex + 1} / ${flattenedGrouped.length} 题` : '';
 
   // Auto-close detail if current problem no longer in filtered
   useEffect(() => {
@@ -1113,6 +1205,7 @@ export default function App() {
     setStartDate('');
     setEndDate('');
     setMasteryFilter('');
+    // dateViewType 是展示偏好，不清除
   }
 
   // --- Detail modal ---
@@ -1705,6 +1798,12 @@ export default function App() {
                           <option value="unfamiliar">不熟悉</option>
                           <option value="practice">需练习</option>
                         </select>
+                        <select className="view-type-select" value={dateViewType}
+                          onChange={(e) => setDateViewType(e.target.value)} title="日期视图类型">
+                          <option value="week">📅 按周</option>
+                          <option value="day">📅 按日</option>
+                          <option value="month">📅 按月</option>
+                        </select>
                         {(query || selectedTags.length > 0 || dateFilterEnabled || masteryFilter) && (
                           <button className="clear-filter-btn" onClick={clearAllFilters}>清空筛选</button>
                         )}
@@ -1713,19 +1812,27 @@ export default function App() {
                         )}
                       </div>
 
-                      {/* 题目网格 */}
+                      {/* 按日期视图分组的题目 */}
                       {allIndexed.length === 0 ? (
                         <div className="empty"><BookOpen size={36} /><p>该学科暂无已索引的错题</p></div>
                       ) : filtered.length === 0 ? (
                         <div className="empty"><Search size={32} /><p>没有匹配的题目，试试调整筛选条件</p></div>
                       ) : (
-                        <div className="grid">
-                          {filtered.map((p) => (
-                            <ProblemCard key={p.file_path} problem={p}
-                              imageUrl={API.imageUrl(p.file_path)}
-                              onClick={() => openDetail(p)} />
-                          ))}
-                        </div>
+                        groupedFiltered.map((group) => (
+                          <div key={group.key} className="date-section">
+                            <div className="date-section-header">
+                              <span className="date-section-label">{group.label}</span>
+                              <span className="date-section-count">{group.items.length} 题</span>
+                            </div>
+                            <div className="grid">
+                              {group.items.map((p) => (
+                                <ProblemCard key={p.file_path} problem={p}
+                                  imageUrl={API.imageUrl(p.file_path)}
+                                  onClick={() => openDetail(p)} />
+                              ))}
+                            </div>
+                          </div>
+                        ))
                       )}
                     </div>
                   </div>
