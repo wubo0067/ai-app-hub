@@ -571,10 +571,17 @@ def upload_solution_image(data: dict):
         match = pattern.match(name)
         if match:
             existing_indexes.append(int(match.group(1)))
-    new_index = (max(existing_indexes) + 1) if existing_indexes else 1
+    # 使用时间戳索引，避免删除后复用旧文件名导致浏览器缓存命中旧图片
+    time_based_index = int(datetime.now().strftime('%Y%m%d%H%M%S%f'))
+    seq_index = (max(existing_indexes) + 1) if existing_indexes else 1
+    new_index = max(time_based_index, seq_index)
 
     filename = _generate_solution_filename(file_path, new_index, ext)
     save_path = os.path.join(directory, filename)
+    while os.path.exists(save_path):
+        new_index += 1
+        filename = _generate_solution_filename(file_path, new_index, ext)
+        save_path = os.path.join(directory, filename)
     base64_str = re.sub(r'^data:image/\w+;base64,', '', image_data.strip())
 
     try:
@@ -591,7 +598,9 @@ def upload_solution_image(data: dict):
 @app.delete("/api/solution-image")
 def delete_solution_image(path: str = Query(..., description="解答图片的绝对路径")):
     if not os.path.isfile(path):
-        raise HTTPException(status_code=404, detail="文件不存在")
+        # 幂等删除：文件已不存在时也返回成功，方便前端清理数据库中的历史引用
+        logger.info(f"[solution-image] 文件不存在，按已删除处理: {path}")
+        return {"status": "ok", "missing": True}
     os.remove(path)
     return {"status": "ok"}
 

@@ -1,4 +1,4 @@
-""",
+"""
 Smart Mistake Lab - LLM 交互模块
 负责 Prompt 管理、AI API 调用、响应解析。
 """
@@ -49,9 +49,10 @@ MATH_KNOWLEDGE_POINTS = [
     "胡不归",
     "圆的内接四边形，对角互补",
     "定边对定角判定四点共圆，",
-    "两定一动求最值，定线段，构造平行四边形",
-    "两定一动，将军饮马",
-    "最值，逆等线段",
+    "求最值，两定一动，定线段，构造平行四边形",
+    "求最值，两定一动，将军饮马",
+    "求最值，逆等线段",
+    "求最值，代数题，数形结合"
     "垂美四边形",
     "托勒密定理",
     "韦达定理",
@@ -78,7 +79,13 @@ MATH_KNOWLEDGE_POINTS = [
     "坐标法/参数法表示线段，转化为函数最值问题",
     "翻折图形，同步信息，连接对称点",
     "遇到梯形想平移",
-    "遇到中线想倍长"
+    "遇到中线想倍长",
+    "柯西不等式",
+    "配凑思想",
+    "数形结合思想",
+    "复合二次根式，把复合根号前面的系数变为 2，完全平方公式",
+    "二倍角",
+    "存在 90 度角就导角",
 ]
 
 PHYSICS_KNOWLEDGE_POINTS = [
@@ -90,7 +97,8 @@ PHYSICS_KNOWLEDGE_POINTS = [
     "光的折射", "凸透镜成像", "温度与物态变化", "比热容",
     "热值", "内能与热机", "电流与电路", "欧姆定律",
     "电阻的串并联", "电功与电功率", "焦耳定律", "家庭电路",
-    "磁场与电流的磁场", "电磁感应", "速度与平均速度", "声音的产生与传播"
+    "磁场与电流的磁场", "电磁感应", "速度与平均速度", "声音的产生与传播",
+    "浮力，融化，密度大于就升，密度小于就降，密度相等就不变",
 ]
 
 CHEMISTRY_KNOWLEDGE_POINTS = [
@@ -486,6 +494,7 @@ ENCOURAGEMENT_PROMPT = """你是一名学习督促助手。
 - 鼓励但不说教，不要用"加油""你可以的"这类空话
 - 结合题目信息和超时情况，让建议具体
 - 不要输出序号或多余解释
+- 必须为每条题目返回对应的 file_path，且不要遗漏任何一条
 - 只输出 JSON 数组，格式：[{"file_path": "...", "message": "..."}]
 """
 
@@ -497,24 +506,75 @@ def parse_encouragement_result(raw_text: str) -> list[dict]:
     cleaned = re.sub(r'^```\s*', '', cleaned)
     cleaned = re.sub(r'```\s*$', '', cleaned)
     cleaned = cleaned.strip()
+
+    if not cleaned:
+        return []
+
+    def normalize_entries(value):
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            if isinstance(value.get("file_path"), str) and isinstance(value.get("message"), str):
+                return [value]
+            for key in ("reminders", "items", "results", "data"):
+                nested = value.get(key)
+                if isinstance(nested, list):
+                    return nested
+            if value and all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()):
+                return [{"file_path": key, "message": val} for key, val in value.items()]
+        return []
+
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError:
         decoder = json.JSONDecoder()
-        start = cleaned.find('[')
+        start_positions = [idx for idx in (cleaned.find('['), cleaned.find('{')) if idx != -1]
+        parsed = None
+        for start in sorted(start_positions):
+            try:
+                parsed, _ = decoder.raw_decode(cleaned[start:])
+                break
+            except json.JSONDecodeError:
+                continue
+        if parsed is None:
+            logger.warning(f"[Encourage] 响应不是 JSON，已忽略：{cleaned[:80]}")
+            return []
+    entries = normalize_entries(parsed)
+    if not entries:
+        logger.warning(f"[Encourage] 期望 JSON 数组或兼容对象，实际得到 {type(parsed).__name__}，已忽略")
+        return []
+    return entries
+
+
+def load_json_relaxed(raw_text: str) -> dict:
+    """宽松解析 AI 返回的 JSON，兼容前后夹杂少量说明文本的情况。"""
+    cleaned = raw_text.strip()
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    for start in (cleaned.find('{'), cleaned.find('[')):
         if start == -1:
-            raise
-        parsed, _ = decoder.raw_decode(cleaned[start:])
-    if not isinstance(parsed, list):
-        raise ValueError(f"期望 JSON 数组，得到 {type(parsed).__name__}")
-    return parsed
+            continue
+        try:
+            parsed, _ = decoder.raw_decode(cleaned[start:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+
+    raise json.JSONDecodeError('Expecting JSON object', cleaned, 0)
 
 
 async def generate_encouragements(items: list[dict]) -> dict:
     """
     批量生成超时题目的鼓励语。
     items: [{title, subject, tags, inactive_hours, is_focus_overdue, file_path}, ...]
-    返回: {file_path: message, ...}
+    返回：{file_path: message, ...}
     """
     from_env = AiConfig.from_env()
     cfg = {
@@ -539,11 +599,12 @@ async def generate_encouragements(items: list[dict]) -> dict:
     for it in items:
         title = it.get("title", "未命名") or "未命名"
         subject = it.get("subject", "") or ""
+        file_path = it.get("file_path", "") or ""
         tags_str = ", ".join((it.get("tags", []) or [])[:3])
         days = round((it.get("inactive_hours", 0) or 0) / 24, 1)
-        lines.append(f"- 题目：{title}（{subject}）标签：{tags_str}，已 {days} 天未练习")
+        lines.append(f"- file_path: {file_path}\n  题目：{title}（{subject}）\n  标签：{tags_str}\n  已 {days} 天未练习")
     items_text = "\n".join(lines)
-    prompt = ENCOURAGEMENT_PROMPT + "\n\n" + items_text + "\n\n请输出 JSON 数组："
+    prompt = ENCOURAGEMENT_PROMPT + "\n\n" + items_text + "\n\n请严格输出 JSON 数组，不要输出任何解释："
 
     logger.info(f"[Encourage] 调用 AI 生成鼓励语，items={len(items)}")
 
@@ -554,19 +615,26 @@ async def generate_encouragements(items: list[dict]) -> dict:
     body = {
         'model': ai_config.model,
         'max_tokens': ai_config.max_tokens,
+        'stream': False,
         'messages': [
             {'role': 'user', 'content': prompt}
         ],
     }
 
+    if is_ollama_chat_endpoint(api_url):
+        body['think'] = False
+        body['format'] = 'json'
+        body['options'] = {'num_predict': ai_config.max_tokens}
+
     async with httpx.AsyncClient(timeout=httpx.Timeout(ai_config.timeout), trust_env=False) as client:
         resp = await client.post(api_url, headers=headers, json=body)
 
     if not resp.is_success:
-        logger.error(f"[Encourage] AI 调用失败: HTTP {resp.status_code}")
+        logger.error(f"[Encourage] AI 调用失败：HTTP {resp.status_code}")
         return {}
 
-    response_text = extract_text_from_response(resp.json(), api_url)
+    response_data = load_json_relaxed(resp.text)
+    response_text = extract_text_from_response(response_data, api_url)
     if not response_text:
         logger.warning("[Encourage] AI 返回空文本")
         return {}
@@ -582,5 +650,5 @@ async def generate_encouragements(items: list[dict]) -> dict:
         logger.info(f"[Encourage] 成功生成 {len(result)} 条鼓励语")
         return result
     except Exception as e:
-        logger.error(f"[Encourage] 解析失败: {e}, raw={response_text[:200]}")
+        logger.error(f"[Encourage] 解析失败：{e}, raw={response_text[:200]}")
         return {}

@@ -1524,7 +1524,6 @@ export default function App() {
 
   function switchToFocus() {
     setTab('focus');
-    if (!focusLoaded) loadFocusItems();
   }
 
   // --- Detail modal ---
@@ -1581,9 +1580,13 @@ export default function App() {
   function closeDetailModal() {
     if (detailSaving) return;
     if (detailDirty) {
-      setDetailError('当前有未保存修改，请先点击“保存修改”');
-      return;
+      const shouldDiscard = window.confirm('当前有未保存修改，确认关闭并放弃这些修改吗？');
+      if (!shouldDiscard) {
+        setDetailError('你取消了关闭，当前修改仍未保存');
+        return;
+      }
     }
+    setDetailError(null);
     setDetail(null);
     setPreviewSolutionImage(null);
   }
@@ -1659,6 +1662,7 @@ export default function App() {
       };
       setDetail(updated);
       setAllIndexed((prev) => prev.map((p) => (p.file_path === detail.file_path ? updated : p)));
+      setFocusItems((prev) => prev.map((p) => (p.file_path === detail.file_path ? { ...p, ...updated } : p)));
       setDetailDirty(false);
     } catch (e) {
       console.error('update failed', e);
@@ -1741,7 +1745,7 @@ export default function App() {
     try {
       const filePath = getSolutionFullPath(filename);
       const resp = await fetch(`/api/solution-image?path=${encodeURIComponent(filePath)}`, { method: 'DELETE' });
-      if (!resp.ok) {
+      if (!resp.ok && resp.status !== 404) {
         const err = await resp.json().catch(() => ({}));
         throw new Error(err.detail || `HTTP ${resp.status}`);
       }
