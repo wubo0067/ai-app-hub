@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/u,r/bin/env python3,,,
 # -*- coding: utf-8 -*-
 """
 网站文件下载爬虫
@@ -47,7 +47,7 @@ class WebFileDownloader:
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"配置文件不存在：{config_path}")
 
-        self.config = configparser.ConfigParser()
+        self.config = configparser.ConfigParser(interpolation=None)
         self.config.read(config_path, encoding="utf-8")
 
         # --- site ---
@@ -84,6 +84,10 @@ class WebFileDownloader:
             "crawler", "user_agent",
             fallback="Mozilla/5.0 (Windows NT 10.0; Win64; x64) WebFileDownloader/1.0",
         )
+        # proxy config (用于 playwright 下载浏览器时的代理)
+        self.proxy_enabled = self.config.getboolean("crawler", "proxy_enabled", fallback=False)
+        self.proxy_http = self.config.get("crawler", "proxy_http", fallback="").strip()
+        self.proxy_https = self.config.get("crawler", "proxy_https", fallback="").strip()
 
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": self.user_agent})
@@ -121,9 +125,9 @@ class WebFileDownloader:
         自动识别表单中的用户名 / 密码字段。
 
         修复点：
-        - 【问题3】多个 type="password" 时不再简单"后者覆盖前者"，
+        - 【问题 3】多个 type="password" 时不再简单"后者覆盖前者"，
           优先选择字段名不含"确认/再次/confirm/repeat"等含义的那一个。
-        - 【问题2】用户名候选字段加入黑名单过滤（验证码/短信验证码等），
+        - 【问题 2】用户名候选字段加入黑名单过滤（验证码/短信验证码等），
           避免 fallback 误抓到无关文本框；并引入"打分 + 与密码框的
           DOM 距离"作为兜底排序依据，而不是简单取第一个非隐藏字段。
         """
@@ -206,77 +210,408 @@ class WebFileDownloader:
 
     # ------------------------------------------------------------------
     def login(self):
-        """尝试登录网站，保持会话 Cookie"""
+        """使用 Playwright 浏览器自动化登录，支持 JS 动态渲染的 SPA 登录页面。
+
+        登录流程：
+        1. 启动 Chromium 浏览器，打开登录页面
+        2. 自动填写用户名、密码，点击登录按钮
+        3. 等待登录完成（URL 跳转离开登录页域）
+        4. 将浏览器中的 Cookie 导入到 requests.Session
+        5. 关闭浏览器
+
+        若自动填写失败，会在终端提示用户手动在浏览器中完成登录后按 Enter 继续。
+        """
         if not self.enable_login:
             log.info("未启用登录，跳过登录步骤。")
             return
 
-        log.info(f"正在访问登录页面：{self.login_url}")
+        # --- 检查 Playwright 是否可用，并自动安装 Chromium 浏览器 ---
         try:
-            resp = self.session.get(self.login_url, timeout=self.timeout)
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            log.error(f"访问登录页面失败：{e}")
-            sys.exit(1)
+            from playwright.sync_api import sync_playwright
+            from playwright.sync_api import TimeoutError as PwTimeout  # noqa: F811
+        except ImportError:
+            self._try_install_playwright_package()
+            try:
+                from playwright.sync_api import sync_playwright
+                from playwright.sync_api import TimeoutError as PwTimeout  # noqa: F811
+            except ImportError:
+                log.error("playwright 安装失败，请手动执行：pip install playwright")
+                input("\n按 Enter 退出...")
+                sys.exit(1)
 
-        # 自动尝试从登录页面表单中提取隐藏字段（如 csrf_token）
-        form_data = dict(self.extra_fields)
-        soup = BeautifulSoup(resp.text, "lxml")
-        # 优先选择包含 password 输入框的登录表单
-        forms=soup.find_all("form")
-        form=None
-        for f in forms:
-            if f.find("input",{"type":"password"}):
-                form=f
-                break
-        if form is None and forms:
-            form=forms[0]
-        if form is None:
-            debug_path = self._save_debug_html(resp.text, "login_page_debug.html")
-            raise RuntimeError(
-                "登录页面中未找到任何 <form> 标签，无法自动识别登录字段。"
-                f"已将抓取到的原始 HTML 保存到 {debug_path}，请打开确认："
-                "1) 是否包含 <form>/<input> 标签（若没有，大概率是页面由 JavaScript 动态渲染，"
-                "本工具基于 requests+BeautifulSoup 无法处理，需要改用 Selenium/Playwright 等"
-                "浏览器自动化方案，或直接抓包分析真实登录接口后在 config.ini 的 extra_fields "
-                "中手动指定登录参数）；2) 登录表单是否位于 iframe 中。"
-            )
-        self.username_field,self.password_field=self._detect_login_fields(form)
-        action=self._attr_str(form.get("action"))
-        if action:
-            self.login_post_url=urljoin(self.login_url,action)
-        for inp in form.find_all("input"):
-            name=inp.get("name")
-            if not name or name in (self.username_field,self.password_field): continue
-            if name in form_data: continue
-            form_data[name]=inp.get("value","")
-        if not self.username_field or not self.password_field:
-            debug_path = self._save_debug_html(resp.text, "login_page_debug.html")
-            raise RuntimeError(
-                f"无法自动识别登录表单中的用户名或密码字段"
-                f"（用户名字段：{self.username_field!r}，密码字段：{self.password_field!r}）。"
-                f"已将原始 HTML 保存到 {debug_path} 供人工核对，也可在 config.ini 的 "
-                f"[login] extra_fields 中手动补充/覆盖字段名。"
-            )
-        log.info(f"已识别登录字段 -> 用户名字段: '{self.username_field}'，"
-                 f"密码字段: '{self.password_field}'，提交地址: {self.login_post_url}")
-        form_data[self.username_field]=self.username
-        form_data[self.password_field]=self.password
+        self._ensure_playwright_browser()
 
-        log.info(f"正在提交登录表单到：{self.login_post_url}")
+        headless = self.config.getboolean("login", "browser_headless", fallback=False)
+        browser_timeout_ms = self.config.getint("login", "browser_timeout", fallback=120) * 1000
+
+        log.info(f"启动 Chromium 浏览器（headless={headless}）...")
+
+        _PwTimeout = PwTimeout  # 本地引用，避免嵌套作用域问题
+        # 修正 PyInstaller 打包后的路径问题：强制 Playwright 从标准缓存目录查找浏览器
+        pw_browsers_path = str(Path.home() / "AppData" / "Local" / "ms-playwright")
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = pw_browsers_path
+        log.info(f"已设置 PLAYWRIGHT_BROWSERS_PATH={pw_browsers_path}")
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=headless)
+            context = browser.new_context(
+                user_agent=self.user_agent,
+                viewport={"width": 1280, "height": 800},
+            )
+            page = context.new_page()
+
+            # --- 步骤 1：打开登录页面 ---
+            log.info(f"正在打开登录页面：{self.login_url}")
+            page.goto(self.login_url, wait_until="domcontentloaded", timeout=browser_timeout_ms)
+            # 再等一次 networkidle，确保 JS 渲染完成
+            try:
+                page.wait_for_load_state("networkidle", timeout=30000)
+            except _PwTimeout:
+                log.warning("登录页 networkidle 超时，继续尝试...")
+
+            # --- 步骤 2：自动填写表单 ---
+            auto_ok = self._browser_fill_login(page, browser_timeout_ms)
+
+            if not auto_ok:
+                log.info("=" * 60)
+                log.info("⚠ 未能完全自动填写/提交登录表单。")
+                log.info("  请在浏览器窗口中手动完成登录操作。")
+                log.info("  登录完成后，回到此终端按 Enter 继续...")
+                log.info("=" * 60)
+                input()
+
+            # --- 步骤 3：等待登录完成 ---
+            self._browser_wait_login(page, browser_timeout_ms)
+
+            # --- 步骤 4：转移 Cookie ---
+            cookies = context.cookies()
+            for c in cookies:
+                self.session.cookies.set(
+                    c.get("name", ""), c.get("value", ""),
+                    domain=c.get("domain", ""),
+                    path=c.get("path", "/"),
+                )
+            log.info(f"已从浏览器导入 {len(cookies)} 个 Cookie 到下载会话")
+
+            # --- 可选：校验页面验证登录状态 ---
+            if self.verify_url:
+                log.info(f"正在访问校验页面确认登录状态：{self.verify_url}")
+                try:
+                    page.goto(self.verify_url, wait_until="networkidle", timeout=30000)
+                    # 刷新 Cookie（校验页可能设置新的）
+                    for c in context.cookies():
+                        self.session.cookies.set(
+                            c.get("name", ""), c.get("value", ""),
+                            domain=c.get("domain", ""),
+                            path=c.get("path", "/"),
+                        )
+                    # 检查校验文本
+                    body = page.content()
+                    if self.verify_fail_text and self.verify_fail_text in body:
+                        log.warning(f"校验页面出现 fail 标记，登录可能未成功！")
+                    elif self.verify_success_text:
+                        if self.verify_success_text in body:
+                            log.info("校验页面确认登录成功。")
+                        else:
+                            log.warning("校验页面未出现 success 标记，登录可能未成功。")
+                except Exception as e:
+                    log.warning(f"校验页面访问失败：{e}")
+
+            browser.close()
+
+        log.info("浏览器登录完成，Cookie 已就绪。")
+
+    # ------------------------------------------------------------------
+    def _browser_fill_login(self, page, timeout_ms: int) -> bool:
+        """在浏览器页面中自动填写用户名、密码并点击登录按钮。
+
+        Returns:
+            True 表示全部自动完成（填用户、填密码、点登录），False 表示部分或全部失败。
+        """
+        from playwright.sync_api import TimeoutError as PwTimeout  # noqa: F811
+
+        # 等待密码框出现（说明 JS 已渲染出登录表单）
         try:
-            login_resp = self.session.post(
-                self.login_post_url, data=form_data, timeout=self.timeout, allow_redirects=True
-            )
-            login_resp.raise_for_status()
-        except requests.RequestException as e:
-            log.error(f"登录请求失败：{e}")
-            sys.exit(1)
+            page.wait_for_selector('input[type="password"]', timeout=15000)
+        except PwTimeout:
+            log.warning("等待密码输入框超时，登录表单可能未渲染。")
+            return False
 
-        log.info(f"登录请求已完成（状态码 {login_resp.status_code}，最终地址 {login_resp.url}）。")
-        self._verify_login(login_resp)
+        # --- 填写用户名 ---
+        filled_user = False
+        user_selectors = [
+            'input[type="text"]',
+            'input[type="email"]',
+            'input[type="tel"]',
+            'input:not([type])',
+            'input[name*="user" i]',
+            'input[name*="account" i]',
+            'input[name*="login" i]',
+            'input[name*="phone" i]',
+            'input[id*="user" i]',
+            'input[id*="account" i]',
+        ]
+        for sel in user_selectors:
+            try:
+                el = page.query_selector(sel)
+                if el and el.is_enabled() and el.is_visible():
+                    el.click()
+                    el.fill("")
+                    el.fill(self.username)
+                    log.info(f"已填入用户名 → {sel}")
+                    filled_user = True
+                    break
+            except Exception:
+                continue
+
+        if not filled_user:
+            log.warning("未找到可用的用户名输入框。")
+
+        # --- 填写密码 ---
+        filled_pwd = False
+        pwd_selectors = [
+            'input[type="password"]',
+            'input[name*="password" i]',
+            'input[name*="pass" i]',
+            'input[id*="password" i]',
+        ]
+        for sel in pwd_selectors:
+            try:
+                el = page.query_selector(sel)
+                if el and el.is_enabled() and el.is_visible():
+                    el.click()
+                    el.fill("")
+                    el.fill(self.password)
+                    log.info(f"已填入密码 → {sel}")
+                    filled_pwd = True
+                    break
+            except Exception:
+                continue
+
+        if not filled_pwd:
+            log.warning("未找到可用的密码输入框。")
+
+        # --- 点击登录按钮 ---
+        clicked = False
+        btn_selectors = [
+            'button[type="submit"]',
+            'input[type="submit"]',
+            'button:has-text("登录")',
+            'button:has-text("登 录")',
+            'a:has-text("登录")',
+            'button:has-text("Login")',
+            'button:has-text("Sign in")',
+            'button:has-text("Log in")',
+            'span:has-text("登录")',
+            'div[role="button"]:has-text("登录")',
+        ]
+        for sel in btn_selectors:
+            try:
+                btn = page.query_selector(sel)
+                if btn and btn.is_enabled() and btn.is_visible():
+                    btn.click()
+                    log.info(f"已点击登录按钮 → {sel}")
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+        if not clicked:
+            log.warning("未找到可点击的登录按钮。")
+
+        # 短暂等待让点击生效
+        page.wait_for_timeout(2000)
+        return filled_user and filled_pwd and clicked
+
+    # ------------------------------------------------------------------
+    def _browser_wait_login(self, page, timeout_ms: int):
+        """等待登录跳转完成（当前 URL 不再包含登录页特征）。"""
+        from playwright.sync_api import TimeoutError as PwTimeout  # noqa: F811
+
+        login_netloc = urlparse(self.login_url).netloc
+        log.info("等待登录跳转...")
+
+        try:
+            # 等待 URL 的域名离开登录页域名
+            page.wait_for_function(
+                """(loginHost) => window.location.hostname !== loginHost""",
+                arg=login_netloc,
+                timeout=timeout_ms,
+            )
+            log.info(f"登录跳转完成，当前页面：{page.url}")
+        except PwTimeout:
+            log.warning(f"等待登录跳转超时（{timeout_ms / 1000:.0f}s），将尝试继续。"
+                        f"当前 URL：{page.url}")
+
+        # 等待页面稳定
+        try:
+            page.wait_for_load_state("networkidle", timeout=30000)
+        except PwTimeout:
+            pass
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _find_system_python() -> str | None:
+        """探测系统上可用的 Python 解释器（不依赖 PATH）。
+
+        按优先级尝试：python3 → python → 常见的安装路径。
+        返回可用的解释器路径，或 None。
+        """
+        candidates = ["python", "python3", "py", "py -3"]
+        # 常见 Windows 安装路径
+        from pathlib import Path
+        for ver in ["312", "311", "310", "39", "313"]:
+            for root in [Path.home() / "AppData" / "Local" / "Programs" / "Python",
+                         Path("C:/Program Files")]:
+                p = root / f"Python{ver}" / "python.exe"
+                if p.exists():
+                    candidates.insert(0, str(p))
+        import subprocess as _sp
+        for cmd in candidates:
+            try:
+                result = _sp.run(
+                    [cmd, "--version"], capture_output=True, text=True, timeout=10,
+                    creationflags=0x08000000 if sys.platform == "win32" else 0,  # CREATE_NO_WINDOW
+                )
+                if result.returncode == 0 and "Python" in (result.stdout or result.stderr):
+                    return cmd
+            except Exception:
+                continue
+        return None
+
+    def _try_install_playwright_package(self):
+        """尝试自动安装 playwright Python 包（若配置了代理则使用代理）。"""
+        log.info("playwright 未安装，尝试自动安装...")
+        py = WebFileDownloader._find_system_python()
+        if not py:
+            log.error("未找到系统 Python，无法自动安装。请手动执行：pip install playwright")
+            return
+        # 构造带代理的 pip 命令（若启用代理）
+        pip_args = [py, "-m", "pip", "install", "playwright"]
+        if self.proxy_enabled and self.proxy_http:
+            pip_args.extend(["--proxy", self.proxy_http])
+            log.info(f"pip 将使用代理：{self.proxy_http}")
+        import subprocess as _sp
+        try:
+            result = _sp.run(
+                pip_args,
+                capture_output=True, text=True, timeout=300,
+                creationflags=0x08000000 if sys.platform == "win32" else 0,
+            )
+            if result.returncode == 0:
+                log.info("playwright 安装成功。")
+            else:
+                log.error(f"pip install 失败：{result.stderr.strip()[-500:]}")
+        except Exception as e:
+            log.error(f"自动安装 playwright 失败：{e}")
+
+    def _ensure_playwright_browser(self):
+        """确保 Playwright Chromium 浏览器已安装；若未安装则自动下载（约 300MB）。
+
+        若配置了代理（proxy_enabled=true），会在进程环境中设置 HTTP_PROXY / HTTPS_PROXY，
+        使得 playwright 能通过代理下载 Chromium 浏览器。
+
+        支持两种运行模式：
+        - 脚本模式：通过 subprocess 调用系统 Python 的 playwright CLI
+        - EXE 模式（PyInstaller）：通过 playwright 进程内 API 直接下载
+        """
+        from pathlib import Path
+        pw_dir = Path.home() / "AppData" / "Local" / "ms-playwright"
+        if pw_dir.exists() and any(pw_dir.glob("chromium-*")):
+            return  # 已安装
+
+        # 设置代理环境变量（对当前进程及其子进程均生效）
+        if self.proxy_enabled:
+            if self.proxy_http and "HTTP_PROXY" not in os.environ:
+                os.environ["HTTP_PROXY"] = self.proxy_http
+                log.info(f"已设置 HTTP_PROXY={self.proxy_http}")
+            if self.proxy_https and "HTTPS_PROXY" not in os.environ:
+                os.environ["HTTPS_PROXY"] = self.proxy_https
+                log.info(f"已设置 HTTPS_PROXY={self.proxy_https}")
+            # 企业代理通常做 SSL 中间人解密（自签名证书），
+            # 需要让 Node.js（playwright 下载器底层）跳过证书验证
+            if "NODE_TLS_REJECT_UNAUTHORIZED" not in os.environ:
+                os.environ["NODE_TLS_REJECT_UNAUTHORIZED"] = "0"
+                log.info("已设置 NODE_TLS_REJECT_UNAUTHORIZED=0（跳过代理证书验证）")
+
+        log.info("=" * 60)
+        log.info("未检测到 Chromium 浏览器（Playwright 需要它来模拟登录）。")
+        log.info("正在自动下载（约 300MB，首次运行只需一次，请耐心等待）...")
+        log.info("=" * 60)
+
+        # --- 尝试 1：进程内 playwright API（兼容 EXE 打包模式）---
+        try:
+            from playwright.__main__ import main as _pw_main
+            import sys as _sys
+            original_argv = _sys.argv[:]
+            try:
+                _sys.argv = ["playwright", "install", "chromium"]
+                _pw_main()
+                # playwright CLI 内部调用 sys.exit(0) 成功时抛出 SystemExit(0)
+            except SystemExit as e:
+                if e.code == 0:
+                    log.info("Chromium 浏览器安装成功！")
+                    return
+                else:
+                    log.warning(f"playwright 进程内安装返回非零退出码：{e.code}")
+            except Exception as e:
+                log.warning(f"playwright 进程内安装异常：{e}")
+            finally:
+                _sys.argv = original_argv
+        except ImportError:
+            log.info("playwright.__main__ 不可用，将尝试子进程方式...")
+        except Exception as e:
+            log.warning(f"playwright 进程内安装方式失败：{e}")
+
+        # --- 尝试 2：通过 subprocess 调用系统 Python（脚本模式）---
+        import subprocess as _sp
+        py = WebFileDownloader._find_system_python()
+        if py:
+            env = os.environ.copy()
+            try:
+                log.info(f"通过 {py} 下载 Chromium 浏览器...")
+                result = _sp.run(
+                    [py, "-m", "playwright", "install", "chromium"],
+                    capture_output=False,
+                    timeout=600,
+                    env=env,
+                )
+                if result.returncode == 0:
+                    log.info("Chromium 浏览器安装成功！")
+                    return
+            except Exception as e:
+                log.warning(f"通过系统 Python 下载失败：{e}")
+
+        # --- 尝试 3：兜底，直接调用 playwright CLI ---
+        cli_candidates = ["playwright", "npx playwright", "python -m playwright"]
+        for cmd in cli_candidates:
+            try:
+                parts = cmd.split()
+                result = _sp.run(
+                    parts + ["install", "chromium"],
+                    capture_output=False, timeout=600,
+                    creationflags=0x08000000 if sys.platform == "win32" else 0,
+                )
+                if result.returncode == 0:
+                    log.info("Chromium 浏览器安装成功！")
+                    return
+            except Exception:
+                continue
+
+        # 全部失败
+        log.error("=" * 60)
+        log.error("❌ 自动下载 Chromium 浏览器失败。请手动执行以下命令后重试：")
+        log.error("   在终端中依次执行：")
+        log.error("   $env:HTTP_PROXY='http://proxy.xfusion.com:8080'")
+        log.error("   $env:HTTPS_PROXY='http://proxy.xfusion.com:8080'")
+        log.error("   playwright install chromium")
+        log.error("=" * 60)
+        input("\n按 Enter 退出...")
+        sys.exit(1)
+
+    # ------------------------------------------------------------------
     @staticmethod
     def _save_debug_html(html_text: str, filename: str) -> str:
+        """保存 HTML 调试文件。"""
         try:
             debug_path = Path(filename).resolve()
             debug_path.write_text(html_text, encoding="utf-8", errors="ignore")
@@ -284,46 +619,6 @@ class WebFileDownloader:
         except OSError as e:
             log.error(f"保存调试 HTML 失败：{e}")
             return "(保存失败)"
-    def _verify_login(self, login_resp: "requests.Response") -> None:
-        """启发式判断登录是否成功；不保证 100% 准确，仅供参考。"""
-        fail_keywords = [
-            "用户名或密码错误", "账号或密码错误", "密码错误", "账号不存在",
-            "登录失败", "验证码错误", "invalid username", "invalid password",
-            "incorrect password", "login failed", "authentication failed",
-            "wrong password",
-        ]
-        text_lower = login_resp.text[:5000].lower()
-        matched = next((kw for kw in fail_keywords if kw.lower() in text_lower), None)
-        if matched:
-            log.warning(f"登录响应中检测到疑似失败关键词：'{matched}'，"
-                        f"请人工确认账号密码是否正确（该判断为启发式，也可能是误判）。")
-        elif self.login_url.rstrip("/") == login_resp.url.rstrip("/"):
-            log.warning("登录提交后仍停留在登录页地址，可能登录未成功，请人工确认。")
-        else:
-            log.info("登录响应未检测到明显失败迹象（启发式判断，不代表 100% 成功）。")
-        if not self.verify_url:
-            log.info("未配置 [login] verify_url，跳过二次登录状态校验。"
-                     "如需更可靠的确认，建议配置 verify_url + verify_success_text。")
-            return
-        log.info(f"正在访问校验页面确认登录状态：{self.verify_url}")
-        try:
-            verify_resp = self.session.get(self.verify_url, timeout=self.timeout)
-        except requests.RequestException as e:
-            log.warning(f"访问校验页面失败，跳过二次校验：{e}")
-            return
-        body = verify_resp.text
-        if self.verify_fail_text and self.verify_fail_text in body:
-            log.warning(f"校验页面中出现了 verify_fail_text（'{self.verify_fail_text}'），"
-                        f"登录很可能未成功。")
-        elif self.verify_success_text:
-            if self.verify_success_text in body:
-                log.info(f"校验页面中出现了 verify_success_text（'{self.verify_success_text}'），登录确认成功。")
-            else:
-                log.warning(f"校验页面中未出现 verify_success_text（'{self.verify_success_text}'），"
-                            f"登录可能未成功，请人工确认。")
-        else:
-            log.info(f"已访问校验页面（状态码 {verify_resp.status_code}），"
-                     f"但未配置 verify_success_text/verify_fail_text，无法自动判断，请人工查看。")
 
     # ------------------------------------------------------------------
     def _is_same_domain(self, url: str) -> bool:
