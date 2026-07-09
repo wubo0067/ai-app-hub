@@ -1,0 +1,16 @@
+[project]
+name = "web-downloader"
+version = "0.1.0"
+description = "网站文件下载爬虫：登录网站，递归爬取指定网址，按目录层级下载docx等文件"
+requires-python = ">=3.9"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "lxml>=6.1.1",
+    "requests>=2.32.5",
+]
+
+[tool.uv]
+package = true
+
+[project.scripts]
+web-downloader = "web_downloader_pro:main"
