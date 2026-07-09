@@ -92,6 +92,37 @@ class WebFileDownloader:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": self.user_agent})
 
+        # 若启用了企业代理，需要：1) 配置代理地址 2) 跳过 SSL 证书验证（代理做了中间人解密）
+        if self.proxy_enabled:
+            # 抑制 InsecureRequestWarning 的终端输出
+            try:
+                import urllib3
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            except ImportError:
+                pass
+            self.session.verify = False
+            if self.proxy_http:
+                self.session.proxies["http"] = self.proxy_http
+            if self.proxy_https:
+                self.session.proxies["https"] = self.proxy_https
+            log.info(f"已为下载会话配置代理：http={self.proxy_http}, https={self.proxy_https}")
+
+        # --- 详情页检测与浏览器下载 ---
+        # URL 前缀列表（匹配任意一个前缀即视为详情页，需要用浏览器点击下载按钮）
+        detail_prefix = self.config.get("crawler", "detail_page_prefix", fallback="").strip()
+        self.detail_page_prefixes = [p.strip() for p in detail_prefix.split(",") if p.strip()]
+        self.download_button_text = self.config.get("crawler", "download_button_text", fallback="下载").strip()
+
+        # 可递归爬取的页面 URL 前缀（逗号分隔），只递归匹配前缀的页面，防止爬遍整个网站
+        # 未配置时回退到旧行为（_looks_like_page 判断）
+        crawl_prefix = self.config.get("crawler", "crawl_page_prefix", fallback="").strip()
+        self.crawl_page_prefixes = [p.strip() for p in crawl_prefix.split(",") if p.strip()]
+
+        # Playwright 浏览器实例（登录后保持存活，供详情页点击下载复用）
+        self._pw_instance = None    # sync_playwright().start() 返回
+        self._pw_browser = None     # chromium.launch() 返回
+        self._pw_context = None     # browser.new_context() 返回
+
         self.visited_pages = set()
         self.downloaded_files = set()
         self.download_count = 0
@@ -251,13 +282,17 @@ class WebFileDownloader:
         pw_browsers_path = str(Path.home() / "AppData" / "Local" / "ms-playwright")
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = pw_browsers_path
         log.info(f"已设置 PLAYWRIGHT_BROWSERS_PATH={pw_browsers_path}")
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=headless)
-            context = browser.new_context(
-                user_agent=self.user_agent,
-                viewport={"width": 1280, "height": 800},
-            )
-            page = context.new_page()
+
+        # 启动持久化的 Playwright 浏览器实例（登录后保留，供详情页点击下载复用）
+        self._pw_instance = sync_playwright().start()
+        self._pw_browser = self._pw_instance.chromium.launch(headless=headless)
+        self._pw_context = self._pw_browser.new_context(
+            user_agent=self.user_agent,
+            viewport={"width": 1280, "height": 800},
+        )
+        page = self._pw_context.new_page()
+
+        try:
 
             # --- 步骤 1：打开登录页面 ---
             log.info(f"正在打开登录页面：{self.login_url}")
@@ -283,7 +318,7 @@ class WebFileDownloader:
             self._browser_wait_login(page, browser_timeout_ms)
 
             # --- 步骤 4：转移 Cookie ---
-            cookies = context.cookies()
+            cookies = self._pw_context.cookies()
             for c in cookies:
                 self.session.cookies.set(
                     c.get("name", ""), c.get("value", ""),
@@ -298,7 +333,7 @@ class WebFileDownloader:
                 try:
                     page.goto(self.verify_url, wait_until="networkidle", timeout=30000)
                     # 刷新 Cookie（校验页可能设置新的）
-                    for c in context.cookies():
+                    for c in self._pw_context.cookies():
                         self.session.cookies.set(
                             c.get("name", ""), c.get("value", ""),
                             domain=c.get("domain", ""),
@@ -316,9 +351,10 @@ class WebFileDownloader:
                 except Exception as e:
                     log.warning(f"校验页面访问失败：{e}")
 
-            browser.close()
+        finally:
+            page.close()
 
-        log.info("浏览器登录完成，Cookie 已就绪。")
+        log.info("浏览器登录完成，Cookie 已就绪（浏览器保持打开用于后续详情页下载）。")
 
     # ------------------------------------------------------------------
     def _browser_fill_login(self, page, timeout_ms: int) -> bool:
@@ -712,25 +748,195 @@ class WebFileDownloader:
 
         time.sleep(self.delay)
 
+        # --- 过滤结果统计（按原因分类）---
+        total = len(links)
+        matched_target = 0
+        matched_detail = 0
+        matched_recurse = 0
+        skipped_diff_domain = []   # 不同域名
+        skipped_no_match = []      # 同域但三类规则都不匹配
+        skipped_static = []        # 静态资源（_should_recurse 回退模式）
+
         for link in links:
             link = link.split("#")[0]  # 去掉锚点
-            if not link or not self._is_same_domain(link):
+            if not link:
+                continue
+            if not self._is_same_domain(link):
+                skipped_diff_domain.append(link)
                 continue
             if self._is_target_file(link):
+                matched_target += 1
+                log.info(f"  → 目标文件: {link}")
                 self.download_file(link)
+            elif self._is_detail_page(link):
+                matched_detail += 1
+                log.info(f"  → 详情页: {link}")
+                self._browser_download_detail_page(link)
+            elif self._should_recurse(link):
+                matched_recurse += 1
+                log.info(f"  → 递归: {link}")
+                self.crawl(link, depth + 1)
             else:
-                # 只递归到看起来是目录/页面的链接，避免爬取无关的静态资源
-                if self._looks_like_page(link):
-                    self.crawl(link, depth + 1)
+                # 同域但三类规则都不匹配，进一步区分是否是静态资源
+                if self.crawl_page_prefixes:
+                    skipped_no_match.append(link)
+                else:
+                    if self._is_static_resource(link):
+                        skipped_static.append(link)
+                    else:
+                        skipped_no_match.append(link)
+
+        same_domain = matched_target + matched_detail + matched_recurse + len(skipped_no_match) + len(skipped_static)
+        total_skipped = len(skipped_diff_domain) + len(skipped_no_match) + len(skipped_static)
+
+        # --- 输出本页过滤摘要 ---
+        log.info(f"[深度 {depth}] 页面链接汇总：提取 {total} 个 | "
+                 f"同域 {same_domain} 个 | "
+                 f"目标文件 {matched_target} | "
+                 f"详情页 {matched_detail} | "
+                 f"递归 {matched_recurse} | "
+                 f"跳过 {total_skipped} 个"
+                 f"（不同域 {len(skipped_diff_domain)}, "
+                 f"未匹配规则 {len(skipped_no_match)}, "
+                 f"静态资源 {len(skipped_static)}）")
+
+        # 输出被跳过的链接详情
+        if skipped_diff_domain:
+            show = min(len(skipped_diff_domain), 10)
+            log.info(f"[深度 {depth}] 跳过-不同域（前 {show} 个）:")
+            for u in skipped_diff_domain[:show]:
+                log.info(f"  SKIP[不同域]: {u}")
+        if skipped_no_match:
+            show = min(len(skipped_no_match), 10)
+            log.info(f"[深度 {depth}] 跳过-未匹配任何规则（前 {show} 个）:")
+            for u in skipped_no_match[:show]:
+                log.info(f"  SKIP[无匹配]: {u}")
+        if skipped_static:
+            show = min(len(skipped_static), 5)
+            log.info(f"[深度 {depth}] 跳过-静态资源（前 {show} 个）:")
+            for u in skipped_static[:show]:
+                log.info(f"  SKIP[静态资源]: {u}")
 
     @staticmethod
-    def _looks_like_page(url: str) -> bool:
+    def _is_static_resource(url: str) -> bool:
+        """判断 URL 是否是静态资源（CSS/JS/图片/字体等）。"""
         path = urlparse(url).path.lower()
         static_exts = (
             ".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
             ".woff", ".woff2", ".ttf", ".mp4", ".mp3", ".zip", ".rar",
         )
-        return not path.endswith(static_exts)
+        return path.endswith(static_exts)
+
+    def _should_recurse(self, url: str) -> bool:
+        """判断是否应该递归爬取该 URL。
+
+        若配置了 crawl_page_prefix，只有匹配前缀的 URL 才会被递归；
+        否则回退到旧行为（排除静态资源后缀）。
+        """
+        if self.crawl_page_prefixes:
+            return any(url.startswith(p) for p in self.crawl_page_prefixes)
+        # 未配置 crawl_page_prefix 时，回退到旧的行为
+        return not self._is_static_resource(url)
+
+    # ------------------------------------------------------------------
+    def _is_detail_page(self, url: str) -> bool:
+        """判断 URL 是否以配置的某个前缀开头（需要用浏览器点击下载）。"""
+        if not self.detail_page_prefixes:
+            return False
+        return any(url.startswith(prefix) for prefix in self.detail_page_prefixes)
+
+    # ------------------------------------------------------------------
+    def _browser_download_detail_page(self, url: str):
+        """使用 Playwright 浏览器打开详情页，点击下载按钮并保存文件到 save_dir。"""
+        if url in self.downloaded_files:
+            return
+        if self._pw_context is None:
+            log.error(f"浏览器未就绪，无法处理详情页：{url}")
+            return
+
+        from playwright.sync_api import TimeoutError as PwTimeout
+
+        log.info(f"使用浏览器打开详情页并尝试下载：{url}")
+        page = self._pw_context.new_page()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=self.timeout * 1000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except PwTimeout:
+                pass
+
+            # 查找下载按钮：优先匹配 title 属性（hover 提示），其次按钮/链接文字
+            btn_text = self.download_button_text
+            download_selectors = [
+                f'[title="{btn_text}"]',
+                f'[title*="{btn_text}"]',
+                f'button:has-text("{btn_text}")',
+                f'a:has-text("{btn_text}")',
+                f'span:has-text("{btn_text}")',
+                f'div:has-text("{btn_text}")',
+            ]
+
+            download_btn = None
+            for sel in download_selectors:
+                try:
+                    el = page.query_selector(sel)
+                    if el and el.is_visible():
+                        download_btn = el
+                        log.info(f"找到下载按钮 → {sel}")
+                        break
+                except Exception:
+                    continue
+
+            if not download_btn:
+                log.warning(f"未在详情页找到下载按钮（搜索文字：{btn_text}）：{url}")
+                return
+
+            # 使用 expect_download 捕获浏览器下载事件
+            with page.expect_download(timeout=60000) as download_info:
+                download_btn.click()
+
+            download = download_info.value
+            suggested = download.suggested_filename
+            local_path = self.save_dir / suggested
+
+            if self.skip_existing and local_path.exists():
+                log.info(f"已存在，跳过：{local_path}")
+                self.downloaded_files.add(url)
+                return
+
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            download.save_as(str(local_path))
+            self.downloaded_files.add(url)
+            self.download_count += 1
+            log.info(f"已保存：{local_path}")
+
+            time.sleep(self.delay)
+
+        except PwTimeout:
+            self.fail_count += 1
+            log.error(f"详情页加载或下载超时：{url}")
+        except Exception as e:
+            self.fail_count += 1
+            log.error(f"浏览器下载失败 [{url}]: {e}")
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    def _cleanup_browser(self):
+        """关闭 Playwright 浏览器，释放资源。"""
+        try:
+            if self._pw_browser:
+                self._pw_browser.close()
+        except Exception:
+            pass
+        try:
+            if self._pw_instance:
+                self._pw_instance.stop()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     def run(self):
@@ -743,14 +949,22 @@ class WebFileDownloader:
 
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
-        self.login()
-        self.crawl(self.start_url, depth=0)
+        try:
+            self.login()
+            self.crawl(self.start_url, depth=0)
+        finally:
+            self._cleanup_browser()
 
         log.info("=" * 60)
         log.info(f"爬取完成。共访问页面 {len(self.visited_pages)} 个，"
                   f"成功下载 {self.download_count} 个文件，失败 {self.fail_count} 个。")
         log.info(f"文件保存在：{self.save_dir}")
         log.info("=" * 60)
+
+
+# 旧的 run() 已被上面的覆盖，保留一份备份以防万一
+# def run(self):
+#     ...
 
 
 def main():
