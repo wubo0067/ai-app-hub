@@ -250,8 +250,9 @@ def validate_tool_call_request(
             parts = normalized.split()
             if parts[:2] == ["sym", "-l"]:
                 return (
-                    "sym -l is only allowed inside run_script with an immediate grep filter; "
-                    "otherwise use sym <symbol>."
+                    "sym -l is forbidden in any form; it dumps all kernel symbols and overflows "
+                    "the context or times out. To enumerate a module's symbols, use "
+                    "sym -m <module> or sym -m <module> | grep -i <keyword>."
                 )
 
         if _uses_module_specific_symbol(lines, debug_symbol_paths=debug_symbol_paths):
@@ -376,33 +377,14 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
     parts = normalized.split()
     command = parts[0]
 
-    # sym -l 默认禁止；仅允许 run_script 中的 target-scoped、grep-bounded 受限查询
+    # sym -l 完全禁止（输出过大，导致 tool 执行超时）
+    # 查看内核模块 symbol 应使用 sym -m <module> 或 sym -m <module> | grep -i <keyword>
     if command == "sym" and len(parts) > 1 and parts[1] == "-l":
-        if len(parts) < 3 or parts[2] == "|":
-            return (
-                "sym -l must include a concrete module or symbol target before the grep filter; "
-                "otherwise use sym <symbol>."
-            )
-
-        pipe_index = parts.index("|") if "|" in parts else -1
-        if (
-            pipe_index == -1
-            or pipe_index == len(parts) - 1
-            or parts[pipe_index + 1] != "grep"
-        ):
-            return (
-                "sym -l is forbidden unless it is immediately piped to grep inside run_script; "
-                "otherwise use sym <symbol>."
-            )
-
-        grep_pattern_index = pipe_index + 2
-        while grep_pattern_index < len(parts) and parts[grep_pattern_index].startswith(
-            "-"
-        ):
-            grep_pattern_index += 1
-
-        if grep_pattern_index >= len(parts):
-            return "sym -l grep filter must include a concrete pattern."
+        return (
+            "sym -l is forbidden in any form (with or without grep); it dumps all kernel "
+            "symbols and overflows the context or times out. To enumerate a module's "
+            "symbols, use sym -m <module> or sym -m <module> | grep -i <keyword>."
+        )
 
     # bt -a 默认禁止：除非是 hard_lockup 场景
     if command == "bt" and "-a" in parts[1:] and not allow_bt_a:

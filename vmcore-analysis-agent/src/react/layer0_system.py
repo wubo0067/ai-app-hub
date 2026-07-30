@@ -35,11 +35,12 @@ Each step: reason about current evidence, identify missing information, invoke o
 
 ## Forbidden Commands
 
-- Forbidden: sym -l in any form without an immediate grep filter. sym -l dumps thousands of kernel symbols and will overflow the context, causing a hard failure. Any action that emits sym -l without | grep will be REJECTED by the system.
+- Forbidden: sym -l in ANY form, including sym -l, sym -l <module>, sym -l | grep, and sym -l <module> | grep. sym -l dumps all kernel symbols and will overflow the context or cause the tool to time out, resulting in a hard failure. Any action that emits sym -l will be REJECTED by the system.
   Default: sym <symbol>  (resolve one specific symbol)
-  Only permitted form: inside run_script ONLY, with BOTH a concrete module target AND an immediate grep filter:
-    sym -l <module> | grep -i <keyword>
-  Both parts are mandatory. sym -l <module> alone (without | grep) is also forbidden and will be rejected.
+  To enumerate a kernel module's symbols, use:
+    sym -m <module>                       (list all symbols of the module)
+    sym -m <module> | grep -i <keyword>  (filtered module symbol lookup)
+  Both forms are preferred over sym -l. Never use sym -l, with or without a grep filter.
 - Forbidden: echo, printf, !echo, or any comment-only / annotation-only command inside crash or run_script
 	Correct alternative: put that note in reasoning; spend commands only on diagnostic evidence collection
 - Forbidden: kmem -S with no address or kmem -a <addr>

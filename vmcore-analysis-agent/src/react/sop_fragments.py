@@ -313,7 +313,7 @@ Sub-step B: extract suspect-device DMA ranges only after fingerprint work or whe
 - Verify object and field paths against the current kernel layout before dereferencing module-private objects.
 - Check whether the faulting PA lies within a validated DMA buffer range.
 - Do not guess protocol-layer or firmware-message struct names for a driver-private queue object. Load module symbols with mod -s first and then inspect the actual driver-private type or field path.
-- If struct -o <guessed_type> fails on a module crash path, do not keep guessing private types. Instead: (1) load module symbols with `mod -s <module>` first; (2) if symbol enumeration is then necessary, emit it as `run_script` with BOTH a concrete module target AND an immediate grep filter: `sym -l <module> | grep -i <keyword>`. `sym -l` without `| grep <pattern>` is ALWAYS forbidden — even with a module target — because it will flood the context and cause a hard failure.
+- If struct -o <guessed_type> fails on a module crash path, do not keep guessing private types. Instead: (1) load module symbols with `mod -s <module>` first; (2) if symbol enumeration is then necessary, use `sym -m <module>` or `sym -m <module> | grep -i <keyword>`. `sym -l` is ALWAYS forbidden in any form (with or without a grep filter) — it dumps all kernel symbols, floods the context, and causes a hard failure or tool timeout.
 
 Sub-step C: when driver structs are unavailable, inspect generic dma_ops and coherent_dma_mask to understand protection level.
 
