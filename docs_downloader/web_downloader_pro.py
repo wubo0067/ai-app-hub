@@ -118,6 +118,13 @@ class WebFileDownloader:
         crawl_prefix = self.config.get("crawler", "crawl_page_prefix", fallback="").strip()
         self.crawl_page_prefixes = [p.strip() for p in crawl_prefix.split(",") if p.strip()]
 
+        # --- SPA 模式（左侧/顶部分类导航 + 文件列表由前端 JS 异步渲染时使用）---
+        # 完全不再走 requests+BeautifulSoup 抓 HTML，而是用 Playwright 实际点击
+        # 浏览器里的分类节点，等待渲染完成后从真实 DOM 中提取详情页链接。
+        self.spa_mode = self.config.getboolean("crawler", "spa_mode", fallback=False)
+        self.spa_category_root = self.config.get("crawler", "spa_category_root", fallback="").strip()
+        self.spa_max_pages = self.config.getint("crawler", "spa_max_pages", fallback=200)
+
         # Playwright 浏览器实例（登录后保持存活，供详情页点击下载复用）
         self._pw_instance = None    # sync_playwright().start() 返回
         self._pw_browser = None     # chromium.launch() 返回
@@ -846,9 +853,220 @@ class WebFileDownloader:
         return any(url.startswith(prefix) for prefix in self.detail_page_prefixes)
 
     # ------------------------------------------------------------------
-    def _browser_download_detail_page(self, url: str):
-        """使用 Playwright 浏览器打开详情页，点击下载按钮并保存文件到 save_dir。"""
-        if url in self.downloaded_files:
+    # SPA 模式：分类导航树 + 文件列表完全由前端 JS 渲染时使用。
+    # 不再依赖 requests+BeautifulSoup 抓 HTML（那样只能拿到空壳），而是用
+    # Playwright 真正点击浏览器里的分类节点，等待渲染完成后从真实 DOM 中
+    # 按已知的详情页 URL 前缀（detail_page_prefix）提取链接。
+    # ------------------------------------------------------------------
+    def crawl_spa(self):
+        if self._pw_context is None:
+            log.error("浏览器未就绪（enable_login 需为 true 才会启动浏览器），无法使用 SPA 模式")
+            return
+        if not self.spa_category_root:
+            log.error("SPA 模式需要在 config.ini 的 [crawler] 段配置 spa_category_root，"
+                       "例如：spa_category_root = 1.0 集成产品开发")
+            return
+
+        page = self._pw_context.new_page()
+        stats = {"links": 0}
+        try:
+            log.info(f"[SPA] 打开起始页：{self.start_url}")
+            page.goto(self.start_url, wait_until="domcontentloaded", timeout=self.timeout * 1000)
+            self._spa_wait_idle(page)
+
+            visited_labels: set = set()
+            self._spa_walk_category(page, self.spa_category_root, [], visited_labels, stats)
+
+            log.info(f"[SPA] 分类树遍历完成，共处理 {stats['links']} 个文档链接"
+                     f"（同一文档若出现在多个分类下，会分别保存到各自分类目录中）")
+        finally:
+            page.close()
+
+    def _spa_wait_idle(self, page, timeout_ms: int = 12000):
+        try:
+            page.wait_for_load_state("networkidle", timeout=timeout_ms)
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    @staticmethod
+    def _sanitize_folder_name(name: str) -> str:
+        """把分类名转成合法的本地文件夹名（去掉 Windows 不允许的字符，限制长度）。"""
+        name = name.strip()
+        name = re.sub(r'[\\/:*?"<>|]', "_", name)
+        name = name.rstrip(". ")  # Windows 不允许文件夹名以点或空格结尾
+        return name[:80] if name else "未命名分类"
+
+    def _spa_walk_category(self, page, label: str, category_path: list, visited: set,
+                            stats: dict, depth: int = 0):
+        """
+        递归处理一个分类节点：点击选中 → 抓取其文件列表(含翻页) → 下载到对应层级目录 → 找子分类并递归。
+        category_path 是从根节点到当前节点（不含当前节点）的目录名列表，用于保持下载文件的
+        目录结构与网站的分类导航层级一一对应，例如：
+            1.0 集成产品开发 (IPD+)/科研项目经费管理规范V01.00.docx
+            1.0 集成产品开发 (IPD+)/1.1 开发基础硬件和管理生命周期/xxx.docx
+        """
+        if label in visited:
+            return
+        visited.add(label)
+        indent = "  " * depth
+        log.info(f"{indent}[SPA] 处理分类：{label}")
+
+        node = self._spa_find_category_node(page, label)
+        if node is None:
+            log.warning(f"{indent}[SPA] 未找到分类节点，跳过：{label}"
+                        f"（如果这是根节点，请检查 config.ini 里 spa_category_root 的文字"
+                        f"是否和页面上显示的完全一致，包括空格）")
+            return
+
+        try:
+            node.click(timeout=8000)
+        except Exception as e:
+            log.warning(f"{indent}[SPA] 点击分类节点失败 [{label}]: {e}")
+            return
+
+        self._spa_wait_idle(page)
+
+        current_path = category_path + [self._sanitize_folder_name(label)]
+        target_subdir = Path(*current_path)
+
+        links = self._spa_collect_all_pages(page)
+        log.info(f"{indent}[SPA] 「{label}」采集到 {len(links)} 个文档链接 → 将保存到目录：{target_subdir}")
+        for link in links:
+            stats["links"] += 1
+            self._browser_download_detail_page(link, target_subdir)
+
+        children = self._spa_collect_children_labels(page, exclude={label, "不限"})
+        if children:
+            log.info(f"{indent}[SPA] 「{label}」下发现子分类：{children}")
+        for child in children:
+            self._spa_walk_category(page, child, current_path, visited, stats, depth + 1)
+
+    def _spa_find_category_node(self, page, label: str):
+        """
+        按可见文本定位分类节点（顶部"公告分类"筛选行 或 左侧导航树里的节点）。
+        分类文字有时会被截断显示省略号，这里用去掉括号后缀的前缀做匹配。
+        【若定位失败，最需要检查的地方】——可以先在浏览器里手动确认该文字
+        在页面上是否可见、是否有多处重复（此时会命中第一个，可能不是想要的那个）。
+        """
+        prefix = re.split(r"[（(]", label)[0].strip()
+        if not prefix:
+            return None
+        try:
+            loc = page.get_by_text(re.compile(r"^\s*" + re.escape(prefix)), exact=False)
+            if loc.count() == 0:
+                return None
+            return loc.first
+        except Exception:
+            return None
+
+    def _spa_collect_children_labels(self, page, exclude: set) -> list:
+        """
+        从"公告分类"筛选行里读取当前选中节点下方展示的所有子分类文字
+        （依据截图：点击 1.0 后，同一行会展示 1.1、1.2 ... 1.8 等可点击文字）。
+
+        【这是本套逻辑里最可能需要根据实际页面调整的部分】——
+        如果你的页面把子分类放在左侧树里而不是顶部一行，需要把下面 anchor 的定位
+        换成左侧树容器的选择器（例如通过"分类导航"文字定位到树容器，再取其子节点文字）。
+        """
+        try:
+            anchor = page.get_by_text("公告分类", exact=False).first
+            if anchor.count() == 0:
+                return []
+            row = anchor.locator("xpath=ancestor::*[self::div or self::li][1]")
+            texts = row.all_inner_texts()
+        except Exception as e:
+            log.debug(f"[SPA] 读取子分类行失败：{e}")
+            return []
+
+        if not texts:
+            return []
+        raw = texts[0]
+        # 行文字类似："公告分类 不限 1.0 集成产品开发（IPD+） 1.1 开发基础硬件和管理生命周期 1.2 ..."
+        # 按"数字.数字(.数字)* "这种编号模式切分出每个分类标签
+        pattern = re.compile(r"\d+(?:\.\d+)*\s+[^\d\n]+?(?=\d+(?:\.\d+)*\s|$)")
+        candidates = [m.strip() for m in pattern.findall(raw)]
+        result = []
+        for c in candidates:
+            short = re.split(r"[（(]", c)[0].strip()
+            if short and short not in exclude and not any(short in e for e in exclude):
+                result.append(c)
+        return result
+
+    def _spa_collect_all_pages(self, page) -> set:
+        """采集当前筛选条件下、所有分页里的详情页链接。"""
+        links: set = set()
+        seen_states = set()
+        page_no = 1
+        while page_no <= self.spa_max_pages:
+            self._spa_wait_idle(page, timeout_ms=6000)
+            new_links = self._spa_collect_current_page_links(page)
+            before = len(links)
+            links.update(new_links)
+            log.info(f"    [SPA] 第 {page_no} 页：本页 {len(new_links)} 个链接，累计 {len(links)} 个")
+
+            if not self._spa_goto_next_page(page):
+                break
+
+            state_key = (page_no, len(links))
+            if state_key in seen_states and len(links) == before:
+                log.warning("    [SPA] 翻页后内容未变化，可能已到最后一页或翻页选择器未命中，停止翻页")
+                break
+            seen_states.add(state_key)
+            page_no += 1
+        return links
+
+    def _spa_collect_current_page_links(self, page) -> set:
+        """从当前渲染出的 DOM 里，按已知的详情页 URL 前缀 / 目标文件后缀提取所有匹配链接。"""
+        links: set = set()
+        try:
+            hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
+        except Exception as e:
+            log.debug(f"[SPA] 提取链接失败：{e}")
+            return links
+        for href in hrefs:
+            if self._is_detail_page(href) or self._is_target_file(href):
+                links.add(href)
+        return links
+
+    def _spa_goto_next_page(self, page) -> bool:
+        """
+        点击"下一页"。依次尝试几种常见的分页控件选择器；
+        【如果你的分页控件不是这些常见模式，翻页会在第 1 页就停止，
+        需要打开浏览器手动检查"下一页"按钮的 title/class/文字，把对应选择器加进列表】。
+        """
+        next_selectors = [
+            '[title="下一页"]',
+            '[aria-label="Next Page"]',
+            '.pagination-next:not(.disabled)',
+            'li.ant-pagination-next:not(.ant-pagination-disabled)',
+            'button:has-text("下一页")',
+            'a:has-text("下一页")',
+            '.el-icon-arrow-right',
+        ]
+        for sel in next_selectors:
+            try:
+                el = page.query_selector(sel)
+                if el and el.is_visible() and el.is_enabled():
+                    el.click(timeout=5000)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    # ------------------------------------------------------------------
+    def _browser_download_detail_page(self, url: str, target_subdir: Path = None):
+        """
+        使用 Playwright 浏览器打开详情页，点击下载按钮并保存文件。
+
+        target_subdir：相对于 save_dir 的子目录（对应网站上的分类导航层级）。
+        不传时保存在 save_dir 根目录，行为和之前一致。
+        同一篇文档如果出现在多个分类下（比如既在 1.0 也在 1.1 的列表里），
+        会分别下载保存到各自分类对应的目录中，因此去重键用 (url, target_subdir)
+        而不是单独用 url，避免第二个目录下的那份被误判为"已下载"而跳过。
+        """
+        dedup_key = (url, str(target_subdir) if target_subdir else "")
+        if dedup_key in self.downloaded_files:
             return
         if self._pw_context is None:
             log.error(f"浏览器未就绪，无法处理详情页：{url}")
@@ -856,7 +1074,8 @@ class WebFileDownloader:
 
         from playwright.sync_api import TimeoutError as PwTimeout
 
-        log.info(f"使用浏览器打开详情页并尝试下载：{url}")
+        log.info(f"使用浏览器打开详情页并尝试下载：{url}"
+                 f"{'（目标目录：' + str(target_subdir) + '）' if target_subdir else ''}")
         page = self._pw_context.new_page()
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=self.timeout * 1000)
@@ -897,16 +1116,17 @@ class WebFileDownloader:
 
             download = download_info.value
             suggested = download.suggested_filename
-            local_path = self.save_dir / suggested
+            base_dir = (self.save_dir / target_subdir) if target_subdir else self.save_dir
+            local_path = base_dir / suggested
 
             if self.skip_existing and local_path.exists():
                 log.info(f"已存在，跳过：{local_path}")
-                self.downloaded_files.add(url)
+                self.downloaded_files.add(dedup_key)
                 return
 
             local_path.parent.mkdir(parents=True, exist_ok=True)
             download.save_as(str(local_path))
-            self.downloaded_files.add(url)
+            self.downloaded_files.add(dedup_key)
             self.download_count += 1
             log.info(f"已保存：{local_path}")
 
@@ -951,7 +1171,11 @@ class WebFileDownloader:
 
         try:
             self.login()
-            self.crawl(self.start_url, depth=0)
+            if self.spa_mode:
+                log.info("已启用 SPA 模式：改用 Playwright 直接点击分类导航 + 文件列表进行爬取")
+                self.crawl_spa()
+            else:
+                self.crawl(self.start_url, depth=0)
         finally:
             self._cleanup_browser()
 

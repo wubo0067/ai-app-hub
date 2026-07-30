@@ -98,7 +98,7 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
             raw = (
                 last_msg.content
                 if isinstance(last_msg.content, str)
-                else json.dumps(last_msg.content)
+                else json.dumps(last_msg.content) if last_msg.content is not None else ""
             )
             last_step = VMCoreAnalysisStep.model_validate_json(raw)
         except Exception:
