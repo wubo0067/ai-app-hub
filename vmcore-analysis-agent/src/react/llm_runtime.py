@@ -16,7 +16,38 @@ REASONER_CONTEXT_LIMIT_TOKENS = 131_072
 DEFAULT_REASONER_MAX_TOKENS = 48_000
 MIN_REASONER_MAX_TOKENS = 4_096
 REASONER_TOKEN_SAFETY_MARGIN = 8_192
-APPROX_CHARS_PER_TOKEN = 3.0
+# 上下文以中文/推理文本为主时，字符与 token 的比值更低（约 1.5~2.0）。
+# 采用更保守的 2.0 估算，避免低估上下文占用导致 context 超限（HTTP 400）。
+APPROX_CHARS_PER_TOKEN = 2.0
+
+# 证据型 crash 工具：其中间输出（日志行、slab 槽位表、反汇编指令、结构体字段）
+# 是诊断的核心证据，无论消息新旧都放宽截断上限，降低"中间截断丢失关键证据"对推理的影响。
+EVIDENCE_TOOL_COMMANDS: frozenset[str] = frozenset(
+    {
+        "bt",
+        "log",
+        "kmem",
+        "struct",
+        "dis",
+        "search",
+        "list",
+        "foreach",
+        "rd",
+        "p",
+        "dev",
+        "files",
+        "mount",
+        "vm",
+        "pte",
+        "whatis",
+        "waitq",
+        "run_script",
+    }
+)
+EVIDENCE_TOOL_LIMIT_CHARS = 24_000
+# nodes.py 去重后返回的 DEDUP 消息前缀：内容为完整缓存输出，是 LLM 主动重请求
+# 以获得完整证据的结果，绝不截断。
+DEDUP_PREFIX = "[DEDUP]"
 
 
 async def ainvoke_with_retry(
@@ -57,14 +88,21 @@ def compress_messages_for_llm(
     max_tool_output_chars: int = 4000,  # 较早的 ToolMessage 内容的最大字符数限制
     recent_tool_messages_to_keep: int = 2,  # 需要应用较宽松限制的最近 ToolMessage 的数量
     max_recent_tool_output_chars: int = 12000,  # 最近 ToolMessage 内容的最大字符数限制
+    evidence_tool_limit_chars: int = EVIDENCE_TOOL_LIMIT_CHARS,  # 证据型命令 ToolMessage 的字符数限制
 ) -> list:
     """
     在发送给 LLM 前对消息历史进行保守压缩，降低 token 消耗。
 
-     策略：
-     1. 所有 AIMessage 一律原样保留，尤其禁止改写 reasoning_content。
+    策略：
+    1. 所有 AIMessage 一律原样保留，尤其禁止改写 reasoning_content。
     2. 最近几条 ToolMessage 默认保留更多内容，但若单条过大仍会压缩到上限。
-    3. 对更早的 ToolMessage，当其返回内容超过 max_tool_output_chars 时，截断其中间部分。
+    3. 证据型命令（bt/log/kmem/struct/dis 等）的 ToolMessage 无论新旧都放宽到
+       evidence_tool_limit_chars，避免中间截断丢失关键证据；同一消息跨轮次使用
+       相同上限，保证 LLM 各轮看到的截断结果一致。
+    4. DEDUP 消息（LLM 主动重请求同一命令得到的完整缓存输出）绝不截断，
+       为 LLM 提供恢复被剪裁证据的通道。
+    5. 对超过限制的 ToolMessage，截断其中间部分，并在截断标记中提示可重新执行
+       原命令获取完整输出。
 
     此函数不修改 AgentState，仅返回压缩后的副本用于当次 LLM 调用。
     """
@@ -89,7 +127,9 @@ def compress_messages_for_llm(
         # 返回截取后的文本：头部 + 系统日志标记 + 尾部
         return (
             text[:head_chars]
-            + f"\n\n[SYSTEM LOG: {omitted} characters from this older tool execution have been pruned to save context window]\n\n"
+            + f"\n\n[SYSTEM LOG: {omitted} characters of this tool output have been pruned "
+            f"(middle section) to save context window. If the pruned portion may contain "
+            f"critical evidence, re-invoke the same command to obtain its full output.]\n\n"
             + text[-tail_chars:]
         )
 
@@ -99,6 +139,8 @@ def compress_messages_for_llm(
     truncated_tool_count = 0
     # 统计被截断的近期 ToolMessage 数量
     truncated_recent_tool_count = 0
+    # 统计被截断的证据型命令 ToolMessage 数量
+    truncated_evidence_tool_count = 0
     # 统计压缩前 ToolMessage 的总字符数
     tool_chars_before = 0
     # 统计压缩后 ToolMessage 的总字符数
@@ -114,12 +156,21 @@ def compress_messages_for_llm(
         # 累加压缩前的字符数
         tool_chars_before += len(msg.content)
 
-        # 根据消息索引判断使用哪种字符限制：近期消息使用较宽松的限制，其他消息使用较严格限制
-        tool_limit = (
-            max_recent_tool_output_chars
-            if index in recent_tool_indices
-            else max_tool_output_chars
-        )
+        # DEDUP 消息的内容就是完整缓存输出（LLM 主动重请求获得的结果），完整保留，绝不截断
+        if msg.content.startswith(DEDUP_PREFIX):
+            tool_chars_after += len(msg.content)
+            compressed.append(msg)
+            continue
+
+        # 字符限制取三者中的最大值：
+        # - 最近 ToolMessage 使用较宽松限制（近期证据权重更高）
+        # - 证据型命令（bt/log/kmem/struct/dis 等）无论新旧都使用更宽松限制，
+        #   避免中间截断丢失关键证据；同时让同一消息跨轮次使用相同上限，保证内容一致
+        tool_limit = max_tool_output_chars
+        if index in recent_tool_indices:
+            tool_limit = max(tool_limit, max_recent_tool_output_chars)
+        if msg.name in EVIDENCE_TOOL_COMMANDS:
+            tool_limit = max(tool_limit, evidence_tool_limit_chars)
         # 如果当前消息内容长度超过了对应限制，则进行截断处理
         if len(msg.content) > tool_limit:
             # 计算头部保留字符数（占限制的 3/5）
@@ -139,6 +190,9 @@ def compress_messages_for_llm(
             # 如果是近期消息，增加近期截断计数
             if index in recent_tool_indices:
                 truncated_recent_tool_count += 1
+            # 如果是证据型命令消息，增加证据型截断计数
+            if msg.name in EVIDENCE_TOOL_COMMANDS:
+                truncated_evidence_tool_count += 1
             # 累加压缩后的字符数
             tool_chars_after += len(msg.content)
             # 将处理后的消息添加到压缩列表
@@ -155,7 +209,8 @@ def compress_messages_for_llm(
             f"[compress] truncated {truncated_tool_count} ToolMessages (older_limit={max_tool_output_chars}, "
             f"before={tool_chars_before}, after={tool_chars_after}, saved={tool_saved}, "
             f"kept recent tool messages full: {recent_tool_messages_to_keep - truncated_recent_tool_count}, "
-            f"bounded recent tool messages: {truncated_recent_tool_count}, recent_limit={max_recent_tool_output_chars})"
+            f"bounded recent tool messages: {truncated_recent_tool_count}, recent_limit={max_recent_tool_output_chars}, "
+            f"bounded evidence tool messages: {truncated_evidence_tool_count}, evidence_limit={evidence_tool_limit_chars})"
         )
     return compressed
 

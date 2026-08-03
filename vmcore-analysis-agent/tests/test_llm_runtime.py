@@ -3,7 +3,11 @@ import unittest
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from src.react.llm_runtime import compute_adaptive_max_tokens, compress_messages_for_llm
+from src.react.llm_runtime import (
+    EVIDENCE_TOOL_LIMIT_CHARS,
+    compute_adaptive_max_tokens,
+    compress_messages_for_llm,
+)
 
 
 class LLMRuntimeCompressionTests(unittest.TestCase):
@@ -154,6 +158,74 @@ class LLMRuntimeCompressionTests(unittest.TestCase):
 
         self.assertLess(adaptive, 48000)
         self.assertGreaterEqual(adaptive, 4096)
+
+    def test_compress_messages_relaxes_evidence_tool_commands(self) -> None:
+        # 证据型命令（log）输出约 5600 字符：超过默认 4000 但低于证据型上限，不截断
+        evidence_output = "KERN-LOG-LINE " * 400
+        # 非证据型命令（ps）输出约 7800 字符：超过默认 4000，仍截断
+        non_evidence_output = "PS-PROC-LINE " * 600
+
+        messages = [
+            HumanMessage(content="Initial Context"),
+            ToolMessage(content=evidence_output, tool_call_id="tool-log", name="log"),
+            ToolMessage(content=non_evidence_output, tool_call_id="tool-ps", name="ps"),
+        ]
+
+        # recent_tool_messages_to_keep=0：两条消息都视为"较早"消息，验证证据型命令的放宽不受新旧影响
+        compressed = compress_messages_for_llm(messages, recent_tool_messages_to_keep=0)
+
+        # 证据型命令放宽到 evidence_tool_limit_chars，未触发截断
+        self.assertEqual(compressed[1].content, evidence_output)
+        # 非证据型命令仍按 max_tool_output_chars 截断
+        self.assertLess(len(compressed[2].content), len(non_evidence_output))
+        self.assertIn("have been pruned", compressed[2].content)
+
+    def test_compress_messages_bounds_oversized_evidence_output(self) -> None:
+        # 证据型命令（kmem）输出约 42000 字符：超过证据型上限，仍会截断
+        huge_evidence = "EVIDENCE-LINE-" * 3000
+
+        messages = [
+            HumanMessage(content="Initial Context"),
+            ToolMessage(content=huge_evidence, tool_call_id="tool-kmem", name="kmem"),
+        ]
+
+        compressed = compress_messages_for_llm(messages)
+
+        self.assertLess(len(compressed[1].content), len(huge_evidence))
+        self.assertLessEqual(
+            len(compressed[1].content), EVIDENCE_TOOL_LIMIT_CHARS + 500
+        )
+        self.assertIn("have been pruned", compressed[1].content)
+
+    def test_compress_messages_never_truncates_dedup_messages(self) -> None:
+        # DEDUP 消息内容为完整缓存输出（约 38000 字符），远超任何上限，但绝不截断
+        cached_output = "CACHED-OUTPUT-LINE " * 2000
+        dedup_content = (
+            f"[DEDUP] This command was already executed in a prior step.\n---\n{cached_output}"
+        )
+
+        messages = [
+            HumanMessage(content="Initial Context"),
+            ToolMessage(content=dedup_content, tool_call_id="tool-dedup", name="log"),
+        ]
+
+        compressed = compress_messages_for_llm(messages, max_tool_output_chars=1000)
+
+        self.assertEqual(compressed[1].content, dedup_content)
+
+    def test_compress_messages_prune_note_guides_reinvoke(self) -> None:
+        old_tool_output = "OLD-TOOL-OUTPUT-" * 600
+
+        messages = [
+            HumanMessage(content="Initial Context"),
+            ToolMessage(content=old_tool_output, tool_call_id="tool-old"),
+        ]
+
+        # recent_tool_messages_to_keep=0：模拟较早消息，触发旧限额（4000）截断
+        compressed = compress_messages_for_llm(messages, recent_tool_messages_to_keep=0)
+
+        self.assertIn("have been pruned", compressed[1].content)
+        self.assertIn("re-invoke the same command", compressed[1].content)
 
 
 if __name__ == "__main__":
