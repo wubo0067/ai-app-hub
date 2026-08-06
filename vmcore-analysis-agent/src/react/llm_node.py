@@ -320,8 +320,16 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
     ]
     adaptive_max_tokens = compute_adaptive_max_tokens(
         messages_to_send,
+        # default_max_tokens: 上下文充裕时允许的最大输出 token 数（上限）。
+        # 此节点只做"文本 reasoning → 结构化 JSON"的简单转换，且用的是
+        # deepseek-chat（非 Reasoner），输出远小于完整分析节点，8192 足够。
         default_max_tokens=8192,
+        # min_max_tokens: 当输入消息逼近上下文上限时，输出预算可压缩到的下限（地板值）。
+        # 2048 保证即便上下文紧张，也至少能产出一份有意义的结论，而非空输出。
         min_max_tokens=2048,
+        # safety_margin_tokens: 预留的安全余量（token）。
+        # 上下文占用是按 approx_chars_per_token≈2.0 粗估的，存在误差；
+        # 预留 2048 兜底，避免估算偏差导致请求超过 context_limit 报 HTTP 400。
         safety_margin_tokens=2048,
     )
 
