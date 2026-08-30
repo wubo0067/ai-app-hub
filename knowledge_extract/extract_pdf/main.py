@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 # main.py - check-pdf-annotation
 # 教材 PDF → Markdown 提取流水线：
-#   pymupdf4llm 提取正文 + PyMuPDF 渲染高清 PNG
-#   → ollama 多模态识别手写笔记 → ollama LLM 整理 → 按页合并
+#   pymupdf4llm 提取正文 + PyMuPDF 渲染高清 PNG + 矢量笔迹预筛
+#   → ollama 多模态识别手写笔记（仅手写）→ 按页合并
 # Author: CalmWU
 # Created: 2026-08-30
 
 import argparse
 import base64
+import math
 import re
 import time
 from pathlib import Path
@@ -33,6 +34,11 @@ LLM_TIMEOUT = 900        # 单次请求超时（秒），需覆盖模型冷启�
 LLM_RETRIES = 1          # 失败重试次数
 
 NO_NOTE_MARK = "NO_HANDWRITING"
+
+# 矢量笔迹预筛：老师电子笔迹在 PDF 中表现为贝塞尔曲线/弯折多段线，
+# 印刷装饰线则是直线/矩形。曲线路径数 >= 此阈值才送 VLM，否则直接跳过。
+# 本机 PDF 实测：有笔记页 >=3，无笔记页恒为 1（印刷花括号弧线），阈值 2 零误分。
+MIN_STROKE_PATHS = 2
 
 PROMPT_VISION = f"""\
 这是一页教材的渲染图。图中印刷体是教材原文，手写笔迹是老师批注。
@@ -62,6 +68,45 @@ def render_page_b64(page: pymupdf.Page) -> str:
     zoom = min(RENDER_ZOOM, MAX_LONG_EDGE * 72 / max(rect.width, rect.height))
     pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
     return base64.b64encode(pix.tobytes("png")).decode()
+
+
+# ---------------- ②.5 矢量笔迹预筛 ----------------
+def _is_straight(pts: list, tol: float = 0.5) -> bool:
+    """点列是否近似共线（直线段，含水平/垂直/斜线）。"""
+    if len(pts) < 3:
+        return True
+    (x0, y0), (x1, y1) = pts[0], pts[-1]
+    dx, dy = x1 - x0, y1 - y0
+    L = math.hypot(dx, dy)
+    if L < 1e-6:
+        return True
+    return all(abs((x - x0) * dy - (y - y0) * dx) / L <= tol
+               for x, y in pts[1:-1])
+
+
+def count_stroke_paths(page: pymupdf.Page) -> int:
+    """统计疑似手写笔迹的矢量路径数：含贝塞尔曲线，或多段但明显弯折。
+
+    印刷体的下划线/表格线/边框是直线或矩形，不计入；老师电子笔迹是曲线笔画。
+    """
+    n = 0
+    for d in page.get_drawings():
+        types = {it[0] for it in d["items"]}
+        if "c" in types:                 # 贝塞尔曲线 → 笔画
+            n += 1
+            continue
+        pts = []
+        for it in d["items"]:
+            if it[0] == "l":
+                pts += [tuple(it[1]), tuple(it[2])]
+        if len(pts) >= 3 and not _is_straight(pts):
+            n += 1                       # 弯折多段线 → 笔画
+    return n
+
+
+def may_have_handwriting(page: pymupdf.Page) -> bool:
+    """预筛：本页是否可能含手写笔迹（决定是否值得调用 VLM）。"""
+    return count_stroke_paths(page) >= MIN_STROKE_PATHS
 
 
 # ---------------- LLM 调用公共部分 ----------------
@@ -152,8 +197,14 @@ def run(pdf_path: str, output_path: str, pages: list[int] | None) -> None:
         try:
             raw = _cache_get(cache, f"page_{i}_vision.md")
             if raw is None:
-                raw = recognize_handwriting(
-                    client, render_page_b64(doc.load_page(i)))
+                page = doc.load_page(i)
+                # 预筛：矢量笔迹不足则判定无手写，跳过昂贵的 VLM 调用
+                if not may_have_handwriting(page):
+                    raw = NO_NOTE_MARK
+                    _cache_put(cache, f"page_{i}_vision.md", raw)
+                    print("    预筛：无矢量笔迹，跳过 VLM")
+                    continue
+                raw = recognize_handwriting(client, render_page_b64(page))
                 _cache_put(cache, f"page_{i}_vision.md", raw)
             else:
                 print("    视觉识别：使用缓存")
