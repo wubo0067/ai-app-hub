@@ -1,4 +1,4 @@
-scrapy,rhel/data/
+scrapy_rhel/data/
 scrapy_rhel/output/
 scrapy_rhel/solutions/
 scrapy_rhel/import_solutions/logs/
@@ -9,5 +9,4 @@ rag-preprocessing/data/md/ssl/*.md
 rag-preprocessing/data/md/*.md
 *.xml
 *.log
-knowledge_extract/extract_pdf/cache/
 knowledge_extract/extract_pdf/output/
