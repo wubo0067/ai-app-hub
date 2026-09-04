@@ -25,6 +25,9 @@
 from __future__ import annotations
 
 import argparse
+import re
+from datetime import datetime
+from pathlib import Path
 
 from agent.workflow import create_circuit_agent
 from ingestion import build_knowledge_bases
@@ -65,6 +68,50 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _normalize_math_delims(text: str) -> str:
+    """把模型偏好的 \\[ \\] / \\( \\) 公式定界符转成跨阅读器通用的 $$ / $。
+
+    标准 Markdown 里 \\[ 与 \\] 是方括号的转义，会被渲染成字面 [ 和 ]，
+    使公式显示成 "[ P_{\\text{总}}=P_1+P_2+\\cdots ]" 这种难读形式；
+    而块级 $$ ... $$ 与行内 $ ... $ 在 VS Code 预览 / GitHub / Typora /
+    Obsidian 等常见阅读器中均能渲染。本函数对模型输出做兜底归一化。
+    """
+    text = re.sub(r"\\\[\s*(.*?)\s*\\\]",
+                  lambda m: "$$\n" + m.group(1).strip() + "\n$$", text, flags=re.S)
+    text = re.sub(r"\\\(\s*(.*?)\s*\\\)",
+                  lambda m: "$" + m.group(1).strip() + "$", text, flags=re.S)
+    return text
+
+
+def _save_answer_markdown(result: dict, fallback_subject: str) -> Path:
+    """把解答结果写成 Markdown 文件（output/answers/），返回文件路径。
+
+    文件名带时间戳与学科，多次提问互不覆盖；内容含元信息 + 提问 + 讲解，
+    便于用任意 Markdown 阅读器查看（讲解正文中的「（见教材第 X 页）」等
+    来源标注在渲染后同样可读）。
+    """
+    ts = datetime.now()
+    subject = result.get("target_subject") or fallback_subject
+    out_dir = Path("output") / "answers"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"answer_{ts:%Y%m%d_%H%M%S}_{subject}.md"
+    lines = [
+        "# 问答讲解结果",
+        "",
+        f"- 生成时间：{ts:%Y-%m-%d %H:%M:%S}",
+        f"- 学科：{subject}",
+    ]
+    concept = result.get("target_concept") or ""
+    if concept:
+        lines.append(f"- 知识锚点：{concept}")
+    lines += [
+        "", "## 提问", "", result.get("query", ""),
+        "", "## 讲解", "", result.get("final_answer", ""), "",
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
 def main() -> None:
     # 密钥优先从 .env / 环境读取（见 config.py）：
     # 视觉 VISION_* / 推理 REASONING_* / Embedding OPENAI_*
@@ -101,13 +148,25 @@ def main() -> None:
         except Exception:
             log.exception("[main] Agent 执行失败")
             raise
+        # 公式定界符兜底归一化：\[ \] / \( \) -> $$ / $，保证 md 跨阅读器可读
+        result["final_answer"] = _normalize_math_delims(result["final_answer"])
         print("=" * 60)
         print("【解答生成结果】:\n")
         print(result["final_answer"])
         print("=" * 60)
+        out_path = _save_answer_markdown(result, args.subject)
+        log.info("[main] 解答已保存: %s", out_path)
+        print(f"\n[已保存] {out_path.resolve()}")
 
     log.info("[main] 流水线完成")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        # 顶层兜底：任何未捕获异常（含建库阶段 RuntimeError 等）都把完整
+        # traceback 写入日志文件，便于离线排查；随后继续抛出让退出码/控制台
+        # 堆栈保持不变。
+        log.exception("[main] 流水线异常终止，完整堆栈:")
+        raise

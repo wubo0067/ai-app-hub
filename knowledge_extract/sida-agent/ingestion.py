@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -115,6 +116,38 @@ def _normalize_subject(subject: str) -> str:
 def _strip_code_fence(text: str) -> str:
     """去掉 LLM 可能附带的三反引号围栏。"""
     return text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+
+
+# JSON 字符串中的合法转义序列：\" \\ \/ \b \f \n \r \t \uXXXX
+_JSON_VALID_ESCAPE_RE = re.compile(r'\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})')
+
+
+def _repair_json_escapes(text: str) -> str:
+    """修复 JSON 文本里的非法反斜杠转义（仅 json.loads 失败后兜底调用）。
+
+    模型常把讲义中的 LaTeX 公式记法（反斜杠后接中文/字母，如 raw backslash
+    加汉字）原样抄进字符串字段，导致解析报 Invalid escape。本函数逐个扫描：
+    合法的 JSON 转义（引号/反斜杠/斜杠/b/f/n/r/t 及 u 加 4 位十六进制）原样
+    保留；其余反斜杠补成双反斜杠，使整体可被重新解析。合法转义不受影响，
+    不会对已是合法 JSON 的文本造成二次破坏。
+    """
+    parts: List[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch != "\\" or i + 1 >= n:
+            parts.append(ch)
+            i += 1
+            continue
+        m = _JSON_VALID_ESCAPE_RE.match(text, i)
+        if m is not None:
+            parts.append(m.group(0))
+            i = m.end()
+            continue
+        # 非法转义：补一个反斜杠（字符串字面 "\\\\" 求值为两个反斜杠字符）
+        parts.append("\\\\")
+        i += 1
+    return "".join(parts)
 
 
 # 抽取 schema 版本：prompt/结构变更时递增，用于失效旧缓存
@@ -268,6 +301,18 @@ def _extract_json(llm: Any, prompt: str, label: str, max_attempts: int = 2) -> D
                 raise ValueError(f"返回的不是 JSON 对象: {type(data)}")
             return data
         except (json.JSONDecodeError, ValueError) as e:
+            # 最后一道保险：若是字符串里夹带了未转义反斜杠（模型把 LaTeX 记法
+            # 原样抄进字段所致），先就地修复转义再解析一次；成功即返回，
+            # 失败才落到警告并追加纠错提示重试。
+            if isinstance(e, json.JSONDecodeError):
+                try:
+                    fixed = json.loads(_repair_json_escapes(clean))
+                    if isinstance(fixed, dict):
+                        log.warning("[ingestion] %s 第 %d 次输出含非法转义反斜杠，已就地修复后解析成功",
+                                    label, attempt)
+                        return fixed
+                except (json.JSONDecodeError, ValueError):
+                    pass  # 修复无效：按原流程警告并进入下一轮重试
             last_err = e
             log.warning("[ingestion] %s 第 %d 次输出解析失败: %s（前 200 字符: %s）",
                         label, attempt, e, clean[:200] or res[:200])
@@ -288,6 +333,7 @@ def _build_knowledge_prompt(subject: str, markdown: str) -> str:
 {guide}
 
 【JSON 结构（所有字段均可选，没有的内容填空数组/空串，严禁编造教材里不存在的实体）】
+注意：字符串值若含公式反斜杠（如 LaTeX 记法），须转义为双反斜杠，或改用纯文本描述公式，避免整批输出解析失败。
 {{
   "chapters": [{{"title": "章节标题", "summary": "本章概要"}}],
   "concepts": [
@@ -332,6 +378,7 @@ def _build_question_prompt(subject: str, markdown: str, concept_names: List[str]
 {names_json}
 
 【JSON 结构（所有字段均可选，没有的内容填空数组/空串，严禁编造教材里不存在的实体）】
+注意：字符串值若含公式反斜杠（如 LaTeX 记法），须转义为双反斜杠，或改用纯文本描述公式，避免整批输出解析失败。
 {{
   "question_types": [
     {{"name": "题型名", "identify_features": ["题干识别特征"], "template": ["解题模板步骤"],

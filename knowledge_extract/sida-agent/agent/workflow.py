@@ -116,6 +116,27 @@ def create_circuit_agent(
                 if hit and hit.get("related_concept"):
                     subgraph = graph_db.get_subgraph(subject, hit["related_concept"])
                     break
+        # 空壳概念重定位：锚点命中但自身内容贫瘠（无 description/breakdown）且未聚合到任何
+        # 题型/例题，说明该节点多半是先修引用自动生成的"空壳"，真实内容（题型/例题）挂在
+        # 1 跳先修/后续概念上；而子图检索的第二跳只沿题型/方法外扩、不会跨概念邻居，所以
+        # 这类锚点必然拿不到例题（例：提问"总功率及电功率的计算"命中空壳"电功率"）。
+        # 此时按查询词在邻居概念里挑选内容枢纽重定向；查询词无匹配且邻居唯一时也重定向，
+        # 否则保持原状，避免把无关模块（如另一个后续概念）的内容卷进答案。
+        cd = subgraph.get("concept") or {}
+        if (cd and not cd.get("description") and not cd.get("breakdown")
+                and not subgraph.get("question_types") and not subgraph.get("examples")):
+            query = state.get("query") or ""
+            cands: List[str] = []
+            for p in subgraph.get("follow_ups", []) + subgraph.get("prerequisites", []):
+                n = p.get("name")
+                if n and n not in cands:
+                    cands.append(n)
+            matched = [n for n in cands if n in query]
+            pick = matched[0] if matched else (cands[0] if len(cands) == 1 else None)
+            if pick:
+                log.warning("[workflow.graph_traversal] 锚点概念 %r 为空壳（无题型/例题挂载），"
+                            "重定位到关联概念 %r", concept, pick)
+                subgraph = graph_db.get_subgraph(subject, pick)
         log.info("[workflow.graph_traversal] 命中: 公式 %d, 实验 %d, 题型 %d, 方法 %d, 例题 %d",
                  len(subgraph.get("formulas", [])), len(subgraph.get("experiments", [])),
                  len(subgraph.get("question_types", [])), len(subgraph.get("methods", [])),
@@ -244,6 +265,9 @@ def create_circuit_agent(
 【输出规范】：
 1. 概念先行：先讲清"是什么"，用分层拆解的方式讲解，避免堆砌术语。
 2. 公式推导：给出公式/定理的来龙去脉与适用条件，不直接扔结论。
+   公式排版：整条独立公式用块级公式，前后各加一行 "$$"，公式内容放中间
+   （即 $$ ... $$ 各自单独成行），行内符号用 $...$；禁止用 \\[ \\] 或 \\( \\)
+   包裹公式——这类定界符在多数 Markdown 阅读器会被渲染成字面的方括号。
 3. 实验/图形：涉及实验用文字描述装置与操作、现象、结论；涉及图形要用文字讲清结构。
 4. 题型溯源：结合图谱中的题型模板与陷阱，把例题归类到具体题型，示范完整推导。
 5. 结尾给出易错点与检查清单。
