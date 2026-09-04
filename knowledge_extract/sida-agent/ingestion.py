@@ -12,7 +12,8 @@
 - formulas         公式/定理：表达式 + 符号表 + 适用条件 + 推导步骤 derivation
 - experiments      实验：目的/器材/步骤/现象/结论 + 装置图解 diagram + 考点
 - question_types   题型：识别特征 + 解题模板 + 陷阱（可溯源到考点概念）
-- examples         例题：原题全文 + 答案 + 解析 + 结构化出处 source + 归属题型
+- examples         例题：编号 + 小标题 + 归属题型 + 结构化出处 source(含 page) + 考点概念
+  （例题原文不再由 LLM 抄写，改由 page 页码到向量库回表取讲义页原文）
 - methods          通法技巧
 - extra_relations  补充关系
 
@@ -20,13 +21,15 @@
 1. 图库（ScienceGraphStore）：实体为节点（subject:Kind:name 学科命名空间隔离），
    依据 prerequisites / related_concepts / question_type 字段自动建边，
    形成「概念拆解链 -> 公式/实验 -> 题型 -> 例题」的可溯源检索结构；
-2. 向量库（Chroma）：各类实体各存一份可检索文本（metadata["id"] 与图节点键
-   一致），供图谱命中后精确回表取全文。
+2. 向量库（Chroma）：各类实体各存一份可检索文本，并额外写入「讲义页切片」
+   （metadata["id"]=subject:Page:页码），供图谱命中例题后按 page 精确回表取原文。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_chroma import Chroma
@@ -113,11 +116,64 @@ def _strip_code_fence(text: str) -> str:
     return text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
 
 
-def _build_extraction_prompt(subject: str, markdown: str) -> str:
-    """按学科生成抽取提示词（含学科引导 + 通用 JSON schema）。"""
+# 抽取 schema 版本：prompt/结构变更时递增，用于失效旧缓存
+_EXTRACT_SCHEMA_VERSION = "v2"
+# 抽取结果缓存目录（按输入哈希落盘，相同输入二次构建直接跳过 LLM）
+_CACHE_DIR = Path(__file__).resolve().parent / "output" / "extract_cache"
+
+
+def _cache_key(subject: str, full_markdown: str) -> str:
+    """抽取结果缓存键：学科 + schema 版本 + 输入全文的 sha256 前 16 位。"""
+    raw = f"{subject}|{_EXTRACT_SCHEMA_VERSION}|{full_markdown}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _load_extract_cache(key: str) -> Optional[Dict[str, Any]]:
+    """读取抽取缓存；不存在或损坏返回 None。"""
+    path = _CACHE_DIR / f"{key}.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        log.warning("[ingestion] 抽取缓存损坏，忽略: %s", path)
+        return None
+    if not isinstance(data, dict):
+        return None
+    log.info("[ingestion] 命中抽取缓存: %s（跳过 LLM 抽取）", key)
+    return data
+
+
+def _save_extract_cache(key: str, data: Dict[str, Any]) -> None:
+    """把抽取结果写入缓存目录，供相同输入下次复用。"""
+    try:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        (_CACHE_DIR / f"{key}.json").write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as e:
+        log.warning("[ingestion] 抽取缓存写入失败: %s", e)
+
+
+def _extract_json(llm: Any, prompt: str, label: str) -> Dict[str, Any]:
+    """调用 LLM 并把返回解析为 JSON 对象（自动剥离代码围栏）。"""
+    log.debug("[ingestion] %s：调用 LLM 抽取...", label)
+    res = str(llm.invoke(prompt).content).strip()
+    clean = _strip_code_fence(res)
+    try:
+        data = json.loads(clean)
+    except json.JSONDecodeError:
+        log.error("[ingestion] %s 返回非法 JSON，前 500 字符: %s", label, clean[:500])
+        raise
+    if not isinstance(data, dict):
+        raise ValueError(f"[ingestion] {label} 返回的不是 JSON 对象: {type(data)}")
+    return data
+
+
+def _build_knowledge_prompt(subject: str, markdown: str) -> str:
+    """第一批：知识体系（章节/概念/公式/实验/方法）抽取提示词。"""
     label = SUBJECT_META[subject]["label"]
     guide = SUBJECT_META[subject]["guide"]
-    return f"""你是深耕初中{label}教学的教研专家。请从下面的教材/讲义文本中提取知识网络，
+    return f"""你是深耕初中{label}教学的教研专家。请从下面的教材/讲义文本中提取【知识体系】，
 只输出一个严格的 JSON 对象（不要 ```json 围栏、不要任何解释文字）：
 
 {markdown}
@@ -141,30 +197,54 @@ def _build_extraction_prompt(subject: str, markdown: str) -> str:
       "phenomenon": "现象", "conclusion": "结论", "diagram": "装置/电路连接的文字图解描述",
       "exam_focus": ["常考考点"], "related_concepts": ["关联概念名"]}}
   ],
+  "methods": [
+    {{"name": "方法名", "scope": "适用场景", "steps": ["步骤"], "related_concepts": ["关联概念名"]}}
+  ]
+}}
+
+【要求】
+1. name 使用原文中的标准名词。
+2. 这是教研知识库抽取，请把核心价值做足：概念给出 breakdown 拆解要点与易错点，
+   公式给出推导/变形思路与适用条件，实验写全器材/步骤/现象/结论。
+3. 文本中根本没有实验时 experiments 返回 []，不要编造。
+4. 本批只做知识体系，不要输出题型/例题/补充关系。
+"""
+
+
+def _build_question_prompt(subject: str, markdown: str, concept_names: List[str]) -> str:
+    """第二批：题型与例题抽取提示词（注入第一批概念名，保证引用一致、原文不回抄）。"""
+    label = SUBJECT_META[subject]["label"]
+    names_json = json.dumps(concept_names, ensure_ascii=False)
+    return f"""你是深耕初中{label}教学的教研专家。请从下面的教材/讲义文本中提取【题型与例题】，
+只输出一个严格的 JSON 对象（不要 ```json 围栏、不要任何解释文字）：
+
+{markdown}
+
+【学科】{label}
+
+【已抽取的概念名（related_concepts / extra_relations 只能引用下列名称，不得杜撰）】
+{names_json}
+
+【JSON 结构（所有字段均可选，没有的内容填空数组/空串，严禁编造教材里不存在的实体）】
+{{
   "question_types": [
     {{"name": "题型名", "identify_features": ["题干识别特征"], "template": ["解题模板步骤"],
       "traps": ["常见陷阱"], "related_concepts": ["考点概念名"]}}
   ],
   "examples": [
     {{"id": "原题编号如 例17", "title": "小标题",
-      "content": "原题完整题干（含数值、选项、图表关键信息，不能省略）",
-      "answer": "答案", "analysis": "解析思路",
-      "question_type": "归属题型名（与上方 question_types.name 对应，无则填空串）",
+      "question_type": "归属题型名（与本批 question_types.name 对应，无则填空串）",
       "source": {{"book": "教材/册", "chapter": "章节", "page": 页码, "number": "题号"}},
       "related_concepts": ["考点概念名"]}}
-  ],
-  "methods": [
-    {{"name": "方法名", "scope": "适用场景", "steps": ["步骤"], "related_concepts": ["关联概念名"]}}
   ],
   "extra_relations": [{{"from": "实体名", "rel": "关系英文名", "to": "实体名"}}]
 }}
 
 【要求】
-1. name 使用原文中的标准名词；例题保留原编号（如"例17"），不要自造编号。
-2. 例题 source 按文本或讲义页填写 book/chapter/page/number，缺失字段省略。
-3. 这是教研知识库抽取，请把核心价值做足：概念给出 breakdown 拆解要点与易错点，
-   公式给出推导/变形思路与适用条件，实验写全器材/步骤/现象/结论，题型给出识别特征与陷阱。
-4. 文本中根本没有实验时 experiments 返回 []，不要编造。
+1. 例题只输出编号/小标题/归属题型/出处(含 page)/考点概念，【不要】抄写题干原文、答案或解析
+   （原文由 page 页码到向量库回表获取，抄写会严重拖慢抽取）。
+2. page 必须填该例题所在讲义页码（正文 "--- 第 N 页 ---" 标记里的 N），这是回表取原文的关键，务必准确。
+3. related_concepts 只能取自上面给出的概念名列表；无对应实体的字段填 []。
 """
 
 
@@ -378,15 +458,32 @@ def _build_vector_docs(subject: str, data: Dict[str, Any]) -> List[Document]:
         src = ex.get("source", {}) or {}
         name = str(ex.get("id") or src.get("number") or f"题{i}").strip()
         lines = [f"【{name}】{ex.get('title', '')}"]
-        if ex.get("content"):
-            lines.append(ex["content"])
-        if ex.get("answer"):
-            lines.append("答案：" + ex["answer"])
-        if ex.get("analysis"):
-            lines.append("解析：" + ex["analysis"])
+        if ex.get("question_type"):
+            lines.append("归属题型：" + ex["question_type"])
+        if src.get("page") is not None:
+            lines.append(f"出处页码：{src.get('page')}")
         _push(K_EXAMPLE, name, "\n".join(lines),
               title=ex.get("title", ""), page=src.get("page"))
 
+    return docs
+
+
+def _build_page_docs(subject: str, pages_data: List[Dict[str, Any]]) -> List[Document]:
+    """把每页讲义原文转为「页切片」向量文档（metadata["id"]=subject:Page:页码）。
+
+    例题不再抄写原文，问答时按例题 source.page 回表取对应页全文。
+    """
+    docs: List[Document] = []
+    for p in pages_data:
+        page = p.get("page")
+        content = (p.get("content") or "").strip()
+        if page is None or not content:
+            continue
+        docs.append(Document(
+            page_content=f"--- 第 {page} 页 ---\n{content}",
+            metadata={"id": node_key(subject, "Page", str(page)),
+                      "subject": subject, "type": "Page", "page": page},
+        ))
     return docs
 
 
@@ -405,7 +502,6 @@ def build_knowledge_bases(
     subject = _normalize_subject(subject)
     log.info("[ingestion] 开始构建知识库: subject=%s, 输入页数=%d",
              SUBJECT_META[subject]["label"], len(pages_data))
-    llm = get_reasoning_llm()
     vector_db = vector_db or get_vector_store()
     graph_db = graph_db or ScienceGraphStore()
     if node_key(subject, K_SUBJECT, subject) not in graph_db.graph:
@@ -414,17 +510,19 @@ def build_knowledge_bases(
     full_markdown = "\n\n".join(f"--- 第 {p['page']} 页 ---\n{p['content']}" for p in pages_data)
     log.debug("[ingestion] 拼接全文长度=%d 字符", len(full_markdown))
 
-    prompt = _build_extraction_prompt(subject, full_markdown)
-    log.debug("[ingestion] 调用 LLM 抽取知识网络 JSON...")
-    res = str(llm.invoke(prompt).content).strip()
-    clean_json = _strip_code_fence(res)
-    try:
-        data = json.loads(clean_json)
-    except json.JSONDecodeError:
-        log.error("[ingestion] LLM 返回非法 JSON，原文前 500 字符: %s", clean_json[:500])
-        raise
-    if not isinstance(data, dict):
-        raise ValueError(f"[ingestion] LLM 返回的不是 JSON 对象: {type(data)}")
+    # 抽取（带缓存）：命中缓存直接复用，否则拆两批串行调用（关闭思考模式提速）
+    cache_key = _cache_key(subject, full_markdown)
+    data = _load_extract_cache(cache_key)
+    if data is None:
+        llm = get_reasoning_llm(enable_thinking=False)
+        k_data = _extract_json(
+            llm, _build_knowledge_prompt(subject, full_markdown), "知识体系抽取")
+        concept_names = [c.get("name", "").strip()
+                         for c in k_data.get("concepts", []) if c.get("name", "").strip()]
+        q_data = _extract_json(
+            llm, _build_question_prompt(subject, full_markdown, concept_names), "题型例题抽取")
+        data = {**k_data, **q_data}
+        _save_extract_cache(cache_key, data)
 
     n_kind = {k: len(data.get(k, [])) for k in
               ("chapters", "concepts", "formulas", "experiments",
@@ -435,10 +533,10 @@ def build_knowledge_bases(
     # 1. 写入 Graph DB
     _write_graph(graph_db, subject, data)
 
-    # 2. 写入 Vector DB（全文回表）
-    docs = _build_vector_docs(subject, data)
+    # 2. 写入 Vector DB（实体切片 + 讲义页切片，按 metadata["id"] 幂等 upsert）
+    docs = _build_vector_docs(subject, data) + _build_page_docs(subject, pages_data)
     if docs:
-        vector_db.add_documents(docs)
+        vector_db.add_documents(docs, ids=[d.metadata["id"] for d in docs])
 
     log.info("[ingestion] 构建完成: 图节点 %d 个, 向量切片 %d 条。",
              graph_db.graph.number_of_nodes(), len(docs))

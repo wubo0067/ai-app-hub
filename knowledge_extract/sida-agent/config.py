@@ -72,11 +72,14 @@ def get_llm(
     max_tokens: int | None = None,
     timeout: float | None = None,
     max_retries: int = 2,
+    enable_thinking: bool | None = None,
 ) -> ChatOpenAI:
     """统一的 LLM 实例工厂，配置完全来自 .env / 环境变量（见 resolve_llm_config）。
 
     role 传 "vision" / "reasoning"；可选 max_tokens / timeout / max_retries
-    覆盖创建参数。三项配置（BASE_URL/MODEL/API_KEY）缺一即报错并列出缺哪几项。
+    覆盖创建参数。enable_thinking=False 时经 extra_body 关闭 Qwen3 思考模式
+    （结构化抽取等追求吞吐的场景适用），None 则沿用模型默认。三项配置
+    （BASE_URL/MODEL/API_KEY）缺一即报错并列出缺哪几项。
     """
     resolved = resolve_llm_config(role)
     base_url = resolved["base_url"] or ""
@@ -105,6 +108,8 @@ def get_llm(
         kwargs["max_tokens"] = max_tokens
     if timeout is not None:
         kwargs["timeout"] = timeout
+    if enable_thinking is not None:
+        kwargs["extra_body"] = {"enable_thinking": enable_thinking}
     return ChatOpenAI(**kwargs)
 
 
@@ -128,11 +133,13 @@ def get_reasoning_llm(
     max_tokens: int | None = None,
     timeout: float | None = None,
     max_retries: int = 2,
+    enable_thinking: bool | None = None,
 ) -> ChatOpenAI:
     """推理模型（知识抽取 / 问答），服务配置来自 .env 的 REASONING_*。"""
     return get_llm(
         REASONING_ROLE, temperature=temperature,
         max_tokens=max_tokens, timeout=timeout, max_retries=max_retries,
+        enable_thinking=enable_thinking,
     )
 
 

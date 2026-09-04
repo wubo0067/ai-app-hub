@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, List
 
 from langchain_chroma import Chroma
 from langgraph.graph import END, START, StateGraph
@@ -23,6 +23,7 @@ from storage.graph_store import (
     K_METHOD,
     K_QUESTION_TYPE,
     ScienceGraphStore,
+    node_key,
 )
 
 log = get_logger()
@@ -71,6 +72,9 @@ def create_circuit_agent(
         prompt = (
             f"判断学生提问所属初中学科与核心知识点锚点。\n"
             f"学科仅限三选一：physics(物理)/chemistry(化学)/math(数学)。\n"
+            f"concept 必须是知识点名词本身（如\"可变电路\"\"欧姆定律\"\"电功率\"），\n"
+            f"严格禁止拼接教学修饰或请求后缀（如\"的分析\"\"的思路\"\"的方法\"\"的讲解\"\"怎么做\"\"如何解\"），\n"
+            f"提问是\"讲解XX的分析思路/解题方法\"时，concept 只填 XX 本身。\n"
             f"只输出一行严格 JSON，不要解释：{{\"subject\": \"physics\", \"concept\": \"知识点名\"}}\n\n"
             f"提问：{query}"
         )
@@ -101,15 +105,32 @@ def create_circuit_agent(
 
     def fetch_chunks_node(state: CircuitAgentState):
         g_ctx = state.get("graph_context", {})
-        example_ids = [ex["id"] for ex in g_ctx.get("examples", [])]
-        log.debug("[workflow.fetch_chunks] 向量库回表, example_ids=%s", example_ids)
-        chunks = []
-        for ex_id in example_ids:
-            results = vector_db.get(where={"id": ex_id})
+        subject = state.get("target_subject") or "physics"
+        examples = g_ctx.get("examples", [])
+        log.debug("[workflow.fetch_chunks] 向量库回表, 例题数=%d", len(examples))
+        # 例题原文按 source.page 回表取讲义页切片；同页多题只取一次
+        page_keys: List[str] = []
+        for ex in examples:
+            page = (ex.get("source") or {}).get("page")
+            if page is None:
+                continue
+            pk = node_key(subject, "Page", str(page))
+            if pk not in page_keys:
+                page_keys.append(pk)
+        chunks: List[str] = []
+        for pk in page_keys:
+            results = vector_db.get(where={"id": pk})
             if results and results.get("documents"):
                 chunks.append(results["documents"][0])
             else:
-                log.warning("[workflow.fetch_chunks] 向量库未命中例题: %s", ex_id)
+                log.warning("[workflow.fetch_chunks] 向量库未命中讲义页: %s", pk)
+        # 兜底：无页码信息的旧例题切片，按 example id 直接回表
+        for ex in examples:
+            if (ex.get("source") or {}).get("page") is not None:
+                continue
+            results = vector_db.get(where={"id": ex["id"]})
+            if results and results.get("documents"):
+                chunks.append(results["documents"][0])
         log.info("[workflow.fetch_chunks] 回表得到原题切片 %d 条", len(chunks))
         return {"vector_chunks": chunks}
 

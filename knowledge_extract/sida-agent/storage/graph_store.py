@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import difflib
 from typing import Any, Dict, List, Optional
 
 import networkx as nx
@@ -40,6 +41,14 @@ REL_TRACES_TO = "TRACES_TO"               # 题型 -> 概念（题型溯源到�
 REL_EXEMPLIFIED_BY = "EXEMPLIFIED_BY"     # 题型/方法 -> 例题
 REL_TESTS = "TESTS"                       # 例题 -> 概念（原题考到的知识点）
 REL_EXTRA = "EXTRA"                       # 其它补充关系
+
+# 概念锚点的常见教学修饰尾缀（意图判定 LLM 常把"分析/思路/方法/讲解"拼进锚点名）
+_CONCEPT_SUFFIXES = (
+    "的分析", "的思路", "的方法", "的讲解", "的规律", "的问题",
+    "分析", "思路", "方法", "讲解", "总结", "归纳", "综合",
+)
+# difflib 模糊兜底的相似度阈值
+_FUZZY_THRESHOLD = 0.6
 
 # 存储时不需要入检索/向量回表的实体类型
 _RETRIEVABLE = (K_CONCEPT, K_FORMULA, K_EXPERIMENT, K_QUESTION_TYPE, K_METHOD, K_EXAMPLE)
@@ -106,6 +115,43 @@ class ScienceGraphStore:
                 info[k_] = v_
         return info
 
+    def _resolve_concept(self, subject: str, name: str) -> Optional[str]:
+        """概念锚点模糊解析：去教学修饰尾缀 -> 双向包含 -> difflib 相似度兜底。
+
+        意图判定 LLM 输出的锚点名常带"分析/思路/方法"等修饰（如
+        "可变电路的分析思路"被缩成"可变电路分析"），与图谱概念名
+        （如"可变电路"）不完全一致。本方法在同科 Concepts 中逐步放宽
+        匹配口径，返回命中的概念名；找不到返回 None。
+        """
+        if not name:
+            return None
+        candidates = [
+            bare_name(n) for n, nd in self.graph.nodes(data=True)
+            if nd.get("subject") == subject and nd.get("type") == K_CONCEPT
+        ]
+        if not candidates:
+            return None
+        # 1) 去掉"分析/思路/方法"等教学修饰尾缀后精确命中
+        for suffix in _CONCEPT_SUFFIXES:
+            if len(name) > len(suffix) and name.endswith(suffix):
+                trimmed = name[:-len(suffix)]
+                if trimmed in candidates:
+                    return trimmed
+        # 2) 双向包含（锚点名与节点名互为子串），取相似度最高者
+        contained = [
+            cand for cand in candidates
+            if len(cand) >= 2 and len(name) >= 2 and (cand in name or name in cand)
+        ]
+        if contained:
+            return max(contained, key=lambda c: difflib.SequenceMatcher(None, name, c).ratio())
+        # 3) difflib 相似度兜底（覆盖同义改写等场景）
+        best, best_ratio = None, 0.0
+        for cand in candidates:
+            ratio = difflib.SequenceMatcher(None, name, cand).ratio()
+            if ratio > best_ratio:
+                best, best_ratio = cand, ratio
+        return best if best_ratio >= _FUZZY_THRESHOLD else None
+
     def get_subgraph(self, subject: str, concept_name: str) -> Dict[str, Any]:
         """按知识点锚点做 1~2 跳聚合检索。
 
@@ -124,8 +170,15 @@ class ScienceGraphStore:
         }
         ckey = node_key(subject, K_CONCEPT, concept_name)
         if ckey not in self.graph:
-            log.warning("[graph_store] 图谱中不存在概念节点: %s", ckey)
-            return result
+            resolved = self._resolve_concept(subject, concept_name)
+            if resolved is not None:
+                log.warning("[graph_store] 概念节点 %s 未精确命中，模糊解析到 %s",
+                             ckey, node_key(subject, K_CONCEPT, resolved))
+                ckey = node_key(subject, K_CONCEPT, resolved)
+                concept_name = resolved
+            else:
+                log.warning("[graph_store] 图谱中不存在概念节点: %s（模糊解析亦未命中）", ckey)
+                return result
         cdata = self.graph.nodes[ckey]
         result["concept"] = {
             "name": concept_name,
