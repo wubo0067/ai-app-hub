@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 from agent.workflow import create_circuit_agent
-from ingestion import _normalize_subject, build_knowledge_bases
+from ingestion import build_knowledge_bases, normalize_subject
 from logger import get_logger
 from pdf_processor import extract_pdf_pages_as_markdown
 from storage.graph_store import ScienceGraphStore
@@ -49,11 +49,11 @@ DEFAULT_QUERY = "请帮我系统讲解可变电路的分析思路，并用具体
 def _subject_choice(value: str) -> str:
     """--subject 参数解析：归一化到 physics/chemistry/math，非法值报命令行错误。
 
-    复用 ingestion._normalize_subject 作为学科别名的唯一事实源（中文/拼音亦可），
+    复用 ingestion.normalize_subject 作为学科别名的唯一事实源（中文/拼音亦可），
     配合 argparse choices 把取值固定为三种。
     """
     try:
-        return _normalize_subject(value)
+        return normalize_subject(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 

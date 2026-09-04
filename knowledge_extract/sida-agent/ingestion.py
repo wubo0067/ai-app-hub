@@ -105,8 +105,11 @@ _VALID_SUBJECT_ALIASES = {
 }
 
 
-def _normalize_subject(subject: str) -> str:
-    """把用户传入的学科写法归一化为内部标识，非法值直接报错。"""
+def normalize_subject(subject: str) -> str:
+    """把用户传入的学科写法归一化为内部标识，非法值直接报错。
+
+    公开导出：学科别名的唯一事实源，供 CLI（main.py）与建库流程共同复用。
+    """
     key = str(subject).strip().lower()
     if key not in _VALID_SUBJECT_ALIASES:
         raise ValueError(f"不支持的学科 '{subject}'，可选：physics/chemistry/math（或中文 物理/化学/数学）")
@@ -683,7 +686,7 @@ def build_knowledge_bases(
     同一 vector_db / graph_db 可跨多次调用、跨学科累积（全科知识库）。
     推理模型固定由 config.py + sida-agent/.env 的 REASONING_* 配置决定。
     """
-    subject = _normalize_subject(subject)
+    subject = normalize_subject(subject)
     log.info("[ingestion] 开始构建知识库: subject=%s, 输入页数=%d",
              SUBJECT_META[subject]["label"], len(pages_data))
     vector_db = vector_db or get_vector_store()
