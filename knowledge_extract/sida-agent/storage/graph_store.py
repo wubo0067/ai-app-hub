@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -64,6 +65,50 @@ _RETRIEVABLE = (K_CONCEPT, K_FORMULA, K_EXPERIMENT, K_QUESTION_TYPE, K_METHOD, K
 _DEFAULT_GRAPH_PATH = str(
     Path(__file__).resolve().parent.parent / "output" / "knowledge_graph.json"
 )
+
+# 章节兜底：query 剥离常见教学词后，与章节主题词需形成互含子串才判定命中；
+# 主题词/剥离后 query 达到该长度才参与判定（防"电路"这类极短词偶然包含）
+_CHAPTER_MATCH_MIN_CHARS = 4
+
+# 学生提问中的常见教学语气词/尾缀（章节兜底前先剥掉，避免干扰标题包含匹配）
+_TEACHING_WORDS = (
+    "请讲解", "帮我讲解", "给我讲解", "介绍一下", "请介绍", "讲一讲", "讲一下",
+    "讲解", "介绍", "说说", "谈谈", "分析", "复习", "总结", "归纳",
+    "什么叫做", "什么是", "什么叫", "怎么样理解", "如何理解", "怎么理解",
+    "如何", "怎么", "怎样", "理解", "掌握", "学习",
+    "的讲解", "的内容", "的知识点", "的知识", "一下",
+    "思路", "怎么做", "如何做",
+)
+
+# 章节标题的常见编号前缀（"模块一"/"第一章"/"1.3"/"第二单元 我们周围的空气"…）。
+# 学生提问从不带章号，章节匹配前必须剥掉编号，标题才能与提问做包含判定。
+_CHAPTER_TITLE_PREFIX_RE = re.compile(
+    r"^(?:第[0-9一二三四五六七八九十百千]+(?:单元|模块|讲|课|章|节|部分)"
+    r"|模块[0-9一二三四五六七八九十百千]+"
+    r"|[0-9]+(?:\.[0-9]+)*)[：:、\s]*"
+)
+
+# 章节主题词参与"被提问包含"判定的最小长度（挡单字噪点）
+_CHAPTER_THEME_MIN_CHARS = 2
+
+
+def _chapter_theme(ch: str) -> str:
+    """剥掉章号前缀并去空白，得到可参与包含判定的主题词。"""
+    t = _CHAPTER_TITLE_PREFIX_RE.sub("", ch or "")
+    return "".join(t.split())
+
+
+def _lcs_len(a: str, b: str) -> int:
+    """两串最长公共子串长度（DP，O(mn)）。"""
+    m, n = len(a), len(b)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    best = 0
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if a[i - 1] == b[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1] + 1
+                best = max(best, dp[i][j])
+    return best
 
 
 def node_key(subject: str, kind: str, name: str) -> str:
@@ -354,4 +399,114 @@ class ScienceGraphStore:
                 "question_type": nd.get("question_type", ""),
                 "source": nd.get("source", {}),
             })
+        return result
+
+    # ----------------------------------------------------------- 章节级检索
+    def resolve_chapter(self, subject: str, query: str) -> Optional[str]:
+        """把学生提问映射到教材章节标题（供空壳概念锚点的章节兜底使用）。
+
+        章节式提问（如"讲解简单电路的电功率"，锚点只命中跨模块通用概念"电功率"）
+        在概念级检索必然拿不到例题。先剥离提问中的教学语气词（讲解/分析/思路…），
+        再与章节主题词（标题剥掉章号/模块号前缀，如"第一章 有理数"→"有理数"）做
+        互含子串判定：短主题词被提问完整包含、或提问是主题词的子串，才视为可靠命中；
+        仅共享"电功率"这类高频词不触发。信号不足或章节间歧义时返回 None，交由调用
+        方保持原状。
+        """
+        if not query:
+            return None
+        qn = "".join(query.split())
+        for w in _TEACHING_WORDS:
+            qn = qn.replace(w, "")
+        if len(qn) < _CHAPTER_MATCH_MIN_CHARS:
+            return None
+        hits: List[tuple] = []
+        seen_ch: set = set()
+        for _nid, nd in self.graph.nodes(data=True):
+            if (nd.get("subject") != subject or nd.get("type") != K_CONCEPT
+                    or not nd.get("chapter") or nd["chapter"] in seen_ch):
+                continue
+            seen_ch.add(nd["chapter"])
+            theme = _chapter_theme(nd["chapter"])
+            if len(theme) < _CHAPTER_THEME_MIN_CHARS:
+                continue
+            # 互含子串（主题词必须完整出现）：短主题词(有理数)被提问整含，
+            # 或提问是主题词(总功率及电功率的复杂计算)的子串 → 命中
+            if theme in qn or qn in theme:
+                hits.append((_lcs_len(qn, theme),
+                            difflib.SequenceMatcher(None, qn, theme).ratio(),
+                            nd["chapter"]))
+        if not hits:
+            return None
+        hits.sort(reverse=True)
+        best_lcs, best_ratio, best_ch = hits[0]
+        # 次优与最优同 lcs 且比率接近 -> 歧义，宁可不猜
+        if len(hits) >= 2:
+            _l2, _r2, _ = hits[1]
+            if best_lcs == _l2 and best_ratio - _r2 < 0.05:
+                return None
+        log.debug("[graph_store] 章节兜底: query=%r 命中章节 %r (qn=%r)",
+                  query, best_ch, qn)
+        return best_ch
+
+    def get_chapter_subgraph(self, subject: str, chapter_title: str,
+                             max_per_kind: Optional[int] = _DEFAULT_MAX_PER_KIND) -> Dict[str, Any]:
+        """整章聚合检索：合并该章节下所有概念的 1~2 跳子图，按名称/例题 id 去重。
+
+        返回结构与 get_subgraph 兼容，差异：concept=None、concepts 为该章全部概念的
+        拆解信息（供下游多概念渲染），prerequisites/follow_ups/related_concepts 同样
+        合并去重；各关联实体先不限量合并、末尾再统一按 max_per_kind 截断，防 prompt 膨胀。
+        """
+        result: Dict[str, Any] = {
+            "subject": subject,
+            "concept": None,
+            "concepts": [],
+            "chapter": chapter_title,
+            "prerequisites": [],
+            "follow_ups": [],
+            "related_concepts": [],
+            "formulas": [],
+            "experiments": [],
+            "question_types": [],
+            "methods": [],
+            "examples": [],
+        }
+        members = sorted(
+            bare_name(nid) for nid, nd in self.graph.nodes(data=True)
+            if (nd.get("subject") == subject and nd.get("type") == K_CONCEPT
+                and nd.get("chapter") == chapter_title)
+        )
+        if not members:
+            log.warning("[graph_store] 章节 %r 下无概念成员，无法聚合", chapter_title)
+            return result
+
+        def _dedup_merge(dst_key: str, items: List[Dict[str, Any]], uid: str) -> None:
+            dst = result[dst_key]
+            seen_ids = {d[uid] for d in dst}
+            for it in items:
+                if it.get(uid) not in seen_ids:
+                    dst.append(it)
+                    seen_ids.add(it[uid])
+
+        for name in members:
+            sub = self.get_subgraph(subject, name, max_per_kind=None)  # 先不限量，末尾统一截断
+            cd = sub.get("concept")
+            if cd:
+                result["concepts"].append(cd)
+            _dedup_merge("prerequisites", sub.get("prerequisites", []), "name")
+            _dedup_merge("follow_ups", sub.get("follow_ups", []), "name")
+            _dedup_merge("related_concepts", sub.get("related_concepts", []), "name")
+            _dedup_merge("formulas", sub.get("formulas", []), "name")
+            _dedup_merge("experiments", sub.get("experiments", []), "name")
+            _dedup_merge("question_types", sub.get("question_types", []), "name")
+            _dedup_merge("methods", sub.get("methods", []), "name")
+            _dedup_merge("examples", sub.get("examples", []), "id")
+
+        for kind in ("formulas", "experiments", "question_types", "methods", "examples"):
+            if max_per_kind is not None and len(result[kind]) > max_per_kind:
+                log.info("[graph_store] 章节 %r 聚合后 %s 共 %d 条，截断至 top-%d",
+                         chapter_title, kind, len(result[kind]), max_per_kind)
+                result[kind] = result[kind][:max_per_kind]
+        log.info("[graph_store] 章节聚合: %s（概念 %d）-> 公式 %d, 题型 %d, 方法 %d, 例题 %d",
+                 chapter_title, len(result["concepts"]), len(result["formulas"]),
+                 len(result["question_types"]), len(result["methods"]), len(result["examples"]))
         return result

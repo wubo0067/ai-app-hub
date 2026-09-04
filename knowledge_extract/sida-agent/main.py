@@ -39,7 +39,7 @@ from storage.vector_store import get_vector_store
 log = get_logger()
 
 # CLI 默认值：不带参数运行即等价于旧版硬编码流水线，便于快速回归。
-DEFAULT_PDF = "H:/wechat_files/xwechat_files/calm-wu_9d75/msg/file/2026-08/9S合并PDF.pdf"
+DEFAULT_PDF = "L:/vivi/初三/物理/9S合并PDF-完整.pdf"
 DEFAULT_START_PAGE = 11
 DEFAULT_END_PAGE = 12
 DEFAULT_SUBJECT = "physics"

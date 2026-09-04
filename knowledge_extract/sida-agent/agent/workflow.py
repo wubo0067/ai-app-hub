@@ -120,8 +120,9 @@ def create_circuit_agent(
         # 题型/例题，说明该节点多半是先修引用自动生成的"空壳"，真实内容（题型/例题）挂在
         # 1 跳先修/后续概念上；而子图检索的第二跳只沿题型/方法外扩、不会跨概念邻居，所以
         # 这类锚点必然拿不到例题（例：提问"总功率及电功率的计算"命中空壳"电功率"）。
-        # 此时按查询词在邻居概念里挑选内容枢纽重定向；查询词无匹配且邻居唯一时也重定向，
-        # 否则保持原状，避免把无关模块（如另一个后续概念）的内容卷进答案。
+        # 阶段一：按查询词在邻居概念里挑选内容枢纽重定向（查询词无匹配且邻居唯一时也重定向）；
+        # 阶段二：邻居也无字面命中（章节式提问，如"讲解简单电路的电功率"），改用章节标题
+        # 匹配做整章聚合兜底，把真实例题/题型（挂在章内各内容枢纽概念上）一并捞回。
         cd = subgraph.get("concept") or {}
         if (cd and not cd.get("description") and not cd.get("breakdown")
                 and not subgraph.get("question_types") and not subgraph.get("examples")):
@@ -137,6 +138,12 @@ def create_circuit_agent(
                 log.warning("[workflow.graph_traversal] 锚点概念 %r 为空壳（无题型/例题挂载），"
                             "重定位到关联概念 %r", concept, pick)
                 subgraph = graph_db.get_subgraph(subject, pick)
+            else:
+                chapter = graph_db.resolve_chapter(subject, query)
+                if chapter:
+                    log.warning("[workflow.graph_traversal] 锚点概念 %r 为空壳且邻居无字面命中，"
+                                "章节兜底聚合整章 %r", concept, chapter)
+                    subgraph = graph_db.get_chapter_subgraph(subject, chapter)
         log.info("[workflow.graph_traversal] 命中: 公式 %d, 实验 %d, 题型 %d, 方法 %d, 例题 %d",
                  len(subgraph.get("formulas", [])), len(subgraph.get("experiments", [])),
                  len(subgraph.get("question_types", [])), len(subgraph.get("methods", [])),
@@ -181,8 +188,23 @@ def create_circuit_agent(
         guide = _SUBJECT_ANSWER_GUIDE.get(subject, "")
 
         concept = g_ctx.get("concept")
+        concepts = g_ctx.get("concepts") or []
         concept_block = ""
-        if concept:
+        if concepts:
+            # 章节聚合检索：一个问题覆盖整章多个概念，逐个渲染供模型组织讲解
+            for i, cd_ in enumerate(concepts, 1):
+                lines = [f"【概念 {i}：{cd_.get('name', '')}】"]
+                if cd_.get("chapter"):
+                    lines.append(f"- 章节：{cd_['chapter']}")
+                lines.append(f"- 定义：{cd_.get('description', '')}")
+                if cd_.get("breakdown"):
+                    lines.append("- 概念拆解：")
+                    lines += [f"  {j + 1}. {b}" for j, b in enumerate(cd_["breakdown"])]
+                if cd_.get("common_mistakes"):
+                    lines.append("- 易错点：")
+                    lines += [f"  * {e}" for e in cd_["common_mistakes"]]
+                concept_block = (concept_block + "\n" if concept_block else "") + "\n".join(lines)
+        elif concept:
             lines = [f"- 定义：{concept.get('description', '')}"]
             if concept.get("chapter"):
                 lines.append(f"- 章节：{concept['chapter']}")
@@ -231,7 +253,7 @@ def create_circuit_agent(
         # 图谱实体（公式/实验/题型/方法）抽取时不记页码，只能标注到「知识图谱」粒度。
         pages_hit = sorted({int(n) for c in chunks for n in re.findall(r"--- 第 (\d+) 页 ---", c)})
         retrieval_status = (
-            f"知识图谱：{'命中' if concept else '未命中'}；"
+            f"知识图谱：{'命中' if (concept or concepts) else '未命中'}；"
             f"讲义原文：{'第 ' + '、'.join(map(str, pages_hit)) + ' 页' if pages_hit else '无'}"
         )
 
