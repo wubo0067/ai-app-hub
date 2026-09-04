@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 from agent.workflow import create_circuit_agent
-from ingestion import build_knowledge_bases
+from ingestion import _normalize_subject, build_knowledge_bases
 from logger import get_logger
 from pdf_processor import extract_pdf_pages_as_markdown
 from storage.graph_store import ScienceGraphStore
@@ -44,6 +44,18 @@ DEFAULT_START_PAGE = 11
 DEFAULT_END_PAGE = 12
 DEFAULT_SUBJECT = "physics"
 DEFAULT_QUERY = "请帮我系统讲解可变电路的分析思路，并用具体的典型例题带我推导一遍"
+
+
+def _subject_choice(value: str) -> str:
+    """--subject 参数解析：归一化到 physics/chemistry/math，非法值报命令行错误。
+
+    复用 ingestion._normalize_subject 作为学科别名的唯一事实源（中文/拼音亦可），
+    配合 argparse choices 把取值固定为三种。
+    """
+    try:
+        return _normalize_subject(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,8 +73,10 @@ def parse_args() -> argparse.Namespace:
                         help="起始页码（从 1 计）。")
     parser.add_argument("--end-page", type=int, default=DEFAULT_END_PAGE,
                         help="结束页码（含），超出总页数自动截断。")
-    parser.add_argument("--subject", default=DEFAULT_SUBJECT,
-                        help="学科：physics / chemistry / math（亦接受中文名）。")
+    parser.add_argument("--subject", type=_subject_choice, default=DEFAULT_SUBJECT,
+                        choices=("physics", "chemistry", "math"),
+                        help="学科，仅限三种：physics/物理、chemistry/化学、math/数学"
+                             "（接受中文或拼音别名，自动归一化）。")
     parser.add_argument("--query", default=DEFAULT_QUERY,
                         help="学生提问（ask/all 阶段使用）。")
     return parser.parse_args()
