@@ -16,8 +16,8 @@ PDF 讲义 ──① 视觉大模型提取──▶ 结构化 Markdown（逐页�
               └─ 向量库 Chroma（metadata.id 与图节点键/讲义页键一致，供精确回表）
                    实体切片 + 讲义页切片 subject:Page:页码
         ──③ LangGraph 问答 Agent──▶ 分层讲解
-              判定学科与知识点锚点 → 图谱聚合检索（模糊解析锚点）
-              → 按例题页码回表取讲义页原文 → 生成回答
+              判定学科与知识点锚点 → 图谱聚合检索（模糊解析锚点 + 每类 top-N 截断）
+              → 按例题页码回表取讲义页原文 → 生成回答（标注教材来源）
 ```
 
 抽取本体（跨学科通用 schema，见 `ingestion.py`）：章节、概念（拆解/易错/前置）、
@@ -60,8 +60,10 @@ uv sync                 # 按 pyproject.toml + uv.lock 安装依赖到 .venv
 ### 启动
 
 ```powershell
-# 把教材 PDF 放到项目根目录，并按需修改 main.py 中的路径/页码/学科
-uv run python main.py
+# 换材料无需改源码，用命令行参数指定 PDF / 页码 / 学科 / 提问
+uv run python main.py --stage build --pdf 教材.pdf --start-page 11 --end-page 12 --subject physics   # 提取并累加进双库
+uv run python main.py --stage ask   --query "请讲解可变电路的分析思路"                                # 仅问答，复用已持久化双库
+uv run python main.py                                                                                  # 不带参数 = 内置默认示例
 ```
 
 ### 测试 / 自检
@@ -80,24 +82,43 @@ Get-Content output\sida_agent.log -Tail 50
 
 | 路径 | 重要度 | 说明 |
 |---|---|---|
-| `main.py` | ★★★ | 流水线入口：提取 → 建库 → 问答，演示完整调用方式 |
+| `main.py` | ★★★ | 流水线入口：提取 → 建库 → 问答；`--stage/--pdf/--start-page/--end-page/--subject/--query` 参数化，换材料无需改源码 |
 | `config.py` | ★★★ | 统一 LLM/Embedding 工厂；`.env` 中 base_url/key/model 在此生效 |
 | `ingestion.py` | ★★★ | 核心：两批串行抽取 prompt、抽取磁盘缓存、学科引导（SUBJECT_META）、双库写入编排 |
-| `agent/workflow.py` | ★★★ | LangGraph 问答工作流：学科判定 → 图谱检索 → 按页码回表讲义页 → 生成 |
-| `storage/graph_store.py` | ★★★ | `ScienceGraphStore` 图谱存储、`get_subgraph` 聚合检索、概念锚点模糊解析 |
+| `agent/workflow.py` | ★★★ | LangGraph 问答工作流：学科判定 → 图谱检索 → 按页码回表讲义页 → 生成（意图/讲解双 LLM 分调优、答案来源标注） |
+| `storage/graph_store.py` | ★★★ | `ScienceGraphStore` 图谱存储、`get_subgraph` 聚合检索（每类实体 top-N 截断）、概念锚点模糊解析 |
 | `pdf_processor.py` | ★★ | PDF 页渲染 + 视觉模型提取 Markdown，逐页缓存于 `output/pdf_extract/` |
-| `storage/vector_store.py` | ★★ | Chroma 向量库初始化（collection `science_kb`） |
+| `storage/vector_store.py` | ★★ | Chroma 向量库初始化（collection `science_kb`，落盘 `output/vector_db/`） |
 | `agent/state.py` | ★ | Agent 状态 TypedDict（query / target_subject / 检索结果等） |
 | `logger.py` | ★ | 控制台 + `output/sida_agent.log` 双通道日志 |
 | `.env` | ★★ | 模型服务配置（不入库）；`.env` 缺失或 key 为空时启动会给出指引报错 |
-| `output/` | — | 运行产物：日志、PDF 提取缓存（`pdf_extract/{pdf_id}/pXXXX.md`）、抽取缓存（`extract_cache/{hash}.json`） |
+| `output/` | — | 运行产物：日志、PDF 提取缓存（`pdf_extract/{pdf_id}/pXXXX_{ver}.md`）、抽取缓存（`extract_cache/{hash}.json`）、向量库（`vector_db/`）、图谱（`knowledge_graph.json`） |
 
 ## 4. 其它说明
 
-- PDF 提取缓存目录结构 `output/pdf_extract/{pdf_id}/p{页码}.md`，`pdf_id` 为 PDF
-  内容 SHA-256 前 16 位，与姊妹项目 `knowledge_extract/extract_pdf` 同算法，可互相复用缓存。
-- 图谱为内存版（进程退出即消失），向量库为 Chroma 默认本地持久化；重启后需重跑
-  `build_knowledge_bases`（PDF 提取缓存命中则不调视觉模型，抽取缓存命中则不调推理
-  LLM，重建仅剩向量/图写入，秒级完成）。
+- PDF 提取缓存目录结构 `output/pdf_extract/{pdf_id}/p{页码}_{版本}.md`，`pdf_id` 为 PDF
+  内容 SHA-256 前 16 位，与姊妹项目 `knowledge_extract/extract_pdf` 同算法；文件名版本
+  取自 `pdf_processor._EXTRACT_VERSION`，调整 PROMPT、渲染分辨率或后处理时递增即可让
+  旧页缓存自动失效，无需手动删目录。
+- 双库均跨进程持久化：向量库落盘 `output/vector_db/`（Chroma PersistentClient），
+  图谱落盘 `output/knowledge_graph.json`（node_link JSON）。`build_knowledge_bases`
+  结束时自动 `save`，`main.py` 启动时 `ScienceGraphStore.load()` 自动载入。因此可
+  分次喂入不同学科/教材 PDF 持续累积成三科知识库，也可另起独立只读问答进程。
+- 清空知识库：删除 `output/vector_db/` 与 `output/knowledge_graph.json`；只删
+  `extract_cache`/`pdf_extract` 则下次重建重新走（缓存命中的）抽取流程。
 - 向量写入以 `metadata.id` 为键幂等 upsert，重复重建不会在 Chroma 中累积重复切片；
-  修改抽取 schema 后请递增 `ingestion._EXTRACT_SCHEMA_VERSION` 使旧抽取缓存失效。
+  修改抽取 schema 后请递增 `ingestion._EXTRACT_SCHEMA_VERSION` 使旧抽取缓存失效，
+  修改 PDF 提取 PROMPT/渲染参数/后处理后请递增 `pdf_processor._EXTRACT_VERSION`
+  使旧页缓存失效。
+- 图谱检索截断：`get_subgraph` 对公式/实验/题型/方法/例题每类默认返回 top-8
+  （`storage/graph_store._DEFAULT_MAX_PER_KIND`，调用时传 `max_per_kind=None` 关闭），
+  命中「枢纽概念」（关联几十条实体）时防止撑爆下游 prompt；examples 截断会连带
+  减少按页回表的讲义页数。
+- 双 LLM 分调优：`agent/workflow.py` 的意图判定与最终讲解各用一个 `get_reasoning_llm`
+  实例——判定走低温 / 小 `max_tokens` / 关思考（只输出一行 JSON，短平快），讲解保留
+  默认思考与大 token 预算（长输出），二者参数互不干扰。
+- 答案可追溯性：生成 prompt 注入「本次检索命中情况」（图谱命中与否 + 讲义命中页码），
+  输出规范要求模型对取自例题原文的内容标注「（见教材第 X 页）」、取自图谱各区块的标注
+  「（教材知识点，图谱收录）」（图谱实体抽取时不记页码，只能到图谱粒度）、自行补充的
+  学科知识另起「【补充说明·教材未涉及】」段；仅当图谱与讲义双双未命中时，才在正文开头
+  声明为通用讲解——避免无教材支撑的内容以同等自信误导学生 / 家长。

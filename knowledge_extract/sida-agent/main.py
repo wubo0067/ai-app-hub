@@ -14,9 +14,17 @@
 
 模型服务（base_url / api_key / model_name）统一在 sida-agent/.env 中配置，
 见 config.py。
+
+命令行用法（换材料无需改源码）：
+    uv run python main.py --stage build --pdf 教材.pdf --start-page 11 --end-page 12 --subject physics
+    uv run python main.py --stage ask   --query "讲解可变电路的分析思路"
+    uv run python main.py                          # 不带参数 = 下方默认值，等价旧行为
+--stage: all=提取+建库+问答（默认）；build=仅提取并累加进双库；ask=仅复用已持久化双库问答。
 """
 
 from __future__ import annotations
+
+import argparse
 
 from agent.workflow import create_circuit_agent
 from ingestion import build_knowledge_bases
@@ -27,58 +35,77 @@ from storage.vector_store import get_vector_store
 
 log = get_logger()
 
+# CLI 默认值：不带参数运行即等价于旧版硬编码流水线，便于快速回归。
+DEFAULT_PDF = "H:/wechat_files/xwechat_files/calm-wu_9d75/msg/file/2026-08/9S合并PDF.pdf"
+DEFAULT_START_PAGE = 11
+DEFAULT_END_PAGE = 12
+DEFAULT_SUBJECT = "physics"
+DEFAULT_QUERY = "请帮我系统讲解可变电路的分析思路，并用具体的典型例题带我推导一遍"
+
+
+def parse_args() -> argparse.Namespace:
+    """解析命令行参数；缺省时回退到模块顶部的默认值。"""
+    parser = argparse.ArgumentParser(
+        description="初中理科全科知识库 Agent：PDF 提取 → 建库 → 问答。",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--stage", choices=("all", "build", "ask"), default="all",
+        help="all=提取+建库+问答；build=仅提取并累加进双库；ask=仅复用已持久化双库问答。",
+    )
+    parser.add_argument("--pdf", default=DEFAULT_PDF, help="教材 PDF 路径（build/all 阶段使用）。")
+    parser.add_argument("--start-page", type=int, default=DEFAULT_START_PAGE,
+                        help="起始页码（从 1 计）。")
+    parser.add_argument("--end-page", type=int, default=DEFAULT_END_PAGE,
+                        help="结束页码（含），超出总页数自动截断。")
+    parser.add_argument("--subject", default=DEFAULT_SUBJECT,
+                        help="学科：physics / chemistry / math（亦接受中文名）。")
+    parser.add_argument("--query", default=DEFAULT_QUERY,
+                        help="学生提问（ask/all 阶段使用）。")
+    return parser.parse_args()
+
 
 def main() -> None:
-    # 1. 配置密钥（优先从 .env / 环境读取，见 config.py）
-    # 视觉解析：VISION_BASE_URL / VISION_MODEL / VISION_API_KEY
-    # 推理（通用）：REASONING_BASE_URL / REASONING_MODEL / REASONING_API_KEY
-    # Embedding：OPENAI_API_KEY / OPENAI_BASE_URL
+    # 密钥优先从 .env / 环境读取（见 config.py）：
+    # 视觉 VISION_* / 推理 REASONING_* / Embedding OPENAI_*
+    args = parse_args()
 
-    # 共享的双库实例：多学科教材可反复累积进同一份知识库
-    vector_db = get_vector_store()
-    graph_db = ScienceGraphStore()
+    # 共享的双库实例：跨进程持久化，多学科教材可反复累积进同一份知识库
+    vector_db = get_vector_store()          # Chroma 本地持久化，自动加载历史切片
+    graph_db = ScienceGraphStore.load()     # 有历史图谱则加载，无则新建空库
 
-    # 2. 多模态提取 PDF 物理页码（例如提取第 6 页到第 12 页）
-    pdf_file_path = "H:/wechat_files/xwechat_files/calm-wu_9d75/msg/file/2026-08/9S合并PDF.pdf"
-    log.info("[main] 流水线启动, PDF=%s", pdf_file_path)
-    pages_data = extract_pdf_pages_as_markdown(
-        pdf_path=pdf_file_path,
-        start_page=11,
-        end_page=12,
-    )
+    # ---- 建库阶段（all / build）：多模态提取 PDF 指定页 → 结构化抽取累积进双库
+    if args.stage in ("all", "build"):
+        log.info("[main] 流水线启动, PDF=%s, 页码=%d-%d, subject=%s",
+                 args.pdf, args.start_page, args.end_page, args.subject)
+        pages_data = extract_pdf_pages_as_markdown(
+            pdf_path=args.pdf,
+            start_page=args.start_page,
+            end_page=args.end_page,
+        )
+        # 同一 vector_db/graph_db 多次调用即跨学科累积全科知识库。
+        vector_db, graph_db = build_knowledge_bases(
+            pages_data=pages_data,
+            subject=args.subject,
+            vector_db=vector_db,
+            graph_db=graph_db,
+        )
+        log.info("[main] 建库完成（stage=%s）", args.stage)
 
-    # 3. 结构化抽取并构建双库。
-    #    每次调用传入学科：physics / chemistry / math。
-    #    后续若要加入其它学科/教材，用同一 vector_db/graph_db 再次调用即可累积：
-    #    build_knowledge_bases(pages_data=chemistry_pages, subject="chemistry",
-    #                          vector_db=vector_db, graph_db=graph_db)
-    vector_db, graph_db = build_knowledge_bases(
-        pages_data=pages_data,
-        subject="physics",
-        vector_db=vector_db,
-        graph_db=graph_db,
-    )
+    # ---- 问答阶段（all / ask）：先判定学科再检索，生成分层讲解
+    if args.stage in ("all", "ask"):
+        agent = create_circuit_agent(vector_db=vector_db, graph_db=graph_db)
+        log.info("[main] Agent 正在处理学生提问: %s", args.query)
+        try:
+            result = agent.invoke({"query": args.query})
+        except Exception:
+            log.exception("[main] Agent 执行失败")
+            raise
+        print("=" * 60)
+        print("【解答生成结果】:\n")
+        print(result["final_answer"])
+        print("=" * 60)
 
-    # 4. 构建并运行全科问答 Agent
-    agent = create_circuit_agent(
-        vector_db=vector_db,
-        graph_db=graph_db,
-    )
-
-    # 5. 执行测试提问（可问物理/化学/数学，Agent 会先判定学科再检索）
-    test_query = "请帮我系统讲解可变电路的分析思路，并用具体的典型例题带我推导一遍"
-    log.info("[main] Agent 正在处理学生提问: %s", test_query)
-
-    try:
-        result = agent.invoke({"query": test_query})
-    except Exception:
-        log.exception("[main] Agent 执行失败")
-        raise
-
-    print("=" * 60)
-    print("【解答生成结果】:\n")
-    print(result["final_answer"])
-    print("=" * 60)
     log.info("[main] 流水线完成")
 
 

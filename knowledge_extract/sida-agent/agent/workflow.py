@@ -3,7 +3,7 @@
 """初中理科全科问答 Agent 工作流（LangGraph）。
 
 链路：提问 -> 学科+知识点锚点判定 -> 图谱聚合检索（概念拆解/公式/实验/题型/例题）
--> 向量库按 id 回表取例题全文 -> 生成分层讲解（概念拆解先行、公式推导、题型溯源）。
+-> 按例题 source.page 回表取讲义页原文 -> 生成分层讲解（概念拆解先行、公式推导、题型溯源）。
 """
 
 from __future__ import annotations
@@ -40,19 +40,35 @@ _SUBJECT_ANSWER_GUIDE = {
 
 
 def _parse_intent(raw: str) -> tuple[str, str]:
-    """从 LLM 输出中稳健解析 {"subject": "...", "concept": "..."}。"""
+    """从 LLM 输出中稳健解析 {"subject": "...", "concept": "..."}。
+
+    任何回退到 physics 的路径都记 log.warning（含原因与原始输出片段），
+    避免化学/数学问题被静默错路由到物理库后无从排查。
+    """
     default_concept = re.sub(r"[？?。！!，,\s]+", "", raw).strip() or "核心知识点"
+    fallback_reason = ""
     try:
         obj = json.loads(raw.strip())
-        subject = str(obj.get("subject", "physics")).strip().lower()
+        subject = str(obj.get("subject", "")).strip().lower()
         concept = str(obj.get("concept", "")).strip()
+        if not subject:
+            fallback_reason = "JSON 输出缺少 subject 字段"
+            subject = "physics"
     except json.JSONDecodeError:
         # 兜底：输出可能不是标准 JSON，退回按行猜测
         m = re.search(r'"subject"\s*:\s*"([^"]+)"', raw)
-        subject = m.group(1).strip().lower() if m else "physics"
+        if m:
+            subject = m.group(1).strip().lower()
+        else:
+            fallback_reason = "输出非 JSON 且正则未匹配到 subject"
+            subject = "physics"
         concept = default_concept
     if subject not in _SUBJECT_LABEL:
+        fallback_reason = f"subject 非法值 {subject!r}"
         subject = "physics"
+    if fallback_reason:
+        log.warning("[workflow._parse_intent] 学科回退为 physics（%s），原始输出: %s",
+                    fallback_reason, raw[:200])
     return subject, concept or default_concept
 
 
@@ -65,7 +81,10 @@ def create_circuit_agent(
     推理模型固定由 config.py + sida-agent/.env 的 REASONING_* 配置决定。
     """
     log.info("[workflow] 构建全科问答 Agent 工作流")
-    llm = get_reasoning_llm()
+    # 意图判定：只输出一行 JSON，追求短平快 —— 低温、小 max_tokens、关思考。
+    intent_llm = get_reasoning_llm(temperature=0.0, max_tokens=128, enable_thinking=False)
+    # 最终讲解：需要长输出与推理质量 —— 沿用模型默认思考与较大 token 预算。
+    answer_llm = get_reasoning_llm(temperature=0.3)
 
     def analyze_intent_node(state: CircuitAgentState):
         query = state["query"]
@@ -79,7 +98,7 @@ def create_circuit_agent(
             f"提问：{query}"
         )
         log.debug("[workflow.analyze_intent] 调用 LLM 判定学科与锚点, query=%r", query)
-        subject, concept = _parse_intent(str(llm.invoke(prompt).content))
+        subject, concept = _parse_intent(str(intent_llm.invoke(prompt).content))
         log.info("[workflow.analyze_intent] 判定结果: subject=%s, concept=%s",
                  _SUBJECT_LABEL.get(subject, subject), concept)
         return {"target_subject": subject, "target_concept": concept}
@@ -124,13 +143,13 @@ def create_circuit_agent(
                 chunks.append(results["documents"][0])
             else:
                 log.warning("[workflow.fetch_chunks] 向量库未命中讲义页: %s", pk)
-        # 兜底：无页码信息的旧例题切片，按 example id 直接回表
+        # 缺 page 的例题无法回表原文：例题自身的向量文档只是「编号+标题+题型」壳，
+        # 从不含题干原文（原文只存在于按 page 索引的讲义页切片）。此处不再拿空壳
+        # 冒充原文塞进 prompt，改为记 warning，让"典型例题原文"缺失显式可见。
         for ex in examples:
-            if (ex.get("source") or {}).get("page") is not None:
-                continue
-            results = vector_db.get(where={"id": ex["id"]})
-            if results and results.get("documents"):
-                chunks.append(results["documents"][0])
+            if (ex.get("source") or {}).get("page") is None:
+                log.warning("[workflow.fetch_chunks] 例题缺 source.page，无法回表原文: %s",
+                            ex.get("id", "?"))
         log.info("[workflow.fetch_chunks] 回表得到原题切片 %d 条", len(chunks))
         return {"vector_chunks": chunks}
 
@@ -155,6 +174,10 @@ def create_circuit_agent(
             concept_block = "\n".join(lines)
 
         prereq_block = "、".join(p["name"] for p in g_ctx.get("prerequisites", [])) or "无"
+        followup_block = "、".join(p["name"] for p in g_ctx.get("follow_ups", [])) or "无"
+        related_block = "、".join(
+            f"{p['name']}（{p.get('relation', '')}）" if p.get("relation") else p["name"]
+            for p in g_ctx.get("related_concepts", [])) or "无"
 
         formula_block = "\n".join(
             f"- {f['name']}：{f['expression']}"
@@ -181,7 +204,15 @@ def create_circuit_agent(
             + (f"（适用：{m.get('scope', '')}）" if m.get("scope") else "")
             for m in g_ctx.get("methods", []))
 
-        examples_text = "\n\n".join(state.get("vector_chunks", []))
+        chunks = state.get("vector_chunks", [])
+        examples_text = "\n\n".join(chunks)
+        # 讲义页切片自带「--- 第 N 页 ---」头，据此列出命中页码供模型标注来源；
+        # 图谱实体（公式/实验/题型/方法）抽取时不记页码，只能标注到「知识图谱」粒度。
+        pages_hit = sorted({int(n) for c in chunks for n in re.findall(r"--- 第 (\d+) 页 ---", c)})
+        retrieval_status = (
+            f"知识图谱：{'命中' if concept else '未命中'}；"
+            f"讲义原文：{'第 ' + '、'.join(map(str, pages_hit)) + ' 页' if pages_hit else '无'}"
+        )
 
         final_prompt = f"""你是一位金牌初中{subject_label}名师。请系统回答学生提问："{state['query']}"。
 
@@ -189,7 +220,9 @@ def create_circuit_agent(
 
 【知识点定位（来自教研知识图谱）】：
 {concept_block if concept_block else "（图谱中暂无该知识点的拆解信息，请基于学科知识作答）"}
-先修基础：{prereq_block}
+先修基础（学本概念前应先掌握）：{prereq_block}
+后续概念（掌握本概念后可进阶）：{followup_block}
+关联概念（相关但非先修，仅供参照）：{related_block}
 
 【公式与推导（图谱）】：
 {formula_block or "暂无"}
@@ -206,14 +239,26 @@ def create_circuit_agent(
 【典型例题原文（向量库回表）】：
 {examples_text or "暂无关联例题"}
 
+【本次检索命中情况】：{retrieval_status}
+
 【输出规范】：
 1. 概念先行：先讲清"是什么"，用分层拆解的方式讲解，避免堆砌术语。
 2. 公式推导：给出公式/定理的来龙去脉与适用条件，不直接扔结论。
 3. 实验/图形：涉及实验用文字描述装置与操作、现象、结论；涉及图形要用文字讲清结构。
 4. 题型溯源：结合图谱中的题型模板与陷阱，把例题归类到具体题型，示范完整推导。
 5. 结尾给出易错点与检查清单。
+6. 来源标注（重要，帮助学生判断内容是否贴合教材）：
+   - 内容取自【典型例题原文】的，句末标注「（见教材第 X 页）」，页码取该段原文所在页；
+   - 内容取自知识图谱各区块（概念拆解/公式/实验/题型/方法）的，标注「（教材知识点，图谱收录）」；
+   - 超出上述资料范围、由你自行补充的学科知识，必须另起一段以「【补充说明·教材未涉及】」
+     开头，不要与教材内容混写在同一段，也不要用肯定教材的口吻表述；
+   - 仅当检索命中情况显示图谱"未命中"且讲义原文为"无"时，本次回答整体属于通用讲解：
+     须在正文开头用一句话说明「以下内容超出当前教材收录范围，为通用讲解」，
+     且不得声称"教材中指出"之类无法追溯的说法；
+   - 讲义原文为"无"但图谱命中时，图谱内容仍按「（教材知识点，图谱收录）」标注，
+     只是不得引用具体页码；宁可说明不确定，也不要编造页码。
 """
-        response = str(llm.invoke(final_prompt).content)
+        response = str(answer_llm.invoke(final_prompt).content)
         log.info("[workflow.generate_response] 解答生成完成, 长度=%d 字符", len(response))
         return {"final_answer": response}
 

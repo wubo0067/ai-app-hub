@@ -54,6 +54,7 @@ from storage.graph_store import (
     REL_TESTS,
     REL_TRACES_TO,
     ScienceGraphStore,
+    bare_name,
     node_key,
 )
 from storage.vector_store import get_vector_store
@@ -154,19 +155,124 @@ def _save_extract_cache(key: str, data: Dict[str, Any]) -> None:
         log.warning("[ingestion] 抽取缓存写入失败: %s", e)
 
 
-def _extract_json(llm: Any, prompt: str, label: str) -> Dict[str, Any]:
-    """调用 LLM 并把返回解析为 JSON 对象（自动剥离代码围栏）。"""
-    log.debug("[ingestion] %s：调用 LLM 抽取...", label)
-    res = str(llm.invoke(prompt).content).strip()
-    clean = _strip_code_fence(res)
-    try:
-        data = json.loads(clean)
-    except json.JSONDecodeError:
-        log.error("[ingestion] %s 返回非法 JSON，前 500 字符: %s", label, clean[:500])
-        raise
-    if not isinstance(data, dict):
-        raise ValueError(f"[ingestion] {label} 返回的不是 JSON 对象: {type(data)}")
-    return data
+# 解析失败时的纠错追加指令：要求只输出严格 JSON 后重试一次
+_JSON_RETRY_HINT = (
+    "\n\n【纠错要求】你上一次的输出无法被解析为合法 JSON。"
+    "请重新输出：只输出一个严格合法的 JSON 对象，"
+    "不要任何解释文字、不要 markdown 代码围栏。"
+)
+
+# 各实体类型中「必须为数组」的字段（LLM 偶尔把数组写成字符串，
+# 无脑 list() 会静默拆成单字符污染图谱）
+_ENTITY_KINDS = (
+    "chapters", "concepts", "formulas", "experiments",
+    "question_types", "examples", "methods", "extra_relations",
+)
+_LIST_FIELDS: Dict[str, Tuple[str, ...]] = {
+    "concepts": ("breakdown", "common_mistakes", "prerequisites"),
+    "formulas": ("symbols", "derivation", "related_concepts"),
+    "experiments": ("apparatus", "steps", "exam_focus", "related_concepts"),
+    "methods": ("steps", "related_concepts"),
+    "question_types": ("identify_features", "template", "traps", "related_concepts"),
+    "examples": ("related_concepts",),
+}
+# 各实体中「必须为字符串」的字段：LLM 可能输出数字/对象，统一 str 化防 .strip() 崩溃
+_STR_FIELDS: Dict[str, Tuple[str, ...]] = {
+    "chapters": ("title", "summary"),
+    "concepts": ("name", "description", "chapter"),
+    "formulas": ("name", "expression", "applicable_scope"),
+    "experiments": ("name", "purpose", "phenomenon", "conclusion", "diagram"),
+    "methods": ("name", "scope"),
+    "question_types": ("name",),
+    "examples": ("id", "title", "question_type"),
+    "extra_relations": ("from", "rel", "to"),
+}
+
+
+def _as_list(value: Any, label: str, field: str, stringify: bool = True) -> List[Any]:
+    """应为数组的字段安全取值：非数组记警告并返回 []，杜绝字符串被拆成单字符。"""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        if stringify:
+            return [v if isinstance(v, str) else str(v) for v in value]
+        return value
+    log.warning("[ingestion] %s.%s 期望数组，实际为 %s，已丢弃: %r",
+                label, field, type(value).__name__, str(value)[:80])
+    return []
+
+
+def _normalize_extracted(data: Dict[str, Any]) -> None:
+    """就地归一化抽取结果（含旧缓存脏数据）：实体须为对象、字符串字段 str 化、
+    数组字段校验类型。
+
+    在写库与建向量之前统一执行一次，覆盖 _write_graph / _build_vector_docs
+    两个消费方，避免逐点防御。
+    """
+    for kind in _ENTITY_KINDS:
+        items = data.get(kind)
+        if items is None:
+            data[kind] = []
+            continue
+        if not isinstance(items, list):
+            log.warning("[ingestion] %s 顶层期望数组，实际为 %s，已置空",
+                        kind, type(items).__name__)
+            data[kind] = []
+            continue
+        cleaned: List[Dict[str, Any]] = []
+        for it in items:
+            if not isinstance(it, dict):
+                log.warning("[ingestion] %s 存在非对象条目，已丢弃: %r",
+                            kind, str(it)[:80])
+                continue
+            for f in _STR_FIELDS.get(kind, ()):
+                v = it.get(f)
+                if v is not None and not isinstance(v, str):
+                    it[f] = str(v)
+            for f in _LIST_FIELDS.get(kind, ()):
+                lab = f"{kind}[{it.get('name') or it.get('id') or '?'}]"
+                got = _as_list(it.get(f), lab, f, stringify=(f != "symbols"))
+                if f == "symbols":  # 符号表元素必须是对象
+                    got = [s for s in got if isinstance(s, dict)]
+                it[f] = got
+            if kind == "examples":
+                src = it.get("source")
+                if src is None:
+                    it["source"] = {}
+                elif not isinstance(src, dict):
+                    log.warning("[ingestion] 例题 %s 的 source 期望对象，实际为 %s，已置空",
+                                it.get("id", "?"), type(src).__name__)
+                    it["source"] = {}
+            cleaned.append(it)
+        data[kind] = cleaned
+
+
+def _extract_json(llm: Any, prompt: str, label: str, max_attempts: int = 2) -> Dict[str, Any]:
+    """调用 LLM 并解析为 JSON 对象；解析失败时追加纠错提示重试一次，仍失败才抛错。
+
+    抽取是整本书级别的高成本操作（两批 LLM 调用），不应因一次格式错误全部作废；
+    与 pdf_processor._invoke_llm 的重试策略对齐。
+    """
+    last_err: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        log.debug("[ingestion] %s：调用 LLM 抽取（第 %d/%d 次）...",
+                  label, attempt, max_attempts)
+        res = ""
+        clean = ""
+        try:
+            res = str(llm.invoke(
+                prompt if attempt == 1 else prompt + _JSON_RETRY_HINT).content).strip()
+            clean = _strip_code_fence(res)
+            data = json.loads(clean)
+            if not isinstance(data, dict):
+                raise ValueError(f"返回的不是 JSON 对象: {type(data)}")
+            return data
+        except (json.JSONDecodeError, ValueError) as e:
+            last_err = e
+            log.warning("[ingestion] %s 第 %d 次输出解析失败: %s（前 200 字符: %s）",
+                        label, attempt, e, clean[:200] or res[:200])
+    log.error("[ingestion] %s 连续 %d 次解析失败，放弃", label, max_attempts)
+    raise RuntimeError(f"[ingestion] {label} JSON 抽取失败: {last_err}")
 
 
 def _build_knowledge_prompt(subject: str, markdown: str) -> str:
@@ -237,7 +343,7 @@ def _build_question_prompt(subject: str, markdown: str, concept_names: List[str]
       "source": {{"book": "教材/册", "chapter": "章节", "page": 页码, "number": "题号"}},
       "related_concepts": ["考点概念名"]}}
   ],
-  "extra_relations": [{{"from": "实体名", "rel": "关系英文名", "to": "实体名"}}]
+  "extra_relations": [{{"from": "概念名", "rel": "关系英文名", "to": "概念名"}}]
 }}
 
 【要求】
@@ -245,6 +351,8 @@ def _build_question_prompt(subject: str, markdown: str, concept_names: List[str]
    （原文由 page 页码到向量库回表获取，抄写会严重拖慢抽取）。
 2. page 必须填该例题所在讲义页码（正文 "--- 第 N 页 ---" 标记里的 N），这是回表取原文的关键，务必准确。
 3. related_concepts 只能取自上面给出的概念名列表；无对应实体的字段填 []。
+4. extra_relations 是【概念与概念】之间的补充关联，from/to 必须取自上面的概念名列表，
+   不得填公式/实验/题型/方法名。
 """
 
 
@@ -289,12 +397,17 @@ def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any]
                                 node_key(subject, K_CONCEPT, name))
 
     def _link_concept_refs(refs: Any, rel: str, key: str) -> None:
-        """把 related_concepts / prerequisites 等引用转成概念节点出/入边。"""
+        """把 related_concepts 等引用转成概念节点出/入边；引用不存在的概念
+        告警跳过，不新建同名空壳（防幽灵节点）。"""
         for ref in refs or []:
             ref = str(ref).strip()
             if not ref:
                 continue
-            ckey = _ensure_entity(graph_db, subject, K_CONCEPT, ref)
+            ckey = node_key(subject, K_CONCEPT, ref)
+            if ckey not in graph_db.graph:
+                log.warning("[ingestion] %s 的 %s 引用了不存在的概念，跳过: %s",
+                            bare_name(key), rel, ref)
+                continue
             if rel == REL_TRACES_TO:      # 题型 -> 概念（溯源）
                 graph_db.relate(key, rel, ckey)
             elif rel == REL_HAS_FORMULA or rel == REL_HAS_EXPERIMENT or rel == REL_HAS_METHOD:
@@ -362,18 +475,42 @@ def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any]
                                 source=src)
         qt_name = str(ex.get("question_type") or "").strip()
         if qt_name:
-            graph_db.relate(qt_keys.get(qt_name) or _ensure_entity(
-                graph_db, subject, K_QUESTION_TYPE, qt_name), REL_EXEMPLIFIED_BY, ex_key)
+            qt_key = qt_keys.get(qt_name)
+            if qt_key is None:
+                log.warning("[ingestion] 例题 %s 的归属题型 %s 不在本批题型中，跳过挂边",
+                            ex_name, qt_name)
+            else:
+                graph_db.relate(qt_key, REL_EXEMPLIFIED_BY, ex_key)
         _link_concept_refs(ex.get("related_concepts"), REL_TESTS, ex_key)
 
-    # --- 补充关系 ---
+    # --- 补充关系：两端必须是已抽取的概念节点，禁止新建同名空壳（防幽灵节点）---
     for r in data.get("extra_relations", []):
         src, dst = str(r.get("from", "")).strip(), str(r.get("to", "")).strip()
-        if not src or not dst:
+        rel = str(r.get("rel") or "").strip() or REL_EXTRA
+        if not src or not dst or src == dst:
             continue
-        src_key = _ensure_entity(graph_db, subject, K_CONCEPT, src)
-        dst_key = _ensure_entity(graph_db, subject, K_CONCEPT, dst)
-        graph_db.relate(src_key, str(r.get("rel") or REL_EXTRA), dst_key)
+        src_key = node_key(subject, K_CONCEPT, src)
+        dst_key = node_key(subject, K_CONCEPT, dst)
+        if src_key not in graph_db.graph or dst_key not in graph_db.graph:
+            log.warning("[ingestion] extra_relations 端点不是已抽取概念，跳过: %s -[%s]-> %s",
+                        src, rel, dst)
+            continue
+        graph_db.relate(src_key, rel, dst_key)
+
+
+def _audit_graph(graph_db: ScienceGraphStore, subject: str) -> None:
+    """构建后审计：列出本学科无描述的空壳概念节点（幽灵节点），暴露误引用。"""
+    shells = [
+        bare_name(key) for key, nd in graph_db.graph.nodes(data=True)
+        if nd.get("subject") == subject and nd.get("type") == K_CONCEPT
+        and not str(nd.get("description", "")).strip()
+    ]
+    if shells:
+        log.warning("[ingestion] 审计: %s 科存在 %d 个空壳概念节点（无描述，"
+                    "多为 prerequisites 前置引用或历史脏数据）: %s",
+                    subject, len(shells), "、".join(shells[:20]))
+    else:
+        log.info("[ingestion] 审计: %s 科无空壳概念节点", subject)
 
 
 def _build_vector_docs(subject: str, data: Dict[str, Any]) -> List[Document]:
@@ -503,7 +640,7 @@ def build_knowledge_bases(
     log.info("[ingestion] 开始构建知识库: subject=%s, 输入页数=%d",
              SUBJECT_META[subject]["label"], len(pages_data))
     vector_db = vector_db or get_vector_store()
-    graph_db = graph_db or ScienceGraphStore()
+    graph_db = graph_db or ScienceGraphStore.load()
     if node_key(subject, K_SUBJECT, subject) not in graph_db.graph:
         graph_db.add_entity(subject, K_SUBJECT, subject, label=SUBJECT_META[subject]["label"])
 
@@ -524,6 +661,9 @@ def build_knowledge_bases(
         data = {**k_data, **q_data}
         _save_extract_cache(cache_key, data)
 
+    # 归一化：校验实体/字段类型（含旧缓存脏数据），杜绝字符串被静默拆成单字符
+    _normalize_extracted(data)
+
     n_kind = {k: len(data.get(k, [])) for k in
               ("chapters", "concepts", "formulas", "experiments",
                "question_types", "examples", "methods", "extra_relations")}
@@ -537,6 +677,12 @@ def build_knowledge_bases(
     docs = _build_vector_docs(subject, data) + _build_page_docs(subject, pages_data)
     if docs:
         vector_db.add_documents(docs, ids=[d.metadata["id"] for d in docs])
+
+    # 3. 构建后审计：暴露空壳概念节点（幽灵节点）
+    _audit_graph(graph_db, subject)
+
+    # 4. 图谱落盘：向量库由 Chroma 自动持久化，图谱需显式 save 才能跨进程累积
+    graph_db.save()
 
     log.info("[ingestion] 构建完成: 图节点 %d 个, 向量切片 %d 条。",
              graph_db.graph.number_of_nodes(), len(docs))

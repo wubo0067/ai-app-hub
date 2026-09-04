@@ -39,7 +39,7 @@ BASE_DIR = Path(__file__).resolve().parent
 log = get_logger()
 
 # ---- 输出路径 -----------------------------------------------------------
-# 与 extract_pdf/main.py 同结构的缓存：output/pdf_extract/{pdf_id}/p{页码}.md
+# 缓存结构：output/pdf_extract/{pdf_id}/p{页码}_{版本}.md（版本见 _EXTRACT_VERSION）
 OUTPUT_DIR = BASE_DIR / "output" / "pdf_extract"
 
 # ---- 视觉解析模型 ---------------------------------------------------------
@@ -50,8 +50,14 @@ LLM_TIMEOUT = 300.0      # 单次请求超时（秒）
 LLM_RETRIES = 2          # 本地调用失败重试次数（指数退避）
 MAX_TOKENS = 8192        # 单次生成最大 token 数
 
-MAX_LONG_EDGE = 2000     # PDF 页面渲染 PNG 的长边像素上限
-MAX_ZOOM = 3.0           # 页面渲染最大放大倍数（72dpi 为 1.0）
+# 手写批注（红笔小字、上下标）在 ~170dpi 下易糊，长边提到 3000px（A4 ≈ 257dpi）；
+# MAX_ZOOM 需同步放大，否则 A4（长边 842pt）会被 3.0x 截在 2526px 到不了 3000。
+MAX_LONG_EDGE = 3000     # PDF 页面渲染 PNG 的长边像素上限
+MAX_ZOOM = 4.0           # 页面渲染最大放大倍数（72dpi 为 1.0）
+
+# 页缓存版本：PROMPT、渲染参数（MAX_LONG_EDGE/MAX_ZOOM）、后处理（_fix_math）
+# 任一变更时递增，使旧页缓存整体失效（对齐 ingestion._EXTRACT_SCHEMA_VERSION）
+_EXTRACT_VERSION = "v2"
 
 # ---- 图片内容提取提示词（物理 / 化学 / 数学通用，勿改为单学科专用）----
 PROMPT = """你是一名专业的 PDF 页面内容结构化提取器。
@@ -380,8 +386,18 @@ def _vision_llm() -> ChatOpenAI:
 
 
 def _fix_math(text: str) -> str:
-    """修复模型输出中导致 KaTeX 报错的 $ 写法：把成对的 $$ 折叠为单个 $。"""
-    return re.sub(r"\$\$", "$", text)
+    """修复模型输出中导致 KaTeX 报错的 $ 写法：把成对的 $$ 块折叠为单个 $。
+
+    注意不能只把 $$ 各自替换成 $：那会留下跨行的 $...$，而主流渲染器的
+    行内公式模式（如 ``$([^$\n]+?)$``）不允许换行，块级公式反而渲染失败。
+    因此折叠时必须把 $$ 之间及其内部的换行一并折成空格，收成单行行内公式。
+    """
+    return re.sub(
+        r"\$\$\s*(.*?)\s*\$\$",
+        lambda m: "$" + re.sub(r"\s*\n\s*", " ", m.group(1)) + "$",
+        text,
+        flags=re.S,
+    )
 
 
 def _invoke_llm(llm: ChatOpenAI, messages: list[HumanMessage]) -> str:
@@ -438,10 +454,13 @@ def extract_pdf_pages_as_markdown(
 ) -> list[dict]:
     """截取 PDF 页面渲染成 PNG，用视觉大模型提取为结构化 Markdown。
 
-    结果逐页缓存到 output/pdf_extract/{pdf_id}/p{页码}.md：
+    结果逐页缓存到 output/pdf_extract/{pdf_id}/p{页码}_{版本}.md：
     已提取（存在且非空）的页直接读缓存，不重复调用模型；
     中断重跑会自动跳过已完成页。缓存目录可通过 output_dir 覆盖
-    （例如指向 extract_pdf 项目的 output 目录以复用其既有提取结果）。
+    （例如指向 extract_pdf 项目的 output 目录以复用其既有提取结果，
+    但旧版命名的 p{页码}.md 不会被命中，等同于重新提取）。
+    文件名带 _EXTRACT_VERSION：PROMPT / 渲染参数 / 后处理变更时递增版本号，
+    旧缓存自动失效，无需手动删目录。
 
     Args:
         pdf_path: PDF 文件路径。
@@ -489,7 +508,7 @@ def extract_pdf_pages_as_markdown(
                  pdf.name, total, start, end, pdf_id)
         pages_data: list[dict] = []
         for page_no in range(start, end + 1):
-            page_file = book_dir / f"p{page_no:04d}.md"
+            page_file = book_dir / f"p{page_no:04d}_{_EXTRACT_VERSION}.md"
             if page_file.exists() and page_file.read_text(encoding="utf-8").strip():
                 content = page_file.read_text(encoding="utf-8").strip()
                 log.info("  [已提取] 第 %d 页（%s）", page_no, page_file.name)

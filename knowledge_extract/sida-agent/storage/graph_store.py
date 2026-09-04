@@ -14,9 +14,12 @@
 from __future__ import annotations
 
 import difflib
-from typing import Any, Dict, List, Optional
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
 import networkx as nx
+from networkx.readwrite import json_graph
 
 from logger import get_logger
 
@@ -50,8 +53,17 @@ _CONCEPT_SUFFIXES = (
 # difflib 模糊兜底的相似度阈值
 _FUZZY_THRESHOLD = 0.6
 
+# get_subgraph 每类关联实体的默认返回上限：命中"枢纽概念"（关联几十条公式/例题）时
+# 截断至 top-N，防止下游问答 prompt 被撑爆；None 表示不限。
+_DEFAULT_MAX_PER_KIND = 8
+
 # 存储时不需要入检索/向量回表的实体类型
 _RETRIEVABLE = (K_CONCEPT, K_FORMULA, K_EXPERIMENT, K_QUESTION_TYPE, K_METHOD, K_EXAMPLE)
+
+# 图谱默认持久化文件（JSON node_link 格式），支持跨进程累积与独立只读问答。
+_DEFAULT_GRAPH_PATH = str(
+    Path(__file__).resolve().parent.parent / "output" / "knowledge_graph.json"
+)
 
 
 def node_key(subject: str, kind: str, name: str) -> str:
@@ -65,10 +77,45 @@ def bare_name(node_key_: str) -> str:
 
 
 class ScienceGraphStore:
-    """初中理科全科知识图谱（内存版）。"""
+    """初中理科全科知识图谱（内存图 + 可选 JSON 落盘）。
+
+    运行期为内存 ``nx.DiGraph``；通过 ``save`` / ``load`` 可持久化到
+    JSON（node_link 格式），实现跨进程累积与独立只读问答。
+    """
 
     def __init__(self) -> None:
         self.graph = nx.DiGraph()
+
+    # ------------------------------------------------------------- 持久化
+    def save(self, path: Union[str, Path, None] = None) -> str:
+        """把当前图谱序列化为 JSON（node_link 格式）落盘，返回写入路径。"""
+        p = str(path or _DEFAULT_GRAPH_PATH)
+        Path(p).parent.mkdir(parents=True, exist_ok=True)
+        data = json_graph.node_link_data(self.graph, edges="links")
+        Path(p).write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        log.info("[graph_store] 图谱已保存: %s（节点 %d, 边 %d）",
+                 p, self.graph.number_of_nodes(), self.graph.number_of_edges())
+        return p
+
+    @classmethod
+    def load(cls, path: Union[str, Path, None] = None) -> "ScienceGraphStore":
+        """从 JSON 文件加载图谱；文件不存在时返回空库（便于首次运行）。"""
+        store = cls()
+        p = str(path or _DEFAULT_GRAPH_PATH)
+        if not Path(p).exists():
+            log.info("[graph_store] 图谱文件不存在，新建空库: %s", p)
+            return store
+        try:
+            data = json.loads(Path(p).read_text(encoding="utf-8"))
+            store.graph = json_graph.node_link_graph(data, edges="links")
+            log.info("[graph_store] 已加载图谱: %s（节点 %d, 边 %d）",
+                     p, store.graph.number_of_nodes(), store.graph.number_of_edges())
+        except Exception:
+            log.exception("[graph_store] 图谱加载失败，回退空库: %s", p)
+            store.graph = nx.DiGraph()
+        return store
 
     # ------------------------------------------------------------------ 写库
     def add_entity(self, subject: str, kind: str, name: str, **attrs: Any) -> str:
@@ -152,16 +199,21 @@ class ScienceGraphStore:
                 best, best_ratio = cand, ratio
         return best if best_ratio >= _FUZZY_THRESHOLD else None
 
-    def get_subgraph(self, subject: str, concept_name: str) -> Dict[str, Any]:
+    def get_subgraph(self, subject: str, concept_name: str,
+                     max_per_kind: Optional[int] = _DEFAULT_MAX_PER_KIND) -> Dict[str, Any]:
         """按知识点锚点做 1~2 跳聚合检索。
 
         返回 concept 自身的拆解信息 + 关联的公式/实验/题型/方法/例题，
         供问答链路组装教研上下文。
+        max_per_kind：每类关联实体的返回上限（None 不限），命中枢纽概念时截断
+        至 top-N 防止下游 prompt 膨胀；examples 截断后回表取原题的页数随之减少。
         """
         result: Dict[str, Any] = {
             "subject": subject,
             "concept": None,
-            "prerequisites": [],   # 先修概念（概念拆解的前置链）
+            "prerequisites": [],    # 真先修：nb -PREREQUISITE_OF-> ckey
+            "follow_ups": [],       # 后续概念：ckey -PREREQUISITE_OF-> nb
+            "related_concepts": [], # 其它概念关联（extra_relations 等，非先修语义）
             "formulas": [],
             "experiments": [],
             "question_types": [],
@@ -189,17 +241,45 @@ class ScienceGraphStore:
         }
         log.debug("[graph_store] 从 %s 出发检索 1~2 跳子图", ckey)
 
-        hop_buckets: Dict[str, List[Any]] = {k: [] for k in _RETRIEVABLE}
+        # 1 跳：非概念邻居按类型归类；概念邻居必须按「边方向 + relation」区分，
+        # 否则会把后续概念、extra_relations 的任意关联误当成先修。
+        hop_buckets: Dict[str, List[Any]] = {
+            k: [] for k in _RETRIEVABLE if k != K_CONCEPT
+        }
+        concept_prereq: List[Any] = []     # nb -PREREQUISITE_OF-> ckey
+        concept_followup: List[Any] = []   # ckey -PREREQUISITE_OF-> nb
+        concept_related: List[Any] = []    # 概念间其它关系（含 REL_EXTRA / 自定义）
         seen_keys: set = {ckey}
 
-        # 1 跳：出边与入边都可能是关联实体（关系方向见 REL_* 常量）
-        for nb in list(self.graph.successors(ckey)) + list(self.graph.predecessors(ckey)):
+        for nb in self.graph.successors(ckey):        # 出边 ckey -> nb
             if nb in seen_keys:
                 continue
             seen_keys.add(nb)
+            rel = self.graph[ckey][nb].get("relation")
             nd = self.graph.nodes[nb]
-            if nd.get("type") in _RETRIEVABLE:
-                hop_buckets[nd["type"]].append((nb, nd))
+            t = nd.get("type")
+            if t == K_CONCEPT:
+                if rel == REL_PREREQUISITE_OF:
+                    concept_followup.append((nb, nd))
+                else:
+                    concept_related.append((nb, nd, rel))
+            elif t in _RETRIEVABLE:
+                hop_buckets[t].append((nb, nd))
+
+        for nb in self.graph.predecessors(ckey):      # 入边 nb -> ckey
+            if nb in seen_keys:
+                continue
+            seen_keys.add(nb)
+            rel = self.graph[nb][ckey].get("relation")
+            nd = self.graph.nodes[nb]
+            t = nd.get("type")
+            if t == K_CONCEPT:
+                if rel == REL_PREREQUISITE_OF:
+                    concept_prereq.append((nb, nd))
+                else:
+                    concept_related.append((nb, nd, rel))
+            elif t in _RETRIEVABLE:
+                hop_buckets[t].append((nb, nd))
 
         # 2 跳：沿题型/方法节点取挂载例题（EXEMPLIFIED_BY）
         for kind in (K_QUESTION_TYPE, K_METHOD):
@@ -211,12 +291,31 @@ class ScienceGraphStore:
                     hop_buckets[K_EXAMPLE].append((ex_key, self.graph.nodes[ex_key]))
 
         # ---- 归类输出
-        for key, nd in hop_buckets[K_CONCEPT]:
+        def _capped(kind: str, items: List[Any]) -> List[Any]:
+            """按 max_per_kind 截断某类实体，命中枢纽概念时记 warning。"""
+            if max_per_kind is not None and len(items) > max_per_kind:
+                log.warning("[graph_store] %s 关联 %s 共 %d 条，截断至 top-%d",
+                            ckey, kind, len(items), max_per_kind)
+                return items[:max_per_kind]
+            return items
+
+        for key, nd in concept_prereq:
             result["prerequisites"].append({
                 "name": bare_name(key),
                 "description": nd.get("description", ""),
             })
-        for key, nd in hop_buckets[K_FORMULA]:
+        for key, nd in concept_followup:
+            result["follow_ups"].append({
+                "name": bare_name(key),
+                "description": nd.get("description", ""),
+            })
+        for key, nd, rel in concept_related:
+            result["related_concepts"].append({
+                "name": bare_name(key),
+                "description": nd.get("description", ""),
+                "relation": rel or REL_EXTRA,
+            })
+        for key, nd in _capped("formulas", hop_buckets[K_FORMULA]):
             result["formulas"].append({
                 "name": bare_name(key),
                 "expression": nd.get("expression", ""),
@@ -224,7 +323,7 @@ class ScienceGraphStore:
                 "applicable_scope": nd.get("applicable_scope", ""),
                 "derivation": list(nd.get("derivation", [])),
             })
-        for key, nd in hop_buckets[K_EXPERIMENT]:
+        for key, nd in _capped("experiments", hop_buckets[K_EXPERIMENT]):
             result["experiments"].append({
                 "name": bare_name(key),
                 "purpose": nd.get("purpose", ""),
@@ -235,20 +334,20 @@ class ScienceGraphStore:
                 "diagram": nd.get("diagram", ""),
                 "exam_focus": list(nd.get("exam_focus", [])),
             })
-        for key, nd in hop_buckets[K_QUESTION_TYPE]:
+        for key, nd in _capped("question_types", hop_buckets[K_QUESTION_TYPE]):
             result["question_types"].append({
                 "name": bare_name(key),
                 "identify_features": list(nd.get("identify_features", [])),
                 "template": list(nd.get("template", [])),
                 "traps": list(nd.get("traps", [])),
             })
-        for key, nd in hop_buckets[K_METHOD]:
+        for key, nd in _capped("methods", hop_buckets[K_METHOD]):
             result["methods"].append({
                 "name": bare_name(key),
                 "scope": nd.get("scope", ""),
                 "steps": list(nd.get("steps", [])),
             })
-        for key, nd in hop_buckets[K_EXAMPLE]:
+        for key, nd in _capped("examples", hop_buckets[K_EXAMPLE]):
             result["examples"].append({
                 "id": key,  # 与向量库 metadata["id"] 一致，供回表取原题全文
                 "title": nd.get("title", ""),
