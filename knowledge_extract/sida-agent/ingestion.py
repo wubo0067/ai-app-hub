@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
-from config import get_llm
+from config import get_reasoning_llm
 from logger import get_logger
 from storage.graph_store import (
     K_CONCEPT,
@@ -301,7 +301,14 @@ def _build_vector_docs(subject: str, data: Dict[str, Any]) -> List[Document]:
     docs: List[Document] = []
 
     def _push(kind: str, name: str, content: str, **extra_meta: Any) -> None:
-        if not name.strip():
+        """追加一条向量切片：正文为拼接后的实体文本，metadata 携带回表标识。
+
+        - name 为空（LLM 漏填）时直接跳过，避免产生无主切片；
+        - metadata["id"] 复用 node_key 生成，与图节点键完全一致，
+          检索命中后可凭此 id 精确回图数据库取实体全文；
+        - extra_meta 传入各实体特有的补充字段（如 chapter、page）。
+        """
+        if not name.strip():  # 无名实体不入向量库
             return
         docs.append(Document(
             page_content=content.strip(),
@@ -387,18 +394,18 @@ def build_knowledge_bases(
     pages_data: List[Dict[str, Any]],
     subject: str = "physics",
     *,
-    text_llm_provider: str = "deepseek",
     vector_db: Optional[Chroma] = None,
     graph_db: Optional[ScienceGraphStore] = None,
 ) -> Tuple[Chroma, ScienceGraphStore]:
     """从 Markdown 中提取结构化知识网络，写入 Vector DB 与 Graph DB。
 
     同一 vector_db / graph_db 可跨多次调用、跨学科累积（全科知识库）。
+    推理模型固定由 config.py + sida-agent/.env 的 REASONING_* 配置决定。
     """
     subject = _normalize_subject(subject)
-    log.info("[ingestion] 开始构建知识库: subject=%s, 输入页数=%d, provider=%s",
-             SUBJECT_META[subject]["label"], len(pages_data), text_llm_provider)
-    llm = get_llm(provider=text_llm_provider, is_vision=False)
+    log.info("[ingestion] 开始构建知识库: subject=%s, 输入页数=%d",
+             SUBJECT_META[subject]["label"], len(pages_data))
+    llm = get_reasoning_llm()
     vector_db = vector_db or get_vector_store()
     graph_db = graph_db or ScienceGraphStore()
     if node_key(subject, K_SUBJECT, subject) not in graph_db.graph:

@@ -3,17 +3,17 @@
 """初中理科全科知识库 Agent 入口。
 
 流程：
-1. extract_pdf_pages_as_markdown：用多模态视觉模型（默认通义千问）将 PDF
+1. extract_pdf_pages_as_markdown：用多模态视觉模型将 PDF
    指定物理页提取为 Markdown；
-2. build_knowledge_bases(subject=...)：把页文本提炼为全科知识网络
+2. build_knowledge_bases(subject=...)：对页文本提炼全科知识网络
    （概念拆解/公式推导/实验图解/题型溯源），写入向量库 + 图谱库；
    可对 physics/chemistry/math 分别喂入对应教材并共享同一份双库，
    累积成三科知识库；
 3. create_circuit_agent：构建全科问答 Agent（自动判定学科并检索）；
 4. invoke：对学生提问生成分层讲解并打印。
 
-密钥通过环境变量配置：DASHSCOPE_API_KEY（视觉）、DEEPSEEK_API_KEY（推理）、
-OPENAI_API_KEY（Embedding），见 config.py。
+模型服务（base_url / api_key / model_name）统一在 sida-agent/.env 中配置，
+见 config.py。
 """
 
 from __future__ import annotations
@@ -29,23 +29,22 @@ log = get_logger()
 
 
 def main() -> None:
-    # 1. 配置密钥（优先从环境读取）
-    # os.environ["DASHSCOPE_API_KEY"] = "sk-xxx"  # 通义千问（视觉）
-    # os.environ["DEEPSEEK_API_KEY"] = "sk-xxx"   # DeepSeek（问答推理）
-    # os.environ["OPENAI_API_KEY"] = "sk-xxx"     # Embedding
+    # 1. 配置密钥（优先从 .env / 环境读取，见 config.py）
+    # 视觉解析：VISION_BASE_URL / VISION_MODEL / VISION_API_KEY
+    # 推理（通用）：REASONING_BASE_URL / REASONING_MODEL / REASONING_API_KEY
+    # Embedding：OPENAI_API_KEY / OPENAI_BASE_URL
 
     # 共享的双库实例：多学科教材可反复累积进同一份知识库
     vector_db = get_vector_store()
     graph_db = ScienceGraphStore()
 
     # 2. 多模态提取 PDF 物理页码（例如提取第 6 页到第 12 页）
-    pdf_file_path = "9S合并PDF.pdf"
+    pdf_file_path = "H:/wechat_files/xwechat_files/calm-wu_9d75/msg/file/2026-08/9S合并PDF.pdf"
     log.info("[main] 流水线启动, PDF=%s", pdf_file_path)
     pages_data = extract_pdf_pages_as_markdown(
         pdf_path=pdf_file_path,
-        start_page=6,
+        start_page=11,
         end_page=12,
-        vision_provider="qwen",
     )
 
     # 3. 结构化抽取并构建双库。
@@ -58,14 +57,12 @@ def main() -> None:
         subject="physics",
         vector_db=vector_db,
         graph_db=graph_db,
-        text_llm_provider="deepseek",
     )
 
     # 4. 构建并运行全科问答 Agent
     agent = create_circuit_agent(
         vector_db=vector_db,
         graph_db=graph_db,
-        provider="deepseek",
     )
 
     # 5. 执行测试提问（可问物理/化学/数学，Agent 会先判定学科再检索）

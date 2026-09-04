@@ -16,7 +16,7 @@ from langchain_chroma import Chroma
 from langgraph.graph import END, START, StateGraph
 
 from agent.state import CircuitAgentState
-from config import get_llm
+from config import get_reasoning_llm
 from logger import get_logger
 from storage.graph_store import (
     K_EXAMPLE,
@@ -58,11 +58,13 @@ def _parse_intent(raw: str) -> tuple[str, str]:
 def create_circuit_agent(
     vector_db: Chroma,
     graph_db: ScienceGraphStore,
-    provider: str = "deepseek",
 ) -> Any:
-    """创建并编译初中理科全科问答 Agent 工作流图。"""
-    log.info("[workflow] 构建全科问答 Agent 工作流, provider=%s", provider)
-    llm = get_llm(provider=provider, is_vision=False)
+    """创建并编译初中理科全科问答 Agent 工作流图。
+
+    推理模型固定由 config.py + sida-agent/.env 的 REASONING_* 配置决定。
+    """
+    log.info("[workflow] 构建全科问答 Agent 工作流")
+    llm = get_reasoning_llm()
 
     def analyze_intent_node(state: CircuitAgentState):
         query = state["query"]

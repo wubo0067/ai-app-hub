@@ -6,7 +6,7 @@
 config.py 创建（不再直连 openai）：
 - 通用结构化提取 PROMPT：对物理、化学、数学页面一视同仁，完整保留
   印刷文字、公式（统一 LaTeX）、表格、图形标签、手写批注；
-- 视觉模型经 config.get_llm(provider="vision", is_vision=True) 获取，
+- 视觉模型经 config.get_vision_llm() 获取，
   base_url / api_key / model_name 在 sida-agent/.env（VISION_*）中配置；
 - 用 PyMuPDF 将每页渲染成 PNG（仅内存，不落盘）交给视觉大模型按提示词提取；
 - 每页结果独立落盘 output/pdf_extract/{pdf_id}/p{页码}.md，
@@ -32,7 +32,7 @@ import pymupdf  # PyMuPDF
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
-from config import get_llm, resolve_llm_config
+from config import VISION_ROLE, get_vision_llm, resolve_llm_config
 from logger import get_logger
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -44,8 +44,7 @@ OUTPUT_DIR = BASE_DIR / "output" / "pdf_extract"
 
 # ---- 视觉解析模型 ---------------------------------------------------------
 # 模型服务（base_url / api_key / model_name）统一在 sida-agent/.env 中配置，
-# 由 config.py 的 get_llm(provider="vision", is_vision=True) 创建。
-VISION_PROVIDER = "vision"
+# 由 config.get_vision_llm() 创建，调用方无需指定模型。
 
 LLM_TIMEOUT = 300.0      # 单次请求超时（秒）
 LLM_RETRIES = 2          # 本地调用失败重试次数（指数退避）
@@ -368,13 +367,11 @@ $Q=I^2Rt$]
 
 
 def _vision_llm() -> ChatOpenAI:
-    """构造视觉解析 LLM（经 config.get_llm，配置来自 .env 的 VISION_*）。
+    """构造视觉解析 LLM（经 config.get_vision_llm，配置来自 .env 的 VISION_*）。
 
     max_retries=0：重试交给 _invoke_llm 的本地指数退避，避免双份重试。
     """
-    return get_llm(
-        provider=VISION_PROVIDER,
-        is_vision=True,
+    return get_vision_llm(
         temperature=0.0,
         max_tokens=MAX_TOKENS,
         timeout=LLM_TIMEOUT,
@@ -436,7 +433,6 @@ def extract_pdf_pages_as_markdown(
     pdf_path: str,
     start_page: int,
     end_page: int,
-    vision_provider: str = "qwen",
     *,
     output_dir: str | Path | None = None,
 ) -> list[dict]:
@@ -451,26 +447,23 @@ def extract_pdf_pages_as_markdown(
         pdf_path: PDF 文件路径。
         start_page: 起始页码（从 1 计）。
         end_page: 结束页码（含），超出 PDF 总页数时自动截断。
-        vision_provider: 保留参数（语义兼容旧接口，仅用于日志）；实际视觉模型
-            由 config.py + sida-agent/.env 的 VISION_* 配置决定。
         output_dir: 可选，覆盖默认缓存目录 output/pdf_extract。
+
+    视觉模型固定由 config.py + sida-agent/.env 的 VISION_* 配置决定。
 
     Returns:
         pages_data: [{"page": 页码, "content": Markdown 文本}, ...]
     """
-    # 视觉模型配置（.env -> config），api_key 为空时给出可操作提示
-    vision_cfg = resolve_llm_config(VISION_PROVIDER)
-    if not (vision_cfg["api_key"] or ""):
-        log.error(
-            "视觉模型(%s)未配置 API Key：请在 sida-agent/.env 设置 VISION_API_KEY "
-            "（或系统环境变量 DASHSCOPE_API_KEY）。", VISION_PROVIDER,
-        )
-        raise RuntimeError(
-            "视觉模型未配置 API Key：请在 sida-agent/.env 设置 VISION_API_KEY，"
-            "或配置 VISION_BASE_URL / VISION_MODEL / VISION_API_KEY。"
-        )
-    log.info("[pdf_processor] 视觉模型 provider=%s: model=%s base_url=%s",
-             VISION_PROVIDER, vision_cfg["model_name"], vision_cfg["base_url"])
+    # 视觉模型配置（全部来自 .env 的 VISION_*），缺项时提前给出可操作提示
+    vision_cfg = resolve_llm_config(VISION_ROLE)
+    missing = [k for k in ("base_url", "model_name", "api_key") if not vision_cfg[k]]
+    if missing:
+        msg = ("视觉模型配置不完整：请在 sida-agent/.env 设置 "
+               + ", ".join(f"VISION_{m.upper()}" for m in missing) + "。")
+        log.error("[pdf_processor] %s", msg)
+        raise RuntimeError(msg)
+    log.info("[pdf_processor] 视觉模型: model=%s base_url=%s",
+             vision_cfg["model_name"], vision_cfg["base_url"])
 
     pdf = Path(pdf_path)
     if not pdf.exists():
