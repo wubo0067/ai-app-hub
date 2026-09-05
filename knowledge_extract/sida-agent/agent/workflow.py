@@ -155,13 +155,18 @@ def create_circuit_agent(
         subject = state.get("target_subject") or "physics"
         examples = g_ctx.get("examples", [])
         log.debug("[workflow.fetch_chunks] 向量库回表, 例题数=%d", len(examples))
-        # 例题原文按 source.page 回表取讲义页切片；同页多题只取一次
+        # 例题原文按 (pdf_id, page) 回表取讲义页切片；同页多题只取一次。
+        # 讲义页切片键带 pdf_id 前缀（subject:Page:{pdf_id}:{页码}），防止跨
+        # PDF 的同页码互相覆盖；例题节点无 pdf_id（旧库/未传）时退化为裸页码
+        # 键，兼容旧数据。
         page_keys: List[str] = []
         for ex in examples:
             page = (ex.get("source") or {}).get("page")
             if page is None:
                 continue
-            pk = node_key(subject, "Page", str(page))
+            pdf_id = str(ex.get("pdf_id") or "")
+            page_token = f"{pdf_id}:{page}" if pdf_id else str(page)
+            pk = node_key(subject, "Page", page_token)
             if pk not in page_keys:
                 page_keys.append(pk)
         chunks: List[str] = []

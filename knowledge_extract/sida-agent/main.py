@@ -17,22 +17,38 @@
 
 命令行用法（换材料无需改源码）：
     uv run python main.py --stage build --pdf 教材.pdf --start-page 11 --end-page 12 --subject physics
+    uv run python main.py --stage build --pdf 整本教材.pdf --start-page 13 --end-page 320 --subject math --max-chunks 20
     uv run python main.py --stage ask   --query "讲解可变电路的分析思路"
     uv run python main.py                          # 不带参数 = 下方默认值，等价旧行为
 --stage: all=提取+建库+问答（默认）；build=仅提取并累加进双库；ask=仅复用已持久化双库问答。
+长文档：页码区间可以开很大（整本书），build_knowledge_bases 会按 --max-chars
+预算自动切子块增量抽取；建库前会先打印规模预估并请求确认（--yes 跳过）。
 """
 
 from __future__ import annotations
 
 import argparse
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Any
+
+import pymupdf
 
 from agent.workflow import create_circuit_agent
-from ingestion import build_knowledge_bases, normalize_subject
+from ingestion import (
+    _CHUNK_MAX_CHARS_DEFAULT,
+    _cache_key,
+    _chunk_markdown,
+    _load_extract_cache,
+    _split_into_chunks,
+    build_knowledge_bases,
+    normalize_subject,
+)
 from logger import get_logger
-from pdf_processor import extract_pdf_pages_as_markdown
+from pdf_processor import (_load_cached_pages, _pdf_id,
+                           extract_pdf_pages_as_markdown)
 from storage.graph_store import ScienceGraphStore
 from storage.vector_store import get_vector_store
 
@@ -77,6 +93,14 @@ def parse_args() -> argparse.Namespace:
                         choices=("physics", "chemistry", "math"),
                         help="学科，仅限三种：physics/物理、chemistry/化学、math/数学"
                              "（接受中文或拼音别名，自动归一化）。")
+    parser.add_argument("--max-chars", type=int, default=_CHUNK_MAX_CHARS_DEFAULT,
+                        help="知识抽取单子块字符预算（build/all）：输入页超过预算即自动"
+                             "切块增量抽取，避免整本书一次喂给推理 LLM 超上下文。")
+    parser.add_argument("--max-chunks", type=int, default=None, metavar="N",
+                        help="本次建库最多处理 N 个未命中缓存的新子块（缓存命中不占额度），"
+                             "达到即主动停，已完成子块已落盘/缓存，重跑同命令续跑。")
+    parser.add_argument("--yes", action="store_true",
+                        help="跳过建库前的规模预估确认（脚本/夜间批量自动放行）。")
     parser.add_argument("--query", default=DEFAULT_QUERY,
                         help="学生提问（ask/all 阶段使用）。")
     return parser.parse_args()
@@ -126,6 +150,149 @@ def _save_answer_markdown(result: dict, fallback_subject: str) -> Path:
     return path
 
 
+class TokenMeter:
+    """LLM token 累计器：从 ChatOpenAI 响应的 usage 元数据取数（实际消耗）。
+
+    兼容 langchain AIMessage 的 usage_metadata（input/output_tokens），
+    取不到时回退 response_metadata.token_usage（prompt/completion_tokens）；
+    服务端未返回 usage 的调用不计入 calls。仅供建库前后打印真实成本，
+    不影响任何业务逻辑。
+    """
+
+    def __init__(self) -> None:
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.calls = 0
+
+    def add(self, response: Any) -> None:
+        um = getattr(response, "usage_metadata", None)
+        if um:
+            prompt = um.get("input_tokens") or 0
+            completion = um.get("output_tokens") or 0
+        else:
+            usage = ((getattr(response, "response_metadata", None) or {})
+                     .get("token_usage") or {})
+            prompt = usage.get("prompt_tokens") or 0
+            completion = usage.get("completion_tokens") or 0
+        if not prompt and not completion:
+            return
+        self.prompt_tokens += int(prompt)
+        self.completion_tokens += int(completion)
+        self.calls += 1
+
+    def report(self, label: str) -> None:
+        if self.calls:
+            log.info("[cost] %s 实际消耗：%d 次调用，输入 %d / 输出 %d tokens",
+                     label, self.calls, self.prompt_tokens, self.completion_tokens)
+        else:
+            log.info("[cost] %s：无实际模型调用（全部命中缓存）", label)
+
+
+# 无任何缓存页可参考时的单页平均字符估算值（仅用于切块预演，非计费依据）
+_ESTIMATE_UNKNOWN_PAGE_CHARS = 2000
+
+
+def _estimate_build(pdf_path: str, start_page: int, end_page: int,
+                    subject: str, max_chars: int) -> dict:
+    """建库规模预估（干跑）：只读逐页缓存 + 按预算预演切块，不调用任何模型。
+
+    返回 dict：
+    - total_pages / cached_pages / new_vision_calls：视觉提取侧（逐页缓存，精确）
+    - plan_chunks / cached_chunks / new_chunks：推理抽取侧（每子块两批 LLM）
+    - approx_len：未缓存页的估算平均字符数（内容未知时仅用于预演切块）
+    含未提取页时，切块/缓存命中判断基于估算内容长度，可能与真实运行略有出入，
+    故 new_chunks 标记为 approx=True 提示；真实消耗以结束时的 TokenMeter 为准。
+    """
+    pdf = Path(pdf_path)
+    if not pdf.exists():
+        raise FileNotFoundError(f"PDF 文件不存在：{pdf_path}")
+    cached = _load_cached_pages(pdf_path)
+    with pymupdf.open(pdf) as doc:
+        total_pages = doc.page_count
+    start = max(1, start_page)
+    end = min(total_pages, end_page)
+    if start > end:
+        raise ValueError(f"页范围 {start}-{end} 无效（PDF 共 {total_pages} 页）。")
+
+    page_nums = list(range(start, end + 1))
+    cached_in = {p: cached[p] for p in page_nums if p in cached}
+    new_vision_calls = len(page_nums) - len(cached_in)
+
+    lengths = [len(v) for v in cached_in.values()]
+    est_len = round(sum(lengths) / len(lengths)) if lengths else _ESTIMATE_UNKNOWN_PAGE_CHARS
+    # 未缓存页用无标题占位文本（长度≈均值）预演切块：与真实运行共用同一套
+    # _split_into_chunks，保证边界规则一致（仅内容未知导致的偏差不可避免）。
+    synth = [
+        {"page": p, "content": cached[p] if p in cached else "　" * est_len}
+        for p in page_nums
+    ]
+    plan = _split_into_chunks(synth, max_chars=max_chars)
+
+    cached_chunks = 0
+    for chunk in plan:
+        pages = [c["page"] for c in chunk]
+        if all(pg in cached for pg in pages):  # 仅整块已缓存时缓存 key 才可精确判定
+            real = [{"page": pg, "content": cached[pg]} for pg in pages]
+            if _load_extract_cache(_cache_key(subject, _chunk_markdown(real))) is not None:
+                cached_chunks += 1
+    new_chunks = len(plan) - cached_chunks
+    return {
+        "total_pages": len(page_nums),
+        "cached_pages": len(cached_in),
+        "new_vision_calls": new_vision_calls,
+        "plan_chunks": len(plan),
+        "cached_chunks": cached_chunks,
+        "new_chunks": new_chunks,
+        "approx_len": est_len,
+    }
+
+
+def _print_estimate(est: dict, max_chars: int) -> None:
+    """打印规模预估（建库正式开始前、未调用任何模型时）。"""
+    log.info("[main] 本次任务规模预估（只读缓存 + 本地统计，未调用任何模型）:")
+    log.info("  页码共 %d 页 | 视觉提取：已缓存 %d 页，需新调用 %d 次",
+             est["total_pages"], est["cached_pages"], est["new_vision_calls"])
+    log.info("  知识抽取：按 --max-chars=%d 自动切 %d 个子块，"
+             "已缓存 %d 个，需新抽取 %d 个（约 %d 次推理 LLM 调用）",
+             max_chars, est["plan_chunks"], est["cached_chunks"],
+             est["new_chunks"], est["new_chunks"] * 2)
+    if est["new_vision_calls"]:
+        log.info("  （含未提取页 %d 页：内容未知，切块按平均页长 %d 字预演，"
+                 "实际块数可能略有出入；真实 token 消耗以结束时统计为准）",
+                 est["new_vision_calls"], est["approx_len"])
+
+
+def _confirm_build(est: dict, yes: bool) -> bool:
+    """建库放行确认：全部命中缓存直接放行；有新调用时交互确认或 --yes 放行。"""
+    new_calls = est["new_vision_calls"] + est["new_chunks"]
+    if new_calls <= 0:
+        log.info("[main] 全部命中缓存，直接执行（本次不产生新模型调用）")
+        return True
+    if yes:
+        log.info("[main] --yes：跳过确认直接执行（预估 %d 次新调用）", new_calls)
+        return True
+    if not sys.stdin.isatty():
+        log.error("[main] 本次将产生约 %d 次新模型调用，且当前不是交互终端；"
+                  "请确认规模后加 --yes 重新执行，或先用 --start-page/--end-page/"
+                  "--max-chunks 缩小本次范围", new_calls)
+        return False
+    try:
+        answer = input("是否继续？[y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer in ("y", "yes")
+
+
+def _report_meters(vision_meter: TokenMeter, reasoning_meter: TokenMeter) -> None:
+    """建库结束汇总：打印视觉/推理两路真实 token 消耗。"""
+    vision_meter.report("视觉提取")
+    reasoning_meter.report("知识抽取")
+    total_in = vision_meter.prompt_tokens + reasoning_meter.prompt_tokens
+    total_out = vision_meter.completion_tokens + reasoning_meter.completion_tokens
+    log.info("[cost] 本次建库累计实际消耗：输入 %d / 输出 %d tokens",
+             total_in, total_out)
+
+
 def main() -> None:
     # 密钥优先从 .env / 环境读取（见 config.py）：
     # 视觉 VISION_* / 推理 REASONING_* / Embedding OPENAI_*
@@ -139,18 +306,39 @@ def main() -> None:
     if args.stage in ("all", "build"):
         log.info("[main] 流水线启动, PDF=%s, 页码=%d-%d, subject=%s",
                  args.pdf, args.start_page, args.end_page, args.subject)
+        # 花钱前先亮规模：只读逐页缓存 + 按预算预演切块（不调用任何模型）；
+        # 全部命中缓存时自动放行，有新调用时交互确认（--yes 跳过）。
+        est = _estimate_build(args.pdf, args.start_page, args.end_page,
+                              args.subject, args.max_chars)
+        _print_estimate(est, args.max_chars)
+        if not _confirm_build(est, args.yes):
+            log.info("[main] 已取消本次建库（未调用任何模型）")
+            return
+        vision_meter = TokenMeter()
+        reasoning_meter = TokenMeter()
         pages_data = extract_pdf_pages_as_markdown(
             pdf_path=args.pdf,
             start_page=args.start_page,
             end_page=args.end_page,
+            meter=vision_meter,
         )
         # 同一 vector_db/graph_db 多次调用即跨学科累积全科知识库。
+        # 页码区间可开很大：内部按 max_chars 自动切子块增量抽取，
+        # max_chunks 限制本次处理的新子块数（达上限主动停，重跑续跑）。
+        # pdf_id = PDF 内容哈希前 16 位：并入讲义页切片 / 例题节点键，
+        # 使不同 PDF 累积进同一知识库时「第 N 页」「例17」互不覆盖（跨书撞车隔离）
+        pdf_id = _pdf_id(Path(args.pdf))
         vector_db, graph_db = build_knowledge_bases(
             pages_data=pages_data,
             subject=args.subject,
             vector_db=vector_db,
             graph_db=graph_db,
+            max_chars=args.max_chars,
+            max_chunks=args.max_chunks,
+            meter=reasoning_meter,
+            pdf_id=pdf_id,
         )
+        _report_meters(vision_meter, reasoning_meter)
         log.info("[main] 建库完成（stage=%s）", args.stage)
 
     # ---- 问答阶段（all / ask）：先判定学科再检索，生成分层讲解

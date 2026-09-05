@@ -27,6 +27,7 @@ import hashlib
 import re
 import time
 from pathlib import Path
+from typing import Any
 
 import pymupdf  # PyMuPDF
 from langchain_core.messages import HumanMessage
@@ -400,13 +401,20 @@ def _fix_math(text: str) -> str:
     )
 
 
-def _invoke_llm(llm: ChatOpenAI, messages: list[HumanMessage]) -> str:
-    """调用视觉 LLM 并带指数退避重试，返回文本结果。"""
+def _invoke_llm(llm: ChatOpenAI, messages: list[HumanMessage],
+                meter: Any | None = None) -> str:
+    """调用视觉 LLM 并带指数退避重试，返回文本结果。
+
+    meter 为可选的 TokenMeter 兼容对象（只需有 .add(response) 方法，
+    见 main.TokenMeter），用于累计本次真实 token 消耗。
+    """
     last_error: Exception | None = None
     for attempt in range(LLM_RETRIES + 1):
         started = time.perf_counter()
         try:
             response = llm.invoke(messages)
+            if meter is not None:
+                meter.add(response)
             content = response.content
             text = content.strip() if isinstance(content, str) else str(content or "").strip()
             log.debug(
@@ -445,12 +453,50 @@ def _render_page(page: pymupdf.Page) -> bytes:
     return pix.tobytes("png")
 
 
+def _page_file_path(book_dir: Path, page_no: int) -> Path:
+    """页码对应的缓存文件路径（含版本号，_EXTRACT_VERSION 递增即整体失效）。"""
+    return book_dir / f"p{page_no:04d}_{_EXTRACT_VERSION}.md"
+
+
+def _load_cached_pages(pdf_path: str | Path, *, output_dir: str | Path | None = None
+                       ) -> dict[int, str]:
+    """只读某 PDF 已有的逐页提取缓存，返回 {页码: Markdown 内容}；不调用任何模型。
+
+    与 extract_pdf_pages_as_markdown 使用同一缓存目录/命名规则，供建库前的
+    「规模预估」复用：pdf_id 需对 PDF 全文做一次 SHA-256（本地 IO，无模型开销）。
+
+    Args:
+        pdf_path: PDF 文件路径（须存在）。
+        output_dir: 可选，覆盖默认缓存目录 output/pdf_extract。
+    """
+    pdf = Path(pdf_path)
+    if not pdf.exists():
+        raise FileNotFoundError(f"PDF 文件不存在：{pdf_path}")
+    cache_root = Path(output_dir) if output_dir else OUTPUT_DIR
+    book_dir = cache_root / _pdf_id(pdf)
+    out: dict[int, str] = {}
+    if not book_dir.is_dir():
+        return out
+    for f in book_dir.glob(f"p*_{_EXTRACT_VERSION}.md"):
+        m = re.match(r"^p(\d+)_", f.name)
+        if not m:
+            continue
+        try:
+            content = f.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if content:
+            out[int(m.group(1))] = content
+    return out
+
+
 def extract_pdf_pages_as_markdown(
     pdf_path: str,
     start_page: int,
     end_page: int,
     *,
     output_dir: str | Path | None = None,
+    meter: Any | None = None,
 ) -> list[dict]:
     """截取 PDF 页面渲染成 PNG，用视觉大模型提取为结构化 Markdown。
 
@@ -467,6 +513,7 @@ def extract_pdf_pages_as_markdown(
         start_page: 起始页码（从 1 计）。
         end_page: 结束页码（含），超出 PDF 总页数时自动截断。
         output_dir: 可选，覆盖默认缓存目录 output/pdf_extract。
+        meter: 可选 TokenMeter 兼容对象（.add(response)），累计视觉调用真实 token。
 
     视觉模型固定由 config.py + sida-agent/.env 的 VISION_* 配置决定。
 
@@ -508,7 +555,7 @@ def extract_pdf_pages_as_markdown(
                  pdf.name, total, start, end, pdf_id)
         pages_data: list[dict] = []
         for page_no in range(start, end + 1):
-            page_file = book_dir / f"p{page_no:04d}_{_EXTRACT_VERSION}.md"
+            page_file = _page_file_path(book_dir, page_no)
             if page_file.exists() and page_file.read_text(encoding="utf-8").strip():
                 content = page_file.read_text(encoding="utf-8").strip()
                 log.info("  [已提取] 第 %d 页（%s）", page_no, page_file.name)
@@ -526,7 +573,7 @@ def extract_pdf_pages_as_markdown(
                     )
                 ]
                 log.info("  [提取] 第 %d 页 ...（缓存：%s）", page_no, page_file)
-                content = _invoke_llm(vision_llm, messages)
+                content = _invoke_llm(vision_llm, messages, meter=meter)
                 content = _fix_math(content)
                 if content:
                     page_file.write_text(content, encoding="utf-8")

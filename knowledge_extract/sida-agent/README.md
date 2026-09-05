@@ -9,15 +9,15 @@
 
 ```
 PDF 讲义 ──① 视觉大模型提取──▶ 结构化 Markdown（逐页缓存，断点续跑）
-        ──② LLM 结构化抽取（两批串行 + 磁盘缓存）──▶ 双知识库
+        ──② LLM 结构化抽取（自动分块增量 + 两批串行 + 滚动上下文 + 磁盘缓存）──▶ 双知识库
               ├─ 知识图谱 ScienceGraphStore（NetworkX 内存图）
               │    节点键 {subject}:{Kind}:{name}，三科命名空间隔离
               │    概念/公式/实验/题型/方法/例题 + 前置/溯源/示范等关系
               └─ 向量库 Chroma（metadata.id 与图节点键/讲义页键一致，供精确回表）
-                   实体切片 + 讲义页切片 subject:Page:页码
+                   实体切片 + 讲义页切片 subject:Page:{pdf_id}:页码
         ──③ LangGraph 问答 Agent──▶ 分层讲解
               判定学科与知识点锚点 → 图谱聚合检索（模糊解析锚点 + 每类 top-N 截断）
-              → 按例题页码回表取讲义页原文 → 生成回答（标注教材来源）
+              → 按 (pdf_id, 页码) 回表取讲义页原文 → 生成回答（标注教材来源）
 ```
 
 抽取本体（跨学科通用 schema，见 `ingestion.py`）：章节、概念（拆解/易错/前置）、
@@ -26,14 +26,99 @@ PDF 讲义 ──① 视觉大模型提取──▶ 结构化 Markdown（逐页�
 原文不由 LLM 抄写，问答时按 `source.page` 回表取讲义页原文）、通法技巧。
 
 同一对 `vector_db` / `graph_db` 可被多个学科反复调用 `build_knowledge_bases`
-累积灌入，形成三科合一的知识库。
+累积灌入，形成三科合一的知识库。**多本不同 PDF 累积进同一知识库**（如两本教材
+都讲「比热容」）时的语义：同名知识实体（概念/公式/实验/题型/方法）是真同一
+知识点，节点属性按「越建越全」合并（无序要点列表 union 去重、描述与步骤序列
+保留更长一份、概念额外累积 `sources` 字段记录收录来源）；而**页码与例题编号
+跨书会撞车**（两本书都有「第 15 页」「例17」），建库时须把 `pdf_id`（PDF 内容
+哈希前 16 位，main.py 自动计算）并入讲义页切片键与例题节点键做来源隔离——
+`main.py` 已自动传入，直接多次 `--stage build --pdf 书B.pdf` 即可安全累积。
 
 抽取提速：LLM 抽取拆为**两批串行**（第一批知识体系 → 第二批题型与例题，并注入
 第一批的概念名保证引用一致），且关闭思考模式（`enable_thinking=False`）；抽取
 结果按「学科 + schema 版本 + 输入全文」哈希缓存于 `output/extract_cache/`，
 相同输入重跑 **0 次 LLM 调用**。
 
-## 2. 常用命令
+**长文档增量建库**：页码区间可以直接开到整本书（几百上千页）而不会撑爆上下文——
+`build_knowledge_bases` 内部自动分块、逐块抽取即落盘、注入滚动上下文保证命名一致、
+并在建库前做规模预估与成本统计。完整机制见下一节「[长文档增量建库](#2-长文档增量建库l1--l2--l3--成本控制)」。
+
+## 2. 长文档增量建库（L1 / L2 / L3 / 成本控制）
+
+一次性把整本书（几百上千页）喂给推理 LLM 会超上下文、崩溃即全丢、且成本不可见。
+`build_knowledge_bases` 因此重构为**分块增量**流水线，围绕四个目标分层实现：
+**支持长文档 + 增量抽取知识体系 + 保证知识点间关系 + 成本可控**。
+
+### L1 · 自动分块 + 逐块落盘（支持长文档 / 断点续跑）
+
+- `_split_into_chunks(pages_data, max_chars=6000)`：按字符预算把输入页切成若干子块。
+  **页面是原子单位**（每页讲义需以 `subject:Page:{pdf_id}:页码` 独立入向量库供例题
+  回表，pdf_id 为空时退化为 `subject:Page:页码`），
+  所以只在「页与页之间」切，绝不把某页的 `--- 第 N 页 ---` 标记与正文拆到两块：
+  - 累加超过 `max_chars` 即切一刀；
+  - 已攒到预算 60% 且下一页是章节标题（`#`/`##`/`###`）时提前切，避免新章节标题落在块尾；
+  - 单页内容超预算时强制单独成块（不跨页拆正文）。
+- `build_knowledge_bases` 逐子块循环：拼该块 Markdown → 查该块抽取缓存 → 未命中才做
+  两批串行 LLM 抽取 → 写图 + 写向量 → **每块处理完立即 `graph_db.save()`**。
+  一次 CLI 可能跑几十次 LLM，中途崩溃只丢当前块，已处理块均已持久化。
+- **每个子块的抽取缓存 key 只由该子块自身内容决定**（`学科 + schema 版本 + 该块 Markdown`），
+  因此**重复执行同一条命令 = 断点续跑**：已处理子块自动命中缓存、0 次 LLM 调用、直接写库。
+
+### L2 · 滚动上下文注入（增量抽取 + 命名一致）
+
+增量建库时模型每次只看到一个子块，看不到此前抽过什么，容易出现「同一概念被起不同
+名字」「同一章节反复开新章」导致图谱隐性重复。处理每个**新**子块前，
+`_gather_known_context` 会拉取两份「已知信息」注入两批 prompt：
+
+- **全书已有章节**：该学科图谱里所有 Chapter 节点标题（轻量全量，封顶 120 条）；
+- **已建库的相关概念**：用当前子块前 2000 字符对向量库做相似度检索
+  （`filter={"subject": 学科, "type": "Concept"}`），只取 top-K（默认 12）条 name + 一句话描述，
+  控制 prompt 体积不随全书概念总数线性增长。
+
+prompt 要求：本批文本若命中上述列表中的同一概念/章节，`name`/`title` **必须逐字复用**，
+严禁另起同义名；未列出的新概念按原文标准名词正常新建。
+> 注：滚动上下文**不参与**抽取缓存 key。图增长后重跑仍复用早先缓存的 JSON（确定性、省钱），
+> 因此上下文注入只在缓存未命中时执行。
+
+### L3 · 关系保全 + 去重审计（保证知识点间关系）
+
+- **跨块题型回退挂边（bugfix）**：例题的归属题型可能在前置子块已定义、本批未重复声明。
+  `_write_graph` 在本批 `qt_keys` 查不到时**回退查全局持久化图**，命中则补挂
+  `EXEMPLIFIED_BY` 边——否则「A 块定义题型、B 块出例题」会永久丢边。
+- **疑似重复审计**：构建结束 `_audit_graph` 除列出空壳概念节点外，按名称相似度
+  （`difflib`，阈值 0.82）扫描并报告疑似重复概念对，给出合并指引。
+- **显式合并**：审计只报告不动库；人工核对后可用
+  `graph_db.merge_concepts(subject, canonical, alias)` 把别名节点的全部关系按原方向重指到
+  规范节点并删除别名（规范名不存在时整体改名，不丢属性），或
+  `graph_db.find_similar_concept(subject, name)` 查最相似候选。
+  > 有意取舍：不在写库前自动改写 LLM 输出的 name（就地替换风险高、缓存一致性难保证），
+  > 改用「L2 预防 + 审计报告 + 显式 merge 兜底」组合。
+
+### 成本控制（花钱前先亮规模，花钱后可见）
+
+- **建库前预估**（`main.py _estimate_build`，只读缓存 + 本地统计，不调用任何模型）：
+  打印「需新视觉调用次数 / 自动切几块 / 已缓存几块 / 需新抽取几块（每块约 2 次推理 LLM）」，
+  随后 `[y/N]` 确认；`--yes` 跳过；非交互终端且需新调用时直接拒绝执行，防止误烧钱。
+- **预算上限** `--max-chunks N`：单次最多处理 N 个**未命中缓存的新子块**（缓存命中不占额度），
+  达到即主动停并提示「重跑同命令续跑」，配合预估分轮灌完整本书。
+- **真实 token 统计**（`main.py TokenMeter`）：从响应 `usage_metadata`（回退
+  `response_metadata.token_usage`）读取真实用量，视觉 / 推理两路分别透传并在结束时打印，
+  服务端不回传 usage 的调用不计入。
+
+### 相关命令行参数
+
+| 参数 | 作用 |
+|---|---|
+| `--max-chars N` | 单子块字符预算（默认 6000）：输入页超过即自动切块 |
+| `--max-chunks N` | 本次最多处理 N 个未命中缓存的新子块（缓存命中不占额度），达上限主动停 |
+| `--yes` | 跳过建库前的规模预估确认（脚本 / 夜间批量自动放行） |
+
+```powershell
+# 整本教材分轮增量建库：先预估，每轮只处理 20 个新子块；再跑同命令即续跑（已缓存块不计费）
+uv run python main.py --stage build --pdf 整本教材.pdf --start-page 13 --end-page 320 --subject math --max-chunks 20
+```
+
+## 3. 常用命令
 
 环境要求：Python ≥ 3.11，[uv](https://docs.astral.sh/uv/)。
 
@@ -62,6 +147,8 @@ uv sync                 # 按 pyproject.toml + uv.lock 安装依赖到 .venv
 ```powershell
 # 换材料无需改源码，用命令行参数指定 PDF / 页码 / 学科 / 提问
 uv run python main.py --stage build --pdf 教材.pdf --start-page 11 --end-page 12 --subject physics   # 提取并累加进双库
+# 整本教材分轮增量建库：先预估，每轮只处理 20 个新子块，交互确认（--yes 跳过）
+uv run python main.py --stage build --pdf 整本教材.pdf --start-page 13 --end-page 320 --subject math --max-chunks 20
 uv run python main.py --stage ask   --query "请讲解可变电路的分析思路"                                # 仅问答，复用已持久化双库
 uv run python main.py                                                                                  # 不带参数 = 内置默认示例
 ```
@@ -78,15 +165,15 @@ uv run python -c "import main, ingestion, pdf_processor, config, agent.workflow,
 Get-Content output\sida_agent.log -Tail 50
 ```
 
-## 3. 重要目录与文件
+## 4. 重要目录与文件
 
 | 路径 | 重要度 | 说明 |
 |---|---|---|
-| `main.py` | ★★★ | 流水线入口：提取 → 建库 → 问答；`--stage/--pdf/--start-page/--end-page/--subject/--query` 参数化，换材料无需改源码 |
+| `main.py` | ★★★ | 流水线入口：提取 → 建库 → 问答；`--stage/--pdf/--start-page/--end-page/--subject/--max-chars/--max-chunks/--yes/--query` 参数化；建库前打印规模预估并确认（`--yes` 跳过），结束打印两路真实 token 消耗，换材料无需改源码 |
 | `config.py` | ★★★ | 统一 LLM/Embedding 工厂；`.env` 中 base_url/key/model 在此生效 |
-| `ingestion.py` | ★★★ | 核心：两批串行抽取 prompt、抽取磁盘缓存、学科引导（SUBJECT_META）、双库写入编排 |
+| `ingestion.py` | ★★★ | 核心：自动切子块（`_split_into_chunks`）、滚动上下文注入（`_gather_known_context`）、两批串行抽取 prompt、逐子块抽取缓存与落盘、双库写入编排、幽灵节点/疑似重复审计 |
 | `agent/workflow.py` | ★★★ | LangGraph 问答工作流：学科判定 → 图谱检索 → 按页码回表讲义页 → 生成（意图/讲解双 LLM 分调优、答案来源标注） |
-| `storage/graph_store.py` | ★★★ | `ScienceGraphStore` 图谱存储、`get_subgraph` 聚合检索（每类实体 top-N 截断）、概念锚点模糊解析 |
+| `storage/graph_store.py` | ★★★ | `ScienceGraphStore` 图谱存储、`get_subgraph` 聚合检索（每类实体 top-N 截断）、概念锚点模糊解析、疑似重复概念合并（`merge_concepts`/`find_similar_concept`） |
 | `pdf_processor.py` | ★★ | PDF 页渲染 + 视觉模型提取 Markdown，逐页缓存于 `output/pdf_extract/` |
 | `storage/vector_store.py` | ★★ | Chroma 向量库初始化（collection `science_kb`，落盘 `output/vector_db/`） |
 | `agent/state.py` | ★ | Agent 状态 TypedDict（query / target_subject / 检索结果等） |
@@ -94,7 +181,7 @@ Get-Content output\sida_agent.log -Tail 50
 | `.env` | ★★ | 模型服务配置（不入库）；`.env` 缺失或 key 为空时启动会给出指引报错 |
 | `output/` | — | 运行产物：日志、PDF 提取缓存（`pdf_extract/{pdf_id}/pXXXX_{ver}.md`）、抽取缓存（`extract_cache/{hash}.json`）、向量库（`vector_db/`）、图谱（`knowledge_graph.json`） |
 
-## 4. 其它说明
+## 5. 其它说明
 
 - PDF 提取缓存目录结构 `output/pdf_extract/{pdf_id}/p{页码}_{版本}.md`，`pdf_id` 为 PDF
   内容 SHA-256 前 16 位，与姊妹项目 `knowledge_extract/extract_pdf` 同算法；文件名版本

@@ -244,6 +244,64 @@ class ScienceGraphStore:
                 best, best_ratio = cand, ratio
         return best if best_ratio >= _FUZZY_THRESHOLD else None
 
+    # ------------------------------------------------------------ 概念合并
+    def find_similar_concept(self, subject: str, name: str,
+                             threshold: float = _FUZZY_THRESHOLD,
+                             require_described: bool = True) -> Optional[str]:
+        """在同科已建概念中找与 name 名称相似度最高的概念名（用于人工核对去重）。
+
+        增量建库长期累积难免出现命名漂移（近义新名与旧节点并存），本方法给出
+        唯一最相似候选；相似度低于 threshold 返回 None（视为新概念）。
+        require_described=True 时跳过无描述的空壳节点：占位引用不应成为合并目标。
+        """
+        best, best_ratio = None, 0.0
+        for n, nd in self.graph.nodes(data=True):
+            if nd.get("subject") != subject or nd.get("type") != K_CONCEPT:
+                continue
+            if require_described and not str(nd.get("description", "")).strip():
+                continue
+            cand = bare_name(n)
+            ratio = difflib.SequenceMatcher(None, name, cand).ratio()
+            if ratio > best_ratio:
+                best, best_ratio = cand, ratio
+        return best if best_ratio >= threshold else None
+
+    def merge_concepts(self, subject: str, canonical: str, alias: str) -> bool:
+        """把冗余概念节点 alias 合并进规范概念 canonical（两概念须为同科）。
+
+        合并动作：alias 的全部入边/出边按原方向与关系重指到 canonical；
+        canonical 缺少 description 时用 alias 的补全；随后删除 alias 节点。
+        特殊情形：canonical 尚不存在（例如想让某别名升格为规范名）时，把
+        alias 节点整体改名为 canonical，等价合并且不丢任何属性。
+        返回是否实际执行了合并（两节点键相同/alias 不存在返回 False）。
+        """
+        alias_key = node_key(subject, K_CONCEPT, alias)
+        canonical_key = node_key(subject, K_CONCEPT, canonical)
+        if canonical == alias or alias_key not in self.graph:
+            return False
+        if canonical_key not in self.graph:
+            self.graph = nx.relabel_nodes(self.graph, {alias_key: canonical_key})
+            log.info("[graph_store] 合并: %s 节点不存在，将 %s 整体改名为 %s",
+                     canonical, alias, canonical)
+            return True
+        # alias 的入边：谁指进 alias，改指 canonical（跳过 canonical 自身回边）
+        for src, _dst, rel in list(self.graph.in_edges(alias_key, data="relation")):
+            if src != canonical_key:
+                self.relate(src, rel or REL_EXTRA, canonical_key)
+        # alias 的出边：alias 指向谁，改由 canonical 指向（跳过指向 canonical 自身）
+        for _src, dst, rel in list(self.graph.out_edges(alias_key, data="relation")):
+            if dst != canonical_key:
+                self.relate(canonical_key, rel or REL_EXTRA, dst)
+        alias_nd = self.graph.nodes[alias_key]
+        canon_nd = self.graph.nodes[canonical_key]
+        if not str(canon_nd.get("description", "")).strip():
+            for k_, v_ in alias_nd.items():
+                canon_nd.setdefault(k_, v_)
+        self.graph.remove_node(alias_key)
+        log.info("[graph_store] 合并完成: %s -> %s（关系已重指，别名节点已删除）",
+                 alias, canonical)
+        return True
+
     def get_subgraph(self, subject: str, concept_name: str,
                      max_per_kind: Optional[int] = _DEFAULT_MAX_PER_KIND) -> Dict[str, Any]:
         """按知识点锚点做 1~2 跳聚合检索。
@@ -398,6 +456,7 @@ class ScienceGraphStore:
                 "title": nd.get("title", ""),
                 "question_type": nd.get("question_type", ""),
                 "source": nd.get("source", {}),
+                "pdf_id": nd.get("pdf_id", ""),  # 例题所在 PDF（回表组键用）
             })
         return result
 
