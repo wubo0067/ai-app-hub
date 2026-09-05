@@ -157,17 +157,30 @@ def main() -> None:
     if args.stage in ("all", "ask"):
         agent = create_circuit_agent(vector_db=vector_db, graph_db=graph_db)
         log.info("[main] Agent 正在处理学生提问: %s", args.query)
+        print("=" * 60)
+        print("【解答生成结果】:\n")
+        result: dict = {}
         try:
-            result = agent.invoke({"query": args.query})
+            # 流式输出：messages 模式把节点内 LLM 调用逐 token 推送（按
+            # langgraph_node 过滤，只打印 generate_response 的正文，意图判定
+            # 等节点的输出不上屏）；values 模式每个节点后给一份状态快照，
+            # 取最后一份作为最终结果供保存。
+            for mode, chunk in agent.stream(
+                {"query": args.query}, stream_mode=["messages", "values"],
+            ):
+                if mode == "messages":
+                    msg, meta = chunk
+                    if meta.get("langgraph_node") == "generate_response":
+                        print(str(msg.content), end="", flush=True)
+                else:
+                    result = chunk
         except Exception:
             log.exception("[main] Agent 执行失败")
             raise
+        print("\n" + "=" * 60)
         # 公式定界符兜底归一化：\[ \] / \( \) -> $$ / $，保证 md 跨阅读器可读
+        # （仅作用于保存的 md 文件；控制台流式输出为模型原始 token 流）
         result["final_answer"] = _normalize_math_delims(result["final_answer"])
-        print("=" * 60)
-        print("【解答生成结果】:\n")
-        print(result["final_answer"])
-        print("=" * 60)
         out_path = _save_answer_markdown(result, args.subject)
         log.info("[main] 解答已保存: %s", out_path)
         print(f"\n[已保存] {out_path.resolve()}")
