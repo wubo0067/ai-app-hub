@@ -18,11 +18,14 @@
 命令行用法（换材料无需改源码）：
     uv run python main.py --stage build --pdf 教材.pdf --start-page 11 --end-page 12 --subject physics
     uv run python main.py --stage build --pdf 整本教材.pdf --start-page 13 --end-page 320 --subject math --max-chunks 20
+    uv run python main.py --stage build --pdf 整本教材.pdf --start-page 13 --end-page 320 --subject math --max-new-calls 20
     uv run python main.py --stage ask   --query "讲解可变电路的分析思路"
     uv run python main.py                          # 不带参数 = 下方默认值，等价旧行为
 --stage: all=提取+建库+问答（默认）；build=仅提取并累加进双库；ask=仅复用已持久化双库问答。
 长文档：页码区间可以开很大（整本书），build_knowledge_bases 会按 --max-chars
 预算自动切子块增量抽取；建库前会先打印规模预估并请求确认（--yes 跳过）。
+--max-chunks 限制推理抽取侧每轮新子块数，--max-new-calls 限制视觉提取侧每轮新页数，
+两者相互独立：已达其一即停，已完成部分已逐页/逐块落盘缓存，重跑同命令续跑。
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, List, Optional
 
 import pymupdf
 
@@ -99,6 +102,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-chunks", type=int, default=None, metavar="N",
                         help="本次建库最多处理 N 个未命中缓存的新子块（缓存命中不占额度），"
                              "达到即主动停，已完成子块已落盘/缓存，重跑同命令续跑。")
+    parser.add_argument("--max-new-calls", type=int, default=None, metavar="N",
+                        help="本次视觉提取最多新调用 N 次（已缓存页不占额度），达到即主动停；"
+                             "已完成页已逐页缓存，重跑同命令续跑（控视觉模型成本，"
+                             "与 --max-chunks 同套分批消费模式）。")
     parser.add_argument("--yes", action="store_true",
                         help="跳过建库前的规模预估确认（脚本/夜间批量自动放行）。")
     parser.add_argument("--query", default=DEFAULT_QUERY,
@@ -193,15 +200,26 @@ _ESTIMATE_UNKNOWN_PAGE_CHARS = 2000
 
 
 def _estimate_build(pdf_path: str, start_page: int, end_page: int,
-                    subject: str, max_chars: int) -> dict:
+                    subject: str, max_chars: int,
+                    max_vision_calls: Optional[int] = None) -> dict:
     """建库规模预估（干跑）：只读逐页缓存 + 按预算预演切块，不调用任何模型。
 
+    max_vision_calls：视觉提取侧分批上限（对应 extract_pdf_pages_as_markdown
+    的 max_new_calls）。传入时按与真实运行完全相同的顺序遍历页：缓存页先纳入，
+    未缓存页计数并纳入，达到上限即停——上限之后的页（含其间尚未提取的缓存页）
+    本次不处理。因此预估/确认里的 new_vision_calls 与切块预演范围都反映「本批
+    真实会做的工作」，而不是把整个大区间一次亮出来误导确认（分批模式下数字不虚高）。
+
     返回 dict：
-    - total_pages / cached_pages / new_vision_calls：视觉提取侧（逐页缓存，精确）
-    - plan_chunks / cached_chunks / new_chunks：推理抽取侧（每子块两批 LLM）
+    - range_pages：用户请求的页码范围总页数（可能大于本次实际处理数）
+    - processed_pages / cached_pages / new_vision_calls / skipped_pages：视觉提取侧
+      （逐页缓存，精确；skipped_pages 为本次因上限而未处理的剩余页）
+    - plan_chunks / cached_chunks / new_chunks：推理抽取侧（每子块两批 LLM，
+      仅对本次实际处理页预演切块）
+    - vision_capped：本次视觉提取是否被上限截断（还有剩余页待续跑）
     - approx_len：未缓存页的估算平均字符数（内容未知时仅用于预演切块）
-    含未提取页时，切块/缓存命中判断基于估算内容长度，可能与真实运行略有出入，
-    故 new_chunks 标记为 approx=True 提示；真实消耗以结束时的 TokenMeter 为准。
+    含未提取页时，切块/缓存命中判断基于估算内容长度，可能与真实运行略有出入；
+    真实消耗以结束时的 TokenMeter 为准。
     """
     pdf = Path(pdf_path)
     if not pdf.exists():
@@ -215,16 +233,28 @@ def _estimate_build(pdf_path: str, start_page: int, end_page: int,
         raise ValueError(f"页范围 {start}-{end} 无效（PDF 共 {total_pages} 页）。")
 
     page_nums = list(range(start, end + 1))
-    cached_in = {p: cached[p] for p in page_nums if p in cached}
-    new_vision_calls = len(page_nums) - len(cached_in)
+    # 与 extract_pdf_pages_as_markdown 同序遍历：缓存页不占额度直接纳入；未缓存页
+    # 计数并纳入，达到 max_vision_calls 即停（其后的页本次不进切块/抽取预演）。
+    processed: List[int] = []
+    new_vision_calls = 0
+    for p in page_nums:
+        if p in cached:
+            processed.append(p)
+            continue
+        if max_vision_calls is not None and new_vision_calls >= max_vision_calls:
+            break
+        new_vision_calls += 1
+        processed.append(p)
+    skipped_pages = len(page_nums) - len(processed)
+    cached_pages = sum(1 for p in processed if p in cached)
 
-    lengths = [len(v) for v in cached_in.values()]
+    lengths = [len(cached[p]) for p in processed if p in cached]
     est_len = round(sum(lengths) / len(lengths)) if lengths else _ESTIMATE_UNKNOWN_PAGE_CHARS
     # 未缓存页用无标题占位文本（长度≈均值）预演切块：与真实运行共用同一套
     # _split_into_chunks，保证边界规则一致（仅内容未知导致的偏差不可避免）。
     synth = [
         {"page": p, "content": cached[p] if p in cached else "　" * est_len}
-        for p in page_nums
+        for p in processed
     ]
     plan = _split_into_chunks(synth, max_chars=max_chars)
 
@@ -237,27 +267,37 @@ def _estimate_build(pdf_path: str, start_page: int, end_page: int,
                 cached_chunks += 1
     new_chunks = len(plan) - cached_chunks
     return {
-        "total_pages": len(page_nums),
-        "cached_pages": len(cached_in),
+        "range_pages": len(page_nums),
+        "processed_pages": len(processed),
+        "cached_pages": cached_pages,
         "new_vision_calls": new_vision_calls,
+        "skipped_pages": skipped_pages,
         "plan_chunks": len(plan),
         "cached_chunks": cached_chunks,
         "new_chunks": new_chunks,
         "approx_len": est_len,
+        "vision_capped": skipped_pages > 0,
     }
 
 
 def _print_estimate(est: dict, max_chars: int) -> None:
     """打印规模预估（建库正式开始前、未调用任何模型时）。"""
     log.info("[main] 本次任务规模预估（只读缓存 + 本地统计，未调用任何模型）:")
-    log.info("  页码共 %d 页 | 视觉提取：已缓存 %d 页，需新调用 %d 次",
-             est["total_pages"], est["cached_pages"], est["new_vision_calls"])
+    if est["vision_capped"]:
+        # 视觉侧被 --max-new-calls 截断：明确告诉用户本批处理量与剩余待续跑页数
+        log.info("  页码范围共 %d 页，本次视觉提取 %d 页（新调用 %d + 已缓存 %d），"
+                 "剩余 %d 页留待下次续跑",
+                 est["range_pages"], est["processed_pages"], est["new_vision_calls"],
+                 est["cached_pages"], est["skipped_pages"])
+    else:
+        log.info("  页码范围共 %d 页 | 视觉提取：已缓存 %d 页，需新调用 %d 次",
+                 est["range_pages"], est["cached_pages"], est["new_vision_calls"])
     log.info("  知识抽取：按 --max-chars=%d 自动切 %d 个子块，"
              "已缓存 %d 个，需新抽取 %d 个（约 %d 次推理 LLM 调用）",
              max_chars, est["plan_chunks"], est["cached_chunks"],
              est["new_chunks"], est["new_chunks"] * 2)
     if est["new_vision_calls"]:
-        log.info("  （含未提取页 %d 页：内容未知，切块按平均页长 %d 字预演，"
+        log.info("  （含本批未提取页 %d 页：内容未知，切块按平均页长 %d 字预演，"
                  "实际块数可能略有出入；真实 token 消耗以结束时统计为准）",
                  est["new_vision_calls"], est["approx_len"])
 
@@ -274,7 +314,7 @@ def _confirm_build(est: dict, yes: bool) -> bool:
     if not sys.stdin.isatty():
         log.error("[main] 本次将产生约 %d 次新模型调用，且当前不是交互终端；"
                   "请确认规模后加 --yes 重新执行，或先用 --start-page/--end-page/"
-                  "--max-chunks 缩小本次范围", new_calls)
+                  "--max-chunks/--max-new-calls 缩小本次范围", new_calls)
         return False
     try:
         answer = input("是否继续？[y/N] ").strip().lower()
@@ -308,8 +348,10 @@ def main() -> None:
                  args.pdf, args.start_page, args.end_page, args.subject)
         # 花钱前先亮规模：只读逐页缓存 + 按预算预演切块（不调用任何模型）；
         # 全部命中缓存时自动放行，有新调用时交互确认（--yes 跳过）。
+        # max_vision_calls 传入 --max-new-calls：预估/确认只亮本批真实会做的量。
         est = _estimate_build(args.pdf, args.start_page, args.end_page,
-                              args.subject, args.max_chars)
+                              args.subject, args.max_chars,
+                              max_vision_calls=args.max_new_calls)
         _print_estimate(est, args.max_chars)
         if not _confirm_build(est, args.yes):
             log.info("[main] 已取消本次建库（未调用任何模型）")
@@ -321,6 +363,7 @@ def main() -> None:
             start_page=args.start_page,
             end_page=args.end_page,
             meter=vision_meter,
+            max_new_calls=args.max_new_calls,
         )
         # 同一 vector_db/graph_db 多次调用即跨学科累积全科知识库。
         # 页码区间可开很大：内部按 max_chars 自动切子块增量抽取，

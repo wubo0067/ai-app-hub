@@ -497,6 +497,7 @@ def extract_pdf_pages_as_markdown(
     *,
     output_dir: str | Path | None = None,
     meter: Any | None = None,
+    max_new_calls: int | None = None,
 ) -> list[dict]:
     """截取 PDF 页面渲染成 PNG，用视觉大模型提取为结构化 Markdown。
 
@@ -514,6 +515,10 @@ def extract_pdf_pages_as_markdown(
         end_page: 结束页码（含），超出 PDF 总页数时自动截断。
         output_dir: 可选，覆盖默认缓存目录 output/pdf_extract。
         meter: 可选 TokenMeter 兼容对象（.add(response)），累计视觉调用真实 token。
+        max_new_calls: 可选，本次最多新提取的页数上限（缓存命中的页不占额度）；
+            达到上限即提前停止，剩余未提取页仍落在下次重跑（逐页缓存 + 自动跳过
+            已完成页保证续跑），与 build_knowledge_bases 的 max_chunks 同一套模式。
+            视觉模型通常是更贵的多模态输入，传一个有限上限可分批消费、控成本。
 
     视觉模型固定由 config.py + sida-agent/.env 的 VISION_* 配置决定。
 
@@ -554,12 +559,19 @@ def extract_pdf_pages_as_markdown(
         log.info("[pdf_processor] PDF=%s（共 %d 页），提取第 %d-%d 页, id=%s",
                  pdf.name, total, start, end, pdf_id)
         pages_data: list[dict] = []
+        new_calls = 0
         for page_no in range(start, end + 1):
             page_file = _page_file_path(book_dir, page_no)
             if page_file.exists() and page_file.read_text(encoding="utf-8").strip():
                 content = page_file.read_text(encoding="utf-8").strip()
                 log.info("  [已提取] 第 %d 页（%s）", page_no, page_file.name)
             else:
+                # 达到本次新提取页上限即主动停：已完成页已落盘缓存，下次重跑
+                # 会跳过它们、从第一个未提取页继续，等价分批消费视觉模型成本。
+                if max_new_calls is not None and new_calls >= max_new_calls:
+                    log.info("[pdf_processor] 已达本次新提取页上限 %d，停止（剩余页保留待下次续跑）",
+                             max_new_calls)
+                    break
                 png = _render_page(doc.load_page(page_no - 1))
                 messages = [
                     HumanMessage(
@@ -575,6 +587,7 @@ def extract_pdf_pages_as_markdown(
                 log.info("  [提取] 第 %d 页 ...（缓存：%s）", page_no, page_file)
                 content = _invoke_llm(vision_llm, messages, meter=meter)
                 content = _fix_math(content)
+                new_calls += 1
                 if content:
                     page_file.write_text(content, encoding="utf-8")
                 else:

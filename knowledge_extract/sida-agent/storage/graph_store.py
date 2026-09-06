@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr,bin/,nv p:t,on3:,
 # -*- coding: utf-8 -*-
 """全科知识图谱存储：基于 NetworkX 的内存有向图（初中物理/化学/数学通用）。
 
@@ -270,7 +270,8 @@ class ScienceGraphStore:
         """把冗余概念节点 alias 合并进规范概念 canonical（两概念须为同科）。
 
         合并动作：alias 的全部入边/出边按原方向与关系重指到 canonical；
-        canonical 缺少 description 时用 alias 的补全；随后删除 alias 节点。
+        随后按「越建越全」策略把 alias 的属性逐字段并入 canonical（见下方
+        注释），最后删除 alias 节点。
         特殊情形：canonical 尚不存在（例如想让某别名升格为规范名）时，把
         alias 节点整体改名为 canonical，等价合并且不丢任何属性。
         返回是否实际执行了合并（两节点键相同/alias 不存在返回 False）。
@@ -294,9 +295,28 @@ class ScienceGraphStore:
                 self.relate(canonical_key, rel or REL_EXTRA, dst)
         alias_nd = self.graph.nodes[alias_key]
         canon_nd = self.graph.nodes[canonical_key]
-        if not str(canon_nd.get("description", "")).strip():
-            for k_, v_ in alias_nd.items():
-                canon_nd.setdefault(k_, v_)
+        # 属性合并：与 ingestion._ensure_entity 的「越建越全」策略保持一致。
+        # 旧实现仅当 canonical 为空壳（无 description）时才 setdefault 补属性，
+        # 但审计报告「疑似重复概念对」恰恰只扫两边都有描述的概念——主场景正是
+        # canonical 与 alias 都有内容，旧逻辑下 alias 的 description/breakdown/
+        # common_mistakes/sources 会随 remove_node 整体丢失，canonical 纹丝不动，
+        # 与"越建越全"背道而驰。改为逐字段合并：type/subject 元数据跳过；
+        # 空值不冲刷；列表 union 去重保序；标量字符串保留更长。
+        for k_, v_ in alias_nd.items():
+            if k_ in ("type", "subject"):
+                continue  # 节点元数据：两节点一致，跳过
+            if v_ is None or v_ == "" or v_ == [] or v_ == {}:
+                continue  # 别名该字段为空：不冲刷 canonical 已有内容
+            old = canon_nd.get(k_)
+            if old is None or old == "" or old == [] or old == {}:
+                canon_nd[k_] = v_  # canonical 缺失/为空：补全
+                continue
+            if isinstance(old, list) and isinstance(v_, list):
+                # 无序要点集合 union 去重保序（concept 无 derivation/template/steps
+                # 之类顺序敏感字段，故无需保留更长的特判）
+                canon_nd[k_] = old + [x for x in v_ if x not in old]
+            elif isinstance(old, str) and isinstance(v_, str) and len(v_) > len(old):
+                canon_nd[k_] = v_  # 标量保留更长表述（description/chapter）
         self.graph.remove_node(alias_key)
         log.info("[graph_store] 合并完成: %s -> %s（关系已重指，别名节点已删除）",
                  alias, canonical)

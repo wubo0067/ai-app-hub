@@ -104,12 +104,28 @@ def create_circuit_agent(
         return {"target_subject": subject, "target_concept": concept}
 
     def graph_traversal_node(state: CircuitAgentState):
+        """图谱聚合检索节点：以意图节点给出的 (学科, 知识点锚点) 为入口，
+        从知识图谱中聚合出概念拆解、公式、实验、题型、方法、例题等教研上下文。
+
+        检索按三级兜底逐级降级：
+        1. 锚点直接命中 Concept 节点 -> get_subgraph 一/二跳聚合；
+        2. 锚点其实不是概念名（而是题型/方法/例题名）-> 反查其所属概念再聚合；
+        3. 命中的是"空壳"概念（先修引用自动生成的占位节点）-> 重定位/章节兜底（见下方注释）。
+        检索结果整体写入 state["graph_context"]，供后续回表与生成节点消费。
+        """
+        # 上游 analyze_intent 的判定结果；缺省时保守回退到物理学科（最常见库）
         subject = state.get("target_subject") or "physics"
         concept = state.get("target_concept") or ""
         log.debug("[workflow.graph_traversal] 图谱聚合检索, subject=%s, concept=%s", subject, concept)
+        # 第一级：按概念名直接做 1~2 跳聚合检索（get_subgraph 内部还有一次模糊解析，
+        # 返回的 dict 里 concept 为 None 即表示图谱里根本没有这个概念节点）
         subgraph = graph_db.get_subgraph(subject, concept)
         if subgraph.get("concept") is None:
-            # 锚点未直接命中概念：尝试把 concept 当题型/方法/例题名反查锚定到概念
+            # 第二级兜底——锚点反查：意图 LLM 给出的 concept 可能并不是概念名，而是
+            # 题型名/方法名/例题名（如问"动态电路分析怎么做"，锚点其实是题型）。
+            # 此时按 题型 -> 方法 -> 例题 的优先级依次尝试把 concept 当作该类实体名
+            # 反查图谱（get_by_name 会顺带返回其相邻的 Concept 节点作为锚定概念），
+            # 一旦找到挂了 related_concept 的实体，就改用该概念重新做子图聚合并停止。
             log.warning("[workflow.graph_traversal] 概念节点未命中，尝试题型/方法锚点定位")
             for kind_alias in (K_QUESTION_TYPE, K_METHOD, K_EXAMPLE):
                 hit = graph_db.get_by_name(subject, kind_alias, concept)
@@ -123,24 +139,38 @@ def create_circuit_agent(
         # 阶段一：按查询词在邻居概念里挑选内容枢纽重定向（查询词无匹配且邻居唯一时也重定向）；
         # 阶段二：邻居也无字面命中（章节式提问，如"讲解简单电路的电功率"），改用章节标题
         # 匹配做整章聚合兜底，把真实例题/题型（挂在章内各内容枢纽概念上）一并捞回。
+        # 空壳判定：concept 节点存在（cd 非空）但四个内容维度全空——
+        # 无定义(description)、无拆解(breakdown)、聚合不到题型、聚合不到例题，
+        # 同时满足才认定为空壳，避免误伤"内容少但有实质信息"的正常概念。
         cd = subgraph.get("concept") or {}
         if (cd and not cd.get("description") and not cd.get("breakdown")
                 and not subgraph.get("question_types") and not subgraph.get("examples")):
+            # 取学生原始提问（非 LLM 提炼的锚点），用于与邻居概念名做字面匹配
             query = state.get("query") or ""
+            # 收集候选重定向目标：后续概念 + 先修概念（真实内容通常挂在这两类 1 跳邻居上），
+            # 按出现顺序去重，保证同名概念只保留一次
             cands: List[str] = []
             for p in subgraph.get("follow_ups", []) + subgraph.get("prerequisites", []):
                 n = p.get("name")
                 if n and n not in cands:
                     cands.append(n)
+            # 阶段一筛选：邻居概念名直接出现在提问原文里的，视为学生真正想问的内容枢纽
             matched = [n for n in cands if n in query]
+            # 选择策略：有字面命中取第一个；无命中但邻居唯一（空壳只挂一个邻居，
+            # 大概率它就是真实内容所在）也敢重定向；多个邻居且无命中则不敢猜，置 None
             pick = matched[0] if matched else (cands[0] if len(cands) == 1 else None)
             if pick:
+                # 阶段一命中：对选中的邻居概念重新做子图聚合，替换掉空壳结果
                 log.warning("[workflow.graph_traversal] 锚点概念 %r 为空壳（无题型/例题挂载），"
                             "重定位到关联概念 %r", concept, pick)
                 subgraph = graph_db.get_subgraph(subject, pick)
             else:
+                # 阶段二兜底：章节式提问（如"讲解简单电路的电功率"）在邻居名上无字面命中，
+                # 改为拿整句提问去匹配图谱中的章节标题，解析出所属章节
                 chapter = graph_db.resolve_chapter(subject, query)
                 if chapter:
+                    # 章节解析成功：聚合整章子图（concepts 列表 + 章内全部公式/题型/例题），
+                    # 真实例题虽挂在章内各内容枢纽概念上，也能被整体捞回
                     log.warning("[workflow.graph_traversal] 锚点概念 %r 为空壳且邻居无字面命中，"
                                 "章节兜底聚合整章 %r", concept, chapter)
                     subgraph = graph_db.get_chapter_subgraph(subject, chapter)

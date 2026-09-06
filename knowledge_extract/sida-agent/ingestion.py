@@ -576,10 +576,16 @@ def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any]
     靠 _ensure_entity 的越建越全合并累积两本书的内容。
     """
     # --- 章节 ---
+    # 章节同样走 _ensure_entity 而非 add_entity：分块只在标题页之间切，不保证单章
+    # 不超过 max_chars，长章节跨子块是常态；后续子块经滚动上下文会"逐字复用"同一
+    # 章节标题，但其 summary 只含本批片段（甚至空串）。若用 add_entity，networkx 的
+    # add_node 会覆盖同名 key，片段/空 summary 会直接顶掉先前子块写好的完整概要。
+    # 走 _ensure_entity 后：空值不冲刷、标量字符串保留更长，与其它实体合并策略一致。
     for ch in data.get("chapters", []):
         title = ch.get("title", "").strip()
         if title:
-            graph_db.add_entity(subject, "Chapter", title, title=title, summary=ch.get("summary", ""))
+            _ensure_entity(graph_db, subject, "Chapter", title,
+                           title=title, summary=ch.get("summary", ""))
 
     # --- 概念（含先修链）---
     concept_names: List[str] = []

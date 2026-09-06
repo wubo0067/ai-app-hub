@@ -99,8 +99,13 @@ prompt 要求：本批文本若命中上述列表中的同一概念/章节，`na
 - **建库前预估**（`main.py _estimate_build`，只读缓存 + 本地统计，不调用任何模型）：
   打印「需新视觉调用次数 / 自动切几块 / 已缓存几块 / 需新抽取几块（每块约 2 次推理 LLM）」，
   随后 `[y/N]` 确认；`--yes` 跳过；非交互终端且需新调用时直接拒绝执行，防止误烧钱。
-- **预算上限** `--max-chunks N`：单次最多处理 N 个**未命中缓存的新子块**（缓存命中不占额度），
-  达到即主动停并提示「重跑同命令续跑」，配合预估分轮灌完整本书。
+- **预算上限（推理侧）** `--max-chunks N`：单次最多处理 N 个**未命中缓存的新子块**
+  （缓存命中不占额度），达到即主动停并提示「重跑同命令续跑」，配合预估分轮灌完整本书。
+- **预算上限（视觉侧）** `--max-new-calls N`：单次最多新提取 N 页（已缓存页不占额度）。
+  视觉模型按多模态输入通常比推理模型更贵，`extract_pdf_pages_as_markdown` 达到上限即停，
+  已完成页已逐页缓存，重跑同命令续跑——与 `--max-chunks` 同一套分批消费模式。
+  传入后规模预估/确认只会亮「本批真实会做的量」（被截断的剩余页数单独提示留待续跑），
+  不会把整个大区间的全量数字拿出来误导确认。
 - **真实 token 统计**（`main.py TokenMeter`）：从响应 `usage_metadata`（回退
   `response_metadata.token_usage`）读取真实用量，视觉 / 推理两路分别透传并在结束时打印，
   服务端不回传 usage 的调用不计入。
@@ -110,12 +115,16 @@ prompt 要求：本批文本若命中上述列表中的同一概念/章节，`na
 | 参数 | 作用 |
 |---|---|
 | `--max-chars N` | 单子块字符预算（默认 6000）：输入页超过即自动切块 |
-| `--max-chunks N` | 本次最多处理 N 个未命中缓存的新子块（缓存命中不占额度），达上限主动停 |
+| `--max-chunks N` | 推理抽取侧：本次最多处理 N 个未命中缓存的新子块（缓存命中不占额度），达上限主动停 |
+| `--max-new-calls N` | 视觉提取侧：本次最多新提取 N 页（已缓存页不占额度），达上限主动停，重跑续跑 |
 | `--yes` | 跳过建库前的规模预估确认（脚本 / 夜间批量自动放行） |
 
 ```powershell
 # 整本教材分轮增量建库：先预估，每轮只处理 20 个新子块；再跑同命令即续跑（已缓存块不计费）
 uv run python main.py --stage build --pdf 整本教材.pdf --start-page 13 --end-page 320 --subject math --max-chunks 20
+
+# 视觉提取也分批：本轮新提取页与推理子块各限 20，剩余页/块下次重跑同命令续跑
+uv run python main.py --stage build --pdf 整本教材.pdf --start-page 13 --end-page 320 --subject math --max-new-calls 20 --max-chunks 20
 ```
 
 ## 3. 常用命令
@@ -149,6 +158,8 @@ uv sync                 # 按 pyproject.toml + uv.lock 安装依赖到 .venv
 uv run python main.py --stage build --pdf 教材.pdf --start-page 11 --end-page 12 --subject physics   # 提取并累加进双库
 # 整本教材分轮增量建库：先预估，每轮只处理 20 个新子块，交互确认（--yes 跳过）
 uv run python main.py --stage build --pdf 整本教材.pdf --start-page 13 --end-page 320 --subject math --max-chunks 20
+# 视觉提取同样分批：每轮新提取页上限 20（控多模态视觉成本），重跑续跑
+uv run python main.py --stage build --pdf 整本教材.pdf --start-page 13 --end-page 320 --subject math --max-new-calls 20
 uv run python main.py --stage ask   --query "请讲解可变电路的分析思路"                                # 仅问答，复用已持久化双库
 uv run python main.py                                                                                  # 不带参数 = 内置默认示例
 ```
@@ -169,7 +180,7 @@ Get-Content output\sida_agent.log -Tail 50
 
 | 路径 | 重要度 | 说明 |
 |---|---|---|
-| `main.py` | ★★★ | 流水线入口：提取 → 建库 → 问答；`--stage/--pdf/--start-page/--end-page/--subject/--max-chars/--max-chunks/--yes/--query` 参数化；建库前打印规模预估并确认（`--yes` 跳过），结束打印两路真实 token 消耗，换材料无需改源码 |
+| `main.py` | ★★★ | 流水线入口：提取 → 建库 → 问答；`--stage/--pdf/--start-page/--end-page/--subject/--max-chars/--max-chunks/--max-new-calls/--yes/--query` 参数化；建库前打印规模预估并确认（`--yes` 跳过，`--max-new-calls` 截断后预估只亮本批真实量），结束打印两路真实 token 消耗，换材料无需改源码 |
 | `config.py` | ★★★ | 统一 LLM/Embedding 工厂；`.env` 中 base_url/key/model 在此生效 |
 | `ingestion.py` | ★★★ | 核心：自动切子块（`_split_into_chunks`）、滚动上下文注入（`_gather_known_context`）、两批串行抽取 prompt、逐子块抽取缓存与落盘、双库写入编排、幽灵节点/疑似重复审计 |
 | `agent/workflow.py` | ★★★ | LangGraph 问答工作流：学科判定 → 图谱检索 → 按页码回表讲义页 → 生成（意图/讲解双 LLM 分调优、答案来源标注） |
