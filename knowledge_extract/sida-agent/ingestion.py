@@ -911,8 +911,13 @@ def _gather_known_context(vector_db: Chroma, graph_db: ScienceGraphStore,
     query = chunk_markdown[:2000].strip()
     if query and vector_db is not None:
         try:
-            hits = vector_db.similarity_search(
-                query, k=top_k, filter={"subject": subject, "type": K_CONCEPT})
+            # 注意：Chroma where 顶层只能有一个字段条件或一个逻辑操作符，
+            # 多字段 AND 必须显式写 $and 数组，否则抛
+            # "Expected where to have exactly one operator"（滚动上下文会静默失效）。
+            # filter 形参类型存根过窄（dict[str, str]），此处用显式 dict 绕开
+            # 静态检查，运行时原样透传给 ChromaDB 的 where。
+            where: Dict[str, Any] = {"$and": [{"subject": subject}, {"type": K_CONCEPT}]}
+            hits = vector_db.similarity_search(query, k=top_k, filter=where)
         except Exception:  # noqa: BLE001
             log.warning("[ingestion] 检索已建相关概念失败，忽略并继续抽取", exc_info=True)
             hits = []
