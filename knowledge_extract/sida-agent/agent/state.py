@@ -4,8 +4,11 @@ class _AgentStateOptional(TypedDict, total=False):
     """Agent 工作流中由各节点分步填充的可选字段"""
     target_subject: Optional[str]    # 判定出的学科：physics / chemistry / math
     target_concept: Optional[str]    # 提取的核心锚点实体（知识点）
+    intent: Optional[str]            # 提问意图：concept（问知识点）/ find_problem（按内容搜题）
+    search_text: Optional[str]       # find_problem 时提炼出的题目内容特征文本
     graph_context: Dict[str, Any]    # 图谱检索出的教研上下文（概念拆解/公式/实验/题型/例题）
     vector_chunks: List[str]        # 向量库回表拿出的原题全文
+    problem_chunks: List[str]       # find_problem 时向量语义检索命中的讲义页切片（含出处头）
     final_answer: str               # 最终生成的系统讲解
 
 class CircuitAgentState(_AgentStateOptional):

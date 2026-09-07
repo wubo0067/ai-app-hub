@@ -15,9 +15,12 @@ PDF 讲义 ──① 视觉大模型提取──▶ 结构化 Markdown（逐页�
               │    概念/公式/实验/题型/方法/例题 + 前置/溯源/示范等关系
               └─ 向量库 Chroma（metadata.id 与图节点键/讲义页键一致，供精确回表）
                    实体切片 + 讲义页切片 subject:Page:{pdf_id}:页码
-        ──③ LangGraph 问答 Agent──▶ 分层讲解
-              判定学科与知识点锚点 → 图谱聚合检索（模糊解析锚点 + 每类 top-N 截断）
-              → 按 (pdf_id, 页码) 回表取讲义页原文 → 生成回答（标注教材来源）
+        ──③ LangGraph 问答 Agent──▶ 分层讲解 / 按题目内容搜题
+              判定学科 + 提问意图（问知识点 / 找题目）
+              ├─ concept：知识点锚点 → 图谱聚合检索（模糊解析锚点 + 每类 top-N 截断）
+              │            → 按 (pdf_id, 页码) 回表取讲义页原文 → 生成回答（标注教材来源）
+              └─ find_problem：整页讲义原文检索（逐字命中 + 语义兜底重排）
+                               → 原题完整呈现 + 出处页码 + 简析（详见下节）
 ```
 
 抽取本体（跨学科通用 schema，见 `ingestion.py`）：章节、概念（拆解/易错/前置）、
@@ -127,7 +130,41 @@ uv run python main.py --stage build --pdf 整本教材.pdf --start-page 13 --end
 uv run python main.py --stage build --pdf 整本教材.pdf --start-page 13 --end-page 320 --subject math --max-new-calls 20 --max-chunks 20
 ```
 
-## 3. 常用命令
+## 3. 问答双意图：知识点讲解与按题目内容搜题
+
+问答入口会先由意图判定节点把提问分成两类（`agent/workflow.py`），再路由到不同链路：
+
+| 意图 | 典型提问 | 链路 |
+|---|---|---|
+| `concept`（问知识点） | 「请讲解可变电路的分析思路」 | 知识点锚点 → 图谱聚合检索 → 按页回表讲义原文 → 分层讲解 |
+| `find_problem`（找题目） | 「我想查询一道题，内容包含'甲、乙两瓶等量煤油中'」 | 整页讲义切片原文检索 → 原题完整呈现 + 出处页码 + 简析 |
+
+**为什么需要 find_problem 链路**：concept 链路靠「知识点锚点 → 图谱」定位内容，学生若
+用题目原文片段找题而非问知识点（如题目挂「焦耳定律/串联分压」名下、锚点却被解析成「比热容」），
+或目标知识点实体不在图谱中时，图谱检索会整体落空。find_problem 链路绕开图谱，直接在
+**整页讲义切片**（`{subject}:Page:{pdf_id}:{页码}`）上做原文检索。
+
+**两级检索策略**（`search_problems_node`，实测均能稳定命中目标页）：
+
+1. **逐字命中**：Chroma `where_document={"$contains": 题目特征文本}` 精确过滤
+   （中文子串匹配可用），命中即返回，零成本零误差；
+2. **语义兜底 + 二元组重排**：原文有改写/跨行断字导致逐字不中时，向量粗召回 top-10，
+   再按「查询字符二元组（bigram）在页面文本中的重合度」降序、向量距离升序重排取
+   top-3——纯向量距离对「短引文 vs 长页面」区分度差（目标页曾排 8/8），bigram 重合度
+   能把目标页拉回第一（实测 0.86 vs 其余 0.29）。
+
+**输出约定**：命中页的整页讲义原样交给讲解 LLM，题目（题号/题干/选项）完整原样呈现、
+不截断不改写，标注「（见教材第 X 页）」；多页相似时列出候选让学生确认；对不上时如实
+说明不编造。注意返回的是**整页切片**，同页其他题目也会一并出现，属预期设计。
+
+前提：目标 PDF 的讲义页切片须已入向量库（对该 PDF 跑过 `--stage build` 即可）。
+
+```powershell
+# 按题目内容找题（可带请求前缀，意图节点会自动提炼 search_text）
+uv run python main.py --stage ask --query "我想查询一道题，内容包含'甲、乙两瓶等量煤油中'"
+```
+
+## 4. 常用命令
 
 环境要求：Python ≥ 3.11，[uv](https://docs.astral.sh/uv/)。
 
@@ -160,7 +197,8 @@ uv run python main.py --stage build --pdf 教材.pdf --start-page 11 --end-page 
 uv run python main.py --stage build --pdf 整本教材.pdf --start-page 13 --end-page 320 --subject math --max-chunks 20
 # 视觉提取同样分批：每轮新提取页上限 20（控多模态视觉成本），重跑续跑
 uv run python main.py --stage build --pdf 整本教材.pdf --start-page 13 --end-page 320 --subject math --max-new-calls 20
-uv run python main.py --stage ask   --query "请讲解可变电路的分析思路"                                # 仅问答，复用已持久化双库
+uv run python main.py --stage ask   --query "请讲解可变电路的分析思路"                                # 仅问答（知识点讲解），复用已持久化双库
+uv run python main.py --stage ask   --query "我想查询一道题，内容包含'甲、乙两瓶等量煤油中'"            # 按题目内容找题（find_problem，见上节）
 uv run python main.py                                                                                  # 不带参数 = 内置默认示例
 ```
 
@@ -176,14 +214,14 @@ uv run python -c "import main, ingestion, pdf_processor, config, agent.workflow,
 Get-Content output\sida_agent.log -Tail 50
 ```
 
-## 4. 重要目录与文件
+## 5. 重要目录与文件
 
 | 路径 | 重要度 | 说明 |
 |---|---|---|
 | `main.py` | ★★★ | 流水线入口：提取 → 建库 → 问答；`--stage/--pdf/--start-page/--end-page/--subject/--max-chars/--max-chunks/--max-new-calls/--yes/--query` 参数化；建库前打印规模预估并确认（`--yes` 跳过，`--max-new-calls` 截断后预估只亮本批真实量），结束打印两路真实 token 消耗，换材料无需改源码 |
 | `config.py` | ★★★ | 统一 LLM/Embedding 工厂；`.env` 中 base_url/key/model 在此生效 |
 | `ingestion.py` | ★★★ | 核心：自动切子块（`_split_into_chunks`）、滚动上下文注入（`_gather_known_context`）、两批串行抽取 prompt、逐子块抽取缓存与落盘、双库写入编排、幽灵节点/疑似重复审计 |
-| `agent/workflow.py` | ★★★ | LangGraph 问答工作流：学科判定 → 图谱检索 → 按页码回表讲义页 → 生成（意图/讲解双 LLM 分调优、答案来源标注） |
+| `agent/workflow.py` | ★★★ | LangGraph 问答工作流：学科 + 提问意图（问知识点/找题目）判定 → concept 走图谱检索、按页码回表讲义页生成；find_problem 走整页讲义两级原文检索（逐字命中 + 语义兜底 bigram 重排）原题呈现（意图/讲解双 LLM 分调优、答案来源标注） |
 | `storage/graph_store.py` | ★★★ | `ScienceGraphStore` 图谱存储、`get_subgraph` 聚合检索（每类实体 top-N 截断）、概念锚点模糊解析、疑似重复概念合并（`merge_concepts`/`find_similar_concept`） |
 | `pdf_processor.py` | ★★ | PDF 页渲染 + 视觉模型提取 Markdown，逐页缓存于 `output/pdf_extract/` |
 | `storage/vector_store.py` | ★★ | Chroma 向量库初始化（collection `science_kb`，落盘 `output/vector_db/`） |
@@ -192,7 +230,7 @@ Get-Content output\sida_agent.log -Tail 50
 | `.env` | ★★ | 模型服务配置（不入库）；`.env` 缺失或 key 为空时启动会给出指引报错 |
 | `output/` | — | 运行产物：日志、PDF 提取缓存（`pdf_extract/{pdf_id}/pXXXX_{ver}.md`）、抽取缓存（`extract_cache/{hash}.json`）、向量库（`vector_db/`）、图谱（`knowledge_graph.json`） |
 
-## 5. 其它说明
+## 6. 其它说明
 
 - PDF 提取缓存目录结构 `output/pdf_extract/{pdf_id}/p{页码}_{版本}.md`，`pdf_id` 为 PDF
   内容 SHA-256 前 16 位，与姊妹项目 `knowledge_extract/extract_pdf` 同算法；文件名版本

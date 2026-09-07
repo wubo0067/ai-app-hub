@@ -38,38 +38,82 @@ _SUBJECT_ANSWER_GUIDE = {
     "math": "推理要严谨，注意分类讨论、辅助线做法与漏解陷阱；结论前先给证明/推导。",
 }
 
+# find_problem 语义搜题：最终送给生成节点的讲义页数量；语义兜底时先取
+# RERANK_K 页候选再按与 search_text 的二元组重合度重排，防止目标页被
+# 「同主题不同题」的页面挤出前列。
+_SEARCH_PROBLEM_TOP_K = 3
+_SEARCH_PROBLEM_RERANK_K = 10
 
-def _parse_intent(raw: str) -> tuple[str, str]:
-    """从 LLM 输出中稳健解析 {"subject": "...", "concept": "..."}。
 
-    任何回退到 physics 的路径都记 log.warning（含原因与原始输出片段），
-    避免化学/数学问题被静默错路由到物理库后无从排查。
+def _bigram_overlap(query: str, page: str) -> float:
+    """query 的相邻字符二元组在 page 中出现的比例（0~1）。
+
+    中文无空格分词，二元组是比单字更强的局部文本信号：目标页含原文片段
+    时重合度显著高于同主题的其他页。query 过短（<2 字符）时恒为 0。
+    """
+    q = re.sub(r"\s+", "", query)
+    if len(q) < 2:
+        return 0.0
+    grams = {q[i:i + 2] for i in range(len(q) - 1)}
+    if not grams:
+        return 0.0
+    hit = sum(1 for g in grams if g in page)
+    return hit / len(grams)
+
+
+def _parse_intent(raw: str) -> tuple[str, str, str, str]:
+    """从 LLM 输出中稳健解析 {"subject", "intent", "concept", "search_text"}。
+
+    intent 取 "concept"（问知识点，默认）或 "find_problem"（按题目内容原文搜题）。
+    find_problem 时 concept 可为空、search_text 为提炼出的题目内容特征；
+    concept 时 search_text 为空。任何回退到 physics 的路径都记 log.warning
+    （含原因与原始输出片段），避免化学/数学问题被静默错路由到物理库后无从排查。
     """
     default_concept = re.sub(r"[？?。！!，,\s]+", "", raw).strip() or "核心知识点"
     fallback_reason = ""
+    intent = "concept"
+    search_text = ""
     try:
         obj = json.loads(raw.strip())
         subject = str(obj.get("subject", "")).strip().lower()
         concept = str(obj.get("concept", "")).strip()
+        intent = str(obj.get("intent", "")).strip().lower()
+        search_text = str(obj.get("search_text", "")).strip()
         if not subject:
             fallback_reason = "JSON 输出缺少 subject 字段"
             subject = "physics"
     except json.JSONDecodeError:
-        # 兜底：输出可能不是标准 JSON，退回按行猜测
+        # 兜底：输出可能不是标准 JSON（缺逗号/多引号等），退回按字段正则提取
         m = re.search(r'"subject"\s*:\s*"([^"]+)"', raw)
         if m:
             subject = m.group(1).strip().lower()
         else:
             fallback_reason = "输出非 JSON 且正则未匹配到 subject"
             subject = "physics"
-        concept = default_concept
+        concept = ""
+        im = re.search(r'"intent"\s*:\s*"([^"]+)"', raw)
+        if im:
+            intent = im.group(1).strip().lower()
+        sm = re.search(r'"search_text"\s*:\s*"([^"]*)"', raw)
+        if sm:
+            search_text = sm.group(1).strip()
+        if intent != "find_problem":
+            cm = re.search(r'"concept"\s*:\s*"([^"]*)"', raw)
+            if cm:
+                concept = cm.group(1).strip()
+    if intent not in ("concept", "find_problem"):
+        intent = "concept"
     if subject not in _SUBJECT_LABEL:
         fallback_reason = f"subject 非法值 {subject!r}"
         subject = "physics"
     if fallback_reason:
         log.warning("[workflow._parse_intent] 学科回退为 physics（%s），原始输出: %s",
                     fallback_reason, raw[:200])
-    return subject, concept or default_concept
+    if intent == "find_problem":
+        # 搜题链路不依赖 concept 锚点：LLM 留空时保持为空，
+        # 不要把整行 JSON 兜底串当概念名（只会污染日志与保存文件元信息）。
+        return subject, concept, intent, search_text
+    return subject, concept or default_concept, intent, search_text
 
 
 def create_circuit_agent(
@@ -89,19 +133,29 @@ def create_circuit_agent(
     def analyze_intent_node(state: CircuitAgentState):
         query = state["query"]
         prompt = (
-            f"判断学生提问所属初中学科与核心知识点锚点。\n"
+            f"判断学生提问的意图、所属初中学科与检索锚点。\n"
             f"学科仅限三选一：physics(物理)/chemistry(化学)/math(数学)。\n"
-            f"concept 必须是知识点名词本身（如\"可变电路\"\"欧姆定律\"\"电功率\"），\n"
+            f"intent 二选一：\n"
+            f"- concept：学生在问某个知识点/公式/题型/方法本身（想要讲解、分析思路、解题方法）。\n"
+            f"- find_problem：学生在「找一道题」——用题目的原文片段/内容特征来描述，希望定位到"
+            f"包含该内容的那道题（如\"查询一道题，内容包含'甲、乙两瓶等量煤油'\"\"有没有讲XX的那道题\"）。\n"
+            f"intent=concept 时：concept 必须是知识点名词本身（如\"可变电路\"\"欧姆定律\"\"电功率\"），\n"
             f"严格禁止拼接教学修饰或请求后缀（如\"的分析\"\"的思路\"\"的方法\"\"的讲解\"\"怎么做\"\"如何解\"），\n"
-            f"提问是\"讲解XX的分析思路/解题方法\"时，concept 只填 XX 本身。\n"
-            f"只输出一行严格 JSON，不要解释：{{\"subject\": \"physics\", \"concept\": \"知识点名\"}}\n\n"
+            f"提问是\"讲解XX的分析思路/解题方法\"时，concept 只填 XX 本身；search_text 留空。\n"
+            f"intent=find_problem 时：search_text 填学生描述的题目内容特征（尽量保留原文关键名词、数字、装置等，"
+            f"去掉\"我想查询一道题\"\"内容包含\"这类请求前缀）；concept 若能判断题目所属知识点则填，否则留空。\n"
+            f"只输出一行严格 JSON，不要解释："
+            f"{{\"subject\": \"physics\", \"intent\": \"concept\", \"concept\": \"知识点名\", \"search_text\": \"\"}}\n\n"
             f"提问：{query}"
         )
-        log.debug("[workflow.analyze_intent] 调用 LLM 判定学科与锚点, query=%r", query)
-        subject, concept = _parse_intent(str(intent_llm.invoke(prompt).content))
-        log.info("[workflow.analyze_intent] 判定结果: subject=%s, concept=%s",
-                 _SUBJECT_LABEL.get(subject, subject), concept)
-        return {"target_subject": subject, "target_concept": concept}
+        log.debug("[workflow.analyze_intent] 调用 LLM 判定意图与锚点, query=%r", query)
+        subject, concept, intent, search_text = _parse_intent(
+            str(intent_llm.invoke(prompt).content))
+        log.info("[workflow.analyze_intent] 判定结果: subject=%s, intent=%s, concept=%s, "
+                 "search_text=%r",
+                 _SUBJECT_LABEL.get(subject, subject), intent, concept, search_text)
+        return {"target_subject": subject, "target_concept": concept,
+                "intent": intent, "search_text": search_text}
 
     def graph_traversal_node(state: CircuitAgentState):
         """图谱聚合检索节点：以意图节点给出的 (学科, 知识点锚点) 为入口，
@@ -215,6 +269,98 @@ def create_circuit_agent(
                             ex.get("id", "?"))
         log.info("[workflow.fetch_chunks] 回表得到原题切片 %d 条", len(chunks))
         return {"vector_chunks": chunks}
+
+    def search_problems_node(state: CircuitAgentState):
+        """按题目内容原文检索讲义页（find_problem 意图专用），两级策略：
+
+        1. 逐字命中：Chroma where_document $contains 对整页原文做子串匹配
+           （实测中文可用；「短引文 vs 长页」的精确找题场景远比向量距离可靠，
+           向量距离区分度可低至 0.006 而把目标页排到第 8）；
+        2. 语义兜底：描述与原文有出入（改写/错字）时走向量检索取 top-N，
+           再按 search_text 字符二元组在页内的重合度重排——纯语义会把目标页
+           淹没在"同主题不同题"的页面里，二元组重合能把含原文片段的页捞回前排。
+        返回整页切片（含该题及同页其他题），由生成节点定位具体题目。
+        """
+        subject = state.get("target_subject") or "physics"
+        text = (state.get("search_text") or "").strip() or (state.get("query") or "").strip()
+        log.debug("[workflow.search_problems] 讲义页搜题, subject=%s, text=%r",
+                  subject, text[:80])
+        problem_chunks: List[str] = []
+        if not text or vector_db is None:
+            log.info("[workflow.search_problems] 无有效检索文本，跳过")
+            return {"problem_chunks": []}
+        # filter 顶层多字段 AND 必须显式 $and，否则 Chroma 抛
+        # "Expected where to have exactly one operator"（同 _gather_known_context）。
+        where: dict = {"$and": [{"subject": subject}, {"type": "Page"}]}
+        try:
+            got = vector_db.get(where=where, where_document={"$contains": text})
+            docs = (got or {}).get("documents") or []
+            if docs:
+                problem_chunks = [d for d in docs if d]
+                log.info("[workflow.search_problems] 原文逐字命中讲义页 %d 页",
+                         len(problem_chunks))
+        except Exception:  # noqa: BLE001
+            log.warning("[workflow.search_problems] $contains 检索失败，转语义兜底",
+                        exc_info=True)
+        if not problem_chunks:
+            try:
+                hits = vector_db.similarity_search_with_score(
+                    text, k=_SEARCH_PROBLEM_RERANK_K, filter=where)
+            except Exception:  # noqa: BLE001
+                log.warning("[workflow.search_problems] 语义搜题失败", exc_info=True)
+                hits = []
+            ranked = sorted(
+                ((_bigram_overlap(text, doc.page_content), dist, doc)
+                 for doc, dist in hits),
+                key=lambda x: (-x[0], x[1]))
+            problem_chunks = [doc.page_content for _, _, doc in
+                              ranked[:_SEARCH_PROBLEM_TOP_K] if doc.page_content]
+            log.info("[workflow.search_problems] 语义兜底重排后取 %d 页（候选 %d 页）",
+                     len(problem_chunks), len(hits))
+        log.info("[workflow.search_problems] 命中讲义页 %d 页", len(problem_chunks))
+        return {"problem_chunks": problem_chunks}
+
+    def generate_problem_response_node(state: CircuitAgentState):
+        """搜题专用生成：从命中的整页讲义原文里定位目标题，原题呈现并简要讲解。"""
+        subject = state.get("target_subject") or "physics"
+        subject_label = _SUBJECT_LABEL.get(subject, subject)
+        guide = _SUBJECT_ANSWER_GUIDE.get(subject, "")
+        query = state["query"]
+        search_text = (state.get("search_text") or "").strip() or query
+        chunks = state.get("problem_chunks", [])
+        pages_text = "\n\n".join(chunks)
+        pages_hit = sorted({int(n) for c in chunks
+                            for n in re.findall(r"--- 第 (\d+) 页 ---", c)})
+        pages_label = ("、".join(map(str, pages_hit)) + " 页") if pages_hit else "无"
+
+        final_prompt = f"""你是一位金牌初中{subject_label}教研老师。学生不是在问知识点，而是在「找一道题」：
+"{query}"
+
+学生的题目内容描述（用于在下方讲义页里定位）："{search_text}"
+
+【检索到的讲义页原文（整页，含该题及同页其他题）】：
+{pages_text or "（未在教材讲义中检索到与该描述匹配的页面）"}
+
+【命中页码】：{pages_label}
+
+{guide}
+
+【任务与输出规范】：
+1. 定位题目：在上述讲义页原文里找出与学生描述匹配的那道题（按题干关键名词、数字、装置比对）。
+   - 若明确命中，先原样完整呈现该题（题号、题干、所有选项/条件，公式用 $...$ 或独立 $$ 块级公式，
+     禁止用 \\[ \\] 或 \\( \\) 包裹）；
+   - 若一页里有多个候选题或匹配不确定，把它们分别列出并说明各自与描述的吻合点，让学生确认；
+   - 若讲义页与描述都对不上，如实说明"教材中未检索到与该描述匹配的题目"，不要编造题目。
+2. 出处标注：每道题标注其所在页码，格式「（见教材第 X 页）」，页码取该题所在切片头部
+   「--- 第 N 页 ---」中的 N；严禁编造未出现的页码。
+3. 简要讲解：定位到题目后，给出该题的答案与简明解析（依据讲义页里出现的内容与{subject_label}
+   学科常识），解析要精炼，不展开与本题无关的知识。
+4. 只依据上方讲义页原文作答，不得虚构教材里没有的题目内容。
+"""
+        response = str(answer_llm.invoke(final_prompt).content)
+        log.info("[workflow.generate_problem_response] 搜题解答生成完成, 长度=%d 字符",
+                 len(response))
+        return {"final_answer": response}
 
     def generate_response_node(state: CircuitAgentState):
         g_ctx = state.get("graph_context", {})
@@ -415,16 +561,28 @@ def create_circuit_agent(
         return {"final_answer": response}
 
     # 组装状态机工作流
+    def route_by_intent(state: CircuitAgentState) -> str:
+        """按意图分流：find_problem 走语义搜题链路，其余走知识点图谱链路。"""
+        return ("search_problems" if state.get("intent") == "find_problem"
+                else "graph_traversal")
+
     workflow = StateGraph(CircuitAgentState)
     workflow.add_node("analyze_intent", analyze_intent_node)
     workflow.add_node("graph_traversal", graph_traversal_node)
     workflow.add_node("fetch_chunks", fetch_chunks_node)
     workflow.add_node("generate_response", generate_response_node)
+    workflow.add_node("search_problems", search_problems_node)
+    workflow.add_node("generate_problem_response", generate_problem_response_node)
 
     workflow.add_edge(START, "analyze_intent")
-    workflow.add_edge("analyze_intent", "graph_traversal")
+    workflow.add_conditional_edges(
+        "analyze_intent", route_by_intent,
+        {"graph_traversal": "graph_traversal",
+         "search_problems": "search_problems"})
     workflow.add_edge("graph_traversal", "fetch_chunks")
     workflow.add_edge("fetch_chunks", "generate_response")
     workflow.add_edge("generate_response", END)
+    workflow.add_edge("search_problems", "generate_problem_response")
+    workflow.add_edge("generate_problem_response", END)
 
     return workflow.compile()

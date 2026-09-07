@@ -408,7 +408,8 @@ def main() -> None:
             ):
                 if mode == "messages":
                     msg, meta = chunk
-                    if meta.get("langgraph_node") == "generate_response":
+                    if meta.get("langgraph_node") in ("generate_response",
+                                                      "generate_problem_response"):
                         print(str(msg.content), end="", flush=True)
                 else:
                     result = chunk
