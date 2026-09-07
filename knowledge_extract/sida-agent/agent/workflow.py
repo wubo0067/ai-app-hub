@@ -222,6 +222,20 @@ def create_circuit_agent(
         subject_label = _SUBJECT_LABEL.get(subject, subject)
         guide = _SUBJECT_ANSWER_GUIDE.get(subject, "")
 
+        # 教材名注册表：pdf_id -> 教材显示名（建库时 --book / 文件名登记，见 ingestion）。
+        # 图谱实体（概念/公式/实验/题型/方法）节点携带 sources=[pdf_id,...]，据此把
+        # 「图谱收录」标注升级为「收录于《具体教材名》」；未登记时回退旧标注。
+        pdf_names = graph_db.pdf_names()
+
+        def _books_of(sources: Any) -> str:
+            """把实体的 sources（pdf_id 列表）解析为《教材名》顿号串；无则空串。"""
+            names: List[str] = []
+            for pid in (sources or []):
+                nm = pdf_names.get(str(pid))
+                if nm and nm not in names:
+                    names.append(nm)
+            return "、".join(f"《{n}》" for n in names)
+
         concept = g_ctx.get("concept")
         concepts = g_ctx.get("concepts") or []
         concept_block = ""
@@ -238,6 +252,9 @@ def create_circuit_agent(
                 if cd_.get("common_mistakes"):
                     lines.append("- 易错点：")
                     lines += [f"  * {e}" for e in cd_["common_mistakes"]]
+                bk = _books_of(cd_.get("sources"))
+                if bk:
+                    lines.append(f"- 收录教材：{bk}")
                 concept_block = (concept_block + "\n" if concept_block else "") + "\n".join(lines)
         elif concept:
             lines = [f"- 定义：{concept.get('description', '')}"]
@@ -249,6 +266,9 @@ def create_circuit_agent(
             if concept.get("common_mistakes"):
                 lines.append("- 易错点：")
                 lines += [f"  * {e}" for e in concept["common_mistakes"]]
+            bk = _books_of(concept.get("sources"))
+            if bk:
+                lines.append(f"- 收录教材：{bk}")
             concept_block = "\n".join(lines)
 
         prereq_block = "、".join(p["name"] for p in g_ctx.get("prerequisites", [])) or "无"
@@ -261,6 +281,7 @@ def create_circuit_agent(
             f"- {f['name']}：{f['expression']}"
             + (f"（适用：{f['applicable_scope']}）" if f.get("applicable_scope") else "")
             + ("；推导： " + " -> ".join(f["derivation"]) if f.get("derivation") else "")
+            + (f"〔收录：{_books_of(f.get('sources'))}〕" if _books_of(f.get("sources")) else "")
             for f in g_ctx.get("formulas", []))
 
         experiment_block = "\n".join(
@@ -269,27 +290,65 @@ def create_circuit_agent(
             + (f"\n  现象：{e.get('phenomenon', '')}" if e.get("phenomenon") else "")
             + (f"\n  结论：{e.get('conclusion', '')}" if e.get("conclusion") else "")
             + (f"\n  装置图解：{e.get('diagram', '')}" if e.get("diagram") else "")
+            + (f"\n  收录教材：{_books_of(e.get('sources'))}" if _books_of(e.get("sources")) else "")
             for e in g_ctx.get("experiments", []))
 
         qtype_block = "\n".join(
             f"- {q['name']}：识别特征：{'、'.join(q.get('identify_features', []))}"
             + (f"；解题模板：{' -> '.join(q.get('template', []))}" if q.get("template") else "")
             + (f"；陷阱：{'、'.join(q.get('traps', []))}" if q.get("traps") else "")
+            + (f"〔收录：{_books_of(q.get('sources'))}〕" if _books_of(q.get("sources")) else "")
             for q in g_ctx.get("question_types", []))
 
         method_block = "\n".join(
             f"- {m['name']}：{' -> '.join(m.get('steps', []))}"
             + (f"（适用：{m.get('scope', '')}）" if m.get("scope") else "")
+            + (f"〔收录：{_books_of(m.get('sources'))}〕" if _books_of(m.get("sources")) else "")
             for m in g_ctx.get("methods", []))
 
         chunks = state.get("vector_chunks", [])
-        examples_text = "\n\n".join(chunks)
+        # 页码 -> 该页所属教材名（来自命中例题的 pdf_id），用于把「见教材第X页」
+        # 升级为「见《教材名》第X页」；一页只对应一本已登记教材时才敢标书名。
+        page_books: dict[int, List[str]] = {}
+        for ex in g_ctx.get("examples", []):
+            pg = (ex.get("source") or {}).get("page")
+            nm = pdf_names.get(str(ex.get("pdf_id") or ""))
+            if pg is not None and nm:
+                try:
+                    pg = int(pg)
+                except (TypeError, ValueError):
+                    continue
+                page_books.setdefault(pg, [])
+                if nm not in page_books[pg]:
+                    page_books[pg].append(nm)
+
+        def _tag_chunk(c: str) -> str:
+            """把讲义页切片头「--- 第 N 页 ---」补成含书名的出处标记。"""
+            m = re.search(r"--- 第 (\d+) 页 ---", c)
+            if m:
+                bs = page_books.get(int(m.group(1)))
+                if bs and len(bs) == 1:
+                    return c.replace(
+                        m.group(0), f"--- 第 {m.group(1)} 页（《{bs[0]}》） ---", 1)
+            return c
+
+        examples_text = "\n\n".join(_tag_chunk(c) for c in chunks)
         # 讲义页切片自带「--- 第 N 页 ---」头，据此列出命中页码供模型标注来源；
         # 图谱实体（公式/实验/题型/方法）抽取时不记页码，只能标注到「知识图谱」粒度。
         pages_hit = sorted({int(n) for c in chunks for n in re.findall(r"--- 第 (\d+) 页 ---", c)})
+        if pages_hit:
+            uniq_books = {page_books[p][0] for p in pages_hit
+                          if len(page_books.get(p, [])) == 1}
+            if len(uniq_books) == 1:
+                orig_label = (f"《{uniq_books.pop()}》第 "
+                              + "、".join(map(str, pages_hit)) + " 页")
+            else:
+                orig_label = "第 " + "、".join(map(str, pages_hit)) + " 页"
+        else:
+            orig_label = "无"
         retrieval_status = (
             f"知识图谱：{'命中' if (concept or concepts) else '未命中'}；"
-            f"讲义原文：{'第 ' + '、'.join(map(str, pages_hit)) + ' 页' if pages_hit else '无'}"
+            f"讲义原文：{orig_label}"
         )
 
         final_prompt = f"""你是一位金牌初中{subject_label}名师。请系统回答学生提问："{state['query']}"。
@@ -337,15 +396,19 @@ def create_circuit_agent(
 3. 实验/图形：涉及实验用文字描述装置与操作、现象、结论；涉及图形要用文字讲清结构。
 4. 题型溯源：结合图谱中的题型模板与陷阱，把例题归类到具体题型，示范完整推导。
 5. 结尾给出易错点与检查清单。
-6. 来源标注（重要，帮助学生判断内容是否贴合教材）：
-   - 内容取自【典型例题原文】的，句末标注「（见教材第 X 页）」，页码取该段原文所在页；
-   - 内容取自知识图谱各区块（概念拆解/公式/实验/题型/方法）的，标注「（教材知识点，图谱收录）」；
-   - 不得出现无出处的内容；确实需要提示资料局限时，另起一段以「【资料说明·教材未涉及】」
+6. 来源标注（重要，帮助学生判断内容出自哪本教材）：
+   - 内容取自【典型例题原文】的，句末标注「（见《教材名》第 X 页）」，书名与页码取该段
+     原文头部「--- 第 N 页（《教材名》） ---」标记中的信息；标记中无书名时才写「（见教材第 X 页）」；
+   - 内容取自知识图谱各区块（概念拆解/公式/实验/题型/方法）的，若该条目带「收录教材：《…》」
+     或「〔收录：《…》〕」，标注「（《教材名》知识点，图谱收录）」（多本共收时书名用顿号并列）；
+     条目未带收录教材时，标「（教材知识点，图谱收录）」；
+   - 不得出现无出处的内容；不得编造区块中不存在的书名或页码；确实需要提示资料局限时，
+     另起一段以「【资料说明·教材未涉及】」
      开头，只说明"该部分内容当前教材未收录"，不要补充具体知识；
    - 当检索命中情况显示图谱"未命中"且讲义原文为"无"时，不要作答，只输出一句：
      「当前教材资料未收录与该提问相关的知识点，无法基于教材作答。」
-   - 讲义原文为"无"但图谱命中时，图谱内容仍按「（教材知识点，图谱收录）」标注，
-     只是不得引用具体页码；宁可说明不确定，也不要编造页码。
+   - 讲义原文为"无"但图谱命中时，图谱内容仍按上述"图谱收录"规则标注（有收录教材
+     信息则带上《教材名》），只是不得引用具体页码；宁可说明不确定，也不要编造页码。
 """
         response = str(answer_llm.invoke(final_prompt).content)
         log.info("[workflow.generate_response] 解答生成完成, 长度=%d 字符", len(response))

@@ -1,6 +1,6 @@
-#!/usr,bin/,nv p:t,on3:,
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""全科知识图谱存储：基于 NetworkX 的内存有向图（初中物理/化学/数学通用）。
+"""全科知识图谱:储：基于 NetworkX 的内存有向图（初中物理/化学/数学通用）。
 
 设计要点：
 - 所有实体节点以 `{subject}:{Kind}:{name}` 作为全局唯一键，
@@ -35,6 +35,10 @@ K_EXPERIMENT = "Experiment"
 K_QUESTION_TYPE = "QuestionType"
 K_METHOD = "Method"
 K_EXAMPLE = "Example"
+K_PDF_SOURCE = "PdfSource"   # pdf_id -> 教材显示名 注册表节点（非学科实体）
+
+# PdfSource 注册表节点的伪学科前缀（与 physics/chemistry/math 不冲突）
+_META_SUBJECT = "meta"
 
 # 关系类型（rel 属性值）
 REL_PREREQUISITE_OF = "PREREQUISITE_OF"   # 先修概念 -> 概念（概念拆解前置依赖）
@@ -181,6 +185,28 @@ class ScienceGraphStore:
                      relation: str, kind_b: str, name_b: str) -> None:
         """带学科前缀的便捷建边：把两个裸名实体转为 node_key 后连边。"""
         self.relate(node_key(subject, kind_a, name_a), relation, node_key(subject, kind_b, name_b))
+
+    # ------------------------------------------------------- 教材名注册表
+    def register_pdf_name(self, pdf_id: str, name: str) -> None:
+        """登记 pdf_id -> 教材显示名（存为 PdfSource 节点，随图谱一起 save/load）。
+
+        问答生成时按实体 sources 里的 pdf_id 反查此表，把「图谱收录」标注
+        升级为「收录于《教材名》」。同名重复登记以最后一次为准（--book 修正）。
+        """
+        if not pdf_id or not name:
+            return
+        self.graph.add_node(node_key(_META_SUBJECT, K_PDF_SOURCE, pdf_id),
+                            type=K_PDF_SOURCE, subject=_META_SUBJECT,
+                            pdf_id=pdf_id, name=name)
+        log.debug("[graph_store] 登记教材名: %s -> %s", pdf_id, name)
+
+    def pdf_names(self) -> Dict[str, str]:
+        """返回 {pdf_id: 教材显示名} 全表（无登记时为空 dict）。"""
+        return {
+            nd["pdf_id"]: nd.get("name", "")
+            for _nid, nd in self.graph.nodes(data=True)
+            if nd.get("type") == K_PDF_SOURCE and nd.get("pdf_id")
+        }
 
     # --------------------------------------------------------------- 检索
     def get_by_name(self, subject: str, kind: str, name: str) -> Optional[Dict[str, Any]]:
@@ -361,6 +387,7 @@ class ScienceGraphStore:
             "description": cdata.get("description", ""),
             "breakdown": list(cdata.get("breakdown", [])),
             "common_mistakes": list(cdata.get("common_mistakes", [])),
+            "sources": list(cdata.get("sources", [])),
         }
         log.debug("[graph_store] 从 %s 出发检索 1~2 跳子图", ckey)
 
@@ -426,17 +453,20 @@ class ScienceGraphStore:
             result["prerequisites"].append({
                 "name": bare_name(key),
                 "description": nd.get("description", ""),
+                "sources": list(nd.get("sources", [])),
             })
         for key, nd in concept_followup:
             result["follow_ups"].append({
                 "name": bare_name(key),
                 "description": nd.get("description", ""),
+                "sources": list(nd.get("sources", [])),
             })
         for key, nd, rel in concept_related:
             result["related_concepts"].append({
                 "name": bare_name(key),
                 "description": nd.get("description", ""),
                 "relation": rel or REL_EXTRA,
+                "sources": list(nd.get("sources", [])),
             })
         for key, nd in _capped("formulas", hop_buckets[K_FORMULA]):
             result["formulas"].append({
@@ -445,6 +475,7 @@ class ScienceGraphStore:
                 "symbols": list(nd.get("symbols", [])),
                 "applicable_scope": nd.get("applicable_scope", ""),
                 "derivation": list(nd.get("derivation", [])),
+                "sources": list(nd.get("sources", [])),
             })
         for key, nd in _capped("experiments", hop_buckets[K_EXPERIMENT]):
             result["experiments"].append({
@@ -456,6 +487,7 @@ class ScienceGraphStore:
                 "conclusion": nd.get("conclusion", ""),
                 "diagram": nd.get("diagram", ""),
                 "exam_focus": list(nd.get("exam_focus", [])),
+                "sources": list(nd.get("sources", [])),
             })
         for key, nd in _capped("question_types", hop_buckets[K_QUESTION_TYPE]):
             result["question_types"].append({
@@ -463,12 +495,14 @@ class ScienceGraphStore:
                 "identify_features": list(nd.get("identify_features", [])),
                 "template": list(nd.get("template", [])),
                 "traps": list(nd.get("traps", [])),
+                "sources": list(nd.get("sources", [])),
             })
         for key, nd in _capped("methods", hop_buckets[K_METHOD]):
             result["methods"].append({
                 "name": bare_name(key),
                 "scope": nd.get("scope", ""),
                 "steps": list(nd.get("steps", [])),
+                "sources": list(nd.get("sources", [])),
             })
         for key, nd in _capped("examples", hop_buckets[K_EXAMPLE]):
             result["examples"].append({

@@ -540,7 +540,11 @@ def _ensure_entity(graph_db: ScienceGraphStore, subject: str, kind: str,
     - 本次传入值为空 → 不动旧值（空抽取不冲刷已收录内容）；
     - 无序集合类列表（breakdown/common_mistakes/sources...）→ union 去重保序；
     - 顺序敏感字段（_SEQUENCE_FIELDS：derivation/template/steps）与标量字符串
-      → 保留更长的一份（更详细的表述），避免两套步骤序列被错乱拼接。
+      → 保留更长的一份（更详细的表述），避免两套步骤序列被错乱拼接；
+    - dict 字段（如例题 source）→ 只补旧值中缺失/为空的键，已有键先到先得、
+      不被后续写入覆盖（修掉「dict 落进 list/str 之外的空隙、永不更新」导致的
+      「新标题配旧页码」缝合怪：题号去重后同一节点可能被多子块重复抽到，
+      page 等定位键必须锁定首次抽取的真实出处）。
     """
     key = node_key(subject, kind, name)
     if key not in graph_db.graph:
@@ -560,6 +564,15 @@ def _ensure_entity(graph_db: ScienceGraphStore, subject: str, kind: str,
                         cur[k_] = v_
                 else:
                     cur[k_] = old + [x for x in v_ if x not in old]
+            elif isinstance(old, dict) and isinstance(v_, dict):
+                # dict 字段（例题 source 等）：只补缺失/为空的键，已有键不覆盖，
+                # 避免 page 等定位信息被后续同名抽取冲刷成「张冠李戴」。
+                for dk, dv in v_.items():
+                    if dv is None or dv == "" or dv == [] or dv == {}:
+                        continue
+                    ov = old.get(dk)
+                    if ov is None or ov == "" or ov == [] or ov == {}:
+                        old[dk] = dv
             elif isinstance(old, str) and isinstance(v_, str) and len(v_) > len(old):
                 cur[k_] = v_
     return key
@@ -569,12 +582,14 @@ def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any]
                  pdf_id: Optional[str] = None) -> None:
     """把抽取出的实体与关系写入图库（核心编排逻辑）。
 
-    pdf_id：PDF 内容哈希前 16 位。仅用于两类需要「来源维度」的键：
-    - 概念节点的 sources 累积（多本教材共同收录 = 更值得重点讲的核心考点信号）；
+    pdf_id：PDF 内容哈希前 16 位。用途：
+    - 各类知识实体（章节/概念/公式/实验/题型/方法）的 sources 属性累积
+      （多本教材共同收录 = 更值得重点讲的核心考点信号，问答标注时反查教材名）；
     - 例题节点键前缀（不同书的「例17」是不同题目，须隔离，否则同名互相锁死）。
     概念/公式/实验/题型/方法等知识实体同名=真同一知识点，不做来源隔离，
     靠 _ensure_entity 的越建越全合并累积两本书的内容。
     """
+    src_list = [pdf_id] if pdf_id else None
     # --- 章节 ---
     # 章节同样走 _ensure_entity 而非 add_entity：分块只在标题页之间切，不保证单章
     # 不超过 max_chars，长章节跨子块是常态；后续子块经滚动上下文会"逐字复用"同一
@@ -585,7 +600,8 @@ def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any]
         title = ch.get("title", "").strip()
         if title:
             _ensure_entity(graph_db, subject, "Chapter", title,
-                           title=title, summary=ch.get("summary", ""))
+                           title=title, summary=ch.get("summary", ""),
+                           **({"sources": list(src_list)} if src_list else {}))
 
     # --- 概念（含先修链）---
     concept_names: List[str] = []
@@ -599,9 +615,9 @@ def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any]
             breakdown=list(c.get("breakdown", [])),
             common_mistakes=list(c.get("common_mistakes", [])),
             chapter=c.get("chapter", ""))
-        if pdf_id:
+        if src_list:
             # 收录来源：同名概念跨 PDF 累积时 union 合并（先建者的 sources 不清空）
-            c_attrs["sources"] = [pdf_id]
+            c_attrs["sources"] = list(src_list)
         _ensure_entity(graph_db, subject, K_CONCEPT, name, **c_attrs)
         for pre in c.get("prerequisites", []):
             pre = str(pre).strip()
@@ -638,7 +654,8 @@ def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any]
                              expression=f.get("expression", ""),
                              symbols=list(f.get("symbols", [])),
                              applicable_scope=f.get("applicable_scope", ""),
-                             derivation=list(f.get("derivation", [])))
+                             derivation=list(f.get("derivation", [])),
+                             **({"sources": list(src_list)} if src_list else {}))
         _link_concept_refs(f.get("related_concepts"), REL_HAS_FORMULA, key)
 
     for e in data.get("experiments", []):
@@ -652,7 +669,8 @@ def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any]
                              phenomenon=e.get("phenomenon", ""),
                              conclusion=e.get("conclusion", ""),
                              diagram=e.get("diagram", ""),
-                             exam_focus=list(e.get("exam_focus", [])))
+                             exam_focus=list(e.get("exam_focus", [])),
+                             **({"sources": list(src_list)} if src_list else {}))
         _link_concept_refs(e.get("related_concepts"), REL_HAS_EXPERIMENT, key)
 
     for m in data.get("methods", []):
@@ -661,7 +679,8 @@ def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any]
             continue
         key = _ensure_entity(graph_db, subject, K_METHOD, name,
                              scope=m.get("scope", ""),
-                             steps=list(m.get("steps", [])))
+                             steps=list(m.get("steps", [])),
+                             **({"sources": list(src_list)} if src_list else {}))
         _link_concept_refs(m.get("related_concepts"), REL_HAS_METHOD, key)
 
     # --- 题型（溯源到考点概念）---
@@ -673,7 +692,8 @@ def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any]
         key = _ensure_entity(graph_db, subject, K_QUESTION_TYPE, name,
                              identify_features=list(qt.get("identify_features", [])),
                              template=list(qt.get("template", [])),
-                             traps=list(qt.get("traps", [])))
+                             traps=list(qt.get("traps", [])),
+                             **({"sources": list(src_list)} if src_list else {}))
         qt_keys[name] = key
         _link_concept_refs(qt.get("related_concepts"), REL_TRACES_TO, key)
 
@@ -681,11 +701,19 @@ def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any]
     for i, ex in enumerate(data.get("examples", []), start=1):
         src = ex.get("source", {}) or {}
         ex_name = str(ex.get("id") or src.get("number") or f"题{i}").strip()
-        # 例题编号跨 PDF 大概率重复（教辅按章节从 1 编：例17/例1/型1...），
-        # 不同书的同名例题是不同题目；key 带 pdf_id 前缀隔离，否则会被当作
-        # 同一节点，title/answer 被先建者锁死且挂到错误题型/概念下。
+        # 例题编号既跨 PDF、也在同一本书内跨章节大量重复（教辅每章从例1重编）。
+        # 仅用 pdf_id 前缀只能隔离「不同书」，同书第 3 章的例1 与第 7 章的例1 仍会
+        # 撞成同一节点：title 走「保留更长」被后题顶替、source(dict) 早期根本不合并
+        # 而锁死首题页码 → 「第二题标题配第一题页码」的缝合怪，问答回表时答非所题。
+        # 故键 = 文档ID + 页定位 + 题号：页码是天然的「页内块位置」主键，缺页时退回
+        # 块内序号兜底；题号(ex_name)降级为展示属性 number，不再充当唯一标识。
+        ex_page = src.get("page")
+        loc = (f"{ex_page}" if ex_page is not None
+               else f"na-{pdf_id or ''}-{i}")  # 缺页兜底：块序 + 全局序号防撞
+        ex_name_key = f"{pdf_id}:{loc}:{ex_name}" if pdf_id else f"{loc}:{ex_name}"
         ex_key = _ensure_entity(graph_db, subject, K_EXAMPLE,
-                                f"{pdf_id}:{ex_name}" if pdf_id else ex_name,
+                                ex_name_key,
+                                number=ex_name,  # 题号仅作展示/反查，不进唯一键
                                 title=ex.get("title", ""),
                                 answer=ex.get("answer", ""),
                                 analysis=ex.get("analysis", ""),
@@ -849,9 +877,13 @@ def _build_vector_docs(subject: str, data: Dict[str, Any], *,
     for i, ex in enumerate(data.get("examples", []), start=1):
         src = ex.get("source", {}) or {}
         name = str(ex.get("id") or src.get("number") or f"题{i}").strip()
-        # 切片 id 与图节点键一致：例题节点键带 pdf_id 前缀（跨书同名编号隔离），
-        # 向量切片 id 必须同步，否则检索/审计回不到同一实体；正文仍展示裸编号
-        key_name = f"{pdf_id}:{name}" if pdf_id else name
+        # 切片 id 与图节点键完全一致：例题键 = 文档ID + 页定位 + 题号（同书跨章重
+        # 复题号靠页定位隔离，见 _write_graph），向量 id 必须同步，否则检索/审计回
+        # 不到同一实体；正文标题仍展示裸题号 name。
+        ex_page = src.get("page")
+        loc = (f"{ex_page}" if ex_page is not None
+               else f"na-{pdf_id or ''}-{i}")
+        key_name = f"{pdf_id}:{loc}:{name}" if pdf_id else f"{loc}:{name}"
         lines = [f"【{name}】{ex.get('title', '')}"]
         if ex.get("question_type"):
             lines.append("归属题型：" + ex["question_type"])
@@ -959,13 +991,19 @@ def _extract_chunk_data(subject: str, md: str, label: str,
 
 def _persist_chunk(chunk: List[Dict[str, Any]], subject: str,
                    vector_db: Chroma, graph_db: ScienceGraphStore,
-                   data: Dict[str, Any], *, pdf_id: Optional[str] = None) -> int:
+                   data: Dict[str, Any], *, pdf_id: Optional[str] = None,
+                   book_name: Optional[str] = None) -> int:
     """归一化 + 写图 + 写向量（实体切片 + 本块讲义页切片）+ 图谱落盘。
 
     每处理完一个子块就 graph_db.save() 一次：一次 CLI 调用可能跑几十次 LLM，
     中途崩溃也只丢当前子块（已处理子块均已持久化），配合按子块内容的抽取
     缓存即天然获得断点续跑。返回本块写入的向量切片条数。
+
+    book_name：该 PDF 的教材显示名（--book 传入，缺省用文件名），与 pdf_id 一起
+    登记进图谱的 PdfSource 注册表，供问答时把「图谱收录」标注成具体教材名。
     """
+    if pdf_id and book_name:
+        graph_db.register_pdf_name(pdf_id, book_name)
     # 归一化：校验实体/字段类型（含旧缓存脏数据），杜绝字符串被静默拆成单字符
     _normalize_extracted(data)
     n_kind = {k: len(data.get(k, [])) for k in
@@ -998,6 +1036,7 @@ def build_knowledge_bases(
     max_chunks: Optional[int] = None,
     meter: Any | None = None,
     pdf_id: Optional[str] = None,
+    book_name: Optional[str] = None,
 ) -> Tuple[Chroma, ScienceGraphStore]:
     """从 Markdown 中提取结构化知识网络，写入 Vector DB 与 Graph DB。
 
@@ -1063,7 +1102,7 @@ def build_knowledge_bases(
         else:
             log.info("[ingestion] %s 命中抽取缓存，直接写库（不调用 LLM）", label)
         total_docs += _persist_chunk(chunk, subject, vector_db, graph_db, data,
-                                     pdf_id=pdf_id)
+                                     pdf_id=pdf_id, book_name=book_name)
 
     # 构建后审计：暴露空壳概念节点（幽灵节点）；审计放整轮结束后，避免逐块刷屏
     _audit_graph(graph_db, subject)

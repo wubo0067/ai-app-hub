@@ -88,6 +88,10 @@ def parse_args() -> argparse.Namespace:
         help="all=提取+建库+问答；build=仅提取并累加进双库；ask=仅复用已持久化双库问答。",
     )
     parser.add_argument("--pdf", default=DEFAULT_PDF, help="教材 PDF 路径（build/all 阶段使用）。")
+    parser.add_argument("--book", default=None, metavar="教材名",
+                        help="该 PDF 的教材显示名（如「质心灵动量教育讲义」），用于答案里"
+                             "「收录于《教材名》」来源标注；缺省取 PDF 文件名（去扩展名）。"
+                             "重复登记同一 --pdf 即改名覆盖。")
     parser.add_argument("--start-page", type=int, default=DEFAULT_START_PAGE,
                         help="起始页码（从 1 计）。")
     parser.add_argument("--end-page", type=int, default=DEFAULT_END_PAGE,
@@ -371,6 +375,8 @@ def main() -> None:
         # pdf_id = PDF 内容哈希前 16 位：并入讲义页切片 / 例题节点键，
         # 使不同 PDF 累积进同一知识库时「第 N 页」「例17」互不覆盖（跨书撞车隔离）
         pdf_id = _pdf_id(Path(args.pdf))
+        # 教材显示名：--book 优先，缺省用文件名去扩展名；登记后问答标注能具体到书名
+        book_name = (args.book or "").strip() or Path(args.pdf).stem
         vector_db, graph_db = build_knowledge_bases(
             pages_data=pages_data,
             subject=args.subject,
@@ -380,6 +386,7 @@ def main() -> None:
             max_chunks=args.max_chunks,
             meter=reasoning_meter,
             pdf_id=pdf_id,
+            book_name=book_name,
         )
         _report_meters(vision_meter, reasoning_meter)
         log.info("[main] 建库完成（stage=%s）", args.stage)
