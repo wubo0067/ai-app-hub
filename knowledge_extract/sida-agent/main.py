@@ -21,7 +21,13 @@
     uv run python main.py --stage build --pdf 整本教材.pdf --start-page 13 --end-page 320 --subject math --max-new-calls 20
     uv run python main.py --stage ask   --query "讲解可变电路的分析思路"
     uv run python main.py                          # 不带参数 = 下方默认值，等价旧行为
---stage: all=提取+建库+问答（默认）；build=仅提取并累加进双库；ask=仅复用已持久化双库问答。
+    uv run python main.py --stage chat             # 多轮对话（新会话；历史落盘 output/chat/）
+    uv run python main.py --stage chat --session s-xxxx # 续聊既有会话（--list 查看 id）
+    uv run python main.py --stage chat --list       # 只列会话清单
+    uv run python main.py --stage chat --export s-xxxx # 把会话导出为 Markdown
+--stage: all=提取+建库+问答（默认）；build=仅提取并累加进双库；ask=仅复用已持久化双库问答；
+        chat=多轮对话 REPL（内置 /new /export /session /list 等命令，Ctrl+C 退出，
+        会话历史按 thread_id 持久化到 output/chat/checkpoints.sqlite，超预算自动压缩进摘要）。
 长文档：页码区间可以开很大（整本书），build_knowledge_bases 会按 --max-chars
 预算自动切子块增量抽取；建库前会先打印规模预估并请求确认（--yes 跳过）。
 --max-chunks 限制推理抽取侧每轮新子块数，--max-new-calls 限制视觉提取侧每轮新页数，
@@ -33,13 +39,21 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional
 
 import pymupdf
+from langchain_core.messages import HumanMessage
 
 from agent.workflow import create_circuit_agent
+from chat_session import (
+    export_session_md,
+    list_sessions,
+    open_saver,
+    session_snapshot,
+)
 from ingestion import (
     _CHUNK_MAX_CHARS_DEFAULT,
     _cache_key,
@@ -84,8 +98,9 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--stage", choices=("all", "build", "ask"), default="all",
-        help="all=提取+建库+问答；build=仅提取并累加进双库；ask=仅复用已持久化双库问答。",
+        "--stage", choices=("all", "build", "ask", "chat"), default="all",
+        help="all=提取+建库+问答；build=仅提取并累加进双库；ask=仅复用已持久化双库问答；"
+             "chat=多轮对话（会话历史持久化，可 --session 续聊）。",
     )
     parser.add_argument("--pdf", default=DEFAULT_PDF, help="教材 PDF 路径（build/all 阶段使用）。")
     parser.add_argument("--book", default=None, metavar="教材名",
@@ -100,6 +115,15 @@ def parse_args() -> argparse.Namespace:
                         choices=("physics", "chemistry", "math"),
                         help="学科，仅限三种：physics/物理、chemistry/化学、math/数学"
                              "（接受中文或拼音别名，自动归一化）。")
+    parser.add_argument("--query", default=DEFAULT_QUERY,
+                        help="学生提问（ask/all 阶段使用）。")
+    # ---- chat 模式专属参数 ----
+    parser.add_argument("--session", default=None, metavar="ID",
+                        help="chat：进入/续聊指定会话（thread_id，见 --list）；缺省新建会话。")
+    parser.add_argument("--list", dest="chat_list", action="store_true",
+                        help="chat：列出既有会话清单后退出（不进入对话）。")
+    parser.add_argument("--export", dest="chat_export", default=None, metavar="ID",
+                        help="chat：把指定会话导出为 Markdown 后退出（不进入对话）。")
     parser.add_argument("--max-chars", type=int, default=_CHUNK_MAX_CHARS_DEFAULT,
                         help="知识抽取单子块字符预算（build/all）：输入页超过预算即自动"
                              "切块增量抽取，避免整本书一次喂给推理 LLM 超上下文。")
@@ -112,8 +136,6 @@ def parse_args() -> argparse.Namespace:
                              "与 --max-chunks 同套分批消费模式）。")
     parser.add_argument("--yes", action="store_true",
                         help="跳过建库前的规模预估确认（脚本/夜间批量自动放行）。")
-    parser.add_argument("--query", default=DEFAULT_QUERY,
-                        help="学生提问（ask/all 阶段使用）。")
     return parser.parse_args()
 
 
@@ -159,6 +181,137 @@ def _save_answer_markdown(result: dict, fallback_subject: str) -> Path:
     ]
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
+
+
+# ---- chat 多轮会话模式 -----------------------------------------------------
+# messages 流按节点过滤：只上屏生成节点（讲解/搜题/闲聊）的正文 token；
+# 意图判定等短 LLM 调用的输出是内部中间件，不上屏。
+_CHAT_STREAM_NODES = ("generate_response", "generate_problem_response",
+                      "respond_chitchat")
+
+
+def _new_thread_id() -> str:
+    """生成新会话 id（REPL 内可见，供 --session 续聊）。"""
+    return "s-" + uuid.uuid4().hex[:12]
+
+
+def _print_sessions() -> None:
+    """--list：打印既有会话清单。"""
+    sessions = list_sessions()
+    if not sessions:
+        log.info("[chat] 暂无历史会话（首次对话会自动创建新会话）")
+        return
+    log.info("[chat] 历史会话（共 %d 个，按最近更新倒序）:", len(sessions))
+    for s in sessions:
+        log.info("  %s | 更新 %s | %d 轮 | %s",
+                 s["thread_id"], s["updated_at"][:19].replace("T", " "),
+                 s["turns"], s["first_question"] or "（无文字提问）")
+
+
+def _run_chat_repl(saver: Any, agent: Any, initial_session: Optional[str]) -> None:
+    """chat REPL 主循环：与 agent 多轮对话，会话历史按 thread_id 持久化。
+
+    内置命令：/exit /quit 退出；/new 开新会话；/export 导出当前会话；
+    /session <id> 切到指定会话（续聊）；/list 列会话；/help 帮助。
+    """
+    sid = initial_session
+    if sid:
+        _, history = session_snapshot(saver, sid)
+        if history:
+            turns = sum(1 for m in history if isinstance(m, HumanMessage))
+            log.info("[chat] 续聊会话 %s（已载入 %d 轮历史，输入 /new 可开新会话）", sid, turns)
+        else:
+            log.warning("[chat] 会话 %s 不存在或为空，改用新会话", sid)
+            sid = None
+    if not sid:
+        sid = _new_thread_id()
+        log.info("[chat] 新会话已创建: %s", sid)
+    print("=" * 60)
+    print(f"【多轮对话】会话 {sid}（理科知识点讲解/按内容搜题）")
+    print("输入提问回车发送；命令: /exit /new /export /session <id> /list /help")
+    print("=" * 60)
+    subject = "physics"  # fallback（实际以每轮判定结果为准）
+    while True:
+        try:
+            line = input("你 > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n[已退出]")
+            break
+        if not line:
+            continue
+        low = line.lower()
+        if low in ("/exit", "/quit", "/q", "退出", "再见"):
+            print("[已退出]")
+            break
+        if low in ("/new", "新会话"):
+            sid = _new_thread_id()
+            log.info("[chat] 已切换到新会话: %s", sid)
+            continue
+        if low == "/export":
+            path = export_session_md(sid)
+            print(f"\n[已导出] {path.resolve() if path else '（当前会话暂无内容）'}\n")
+            continue
+        if low == "/list":
+            _print_sessions()
+            continue
+        if low == "/help":
+            print("命令: /exit 退出 | /new 新会话 | /export 导出当前会话为 md |\n"
+                  "      /session <id> 切到指定会话续聊 | /list 列会话 | /help 帮助")
+            continue
+        if low.startswith("/session"):
+            parts = line.split()
+            if len(parts) < 2:
+                print("用法: /session <会话ID>（见 /list）")
+                continue
+            target = parts[1].strip()
+            _, history = session_snapshot(saver, target)
+            if history:
+                turns = sum(1 for m in history if isinstance(m, HumanMessage))
+                log.info("[chat] 已切换到会话 %s（%d 轮历史）", target, turns)
+                sid = target
+            else:
+                print(f"会话 {target} 不存在或为空")
+            continue
+        if low.startswith("/"):
+            print(f"未知命令: {line}（输入 /help 查看可用命令）")
+            continue
+
+        # ---- 常规提问：一轮 agent 执行（同步 + checkpointer 持久化） ----
+        inputs = {"query": line, "messages": [HumanMessage(content=line)]}
+        config = {"configurable": {"thread_id": sid}}
+        print()
+        printed = ""
+        result: dict = {}
+        try:
+            # messages 模式推送生成节点 LLM 的逐 token 增量（delta 去重打印，
+            # 兼容部分后端"先增量块、再完整块"的重复推送）；values 模式给每
+            # 节点后的状态快照，取最后一份作为该轮最终结果供保存。
+            for mode, chunk in agent.stream(
+                inputs, config=config, stream_mode=["messages", "values"],
+            ):
+                if mode == "messages":
+                    msg, meta = chunk
+                    if meta.get("langgraph_node") not in _CHAT_STREAM_NODES:
+                        continue
+                    text = (msg.content if isinstance(msg.content, str) else "")
+                    if text and len(text) > len(printed) and text.startswith(printed):
+                        print(text[len(printed):], end="", flush=True)
+                        printed = text
+                else:
+                    result = chunk
+        except Exception:
+            log.exception("[chat] 该轮执行失败")
+            print("\n[该轮失败，请重试或 /new 另开会话]")
+            continue
+        print()
+        if result.get("final_answer"):
+            # 每轮讲解同时存一份 answer md（与 ask 同格式，便于事后翻阅）
+            result["query"] = line
+            result["final_answer"] = _normalize_math_delims(result["final_answer"])
+            path = _save_answer_markdown(result, subject)
+            print(f"\n[已保存] {path.resolve()}\n")
+        else:
+            print("\n[未生成有效讲解内容]\n")
 
 
 class TokenMeter:
@@ -342,9 +495,32 @@ def main() -> None:
     # 视觉 VISION_* / 推理 REASONING_* / Embedding OPENAI_*
     args = parse_args()
 
-    # 共享的双库实例：跨进程持久化，多学科教材可反复累积进同一份知识库
+    # ---- chat 快捷子模式（不依赖双库，先行处理） ----
+    if args.chat_list:
+        _print_sessions()
+        return
+    if args.chat_export is not None:
+        path = export_session_md(args.chat_export)
+        if path is None:
+            log.error("[chat] 会话不存在或为空: %s", args.chat_export)
+        else:
+            log.info("[chat] 已导出会话 %s -> %s", args.chat_export, path.resolve())
+        return
+
+    # 共享的双库实例：跨进程持久化，多学科教材可累积进同一份知识库
     vector_db = get_vector_store()          # Chroma 本地持久化，自动加载历史切片
     graph_db = ScienceGraphStore.load()     # 有历史图谱则加载，无则新建空库
+
+    # ---- chat 阶段：多轮对话 REPL（会话历史经 checkpointer 持久化） ----
+    if args.stage == "chat":
+        # SqliteSaver 纯同步后端：单连接包住整个 REPL（compile 传 checkpointer，
+        # 每轮 stream 带 thread_id 即落盘，可随时 Ctrl+C / /exit 后 --session 续聊）
+        with open_saver() as saver:
+            agent = create_circuit_agent(vector_db=vector_db, graph_db=graph_db,
+                                         checkpointer=saver)
+            _run_chat_repl(saver, agent, args.session)
+        log.info("[chat] 对话结束")
+        return
 
     # ---- 建库阶段（all / build）：多模态提取 PDF 指定页 → 结构化抽取累积进双库
     if args.stage in ("all", "build"):

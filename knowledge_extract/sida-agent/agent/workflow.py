@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, List
+import uuid
+from typing import Any, List, Optional
 
 from langchain_chroma import Chroma
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveMessage
 from langgraph.graph import END, START, StateGraph
 
 from agent.state import CircuitAgentState
@@ -37,6 +39,13 @@ _SUBJECT_ANSWER_GUIDE = {
     "chemistry": "书写化学方程式注意配平与反应条件；回答现象要具体（颜色、沉淀、气体、放热等）。",
     "math": "推理要严谨，注意分类讨论、辅助线做法与漏解陷阱；结论前先给证明/推导。",
 }
+
+# ---- chat 会话上下文管理预算（字符粗估，非计费口径） -----------------------
+# 推理模型为本地 qwen3.8-flash（~64k 窗口）。对话历史超过预算即由
+# manage_context 截断旧消息：被丢弃部分增量压缩进 history_summary，
+# 保证每次 LLM 输入 = 摘要 + 最近窗口 + 本轮检索资料，均有界。
+_CHAT_HISTORY_BUDGET_CHARS = 12000    # 保留在 messages 中的最近历史字符上限
+_CHAT_SUMMARY_MAX_TOKENS = 600        # 单次摘要输出 token 上限
 
 # find_problem 语义搜题：最终送给生成节点的讲义页数量；语义兜底时先取
 # RERANK_K 页候选再按与 search_text 的二元组重合度重排，防止目标页被
@@ -101,7 +110,7 @@ def _parse_intent(raw: str) -> tuple[str, str, str, str]:
             cm = re.search(r'"concept"\s*:\s*"([^"]*)"', raw)
             if cm:
                 concept = cm.group(1).strip()
-    if intent not in ("concept", "find_problem"):
+    if intent not in ("concept", "find_problem", "offtopic"):
         intent = "concept"
     if subject not in _SUBJECT_LABEL:
         fallback_reason = f"subject 非法值 {subject!r}"
@@ -113,40 +122,178 @@ def _parse_intent(raw: str) -> tuple[str, str, str, str]:
         # 搜题链路不依赖 concept 锚点：LLM 留空时保持为空，
         # 不要把整行 JSON 兜底串当概念名（只会污染日志与保存文件元信息）。
         return subject, concept, intent, search_text
+    if intent == "offtopic":
+        # 闲聊/与知识库无关：不检索、不需要概念锚点，直接走轻量回复节点
+        return subject, "", intent, ""
     return subject, concept or default_concept, intent, search_text
+
+
+# ---------------- chat 会话上下文辅助（纯函数，无 LLM 调用） ----------------
+
+def _msg_text(msg: AnyMessage) -> str:
+    """取消息正文文本（content 为 str 或文本块列表时均返回纯文本）。"""
+    c = msg.content
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return "".join(b.get("text", "") if isinstance(b, dict) else str(b)
+                       for b in c)
+    return str(c)
+
+
+def _dialogue_text(msgs: List[AnyMessage]) -> str:
+    """把一段消息渲染为「学生：…/老师：…」对话文本（摘要/上下文注入用）。"""
+    lines: List[str] = []
+    for m in msgs:
+        if isinstance(m, HumanMessage):
+            lines.append(f"学生：{_msg_text(m)}")
+        elif isinstance(m, AIMessage):
+            lines.append(f"老师：{_msg_text(m)}")
+    return "\n".join(lines)
+
+
+def _recent_context(state: CircuitAgentState, *, max_chars: int = 3000) -> str:
+    """渲染最近对话上下文（不含本轮提问，即去掉 messages 最后一条）。
+
+    供意图判定与生成节点拼进 prompt 以支持指代消解；超出 max_chars 截断
+    （中文字符粗估兜底，正常窗口远小于该值）。
+    """
+    msgs = list(state.get("messages") or [])
+    if not msgs:
+        return ""
+    text = _dialogue_text(msgs[:-1]).strip()
+    if not text:
+        return ""
+    if len(text) > max_chars:
+        text = "…（更早内容略）\n" + text[-max_chars:]
+    return text
+
+
+def _summary_prefix(state: CircuitAgentState) -> str:
+    """历史摘要区块文本（无摘要时返回空串）。"""
+    summary = (state.get("history_summary") or "").strip()
+    return f"（此前对话摘要：{summary}）\n" if summary else ""
+
+
+def _context_block(state: CircuitAgentState) -> str:
+    """拼装完整「对话背景」区块：此前摘要 + 最近若干轮（不含本轮提问）。"""
+    summary = _summary_prefix(state)
+    recent = _recent_context(state)
+    if not summary and not recent:
+        return ""
+    return f"【对话背景（此前交流，供理解指代）】：\n{summary}{recent}\n"
+
+
+def _stream_answer(llm, prompt: str) -> str:
+    """以流式调用生成完整回答并返回拼接文本。
+
+    节点内用 llm.stream 逐块产出：LangGraph 会把每个增量块作为
+    stream_mode="messages" 的 token 推送（前端/CLI 据此逐字打印）；
+    此处只负责把全部块拼回全文，写入 final_answer 与 AIMessage。
+    """
+    out: List[str] = []
+    for chunk in llm.stream(prompt):
+        content = getattr(chunk, "content", None)
+        if isinstance(content, str):
+            out.append(content)
+    return "".join(out)
 
 
 def create_circuit_agent(
     vector_db: Chroma,
     graph_db: ScienceGraphStore,
+    checkpointer: Any = None,
 ) -> Any:
     """创建并编译初中理科全科问答 Agent 工作流图。
 
     推理模型固定由 config.py + sida-agent/.env 的 REASONING_* 配置决定。
+    checkpointer：传 SqliteSaver 等 checkpointer 后支持 chat 多轮会话
+    （消息按 thread_id 持久化、可续聊）。单轮 ask/all 模式可不传。
     """
     log.info("[workflow] 构建全科问答 Agent 工作流")
     # 意图判定：只输出一行 JSON，追求短平快 —— 低温、小 max_tokens、关思考。
     intent_llm = get_reasoning_llm(temperature=0.0, max_tokens=128, enable_thinking=False)
     # 最终讲解：需要长输出与推理质量 —— 沿用模型默认思考与较大 token 预算。
     answer_llm = get_reasoning_llm(temperature=0.3)
+    # 上下文摘要：短输出压缩（chat 模式上下文管理用）。
+    summary_llm = get_reasoning_llm(temperature=0.0, max_tokens=_CHAT_SUMMARY_MAX_TOKENS,
+                                    enable_thinking=False)
+
+    def manage_context_node(state: CircuitAgentState):
+        """chat 上下文管理：messages 超预算时截断旧消息并增量压缩摘要。
+
+        messages 是累积 channel：本节点只返回 RemoveMessage（删除被丢弃
+        的旧消息）与 history_summary（覆盖式更新），窗口内保留消息不动。
+        被丢弃的对话压进 history_summary，供后续节点以「对话背景」形式
+        注入 prompt，保证每次 LLM 输入 = 摘要 + 最近窗口 + 本轮资料，均有界。
+        单轮模式（无 messages）直接跳过。
+        """
+        msgs = list(state.get("messages") or [])
+        if not msgs:
+            return {}
+        total = sum(len(_msg_text(m)) for m in msgs)
+        if total <= _CHAT_HISTORY_BUDGET_CHARS:
+            return {}
+        # 从末尾往回尽量保留消息直到预算；保底保留最近 1 条（本轮提问）。
+        kept: List[AnyMessage] = []
+        acc = 0
+        for m in reversed(msgs):
+            if kept and acc + len(_msg_text(m)) > _CHAT_HISTORY_BUDGET_CHARS:
+                break
+            kept.append(m)
+            acc += len(_msg_text(m))
+        kept.reverse()
+        dropped = msgs[: len(msgs) - len(kept)]
+        if not dropped:
+            return {}
+        old_summary = (state.get("history_summary") or "").strip()
+        dropped_text = _dialogue_text(dropped)
+        log.info("[workflow.manage_context] 历史 %d 字符超预算，截断 %d 条旧消息"
+                 "（保留最近 %d 条/%d 字符）并增量压缩摘要",
+                 total, len(dropped), len(kept), acc)
+        prompt = (
+            "把下面的「旧对话」压缩成一段简洁的中文会话摘要。\n"
+            "覆盖要点：学生问过的知识点/题型、已讲解的结论与例题、学生薄弱点、"
+            "有待继续追问的话题。"
+            + (f"\n【旧摘要（保留其要点，只增补/修正新信息）】\n{old_summary}"
+               if old_summary else "")
+            + f"\n【旧对话】\n{dropped_text}\n"
+            "直接输出更新后的摘要正文，不要任何前缀解释。"
+        )
+        try:
+            new_summary = str(summary_llm.invoke(prompt).content).strip()
+        except Exception:  # 摘要失败不阻断主链路：保留旧摘要继续走
+            log.warning("[workflow.manage_context] 摘要生成失败，保留原摘要",
+                        exc_info=True)
+            return {"messages": [RemoveMessage(id=m.id) for m in dropped
+                                 if getattr(m, "id", None)]}
+        removals = [RemoveMessage(id=m.id) for m in dropped if getattr(m, "id", None)]
+        log.info("[workflow.manage_context] 摘要完成 %d 字", len(new_summary))
+        return {"messages": removals, "history_summary": new_summary}
 
     def analyze_intent_node(state: CircuitAgentState):
         query = state["query"]
+        background = _context_block(state)
         prompt = (
             f"判断学生提问的意图、所属初中学科与检索锚点。\n"
             f"学科仅限三选一：physics(物理)/chemistry(化学)/math(数学)。\n"
-            f"intent 二选一：\n"
+            f"intent 三选一：\n"
             f"- concept：学生在问某个知识点/公式/题型/方法本身（想要讲解、分析思路、解题方法）。\n"
             f"- find_problem：学生在「找一道题」——用题目的原文片段/内容特征来描述，希望定位到"
             f"包含该内容的那道题（如\"查询一道题，内容包含'甲、乙两瓶等量煤油'\"\"有没有讲XX的那道题\"）。\n"
+            f"- offtopic：寒暄、闲聊、夸奖或与理科知识学习无关的提问（如\"你好\"\"谢谢\"\"你是谁\"）。\n"
             f"intent=concept 时：concept 必须是知识点名词本身（如\"可变电路\"\"欧姆定律\"\"电功率\"），\n"
             f"严格禁止拼接教学修饰或请求后缀（如\"的分析\"\"的思路\"\"的方法\"\"的讲解\"\"怎么做\"\"如何解\"），\n"
             f"提问是\"讲解XX的分析思路/解题方法\"时，concept 只填 XX 本身；search_text 留空。\n"
             f"intent=find_problem 时：search_text 填学生描述的题目内容特征（尽量保留原文关键名词、数字、装置等，"
             f"去掉\"我想查询一道题\"\"内容包含\"这类请求前缀）；concept 若能判断题目所属知识点则填，否则留空。\n"
+            f"intent=offtopic 时：concept 与 search_text 均留空。\n"
+            f"提问可能存在省略与指代（如\"那第二题呢\"\"上面说的那个概念\"），"
+            f"可结合下方对话背景理解，必要时补全 concept，但不要臆造背景中没有的知识点。\n"
             f"只输出一行严格 JSON，不要解释："
-            f"{{\"subject\": \"physics\", \"intent\": \"concept\", \"concept\": \"知识点名\", \"search_text\": \"\"}}\n\n"
-            f"提问：{query}"
+            f"{{\"subject\": \"physics\", \"intent\": \"concept\", \"concept\": \"知识点名\", \"search_text\": \"\"}}\n"
+            + (f"\n【对话背景】\n{background}" if background else "")
+            + f"\n提问：{query}"
         )
         log.debug("[workflow.analyze_intent] 调用 LLM 判定意图与锚点, query=%r", query)
         subject, concept, intent, search_text = _parse_intent(
@@ -326,6 +473,7 @@ def create_circuit_agent(
         subject_label = _SUBJECT_LABEL.get(subject, subject)
         guide = _SUBJECT_ANSWER_GUIDE.get(subject, "")
         query = state["query"]
+        background = _context_block(state)
         search_text = (state.get("search_text") or "").strip() or query
         chunks = state.get("problem_chunks", [])
         pages_text = "\n\n".join(chunks)
@@ -333,9 +481,13 @@ def create_circuit_agent(
                             for n in re.findall(r"--- 第 (\d+) 页 ---", c)})
         pages_label = ("、".join(map(str, pages_hit)) + " 页") if pages_hit else "无"
 
+        # 对话背景块（f-string 表达式内不允许反斜杠，故先拼好再插值）
+        background_block = ("【对话背景（此前交流，供理解指代，"
+                            + '如"第二题"指代上一条内容）】：\n'
+                            + background + "\n") if background else ""
         final_prompt = f"""你是一位金牌初中{subject_label}教研老师。学生不是在问知识点，而是在「找一道题」：
 "{query}"
-
+{background_block}
 学生的题目内容描述（用于在下方讲义页里定位）："{search_text}"
 
 【检索到的讲义页原文（整页，含该题及同页其他题）】：
@@ -357,16 +509,19 @@ def create_circuit_agent(
    学科常识），解析要精炼，不展开与本题无关的知识。
 4. 只依据上方讲义页原文作答，不得虚构教材里没有的题目内容。
 """
-        response = str(answer_llm.invoke(final_prompt).content)
+        response = _stream_answer(answer_llm, final_prompt)
         log.info("[workflow.generate_problem_response] 搜题解答生成完成, 长度=%d 字符",
                  len(response))
-        return {"final_answer": response}
+        # final_answer 供单轮 ask/all 复用（main 保存 md）；AIMessage 供
+        # chat 模式把回答写回 messages 会话历史（由 checkpointer 持久化）。
+        return {"final_answer": response, "messages": [AIMessage(content=response)]}
 
     def generate_response_node(state: CircuitAgentState):
         g_ctx = state.get("graph_context", {})
         subject = g_ctx.get("subject") or state.get("target_subject") or "physics"
         subject_label = _SUBJECT_LABEL.get(subject, subject)
         guide = _SUBJECT_ANSWER_GUIDE.get(subject, "")
+        background = _context_block(state)
 
         # 教材名注册表：pdf_id -> 教材显示名（建库时 --book / 文件名登记，见 ingestion）。
         # 图谱实体（概念/公式/实验/题型/方法）节点携带 sources=[pdf_id,...]，据此把
@@ -497,8 +652,10 @@ def create_circuit_agent(
             f"讲义原文：{orig_label}"
         )
 
+        background_block = ("【对话背景（此前交流，供理解指代与衔接）】：\n"
+                            + background + "\n") if background else ""
         final_prompt = f"""你是一位金牌初中{subject_label}名师。请系统回答学生提问："{state['query']}"。
-
+{background_block}
 【最高优先级约束·严格依据资料】：
 本次回答的每一个知识点、公式、例题、结论，都必须能在下方【知识点定位】【公式与推导】
 【实验与图解】【题型模板与陷阱】【方法套路】【典型例题原文】六个区块中找到出处。
@@ -556,33 +713,65 @@ def create_circuit_agent(
    - 讲义原文为"无"但图谱命中时，图谱内容仍按上述"图谱收录"规则标注（有收录教材
      信息则带上《教材名》），只是不得引用具体页码；宁可说明不确定，也不要编造页码。
 """
-        response = str(answer_llm.invoke(final_prompt).content)
+        response = _stream_answer(answer_llm, final_prompt)
         log.info("[workflow.generate_response] 解答生成完成, 长度=%d 字符", len(response))
-        return {"final_answer": response}
+        # final_answer 供单轮 ask/all 复用（main 保存 md）；AIMessage 供
+        # chat 模式把回答写回 messages 会话历史（由 checkpointer 持久化）。
+        return {"final_answer": response, "messages": [AIMessage(content=response)]}
+
+    def respond_chitchat_node(state: CircuitAgentState):
+        """闲聊/与知识库无关话题的轻量直答：不触发图谱/向量检索。
+
+        chat 模式下学生寒暄（你好/谢谢/你是谁）不至于空跑整条检索链路，
+        仅给一句简短自然回应并把话题引导回学习；该轮也写入会话历史。
+        """
+        query = state["query"]
+        background = _context_block(state)
+        prompt = (
+            "你是初中理科学习助教，背后知识库是教材讲义。学生刚才说的是与具体"
+            "理科知识点学习无关的话（寒暄/闲聊/致谢/闲聊式提问）。请用一两句简短、"
+            "自然、友好的话回应（结合对话背景，避免机械重复），并在结尾自然地把"
+            "学生引导回物理/化学/数学知识点提问。不要编造教材内容，不要长篇大论。\n"
+            + (f"【对话背景】\n{background}\n" if background else "")
+            + f"学生说：{query}"
+        )
+        response = _stream_answer(answer_llm, prompt)
+        log.info("[workflow.respond_chitchat] 闲聊回复完成, 长度=%d 字符", len(response))
+        return {"final_answer": response, "messages": [AIMessage(content=response)]}
 
     # 组装状态机工作流
     def route_by_intent(state: CircuitAgentState) -> str:
-        """按意图分流：find_problem 走语义搜题链路，其余走知识点图谱链路。"""
-        return ("search_problems" if state.get("intent") == "find_problem"
-                else "graph_traversal")
+        """按意图分流：find_problem 走语义搜题链路，offtopic 走轻量直答，其余走图谱链路。"""
+        intent = state.get("intent")
+        if intent == "find_problem":
+            return "search_problems"
+        if intent == "offtopic":
+            return "respond_chitchat"
+        return "graph_traversal"
 
     workflow = StateGraph(CircuitAgentState)
+    # chat 模式上下文管理：置于入口，analyze_intent 之前先做截断/摘要
+    workflow.add_node("manage_context", manage_context_node)
     workflow.add_node("analyze_intent", analyze_intent_node)
     workflow.add_node("graph_traversal", graph_traversal_node)
     workflow.add_node("fetch_chunks", fetch_chunks_node)
     workflow.add_node("generate_response", generate_response_node)
     workflow.add_node("search_problems", search_problems_node)
     workflow.add_node("generate_problem_response", generate_problem_response_node)
+    workflow.add_node("respond_chitchat", respond_chitchat_node)
 
-    workflow.add_edge(START, "analyze_intent")
+    workflow.add_edge(START, "manage_context")
+    workflow.add_edge("manage_context", "analyze_intent")
     workflow.add_conditional_edges(
         "analyze_intent", route_by_intent,
         {"graph_traversal": "graph_traversal",
-         "search_problems": "search_problems"})
+         "search_problems": "search_problems",
+         "respond_chitchat": "respond_chitchat"})
     workflow.add_edge("graph_traversal", "fetch_chunks")
     workflow.add_edge("fetch_chunks", "generate_response")
     workflow.add_edge("generate_response", END)
     workflow.add_edge("search_problems", "generate_problem_response")
     workflow.add_edge("generate_problem_response", END)
+    workflow.add_edge("respond_chitchat", END)
 
-    return workflow.compile()
+    return workflow.compile(checkpointer=checkpointer)
