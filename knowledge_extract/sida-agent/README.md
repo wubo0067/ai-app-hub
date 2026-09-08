@@ -1,377 +1,448 @@
 # sida-agent · 初中理科全科知识库问答 Agent
 
-把初中**物理 / 化学 / 数学**教材与讲义 PDF 转化为可溯源的知识库，并对学生提问生成
-「概念拆解 → 公式推导 → 实验图解 → 题型溯源 → 例题带练」的分层讲解。
+把初中**物理 / 化学 / 数学**教材 / 讲义 PDF，用视觉大模型提取、再用推理大模型结构化抽取，
+沉淀为一套「知识图谱 + 向量库」双库，并对学生提问生成可溯源到教材页码的分层讲解。
 
-## 1. 这个项目是做什么的
+---
 
-一条端到端流水线（入口 `main.py`）：
+## 1. 这个项目解决什么问题 / 核心能力
 
-```
-PDF 讲义 ──① 视觉大模型提取──▶ 结构化 Markdown（逐页缓存，断点续跑）
-        ──② LLM 结构化抽取（自动分块增量 + 两批串行 + 滚动上下文 + 磁盘缓存）──▶ 双知识库
-              ├─ 知识图谱 ScienceGraphStore（NetworkX 内存图）
-              │    节点键 {subject}:{Kind}:{name}，三科命名空间隔离
-              │    概念/公式/实验/题型/方法/例题 + 前置/溯源/示范等关系
-              └─ 向量库 Chroma（metadata.id 与图节点键/讲义页键一致，供精确回表）
-                   实体切片 + 讲义页切片 subject:Page:{pdf_id}:页码
-        ──③ LangGraph 问答 Agent──▶ 分层讲解 / 按题目内容搜题 / 多轮对话
-              判定学科 + 提问意图（问知识点 / 找题目 / 闲聊）
-              ├─ concept：知识点锚点 → 图谱聚合检索（模糊解析锚点 + 每类 top-N 截断）
-              │            → 按 (pdf_id, 页码) 回表取讲义页原文 → 生成回答（标注教材来源）
-              ├─ find_problem：整页讲义原文检索（逐字命中 + 语义兜底重排）
-              │               → 原题完整呈现 + 出处页码 + 简析（详见下节）
-              └─ chat：会话记忆 + 上下文压缩 + 跨进程续聊（详见第 4 节 chat 小节）
-```
+- **把纸质讲义变成能问答的知识库**：PDF 每一页先用多模态视觉模型转成结构化 Markdown
+  （保留印刷文字、LaTeX 公式、表格、电路图 / 实验装置图的文字描述、手写批注），
+  再由推理模型提炼成概念 / 公式 / 实验 / 题型 / 例题 / 方法等教研实体。
+- **答案能指到教材第几页**：例题正文不由模型抄写，而是在抽取时记下出处页码，
+  问答时按页码回向量库取讲义原文，生成的讲解里标注「（见《教材名》第 X 页）」。
+- <span style="color:red">**三科共享一套双库、可反复累积**：同一份图谱 + 向量库可被物理 / 化学 / 数学、
+  多本不同 PDF 多次灌入；同名概念按「越建越全」合并，不同书的同页码 / 同题号靠
+  `pdf_id` 前缀隔离，互不覆盖。</span>
+- **整本书也能喂**：页码区间可开到几百页，内部按字符预算自动切子块、逐块抽取即落盘，
+  配合缓存天然支持断点续跑，不必一次成功。
+- **花钱前先亮规模**：建库前做一次只读「规模预估」（不调模型），统计要新增多少次视觉 /
+  推理调用，交互确认或用 `--yes` 放行；结束打印两路真实 token 消耗。
+- **三种用法**：单轮问答（`ask`）、一次性讲解（`all`）、可续聊的多轮对话（`chat`，
+  会话落盘、超预算自动压缩进摘要、能按题目原文「找题」）。
 
-抽取本体（跨学科通用 schema，见 `ingestion.py`）：章节、概念（拆解/易错/前置）、
-公式（符号表/适用条件/推导步骤）、实验（器材/步骤/现象/结论/装置图解）、
-题型（识别特征/解题模板/陷阱）、例题（编号/小标题/归属题型/结构化出处含页码，
-原文不由 LLM 抄写，问答时按 `source.page` 回表取讲义页原文）、通法技巧。
+---
 
-同一对 `vector_db` / `graph_db` 可被多个学科反复调用 `build_knowledge_bases`
-累积灌入，形成三科合一的知识库。**多本不同 PDF 累积进同一知识库**（如两本教材
-都讲「比热容」）时的语义：同名知识实体（概念/公式/实验/题型/方法）是真同一
-知识点，节点属性按「越建越全」合并（无序要点列表 union 去重、描述与步骤序列
-保留更长一份、概念额外累积 `sources` 字段记录收录来源）；而**页码与例题编号
-跨书会撞车**（两本书都有「第 15 页」「例17」），建库时须把 `pdf_id`（PDF 内容
-哈希前 16 位，main.py 自动计算）并入讲义页切片键与例题节点键做来源隔离——
-`main.py` 已自动传入，直接多次 `--stage build --pdf 书B.pdf` 即可安全累积。
+## 2. 整体架构
 
-抽取提速：LLM 抽取拆为**两批串行**（第一批知识体系 → 第二批题型与例题，并注入
-第一批的概念名保证引用一致），且关闭思考模式（`enable_thinking=False`）；抽取
-结果按「学科 + schema 版本 + 输入全文」哈希缓存于 `output/extract_cache/`，
-相同输入重跑 **0 次 LLM 调用**。
+数据从输入到输出经过「视觉提取 → 结构化抽取入库 → 检索问答」三个阶段，
+入口都是 `main.py`，由 `--stage` 决定走哪几段。
 
-**长文档增量建库**：页码区间可以直接开到整本书（几百上千页）而不会撑爆上下文——
-`build_knowledge_bases` 内部自动分块、逐块抽取即落盘、注入滚动上下文保证命名一致、
-并在建库前做规模预估与成本统计。完整机制见下一节「[长文档增量建库](#2-长文档增量建库l1--l2--l3--成本控制)」。
+```mermaid
+flowchart TD
+    PDF[教材 PDF] -->|① pdf_processor.extract_pdf_pages_as_markdown| MD[逐页 Markdown]
+    MD -->|缓存 output/pdf_extract/pdf_id/p页码_v2.md| MD
+    MD -->|② ingestion.build_knowledge_bases| EXTRACT[两批串行抽取 + 滚动上下文]
+    EXTRACT -->|缓存 output/extract_cache/key.json| EXTRACT
+    EXTRACT --> GRAPH[(知识图谱 ScienceGraphStore<br/>output/knowledge_graph.json)]
+    EXTRACT --> VECTOR[(向量库 Chroma<br/>output/vector_db)]
 
-## 2. 长文档增量建库（L1 / L2 / L3 / 成本控制）
-
-一次性把整本书（几百上千页）喂给推理 LLM 会超上下文、崩溃即全丢、且成本不可见。
-`build_knowledge_bases` 因此重构为**分块增量**流水线，围绕四个目标分层实现：
-**支持长文档 + 增量抽取知识体系 + 保证知识点间关系 + 成本可控**。
-
-### L1 · 自动分块 + 逐块落盘（支持长文档 / 断点续跑）
-
-- `_split_into_chunks(pages_data, max_chars=6000)`：按字符预算把输入页切成若干子块。
-  **页面是原子单位**（每页讲义需以 `subject:Page:{pdf_id}:页码` 独立入向量库供例题
-  回表，pdf_id 为空时退化为 `subject:Page:页码`），
-  所以只在「页与页之间」切，绝不把某页的 `--- 第 N 页 ---` 标记与正文拆到两块：
-  - 累加超过 `max_chars` 即切一刀；
-  - 已攒到预算 60% 且下一页是章节标题（`#`/`##`/`###`）时提前切，避免新章节标题落在块尾；
-  - 单页内容超预算时强制单独成块（不跨页拆正文）。
-- `build_knowledge_bases` 逐子块循环：拼该块 Markdown → 查该块抽取缓存 → 未命中才做
-  两批串行 LLM 抽取 → 写图 + 写向量 → **每块处理完立即 `graph_db.save()`**。
-  一次 CLI 可能跑几十次 LLM，中途崩溃只丢当前块，已处理块均已持久化。
-- **每个子块的抽取缓存 key 只由该子块自身内容决定**（`学科 + schema 版本 + 该块 Markdown`），
-  因此**重复执行同一条命令 = 断点续跑**：已处理子块自动命中缓存、0 次 LLM 调用、直接写库。
-
-### L2 · 滚动上下文注入（增量抽取 + 命名一致）
-
-增量建库时模型每次只看到一个子块，看不到此前抽过什么，容易出现「同一概念被起不同
-名字」「同一章节反复开新章」导致图谱隐性重复。处理每个**新**子块前，
-`_gather_known_context` 会拉取两份「已知信息」注入两批 prompt：
-
-- **全书已有章节**：该学科图谱里所有 Chapter 节点标题（轻量全量，封顶 120 条）；
-- **已建库的相关概念**：用当前子块前 2000 字符对向量库做相似度检索
-  （`filter={"subject": 学科, "type": "Concept"}`），只取 top-K（默认 12）条 name + 一句话描述，
-  控制 prompt 体积不随全书概念总数线性增长。
-
-prompt 要求：本批文本若命中上述列表中的同一概念/章节，`name`/`title` **必须逐字复用**，
-严禁另起同义名；未列出的新概念按原文标准名词正常新建。
-> 注：滚动上下文**不参与**抽取缓存 key。图增长后重跑仍复用早先缓存的 JSON（确定性、省钱），
-> 因此上下文注入只在缓存未命中时执行。
-
-### L3 · 关系保全 + 去重审计（保证知识点间关系）
-
-- **跨块题型回退挂边（bugfix）**：例题的归属题型可能在前置子块已定义、本批未重复声明。
-  `_write_graph` 在本批 `qt_keys` 查不到时**回退查全局持久化图**，命中则补挂
-  `EXEMPLIFIED_BY` 边——否则「A 块定义题型、B 块出例题」会永久丢边。
-- **疑似重复审计**：构建结束 `_audit_graph` 除列出空壳概念节点外，按名称相似度
-  （`difflib`，阈值 0.82）扫描并报告疑似重复概念对，给出合并指引。
-- **显式合并**：审计只报告不动库；人工核对后可用
-  `graph_db.merge_concepts(subject, canonical, alias)` 把别名节点的全部关系按原方向重指到
-  规范节点并删除别名（规范名不存在时整体改名，不丢属性），或
-  `graph_db.find_similar_concept(subject, name)` 查最相似候选。
-  > 有意取舍：不在写库前自动改写 LLM 输出的 name（就地替换风险高、缓存一致性难保证），
-  > 改用「L2 预防 + 审计报告 + 显式 merge 兜底」组合。
-
-### 成本控制（花钱前先亮规模，花钱后可见）
-
-- **建库前预估**（`main.py _estimate_build`，只读缓存 + 本地统计，不调用任何模型）：
-  打印「需新视觉调用次数 / 自动切几块 / 已缓存几块 / 需新抽取几块（每块约 2 次推理 LLM）」，
-  随后 `[y/N]` 确认；`--yes` 跳过；非交互终端且需新调用时直接拒绝执行，防止误烧钱。
-- **预算上限（推理侧）** `--max-chunks N`：单次最多处理 N 个**未命中缓存的新子块**
-  （缓存命中不占额度），达到即主动停并提示「重跑同命令续跑」，配合预估分轮灌完整本书。
-- **预算上限（视觉侧）** `--max-new-calls N`：单次最多新提取 N 页（已缓存页不占额度）。
-  视觉模型按多模态输入通常比推理模型更贵，`extract_pdf_pages_as_markdown` 达到上限即停，
-  已完成页已逐页缓存，重跑同命令续跑——与 `--max-chunks` 同一套分批消费模式。
-  传入后规模预估/确认只会亮「本批真实会做的量」（被截断的剩余页数单独提示留待续跑），
-  不会把整个大区间的全量数字拿出来误导确认。
-- **真实 token 统计**（`main.py TokenMeter`）：从响应 `usage_metadata`（回退
-  `response_metadata.token_usage`）读取真实用量，视觉 / 推理两路分别透传并在结束时打印，
-  服务端不回传 usage 的调用不计入。
-
-### 相关命令行参数
-
-| 参数 | 作用 |
-|---|---|
-| `--max-chars N` | 单子块字符预算（默认 6000）：输入页超过即自动切块 |
-| `--max-chunks N` | 推理抽取侧：本次最多处理 N 个未命中缓存的新子块（缓存命中不占额度），达上限主动停 |
-| `--max-new-calls N` | 视觉提取侧：本次最多新提取 N 页（已缓存页不占额度），达上限主动停，重跑续跑 |
-| `--yes` | 跳过建库前的规模预估确认（脚本 / 夜间批量自动放行） |
-
-```powershell
-# 整本教材分轮增量建库：先预估，每轮只处理 20 个新子块；再跑同命令即续跑（已缓存块不计费）
-uv run python main.py --stage build --pdf 整本教材.pdf --start-page 13 --end-page 320 --subject math --max-chunks 20
-
-# 视觉提取也分批：本轮新提取页与推理子块各限 20，剩余页/块下次重跑同命令续跑
-uv run python main.py --stage build --pdf 整本教材.pdf --start-page 13 --end-page 320 --subject math --max-new-calls 20 --max-chunks 20
+    Q[学生提问] -->|③ agent.workflow.create_circuit_agent| INTENT[analyze_intent<br/>判定学科+意图+锚点]
+    INTENT -->|concept| TRAVERSAL[graph_traversal<br/>图谱聚合检索]
+    INTENT -->|find_problem| SEARCH[search_problems<br/>整页原文检索]
+    INTENT -->|offtopic| CHITCHAT[respond_chitchat]
+    GRAPH --> TRAVERSAL
+    VECTOR --> TRAVERSAL
+    TRAVERSAL --> FETCH[fetch_chunks<br/>按 pdf_id+页码 回表取原文]
+    VECTOR --> FETCH
+    FETCH --> GEN[generate_response<br/>分层讲解+来源标注]
+    SEARCH --> GENQ[generate_problem_response]
+    GEN --> ANS[讲解 Markdown<br/>output/answers/]
+    GENQ --> ANS
+    CHITCHAT --> ANS
 ```
 
-## 3. 问答意图：知识点讲解 / 按题目内容搜题 / 闲聊
+- **阶段①（视觉）**：`pdf_processor.py`，PDF 页 → Markdown，逐页缓存。
+- **阶段②（抽取入库）**：`ingestion.py`，Markdown → 双库，按子块增量、抽取结果缓存。
+- **阶段③（问答）**：`agent/workflow.py`（LangGraph），提问 → 检索 → 生成分层讲解。
+  `--stage chat` 时额外经 `chat_session.py` 挂 SqliteSaver 做会话持久化。
 
-问答入口会先由意图判定节点把提问分成三类（`agent/workflow.py`），再路由到不同链路：
+---
 
-| 意图 | 典型提问 | 链路 |
+## 3. 关键技术方案
+
+### 3.1 视觉提取与逐页缓存（`pdf_processor.py`）
+
+- `extract_pdf_pages_as_markdown(pdf_path, start_page, end_page, ...)`：用 PyMuPDF
+  把每页渲染成 PNG（仅内存，长边上限 `MAX_LONG_EDGE=3000`、放大倍数上限 `MAX_ZOOM=4.0`），
+  连同一段通用结构化提示词 `PROMPT` 交给视觉模型。
+- **缓存命名**：`output/pdf_extract/{pdf_id}/p{页码:04d}_{_EXTRACT_VERSION}.md`，
+  当前 `_EXTRACT_VERSION="v2"`。`pdf_id = _pdf_id(pdf)` 是 **PDF 文件内容 SHA-256 的前 16 位**
+  （与 `knowledge_extract/extract_pdf` 同算法，两项目可共用缓存目录）。
+- **判定「已提取」**：`extract_pdf_pages_as_markdown` 循环里，页缓存文件存在且
+  `read_text().strip()` 非空即直接读缓存、不再调模型。因此**中断重跑自动跳过已完成页**。
+  版本号 `v2` 变更（`PROMPT` / 渲染参数 / 后处理调整）会让旧缓存整体失效。
+- **后处理**：`_fix_math` 把模型偶发的成对 `$$ ... $$`（跨行）折叠成单行行内 `$...$`，
+  避免块级公式在部分渲染器里失效。
+- **重试 / 超时 / 失败处理**：`_invoke_llm` 外层重试 `LLM_RETRIES=2`（最多 3 次尝试），
+  失败按 `wait = 2*(attempt+1)` 秒退避（2s、4s）；底层 `ChatOpenAI` 用 `max_retries=0`
+  避免双份重试；单次请求 `LLM_TIMEOUT=300s`、`MAX_TOKENS=8192`。三次仍失败抛
+  `RuntimeError`。模型返回空内容时**不写缓存**并记 warning（该页下次会重抽）。
+
+### 3.2 长文档自动分块（`ingestion._split_into_chunks`）
+
+- 页面是**原子单位**（每页需以 `subject:Page:{pdf_id}:{页码}` 独立入向量库供例题回表），
+  因此**只在页与页之间切**，不跨页拆内容。切分条件：
+  - 累加后 `cur_len + len(content) > max_chars`（默认 `6000`，即 `--max-chars`）；或
+  - 已攒到预算的 `_CHUNK_HEADING_FACTOR=0.6`（即 3600 字）且**下一页是 Markdown 标题行**
+    （正则 `^#{1,3}\s`）时提前切一刀，避免把新章节标题留在块尾。
+  - 单页内容超预算时强制单独成块。
+
+### 3.3 两批串行抽取 + 滚动上下文（`ingestion._extract_chunk_data`）
+
+- 每个子块做**两批** LLM 抽取：`_build_knowledge_prompt`（章节 / 概念 / 公式 / 实验 / 方法）
+  → `_build_question_prompt`（题型 / 例题 / 补充关系，并注入第一批的概念名保证引用一致）。
+- 推理模型经 `get_reasoning_llm(enable_thinking=False)` 创建（追求吞吐，关思考模式）。
+- **滚动上下文**（`_gather_known_context`）：处理子块前注入两块信息，让模型「记得」此前建过什么，
+  解决跨子块命名不一致 / 章节重复开章：
+  - 章节：从图谱取该学科所有 `Chapter` 节点标题（上限 `_KNOWN_CONTEXT_CHAPTERS_CAP=120`）；
+  - 相关概念：用当前子块**前 2000 字符**去向量库做相似度检索（限定 `subject`+`Concept`），
+    取 top `_KNOWN_CONTEXT_TOP_K=12` 条「名称：描述前 40 字」。
+  - 注入块（`_build_context_block`）明确要求：命中已有概念 / 章节时 `name`/`title` **逐字复用**，
+    不得另起同义名。检索失败时捕获异常、忽略并继续（不阻断抽取）。
+
+### 3.4 抽取缓存与断点续跑（`ingestion`）
+
+- **缓存 key**：`_cache_key(subject, full_markdown)` =
+  `sha256(f"{subject}|{_EXTRACT_SCHEMA_VERSION}|{full_markdown}")[:16]`，当前
+  `_EXTRACT_SCHEMA_VERSION="v3"`。缓存文件 `output/extract_cache/{key}.json`。
+- key **只由该子块自身内容决定**，所以重跑同一条命令时已处理子块直接命中缓存、0 次 LLM 调用。
+  `_persist_chunk` 每处理完一个子块就 `graph_db.save()` 一次——中途崩溃只丢当前子块，
+  已处理子块均已持久化 + 缓存，配合上条即**天然断点续跑**。
+- JSON 解析健壮性（`_extract_json`）：解析失败时追加 `_JSON_RETRY_HINT` 重试一次
+  （`max_attempts=2`）；若是字符串里夹带未转义反斜杠（模型把 LaTeX 记法原样抄入），
+  先经 `_repair_json_escapes` 就地修复再解析；两次都失败才抛 `RuntimeError`。
+- 字段类型归一化（`_normalize_extracted`）：写库 / 建向量前统一执行一次（**缓存命中的旧脏数据也覆盖**），
+  把「应为数组却是字符串」的字段告警置空（杜绝 `list("中文")` 拆成单字符），
+  `symbols` 仅保留 dict 元素，例题 `source` 非 dict 置 `{}`。
+
+### 3.5 跨块 / 跨来源合并策略（`ingestion._ensure_entity`）
+
+实体节点键 = `node_key(subject, kind, name)` = `f"{subject}:{Kind}:{name}"`（学科命名空间隔离，
+避免物理「分子」与化学「分子」互相覆盖）。同名实体第二次写入按「**越建越全**」逐属性合并
+（不再是先到先得的 `setdefault`）：
+
+| 字段类别 | 合并规则 | 判断依据 |
 |---|---|---|
-| `concept`（问知识点） | 「请讲解可变电路的分析思路」 | 知识点锚点 → 图谱聚合检索 → 按页回表讲义原文 → 分层讲解 |
-| `find_problem`（找题目） | 「我想查询一道题，内容包含'甲、乙两瓶等量煤油中'」 | 整页讲义切片原文检索 → 原题完整呈现 + 出处页码 + 简析 |
-| `offtopic`（闲聊 / 寒暄） | 「谢谢」「你好」「你是谁」 | 不触发任何检索 → `respond_chitchat` 轻量直答并引导回学习 |
+| 旧值缺失 / 为空（`None`/`""`/`[]`/`{}`） | 补上新值 | 修掉空壳节点永不更新 |
+| 本次传入为空值 | 保留旧值不动 | 空抽取不冲刷已收录内容 |
+| 无序列表（`breakdown`/`common_mistakes`/`sources`/`related_concepts`…） | union 去重保序 | 要点集合可累加 |
+| **顺序敏感字段**（`_SEQUENCE_FIELDS` = `derivation`/`template`/`steps`） | 保留更长的一份 | 两套步骤 union 会串成乱序流程 |
+| 标量字符串 | 保留更长的一份 | 更详细的表述优先 |
+| dict 字段（例题 `source`） | 只补缺失 / 为空的键，已有键先到先得、不覆盖 | 锁定首次抽取的真实 `page`，防「新标题配旧页码」缝合怪 |
 
-> 三种意图由同一判定节点输出（`analyze_intent` 只出一行 JSON）。chat 模式会额外把
-> 每轮提问与回答累积成 `messages` 并注入【对话背景】帮助指代消解（机制详见第 4 节
-> 「chat 多轮对话模式」），ask 单轮则无历史，二者判定 prompt 相同。
+**跨 PDF 来源隔离**：`main.py` 把 `pdf_id`（内容哈希前 16 位）传入 `build_knowledge_bases`，
+用于两类无来源维度的键：
+- 讲义页切片键 → `subject:Page:{pdf_id}:{页码}`（`_build_page_docs`）；
+- 例题节点键 → `{pdf_id}:{loc}:{题号}`（`_write_graph`），`loc` 取 `source.page`，缺页时退化为
+  `na-{pdf_id}-{序号}`。题号降级为展示属性 `number`，不再充当唯一标识
+  （教辅每章从「例1」重编，同书跨章也会撞号，故必须带页定位）。
 
-**为什么需要 find_problem 链路**：concept 链路靠「知识点锚点 → 图谱」定位内容，学生若
-用题目原文片段找题而非问知识点（如题目挂「焦耳定律/串联分压」名下、锚点却被解析成「比热容」），
-或目标知识点实体不在图谱中时，图谱检索会整体落空。find_problem 链路绕开图谱，直接在
-**整页讲义切片**（`{subject}:Page:{pdf_id}:{页码}`）上做原文检索。
+概念 / 公式 / 实验 / 题型 / 方法等知识实体**同名即同一知识点，不做来源隔离**，
+靠上表合并累积；`sources` 属性累积 `pdf_id` 列表，作为「多本教材共收 = 核心考点」信号，
+问答时反查 `PdfSource` 注册表把「图谱收录」升级为「收录于《教材名》」。
 
-**两级检索策略**（`search_problems_node`，实测均能稳定命中目标页）：
+### 3.6 审计 / 异常检测（`ingestion._audit_graph`）
 
-1. **逐字命中**：Chroma `where_document={"$contains": 题目特征文本}` 精确过滤
-   （中文子串匹配可用），命中即返回，零成本零误差；
-2. **语义兜底 + 二元组重排**：原文有改写/跨行断字导致逐字不中时，向量粗召回 top-10，
-   再按「查询字符二元组（bigram）在页面文本中的重合度」降序、向量距离升序重排取
-   top-3——纯向量距离对「短引文 vs 长页面」区分度差（目标页曾排 8/8），bigram 重合度
-   能把目标页拉回第一（实测 0.86 vs 其余 0.29）。
+整轮建库结束后（`graph_db.save()` 前）审计本学科：
+- 列出**空壳概念节点**（无 `description`，多为 `prerequisites` 前置引用或历史脏数据），报告前 20 个；
+- 用 `difflib.SequenceMatcher` 两两比较**有描述**的概念名，相似度 ≥ `_DUP_CONCEPT_RATIO=0.82`
+  的报为**疑似重复概念对**（前 10 对）。审计**只报告不动库**，用户核对后可显式
+  `graph_db.merge_concepts(subject, canonical, alias)` 合并。
+- 防幽灵节点：`_write_graph` 里 `extra_relations` / `related_concepts`（经 `_link_concept_refs`）/
+  例题 `question_type` 引用不存在的概念时**告警跳过、不盲建空壳**（例外：`prerequisites`
+  仍用 `_ensure_entity` 建占位 Concept，作为跨 PDF 分次累积的合理前向声明）。
 
-**输出约定**：命中页的整页讲义原样交给讲解 LLM，题目（题号/题干/选项）完整原样呈现、
-不截断不改写，标注「（见教材第 X 页）」；多页相似时列出候选让学生确认；对不上时如实
-说明不编造。注意返回的是**整页切片**，同页其他题目也会一并出现，属预期设计。
+### 3.7 检索与问答链路（`agent/workflow.py`）
 
-前提：目标 PDF 的讲义页切片须已入向量库（对该 PDF 跑过 `--stage build` 即可）。
+LangGraph 状态机（`create_circuit_agent` 编译），节点：
+`manage_context → analyze_intent → {graph_traversal → fetch_chunks → generate_response
+| search_problems → generate_problem_response | respond_chitchat} → END`。
+分流由 `route_by_intent` 按意图决定。
+
+- **`analyze_intent`**：一次低温短输出 LLM 调用（`temperature=0.0`、`max_tokens=128`、关思考），
+  判定 `{subject, intent, concept, search_text}`；`intent` 三选一 `concept`/`find_problem`/`offtopic`。
+  解析用 `_parse_intent`（非标准 JSON 时退回正则提取字段；任何回退到 `physics` 都记 warning）。
+- **`graph_traversal`（concept 链路）三级兜底**：
+  1. 概念名直接命中 → `get_subgraph` 做 1~2 跳聚合（`_resolve_concept` 内部还有一次
+     去教学尾缀 → 双向包含 → `difflib≥0.6` 的模糊解析）；
+  2. 锚点其实是题型 / 方法 / 例题名 → `get_by_name` 反查相邻 Concept 再聚合；
+  3. 命中的是**空壳概念**（无 description/breakdown 且聚合不到题型 / 例题）→
+     阶段一按提问原文在 1 跳邻居概念里挑字面命中的内容枢纽重定向；无命中则阶段二用
+     `resolve_chapter`（剥教学语气词 + 章节主题词互含判定）做**整章聚合**
+     `get_chapter_subgraph` 兜底。
+- **`fetch_chunks`**：按命中例题的 `(pdf_id, page)` 组向量键 `subject:Page:{pdf_id}:{页码}`，
+  用 `vector_db.get(where={"id": pk})` 精确回表取讲义页原文；未命中记 warning，
+  缺 `page` 的例题不拿空壳冒充原文。
+- **`generate_response`**：把图谱上下文（概念拆解 / 公式 / 实验 / 题型 / 方法 / 先修 / 后续）
+  与回表原文拼进提示词，强约束「每个知识点必须能在六个区块里找到出处，资料没有的写
+  『当前教材资料未收录』」，流式生成。图谱每类关联实体默认截断 top `_DEFAULT_MAX_PER_KIND=8`
+  防 prompt 膨胀（见日志「关联 examples 共 94 条，截断至 top-8」）。
+- **`search_problems`（find_problem 链路）两级**：先 Chroma `where_document={"$contains": text}`
+  整页逐字命中；无命中再语义检索取 top `_SEARCH_PROBLEM_RERANK_K=10` 候选，
+  按 `_bigram_overlap`（相邻字符二元组重合度）重排后取 top `_SEARCH_PROBLEM_TOP_K=3`，
+  由 `generate_problem_response` 在整页原文里定位目标题、原题呈现并简析。
+- **`respond_chitchat`（offtopic）**：不触发任何检索，一两句轻量回应并引导回学习。
+
+### 3.8 多轮对话与会话持久化（`chat_session.py` + `workflow.manage_context`）
+
+- `--stage chat` 用 `open_saver()` 打开 **SqliteSaver**（纯同步后端），
+  落盘 `output/chat/checkpoints.sqlite`；每轮以 `{"configurable": {"thread_id": sid}}`
+  调 `agent.stream`，消息按 `thread_id` 逐轮持久化，可随时 `Ctrl+C` / `/exit` 后
+  `--session <id>` 续聊。
+- REPL 内置命令：`/exit` `/quit` `/q` `退出` `再见`、`/new`、`/export`、`/list`、
+  `/session <id>`、`/help`。会话 id 形如 `s-` + uuid 前 12 位（`_new_thread_id`）。
+- **上下文压缩**（`manage_context_node`）：`messages` 累计字符超 `_CHAT_HISTORY_BUDGET_CHARS=12000`
+  时，从末尾往回保留最近消息（保底保留本轮提问），被丢弃的旧对话经 `summary_llm`
+  增量压缩进 `history_summary`（`RemoveMessage` 删旧消息）。摘要失败不阻断主链路，保留旧摘要继续。
+  后续节点以「对话背景」形式注入摘要 + 最近窗口，保证每次 LLM 输入有界。
+
+### 3.9 成本 / 资源控制（`main.py`）
+
+- **规模预估（干跑）**：`_estimate_build` 只读逐页缓存 + 本地统计，**不调任何模型**，
+  按与真实运行相同顺序遍历页，算出视觉侧（已缓存页 / 需新调用 / 因 `--max-new-calls` 被截断的剩余页）
+  和推理侧（切几个子块 / 已缓存块 / 需新抽取块 ≈ ×2 次推理调用）。含未提取页时按平均页长
+  （缓存内容均值，无缓存则 `_ESTIMATE_UNKNOWN_PAGE_CHARS=2000`）预演切块，实际块数可能略有出入。
+- **放行确认**：`_confirm_build` 全部命中缓存直接放行；有新调用时交互确认 `[y/N]`，
+  `--yes` 跳过；非交互终端（`not sys.stdin.isatty()`）且有新调用时**报错拒绝**并提示缩小范围或加 `--yes`。
+- **分批消费**：`--max-new-calls`（视觉侧新提取页数上限）、`--max-chunks`（推理侧新子块数上限）
+  相互独立，达上限主动停，已完成部分已落盘 / 缓存，重跑同命令续跑。
+- **真实消耗统计**：`TokenMeter` 从响应 `usage_metadata`（回退 `response_metadata.token_usage`）
+  取 input/output tokens；建库结束 `_report_meters` 打印视觉 / 推理两路。**服务端未返回 usage
+  的调用不计入**（见「已知局限」）。
+
+### 3.10 双库持久化（`storage/`）
+
+- **向量库**（`storage/vector_store.get_vector_store`）：`Chroma`，collection 默认 `science_kb`，
+  `persist_directory` 默认 `output/vector_db`（PersistentClient 自动落盘 / 加载，显式传 `None` 回退内存库）。
+  每条 `Document.metadata` 至少含 `id`（与图节点键一致，供回表）、`subject`、`type`。
+  写入用 `add_documents(docs, ids=[...])`，按 id **幂等 upsert**。
+- **知识图谱**（`storage/graph_store.ScienceGraphStore`）：运行期内存 `nx.DiGraph`；
+  `save()` / `load()`（classmethod）用 JSON node_link 格式（**必须带 `edges="links"`**，
+  跨 networkx 版本稳定），默认 `output/knowledge_graph.json`。`load` 缺文件 / 解析异常回退空库。
+  向量库靠 Chroma 自动持久化，图谱需**显式 save** 才能跨进程累积。
+- **教材名注册表**：`register_pdf_name(pdf_id, name)` 存为 `meta:PdfSource:{pdf_id}` 节点
+  （伪学科 `meta`，不与三科冲突），`pdf_names()` 反查全表。`--book` 传入教材显示名，缺省用文件名去扩展名，
+  重复登记同名 `--pdf` 即改名覆盖。
+- **去重 / 合并方法**：`find_similar_concept`（同科内找最相似已建概念，默认阈值 0.6，
+  可跳过空壳）、`merge_concepts`（把 alias 的入边 / 出边按原关系重指到 canonical，
+  再按「越建越全」逐字段合并属性、删除 alias；canonical 不存在时整体改名）。
+
+---
+
+## 4. 快速开始
+
+### 4.1 安装
+
+项目用 [uv](https://docs.astral.sh/uv/) 管理（依赖见 `pyproject.toml` / `uv.lock`，要求 Python ≥ 3.11）。
 
 ```powershell
-# 按题目内容找题（可带请求前缀，意图节点会自动提炼 search_text）
-uv run python main.py --stage ask --query "我想查询一道题，内容包含'甲、乙两瓶等量煤油中'"
+cd knowledge_extract/sida-agent
+uv sync
 ```
 
-## 4. 常用命令
-
-环境要求：Python ≥ 3.11，[uv](https://docs.astral.sh/uv/)。
-
-### 安装
+Embedding 走本地 Ollama，首次需拉取模型（模型名以 `.env` 里 `EMBEDDING_MODEL` 为准）：
 
 ```powershell
-uv sync                 # 按 pyproject.toml + uv.lock 安装依赖到 .venv
+ollama pull nomic-embed-text:latest
 ```
 
-### 配置
+并确保 Ollama 服务已启动（`EMBEDDING_BASE_URL` 指向它，如 `http://localhost:11434`）。
 
-复制/编辑项目根 `.env`（已被 `.gitignore` 忽略，勿提交）：
+### 4.2 配置 `.env`
 
-| 变量 | 用途 |
-|---|---|
-| `VISION_BASE_URL` / `VISION_MODEL` / `VISION_API_KEY` | 视觉解析模型（PDF 页 → Markdown） |
-| `REASONING_BASE_URL` / `REASONING_MODEL` / `REASONING_API_KEY` | 推理模型（知识抽取〔关闭思考模式〕+ 问答） |
-| `OPENAI_API_KEY` / `OPENAI_BASE_URL` | Embedding（向量库） |
+在 `sida-agent/` 下创建 `.env`（仓库里已有 `.gitignore` 忽略它，**本仓库未提供 `.env.example`**）。
+所有值均无内置默认，缺项会在启动时报「配置不完整」并列出缺哪几项：
 
-`config.py` 启动时加载 `.env`（系统同名环境变量优先）。业务代码不指定模型：
-视觉解析用 `config.get_vision_llm()`，抽取/问答用 `config.get_reasoning_llm()`，
-由 `.env` 固定各自使用哪个大模型。
+```ini
+# 角色一：视觉解析（PDF 页 -> Markdown），填任意 OpenAI 兼容视觉端点
+VISION_BASE_URL=http://your-vision-host/v1
+VISION_MODEL=your-vision-model
+VISION_API_KEY=sk-xxxx
 
-### 启动
+# 角色二：推理（知识抽取 + 问答），填任意 OpenAI 兼容端点
+REASONING_BASE_URL=http://your-reasoning-host/v1
+REASONING_MODEL=your-reasoning-model
+REASONING_API_KEY=sk-xxxx
+
+# Embedding（向量库，本地 Ollama）
+EMBEDDING_BASE_URL=http://localhost:11434
+EMBEDDING_MODEL=nomic-embed-text:latest
+```
+
+> `config.py` 用 `load_dotenv` 读取，**同名系统环境变量优先于 `.env`**。Ollama 直连时
+> `trust_env=False`，避免被 Windows 系统代理劫持（否则可能 502）。
+
+### 4.3 最小可跑命令
+
+先建库（把某本 PDF 的第 11–12 页灌入物理库），再单轮问答：
 
 ```powershell
-# 换材料无需改源码，用命令行参数指定 PDF / 页码 / 学科 / 提问
-uv run python main.py --stage build --pdf 教材.pdf --start-page 11 --end-page 12 --subject physics   # 提取并累加进双库
-# 整本教材分轮增量建库：先预估，每轮只处理 20 个新子块，交互确认（--yes 跳过）
-uv run python main.py --stage build --pdf 整本教材.pdf --start-page 13 --end-page 320 --subject math --max-chunks 20
-# 视觉提取同样分批：每轮新提取页上限 20（控多模态视觉成本），重跑续跑
-uv run python main.py --stage build --pdf 整本教材.pdf --start-page 13 --end-page 320 --subject math --max-new-calls 20
-uv run python main.py --stage ask   --query "请讲解可变电路的分析思路"                                # 仅问答（知识点讲解），复用已持久化双库
-uv run python main.py --stage ask   --query "我想查询一道题，内容包含'甲、乙两瓶等量煤油中'"            # 按题目内容找题（find_problem，见上节）
-uv run python main.py --stage chat                                                                     # 多轮对话 REPL（新开会话）
-uv run python main.py --stage chat --session s-018522af7119                                            # 续聊指定会话（跨进程恢复历史）
-uv run python main.py --stage chat --list                                                              # 列出历史会话
-uv run python main.py --stage chat --export s-018522af7119                                             # 把会话导出为 Markdown
-uv run python main.py                                                                                  # 不带参数 = 内置默认示例
+# 建库：视觉提取 + 结构化抽取，累积进双库
+uv run python main.py --stage build --pdf "L:/vivi/初三/物理/9S合并PDF-完整.pdf" --start-page 11 --end-page 12 --subject physics
+
+# 问答：复用已持久化的双库
+uv run python main.py --stage ask --query "讲解可变电路的分析思路"
 ```
 
-### chat 多轮对话模式（`--stage chat`）
+多轮对话 REPL（会话落盘 `output/chat/`，`Ctrl+C` 退出）：
 
-`--stage ask` 是"每问一次跑一轮无状态问答"；`--stage chat` 在同一会话内可连续追问
-（知识点讲解 / 按内容找题 / 闲聊），并把对话按会话 ID（`thread_id`）持久化，可跨进程续聊。
+```powershell
+uv run python main.py --stage chat                 # 新建会话
+uv run python main.py --stage chat --list           # 只列既有会话
+uv run python main.py --stage chat --session s-xxxx # 续聊指定会话
+```
 
-**功能速览**
+> `--pdf` 默认值 `L:/vivi/初三/物理/9S合并PDF-完整.pdf` 是开发机路径，换机器请显式传入自己的 PDF。
 
-- **会话持久化**：每轮提问与回答作为消息追加，由 `langgraph-checkpoint-sqlite` 按
-  `thread_id` 写入 `output/chat/checkpoints.sqlite`（新会话自动分配，如 `s-018522af7119`）。
-- **REPL 命令**：`/exit` 退出 | `/new` 开新会话 | `/list` 列历史会话 | `/session <id>` 切换续聊 |
-  `/export` 导出当前会话 Markdown | `/help` 帮助（`--stage chat --list` / `--export <id>`
-  也可不经 REPL 直接调用）。
-- **闲聊兜底**：与学科无关的话（`offtopic`）直接简短闲聊回复，不触发图谱 / 向量检索。
-- **每轮存档**：讲解同时按 ask 同款格式存 `output/answers/answer_{时间戳}_{学科}.md`。
+---
 
-> 注：单轮 `--stage ask` 行为与历史完全一致（不携带 `messages`、不写会话库），可混用；
-> 两种模式共用同一张编译图，chat = 编译时挂 `checkpointer` + 每轮多传 `messages`。
+## 5. 命令行参数表
 
-#### chat memory 是什么（记忆机制）
+逐条对应 `main.py` 的 `parse_args()`（`ArgumentDefaultsHelpFormatter`，帮助里会显示默认值）。
 
-对话记忆分两层，都随会话 `thread_id` 存于 SQLite checkpoint：
-
-| 层 | 状态字段 | 内容 | 作用 |
+| 参数 | 类型 / 取值 | 默认值 | 作用 |
 |---|---|---|---|
-| 短期记忆 | `messages` | 最近若干轮 Human/AI 消息原文（保留预算见下节） | 可逐字引用的对话窗口 |
-| 长期记忆 | `history_summary` | 被截断的更早轮次压缩出的中文摘要（覆盖式，不随轮累积） | 超窗话题仍可指代 |
+| `--stage` | `all` / `build` / `ask` / `chat` | `all` | `all`=提取+建库+问答；`build`=仅提取并累加进双库；`ask`=仅复用已持久化双库问答；`chat`=多轮对话 REPL |
+| `--pdf` | str | `L:/vivi/初三/物理/9S合并PDF-完整.pdf` | 教材 PDF 路径（build/all 使用） |
+| `--book` | str（metavar 教材名） | `None` | 该 PDF 的教材显示名，用于答案「收录于《教材名》」来源标注；缺省取 PDF 文件名去扩展名；重复登记同一 `--pdf` 即改名覆盖 |
+| `--start-page` | int | `11` | 起始页码（从 1 计） |
+| `--end-page` | int | `12` | 结束页码（含），超出总页数自动截断 |
+| `--subject` | `physics` / `chemistry` / `math` | `physics` | 学科；接受中文 / 拼音别名，`_subject_choice` 经 `normalize_subject` 归一化，非法值报命令行错误 |
+| `--query` | str | `请帮我系统讲解可变电路的分析思路，并用具体的典型例题带我推导一遍` | 学生提问（ask/all 使用） |
+| `--session` | str（metavar ID） | `None` | chat：进入 / 续聊指定会话（`thread_id`，见 `--list`）；缺省新建会话 |
+| `--list` | flag（`dest=chat_list`） | `False` | 列出既有会话清单后退出（不进入对话） |
+| `--export` | str（`dest=chat_export`，metavar ID） | `None` | 把指定会话导出为 Markdown 后退出（不进入对话） |
+| `--max-chars` | int | `6000` | 知识抽取单子块字符预算（build/all）：超过即自动切块增量抽取 |
+| `--max-chunks` | int（metavar N） | `None` | 本次建库最多处理 N 个未命中缓存的新子块（缓存命中不占额度），达上限即停、重跑续跑 |
+| `--max-new-calls` | int（metavar N） | `None` | 本次视觉提取最多新调用 N 次（已缓存页不占额度），达上限即停、重跑续跑（控视觉模型成本） |
+| `--yes` | flag | `False` | 跳过建库前的规模预估确认（脚本 / 夜间批量自动放行） |
 
-- `messages` 是 LangGraph 累积通道（`Annotated[list[AnyMessage], add_messages]`，见
-  `agent/state.py`）：每轮提问以 `HumanMessage` 压入，生成节点把回答以 `AIMessage` 写回
-  （`agent/workflow.py` 各生成节点的返回值带 `messages` 字段）；checkpoint 每轮结束后把
-  整图状态快照（含 messages / history_summary / query / final_answer）落盘。
-- **恢复原理**：跨进程 / 崩溃续聊 = 用同一 `thread_id` 打开 saver → 取该会话最新
-  checkpoint 的 `channel_values` 重建状态 → 继续跑同一张图，无需手工拼历史。
-- **与知识库记忆的区别**：Chroma / 知识图谱记的是"教材内容"（跨会话恒定，所有人共用）；
-  checkpoint 记的是"这个会话聊了什么"（按 thread_id 隔离）。当前**不做**跨会话的
-  用户画像 / 长期偏好记忆（如需要按学生持久化画像，可在此结构上扩展）。
-- 三层 LLM 分工（`create_circuit_agent`）：意图判定（低温 / 128 token / 关思考，只出
-  一行 JSON）、最终讲解（默认思考 / 大 token 预算）、上下文摘要 `summary_llm`
-  （低温 / `_CHAT_SUMMARY_MAX_TOKENS=600` / 关思考）——摘要实例独立，不挤占讲解质量。
+> `--list` / `--export` 在 `main()` 里**先于 `--stage` 分发**处理，命中即执行并退出。
+> 不带任何参数运行 = 全部默认值（等价旧版硬编码流水线，便于快速回归）。
 
-#### 超过 LLM context limit 怎么解决（`manage_context` 节点）
+---
 
-图入口先经 `manage_context`（在意图判定**之前**），把喂给 LLM 的输入与总轮数解耦，
-保证单轮输入恒为有界：
-
-1. 把 `messages` 全部正文长度求和；未超过预算
-   `_CHAT_HISTORY_BUDGET_CHARS = 12000`（字符）时什么都不做；
-2. 超预算：从末尾往前保留消息直到预算，**保底保留最近 1 条（本轮提问）**，其余判为丢弃；
-3. 丢弃的消息渲染成「学生：… / 老师：…」交给 `summary_llm` 压缩；prompt 携带**旧摘要**
-   做**增量更新**（只增补 / 修正新要点），输出上限 600 token、每次覆盖写回
-   `history_summary`，避免摘要随轮数无限膨胀；
-4. 节点返回 `RemoveMessage` 列表删除被丢弃的旧消息 + 覆盖式新摘要；摘要 LLM 异常时
-   降级为"只删消息、保留旧摘要"（`log.warning` 留痕），不阻断主链路。
-
-随后每轮的意图判定 / 生成 / 闲聊 prompt 都注入【对话背景】= `history_summary` + 最近
-≤3000 字符的对话窗口（`_recent_context`，且去掉本轮提问本身），于是：
-
-- 隔轮 / 跨进程都能指代前文（"那第二题呢""刚才说的适用条件是什么"）；
-- 单次 LLM 输入 ≈ 有界背景 + 本轮检索资料 + 本轮提问 + 系统指令 → 会话可无限长；
-- 代价：被摘要的消息不再逐字保留（导出 md 会在头部标注"更早对话摘要"）。
-
-预算常量（`agent/workflow.py` 顶部）：`_CHAT_HISTORY_BUDGET_CHARS=12000`（保留窗口）、
-`_CHAT_SUMMARY_MAX_TOKENS=600`（单次摘要）、`_recent_context max_chars=3000`（注入窗口），
-均可按所选模型窗口大小调整。
-
-#### 一轮对话的完整数据流
+## 6. 目录结构与关键文件职责
 
 ```
-你 > 提问
- └─ inputs = {"query": 提问, "messages": [HumanMessage(提问)]}
-    config = {"configurable": {"thread_id": 会话ID}}      # 同一 id 即同一会话
-    agent.stream(inputs, config=config, stream_mode=["messages", "values"])
-     ├─ manage_context    超预算才截断 + 增量摘要（见上）
-     ├─ analyze_intent    注入背景 → JSON：subject / intent / concept / search_text
-     ├─ 路由 route_by_intent
-     │    ├─ concept      → graph_traversal → fetch_chunks → generate_response
-     │    ├─ find_problem → search_problems → generate_problem_response
-     │    └─ offtopic     → respond_chitchat
-     ├─ 生成节点用 llm.stream 流式产出（_stream_answer 内部拼回全文）
-     └─ 返回 AIMessage 追加进 messages → checkpointer 落盘 → 等待下一轮
+sida-agent/
+├── main.py                    # CLI 入口：argparse、stage 分发、规模预估/确认、TokenMeter、chat REPL、答案落盘
+├── config.py                  # LLM 配置：.env 读取、get_llm/get_vision_llm/get_reasoning_llm/get_embedding_model
+├── logger.py                  # 日志：控制台(INFO+) + 文件 output/sida_agent.log(DEBUG+) 双通道
+├── pdf_processor.py           # 阶段①：PDF 页 → Markdown（视觉提取、逐页缓存、重试/超时、_fix_math、_pdf_id）
+├── ingestion.py               # 阶段②：分块 + 两批抽取 + 滚动上下文 + 合并写库 + 审计 + 双库落盘（核心）
+├── chat_session.py            # chat 会话后端：SqliteSaver、会话清单/快照/导出 Markdown
+├── migrate_book_sources.py    # 一次性迁移脚本：为既有图谱回填 sources + 注册 PdfSource（零 LLM，硬编码历史 pdf_id）
+├── agent/
+│   ├── state.py               # LangGraph 状态定义（CircuitAgentState）
+│   └── workflow.py            # 阶段③：问答工作流（意图判定/图谱检索/回表/生成/搜题/闲聊/上下文压缩）
+├── storage/
+│   ├── graph_store.py         # ScienceGraphStore：node_key 规则、增删边、get_subgraph/章节聚合、模糊解析、合并、save/load
+│   └── vector_store.py        # get_vector_store：Chroma 持久化封装
+├── pyproject.toml             # 依赖与 Python 版本声明
+├── uv.lock                    # 锁定依赖版本
+├── .env                       # 模型服务配置（被 .gitignore 忽略，不入库）
+├── .python-version            # uv 使用的 Python 版本（3.11）
+└── output/                    # 运行产物（被 .gitignore 忽略）
+    ├── pdf_extract/{pdf_id}/p{页码}_v2.md   # 视觉逐页缓存
+    ├── extract_cache/{key}.json             # 抽取结果缓存
+    ├── vector_db/                           # Chroma 持久化向量库
+    ├── knowledge_graph.json                 # 图谱 JSON 快照
+    ├── answers/answer_{时间}_{学科}.md       # 单轮问答讲解
+    ├── chat/checkpoints.sqlite              # chat 会话检查点
+    ├── chat/exports/                        # chat 会话导出
+    └── sida_agent.log                       # 全量 DEBUG 日志
 ```
 
-#### 流式打印与存档（CLI 层，`main.py::_run_chat_repl`）
+### 关键第三方依赖（`pyproject.toml`，Python ≥ 3.11）
 
-- `stream_mode=["messages", "values"]` 双流并行：
-  - `messages` 流：生成节点 LLM 的逐 token 增量，按 `meta["langgraph_node"]` 过滤出
-    `generate_response` / `generate_problem_response` / `respond_chitchat` 三个生成节点，
-    delta 增量打印（`text.startswith(printed)` 去重，兼容部分后端"先增量块、再完整块"
-    的重复推送），实现"边生成边显示"；
-  - `values` 流：每个节点执行后的完整状态快照，取最后一份作为该轮 `final_answer`，
-    归一公式定界符后存 `output/answers/answer_*.md`。
-- 单轮 ask 与 chat 共用同一套流式打印逻辑（`main.py` 两处调用同一模式）。
+| 依赖 | 用途 |
+|---|---|
+| `pymupdf` | PDF 页面渲染成 PNG 供视觉模型 |
+| `langchain-openai` | 经 OpenAI 兼容端点调用视觉 / 推理模型（`ChatOpenAI`） |
+| `langchain-ollama` | 本地 Ollama 嵌入模型（`OllamaEmbeddings`） |
+| `langchain-chroma` / `chromadb` | 向量库持久化与检索 |
+| `langgraph` / `langgraph-checkpoint-sqlite` | 问答工作流状态机 + chat 会话检查点 |
+| `networkx` | 知识图谱（`DiGraph` + node_link JSON 读写） |
+| `langchain-core` / `openai` / `pydantic` | 消息 / 客户端 / 配置类型 |
+| `python-dotenv` | 读取 `.env` |
 
-#### 导出与会话管理
+---
 
-- `chat_session.py`：`open_saver()` 生命周期内保持单连接；`list_sessions()` 直接读
-  sqlite 统计（thread_id / 更新时间 / 轮数 / 首问）；`export_session_md` 读该会话最新
-  checkpoint 的 `messages` 通道按轮渲染——有摘要先列"更早对话摘要"，末尾悬空提问标注
-  "（该轮暂无回答）"，`\[…\]` / `\(…\)` 公式定界符归一为 `$$…$$` / `$…$`；
-  产物 `output/chat/exports/session_{id}_{ts}.md`。
-- 数据位置与清理：全部会话在同一 sqlite 文件（thread_id 维度），删除 `output/chat/`
-  即清空所有会话历史，不影响知识库双库与 `output/answers/`。
+## 7. 已知局限 / 待优化项
 
-### 测试 / 自检
+以下均来自本次代码走查读到的实际实现边界，非推测：
 
-项目暂无正式测试套件，常用冒烟方式：
+- **`--pdf` 默认值是开发机绝对路径**（`L:/vivi/...`），换机器不带 `--pdf` 会直接
+  `FileNotFoundError`。
+- **无自动化测试 / 冒烟脚本**：仓库内没有任何 `test_*.py` 或 smoke 脚本，正确性依赖
+  `output/sida_agent.log` 与人工核对。
+- **`TokenMeter` 只统计返回 usage 的调用**：`add()` 在 prompt 与 completion 都为 0 时
+  直接 `return`，若某后端不回传 usage，则该次不计入成本统计（`report` 会显示「无实际模型调用」）。
+- **规模预估对未提取页是估算**：未缓存页用平均页长占位预演切块，`_estimate_build` docstring
+  已注明「实际块数可能略有出入」，真实消耗以结束时 `TokenMeter` 为准。
+- **图谱每类关联实体默认截断 top-8**（`_DEFAULT_MAX_PER_KIND`）：命中「枢纽概念」
+  （如日志里 `欧姆定律` / `串联电路` 关联上百条例题）时，回表取原文的页数随之减少，
+  可能漏掉部分例题。
+- **`_audit_graph` 疑似重复检测有假阳性**：`difflib` 名称相似度会把语义相反的近义词判为重复
+  （日志实例：`纯电阻电路 ≈ 非纯电阻电路 (0.91)`），且只报告不自动合并，需人工 `merge_concepts`。
+- **空壳概念节点仍会存在**：`prerequisites` 前置引用会主动建无描述 Concept 占位（设计上允许），
+  审计会列出但不消除。
+- **`migrate_book_sources.py` 硬编码了两个历史 `pdf_id` → 教材名**（`3c62fbd6...`、`8babbb8e...`），
+  是一次性迁移脚本，不是常规功能，换数据集不适用。
+- **多轮对话预算按「字符」粗估**（`_CHAT_HISTORY_BUDGET_CHARS=12000`），非 token 口径，
+  中英混排下与实际上下文窗口占用会有偏差。
 
-```powershell
-# 全模块导入冒烟
-uv run python -c "import main, ingestion, pdf_processor, config, agent.workflow, storage.graph_store, storage.vector_store; print('ALL IMPORTS OK')"
+### 待确认清单（代码无法判断业务原因，不下结论）
 
-# 查看运行日志（控制台 INFO，文件 DEBUG）
-Get-Content output\sida_agent.log -Tail 50
-```
+- `SUBJECT_ANSWER_GUIDE` / 视觉 `PROMPT` 中若干提示词措辞的教学取舍依据，代码未注释原因。
+- `_EXTRACT_VERSION`（v2）与 `_EXTRACT_SCHEMA_VERSION`（v3）版本号不同步是否为有意设计
+  （两者分别管视觉页缓存与抽取结果缓存，代码未说明为何不统一）。
+- `EMBEDDING_BASE_URL` 示例端口在 `.env` 注释里写的是 `11636`（而非常见 `11434`），
+  是否为该环境的自定义端口——以用户实际 `.env` 为准。
 
-## 5. 重要目录与文件
+---
 
-| 路径 | 重要度 | 说明 |
-|---|---|---|
-| `main.py` | ★★★ | 流水线入口：提取 → 建库 → 问答 / 多轮对话；`--stage/--pdf/--start-page/--end-page/--subject/--max-chars/--max-chunks/--max-new-calls/--yes/--query` 参数化；`--stage chat` 多轮对话 REPL（`--session <id>` 续聊 / `--list` 列会话 / `--export <id>` 导出会话 md）；建库前打印规模预估并确认（`--yes` 跳过，`--max-new-calls` 截断后预估只亮本批真实量），结束打印两路真实 token 消耗，换材料无需改源码 |
-| `chat_session.py` | ★★ | chat 会话后端：SqliteSaver 连接与生命周期（`open_saver`）、会话清单（`list_sessions`）、最新 checkpoint 快照（`session_snapshot`）、会话导出 Markdown（`export_session_md`）；数据落 `output/chat/checkpoints.sqlite` |
-| `config.py` | ★★★ | 统一 LLM/Embedding 工厂；`.env` 中 base_url/key/model 在此生效 |
-| `ingestion.py` | ★★★ | 核心：自动切子块（`_split_into_chunks`）、滚动上下文注入（`_gather_known_context`）、两批串行抽取 prompt、逐子块抽取缓存与落盘、双库写入编排、幽灵节点/疑似重复审计 |
-| `agent/workflow.py` | ★★★ | LangGraph 问答工作流：学科 + 提问意图（问知识点 / 找题目 / 闲聊）判定 → concept 走图谱检索、按页码回表讲义页生成；find_problem 走整页讲义两级原文检索（逐字命中 + 语义兜底 bigram 重排）原题呈现；chat 模式 `manage_context` 上下文截断 + 增量摘要、`respond_chitchat` 闲聊直答、生成节点流式产出并写回会话历史（意图/摘要/讲解三 LLM 分调优、答案来源标注） |
-| `storage/graph_store.py` | ★★★ | `ScienceGraphStore` 图谱存储、`get_subgraph` 聚合检索（每类实体 top-N 截断）、概念锚点模糊解析、疑似重复概念合并（`merge_concepts`/`find_similar_concept`） |
-| `pdf_processor.py` | ★★ | PDF 页渲染 + 视觉模型提取 Markdown，逐页缓存于 `output/pdf_extract/` |
-| `storage/vector_store.py` | ★★ | Chroma 向量库初始化（collection `science_kb`，落盘 `output/vector_db/`） |
-| `agent/state.py` | ★ | Agent 状态 TypedDict：query / target_subject / 检索结果等 + chat 字段 `messages`（`add_messages` 累积通道）与 `history_summary`（截断旧对话的覆盖式摘要） |
-| `logger.py` | ★ | 控制台 + `output/sida_agent.log` 双通道日志 |
-| `.env` | ★★ | 模型服务配置（不入库）；`.env` 缺失或 key 为空时启动会给出指引报错 |
-| `output/` | — | 运行产物：日志、PDF 提取缓存（`pdf_extract/{pdf_id}/pXXXX_{ver}.md`）、抽取缓存（`extract_cache/{hash}.json`）、向量库（`vector_db/`）、图谱（`knowledge_graph.json`）、chat 会话库与导出（`chat/checkpoints.sqlite`、`chat/exports/`） |
+## 8. 常见问题（结合日志典型场景）
 
-## 6. 其它说明
+日志文件：`output/sida_agent.log`（DEBUG 全量，含时间戳 / 模块:行号）。每次进程启动写一条
+「新运行开始」分隔行。
 
-- PDF 提取缓存目录结构 `output/pdf_extract/{pdf_id}/p{页码}_{版本}.md`，`pdf_id` 为 PDF
-  内容 SHA-256 前 16 位，与姊妹项目 `knowledge_extract/extract_pdf` 同算法；文件名版本
-  取自 `pdf_processor._EXTRACT_VERSION`，调整 PROMPT、渲染分辨率或后处理时递增即可让
-  旧页缓存自动失效，无需手动删目录。
-- 双库均跨进程持久化：向量库落盘 `output/vector_db/`（Chroma PersistentClient），
-  图谱落盘 `output/knowledge_graph.json`（node_link JSON）。`build_knowledge_bases`
-  结束时自动 `save`，`main.py` 启动时 `ScienceGraphStore.load()` 自动载入。因此可
-  分次喂入不同学科/教材 PDF 持续累积成三科知识库，也可另起独立只读问答进程。
-- 清空知识库：删除 `output/vector_db/` 与 `output/knowledge_graph.json`；只删
-  `extract_cache`/`pdf_extract` 则下次重建重新走（缓存命中的）抽取流程。
-- 清空 chat 会话历史：删除 `output/chat/`（`checkpoints.sqlite` + `exports/`）即可；
-  知识库双库与 `output/answers/` 单轮讲解存档不受影响。
-- 向量写入以 `metadata.id` 为键幂等 upsert，重复重建不会在 Chroma 中累积重复切片；
-  修改抽取 schema 后请递增 `ingestion._EXTRACT_SCHEMA_VERSION` 使旧抽取缓存失效，
-  修改 PDF 提取 PROMPT/渲染参数/后处理后请递增 `pdf_processor._EXTRACT_VERSION`
-  使旧页缓存失效。
-- 图谱检索截断：`get_subgraph` 对公式/实验/题型/方法/例题每类默认返回 top-8
-  （`storage/graph_store._DEFAULT_MAX_PER_KIND`，调用时传 `max_per_kind=None` 关闭），
-  命中「枢纽概念」（关联几十条实体）时防止撑爆下游 prompt；examples 截断会连带
-  减少按页回表的讲义页数。
-- 多 LLM 分调优：`agent/workflow.py` 的意图判定、上下文摘要、最终讲解各用独立的
-  `get_reasoning_llm` 实例——判定走低温 / 小 `max_tokens` / 关思考（只输出一行 JSON，
-  短平快）；摘要（chat 上下文管理用）同样低温 / 600 token / 关思考；讲解保留默认思考
-  与大 token 预算（长输出），三者参数互不干扰。
-- 答案可追溯性：生成 prompt 注入「本次检索命中情况」（图谱命中与否 + 讲义命中页码），
-  输出规范要求模型对取自例题原文的内容标注「（见教材第 X 页）」、取自图谱各区块的标注
-  「（教材知识点，图谱收录）」（图谱实体抽取时不记页码，只能到图谱粒度）、自行补充的
-  学科知识另起「【补充说明·教材未涉及】」段；仅当图谱与讲义双双未命中时，才在正文开头
-  声明为通用讲解——避免无教材支撑的内容以同等自信误导学生 / 家长。
+- **启动报「配置不完整：请在 sida-agent/.env 设置 …」**
+  → `config.py` 的 `get_llm` / `get_embedding_model` 缺 `*_BASE_URL`/`*_MODEL`/`*_API_KEY`
+  或 `EMBEDDING_*`。按报错列出的变量名补齐 `.env` 并重启（`load_dotenv` 只在启动读一次）。
+
+- **Embedding 502 / 连不上**
+  → 确认 Ollama 服务在跑、`EMBEDDING_BASE_URL` 端口正确；`config.py` 已用
+  `client_kwargs={"trust_env": False}` 绕系统代理，若仍异常检查是否被代理软件拦截。
+
+- **`[workflow.fetch_chunks] 向量库未命中讲义页: physics:Page:...:11`**
+  → 该页讲义页切片不在向量库（多为对应页还没 `--stage build` 入库，或 `pdf_id` 变了导致键对不上）。
+  先对含该页的区间跑一次 build。
+
+- **`[graph_store] 图谱中不存在概念节点 …（模糊解析亦未命中）` + `概念节点未命中，尝试题型/方法锚点定位`**
+  → 意图 LLM 提炼的锚点在图谱里没有对应概念（如问了库中未收录的「地震波」）。属正常兜底路径，
+  若最终六区块全空，回答会按提示词输出「当前教材资料未收录…」——需要扩充建库。
+
+- **`[graph_store] … 关联 examples 共 94 条，截断至 top-8`**
+  → 命中枢纽概念，`get_subgraph` 按 `_DEFAULT_MAX_PER_KIND=8` 截断，讲解只覆盖部分例题，
+  属预期防 prompt 膨胀行为，不是错误。
+
+- **`[ingestion] 例题 … 的归属题型 … 不在本批题型中，全局图亦不存在，跳过挂边` / `… 的 TESTS 引用了不存在的概念，跳过` / `extra_relations 端点不是已抽取概念，跳过`**
+  → 抽取时模型引用了本批和全局图都不存在的实体名（跨子块命名漂移或模型杜撰）。系统**告警跳过、
+  不建幽灵节点**，图谱保持干净；如反复出现可考虑增大 `--max-chars` 让相关概念落在同一子块内抽取。
+
+- **`[ingestion] 审计: … 空壳概念节点` / `疑似重复概念对`**
+  → 建库后审计报告。空壳多为 `prerequisites` 前置引用；疑似重复是命名漂移。核对后可用
+  `graph_db.merge_concepts(subject, canonical=规范名, alias=冗余名)` 显式合并（会重定向关系并删除别名节点）。
+
+- **非交互终端跑 build 被拒绝**
+  → `_confirm_build` 检测到 `not sys.stdin.isatty()` 且预估有新调用时直接报错退出。
+  确认规模后加 `--yes`，或先用 `--start-page/--end-page/--max-chunks/--max-new-calls` 缩小本次范围。
+
+- **想清空重来**
+  → 删除 `output/vector_db` 与 `output/knowledge_graph.json`（双库）；如需连提取 / 抽取缓存一起清，
+  再删 `output/pdf_extract` 与 `output/extract_cache`。注意：删 `output/pdf_extract` 会导致下次重新调用
+  视觉模型（更贵）。
