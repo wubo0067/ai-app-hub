@@ -322,17 +322,25 @@ def create_circuit_agent(
         # 返回的 dict 里 concept 为 None 即表示图谱里根本没有这个概念节点）
         subgraph = graph_db.get_subgraph(subject, concept)
         if subgraph.get("concept") is None:
-            # 第二级兜底——锚点反查：意图 LLM 给出的 concept 可能并不是概念名，而是
-            # 题型名/方法名/例题名（如问"动态电路分析怎么做"，锚点其实是题型）。
-            # 此时按 题型 -> 方法 -> 例题 的优先级依次尝试把 concept 当作该类实体名
-            # 反查图谱（get_by_name 会顺带返回其相邻的 Concept 节点作为锚定概念），
-            # 一旦找到挂了 related_concept 的实体，就改用该概念重新做子图聚合并停止。
-            log.warning("[workflow.graph_traversal] 概念节点未命中，尝试题型/方法锚点定位")
-            for kind_alias in (K_QUESTION_TYPE, K_METHOD, K_EXAMPLE):
-                hit = graph_db.get_by_name(subject, kind_alias, concept)
-                if hit and hit.get("related_concept"):
-                    subgraph = graph_db.get_subgraph(subject, hit["related_concept"])
-                    break
+            # 第二级兜底——非概念实体锚点：意图 LLM 给出的 concept 可能不是概念名，
+            # 而是公式名/题型名/方法名（如问"三角函数的倍角公式"，锚点其实是公式）。
+            # 此时把锚点当作各类实体名依次解析，命中后以该实体为中心聚合其内容与
+            # 关联概念；这一级必须在旧的 get_by_name 反查之前——get_by_name 要求
+            # 实体已挂到概念上，而孤立公式（历史建库遗留的孤儿节点）恰恰挂不上，
+            # 会直接漏掉。
+            log.warning("[workflow.graph_traversal] 概念节点未命中，尝试实体锚点定位")
+            entity_sub = graph_db.get_entity_subgraph(subject, concept)
+            if entity_sub is not None:
+                subgraph = entity_sub
+            else:
+                # 第三级兜底——题型/方法/例题反查：实体名未直接命中时，按
+                # 题型 -> 方法 -> 例题 的优先级反查图谱（get_by_name 会顺带返回其
+                # 相邻 Concept 作为锚定概念），找到就改用该概念重新聚合。
+                for kind_alias in (K_QUESTION_TYPE, K_METHOD, K_EXAMPLE):
+                    hit = graph_db.get_by_name(subject, kind_alias, concept)
+                    if hit and hit.get("related_concept"):
+                        subgraph = graph_db.get_subgraph(subject, hit["related_concept"])
+                        break
         # 空壳概念重定位：锚点命中但自身内容贫瘠（无 description/breakdown）且未聚合到任何
         # 题型/例题，说明该节点多半是先修引用自动生成的"空壳"，真实内容（题型/例题）挂在
         # 1 跳先修/后续概念上；而子图检索的第二跳只沿题型/方法外扩、不会跨概念邻居，所以
@@ -647,8 +655,14 @@ def create_circuit_agent(
                 orig_label = "第 " + "、".join(map(str, pages_hit)) + " 页"
         else:
             orig_label = "无"
+        # "图谱命中"判据必须覆盖全部实体桶：非概念锚点（公式/题型/方法/例题）
+        # 命中时 concept/concepts 恒为空，若只看这两个会把命中误报成"未命中"，
+        # 模型随即按输出规范第 6 条拒答（问"三角函数的倍角公式"即踩此坑）。
+        graph_hit = bool(concept or concepts or g_ctx.get("formulas")
+                         or g_ctx.get("experiments") or g_ctx.get("question_types")
+                         or g_ctx.get("methods") or g_ctx.get("examples"))
         retrieval_status = (
-            f"知识图谱：{'命中' if (concept or concepts) else '未命中'}；"
+            f"知识图谱：{'命中' if graph_hit else '未命中'}；"
             f"讲义原文：{orig_label}"
         )
 
@@ -710,8 +724,11 @@ def create_circuit_agent(
      开头，只说明"该部分内容当前教材未收录"，不要补充具体知识；
    - 当检索命中情况显示图谱"未命中"且讲义原文为"无"时，不要作答，只输出一句：
      「当前教材资料未收录与该提问相关的知识点，无法基于教材作答。」
-   - 讲义原文为"无"但图谱命中时，图谱内容仍按上述"图谱收录"规则标注（有收录教材
-     信息则带上《教材名》），只是不得引用具体页码；宁可说明不确定，也不要编造页码。
+   - 图谱"命中"即表示上述六个区块中至少有一个含实际内容：此时必须基于这些区块
+     作答，不得因为【知识点定位】为空（提问锚点是公式/题型名而非概念名时属正常）
+     就判定为未收录；讲义原文为"无"时，图谱内容仍按上述"图谱收录"规则标注（有
+     收录教材信息则带上《教材名》），只是不得引用具体页码；宁可说明不确定，
+     也不要编造页码。
 """
         response = _stream_answer(answer_llm, final_prompt)
         log.info("[workflow.generate_response] 解答生成完成, 长度=%d 字符", len(response))

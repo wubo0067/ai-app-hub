@@ -578,6 +578,25 @@ def _ensure_entity(graph_db: ScienceGraphStore, subject: str, kind: str,
     return key
 
 
+# 引用解析的候选节点种类：related_concepts 字段名义上填「概念名」，但 LLM 实测
+# 常填兄弟实体名（公式/题型/方法等）。按此顺序逐个精确查找，Concept 优先。
+_REF_KINDS = (K_CONCEPT, K_FORMULA, K_EXPERIMENT, K_QUESTION_TYPE, K_METHOD, K_EXAMPLE)
+
+
+def _resolve_ref_key(graph_db: ScienceGraphStore, subject: str,
+                     ref: str) -> Optional[Tuple[str, str]]:
+    """把一个引用名解析为已存在的节点键与种类；不存在返回 None。
+
+    只做精确匹配、不新建节点：引用指向未抽取的内容时宁可跳过，也不制造
+    同名空壳（防幽灵节点）。
+    """
+    for kind in _REF_KINDS:
+        key = node_key(subject, kind, ref)
+        if key in graph_db.graph:
+            return key, kind
+    return None
+
+
 def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any], *,
                  pdf_id: Optional[str] = None) -> None:
     """把抽取出的实体与关系写入图库（核心编排逻辑）。
@@ -626,24 +645,53 @@ def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any]
                 graph_db.relate(pre_key, REL_PREREQUISITE_OF,
                                 node_key(subject, K_CONCEPT, name))
 
-    def _link_concept_refs(refs: Any, rel: str, key: str) -> None:
-        """把 related_concepts 等引用转成概念节点出/入边；引用不存在的概念
-        告警跳过，不新建同名空壳（防幽灵节点）。"""
+    def _link_concept_refs(refs: Any, rel: str, key: str,
+                           co_occur_concepts: List[str]) -> None:
+        """把 related_concepts 等引用转成节点出/入边；引用不存在的节点告警跳过，
+        不新建同名空壳（防幽灵节点）。
+
+        引用名按 _REF_KINDS 跨种类解析：LLM 常把该字段填成「兄弟公式名」
+        （如二倍角公式 → 两角和的正弦公式），若只认 Concept，这些引用会被
+        整体丢弃，公式节点随即成为无任何边的孤儿——图谱里看得见、检索链路
+        永远走不到（get_subgraph 只从概念节点出发）。非概念引用改用补充关系
+        连边，保住节点连通性。
+        """
         for ref in refs or []:
             ref = str(ref).strip()
             if not ref:
                 continue
-            ckey = node_key(subject, K_CONCEPT, ref)
-            if ckey not in graph_db.graph:
-                log.warning("[ingestion] %s 的 %s 引用了不存在的概念，跳过: %s",
+            resolved = _resolve_ref_key(graph_db, subject, ref)
+            if resolved is None:
+                log.warning("[ingestion] %s 的 %s 引用了不存在的节点，跳过: %s",
                             bare_name(key), rel, ref)
                 continue
+            ref_key, ref_kind = resolved
+            if ref_kind != K_CONCEPT:
+                # 兄弟实体（公式↔公式等）：按补充关系连边，避免孤儿节点
+                graph_db.relate(key, REL_EXTRA, ref_key)
+                continue
             if rel == REL_TRACES_TO:      # 题型 -> 概念（溯源）
-                graph_db.relate(key, rel, ckey)
+                graph_db.relate(key, rel, ref_key)
             elif rel == REL_HAS_FORMULA or rel == REL_HAS_EXPERIMENT or rel == REL_HAS_METHOD:
-                graph_db.relate(ckey, rel, key)
+                graph_db.relate(ref_key, rel, key)
             elif rel == REL_TESTS:        # 例题 -> 概念
-                graph_db.relate(key, rel, ckey)
+                graph_db.relate(key, rel, ref_key)
+
+        # 共现兜底：实体一个概念邻居都没有时（引用全是兄弟实体或整段为空），
+        # 按「同块共现」挂到本块声明的概念上，保证每个实体都能从概念出发被检索到。
+        if co_occur_concepts:
+            has_concept_nb = any(
+                graph_db.graph.nodes[nb].get("type") == K_CONCEPT
+                for nb in set(graph_db.graph.successors(key))
+                | set(graph_db.graph.predecessors(key)))
+            if not has_concept_nb:
+                linked = [c for c in co_occur_concepts
+                          if node_key(subject, K_CONCEPT, c) in graph_db.graph]
+                for cname in linked:
+                    graph_db.relate(node_key(subject, K_CONCEPT, cname),
+                                    REL_EXTRA, key)
+                log.info("[ingestion] %s 无概念邻居，按同块共现挂到 %d 个概念: %s",
+                         bare_name(key), len(linked), "、".join(linked[:5]))
 
     # --- 公式 / 实验 / 方法（概念 -> 实体）---
     for f in data.get("formulas", []):
@@ -656,7 +704,8 @@ def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any]
                              applicable_scope=f.get("applicable_scope", ""),
                              derivation=list(f.get("derivation", [])),
                              **({"sources": list(src_list)} if src_list else {}))
-        _link_concept_refs(f.get("related_concepts"), REL_HAS_FORMULA, key)
+        _link_concept_refs(f.get("related_concepts"), REL_HAS_FORMULA, key,
+                           concept_names)
 
     for e in data.get("experiments", []):
         name = e.get("name", "").strip()
@@ -671,7 +720,8 @@ def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any]
                              diagram=e.get("diagram", ""),
                              exam_focus=list(e.get("exam_focus", [])),
                              **({"sources": list(src_list)} if src_list else {}))
-        _link_concept_refs(e.get("related_concepts"), REL_HAS_EXPERIMENT, key)
+        _link_concept_refs(e.get("related_concepts"), REL_HAS_EXPERIMENT, key,
+                           concept_names)
 
     for m in data.get("methods", []):
         name = m.get("name", "").strip()
@@ -681,7 +731,8 @@ def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any]
                              scope=m.get("scope", ""),
                              steps=list(m.get("steps", [])),
                              **({"sources": list(src_list)} if src_list else {}))
-        _link_concept_refs(m.get("related_concepts"), REL_HAS_METHOD, key)
+        _link_concept_refs(m.get("related_concepts"), REL_HAS_METHOD, key,
+                           concept_names)
 
     # --- 题型（溯源到考点概念）---
     qt_keys: Dict[str, str] = {}
@@ -695,7 +746,8 @@ def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any]
                              traps=list(qt.get("traps", [])),
                              **({"sources": list(src_list)} if src_list else {}))
         qt_keys[name] = key
-        _link_concept_refs(qt.get("related_concepts"), REL_TRACES_TO, key)
+        _link_concept_refs(qt.get("related_concepts"), REL_TRACES_TO, key,
+                           concept_names)
 
     # --- 例题（题型/方法 -> 例题，例题 -> 概念）---
     for i, ex in enumerate(data.get("examples", []), start=1):
@@ -737,7 +789,8 @@ def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any]
                                 "全局图亦不存在，跳过挂边", ex_name, qt_name)
             if qt_key is not None:
                 graph_db.relate(qt_key, REL_EXEMPLIFIED_BY, ex_key)
-        _link_concept_refs(ex.get("related_concepts"), REL_TESTS, ex_key)
+        _link_concept_refs(ex.get("related_concepts"), REL_TESTS, ex_key,
+                           concept_names)
 
     # --- 补充关系：两端必须是已抽取的概念节点，禁止新建同名空壳（防幽灵节点）---
     for r in data.get("extra_relations", []):

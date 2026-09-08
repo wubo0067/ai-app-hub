@@ -58,12 +58,29 @@ _CONCEPT_SUFFIXES = (
 # difflib 模糊兜底的相似度阈值
 _FUZZY_THRESHOLD = 0.6
 
+# 非概念实体（公式/题型/方法）的 difflib 兜底阈值。中文短名的 difflib 过于宽松
+# （"锐角三角函数" 会以 0.667 误命中公式 "特殊角三角函数值表"），故收紧到 0.8；
+# 学生把公式名念长一截的情形由双向包含兜住，不依赖调低阈值。
+_FUZZY_THRESHOLD_ENTITY = 0.8
+
+# 「同族实体」批量解析：用于锚点是集合名词的场景（提问"两角和公式"→ 图谱里其实是
+# "两角和的正弦公式/余弦公式/正切公式"多条）。判据为「被 >=2 个候选名共享、且出现在
+# 锚点中的最长前缀」，比 difflib 更有判别力：既能命中"三角函数的两角和公式"这类改写，
+# 又不会把"两角差的正弦公式"（前缀只被一条共享）误拉成族。
+_FAMILY_MIN_LEN = 3
+
 # get_subgraph 每类关联实体的默认返回上限：命中"枢纽概念"（关联几十条公式/例题）时
 # 截断至 top-N，防止下游问答 prompt 被撑爆；None 表示不限。
 _DEFAULT_MAX_PER_KIND = 8
 
 # 存储时不需要入检索/向量回表的实体类型
 _RETRIEVABLE = (K_CONCEPT, K_FORMULA, K_EXPERIMENT, K_QUESTION_TYPE, K_METHOD, K_EXAMPLE)
+
+# 实体种类 -> get_subgraph 结果里的桶名（非概念实体聚合时按此归位）
+_BUCKET_OF = {
+    K_FORMULA: "formulas", K_EXPERIMENT: "experiments",
+    K_QUESTION_TYPE: "question_types", K_METHOD: "methods", K_EXAMPLE: "examples",
+}
 
 # 图谱默认持久化文件（JSON node_link 格式），支持跨进程累积与独立只读问答。
 _DEFAULT_GRAPH_PATH = str(
@@ -123,6 +140,42 @@ def node_key(subject: str, kind: str, name: str) -> str:
 def bare_name(node_key_: str) -> str:
     """去掉 `subject:Kind:` 前缀，还原展示用名称。"""
     return node_key_.split(":", 2)[-1]
+
+
+# 各类实体在检索结果中的字段映射：kind -> {输出字段: (节点属性, 是否列表)}
+_PAYLOAD_FIELDS = {
+    K_FORMULA: {"name": (None, False), "expression": ("expression", False),
+                "symbols": ("symbols", True), "applicable_scope": ("applicable_scope", False),
+                "derivation": ("derivation", True), "sources": ("sources", True)},
+    K_EXPERIMENT: {"name": (None, False), "purpose": ("purpose", False),
+                   "apparatus": ("apparatus", True), "steps": ("steps", True),
+                   "phenomenon": ("phenomenon", False), "conclusion": ("conclusion", False),
+                   "diagram": ("diagram", False), "exam_focus": ("exam_focus", True),
+                   "sources": ("sources", True)},
+    K_QUESTION_TYPE: {"name": (None, False), "identify_features": ("identify_features", True),
+                      "template": ("template", True), "traps": ("traps", True),
+                      "sources": ("sources", True)},
+    K_METHOD: {"name": (None, False), "scope": ("scope", False),
+               "steps": ("steps", True), "sources": ("sources", True)},
+    K_EXAMPLE: {"id": (None, False), "title": ("title", False),
+                "question_type": ("question_type", False), "source": ("source", False),
+                "pdf_id": ("pdf_id", False)},
+}
+
+
+def _entity_payload(kind: str, key: str, nd: dict) -> dict:
+    """按种类把节点属性整成检索结果条目（字段集合见 _PAYLOAD_FIELDS）。
+
+    name/id 取节点键的裸名：例题的裸名即向量库 metadata["id"]，供回表取原题全文。
+    """
+    out: dict = {}
+    for field, (attr, is_list) in _PAYLOAD_FIELDS[kind].items():
+        if attr is None:
+            out[field] = bare_name(key)
+        else:
+            val = nd.get(attr, [])
+            out[field] = list(val) if is_list else val
+    return out
 
 
 class ScienceGraphStore:
@@ -234,18 +287,32 @@ class ScienceGraphStore:
         return info
 
     def _resolve_concept(self, subject: str, name: str) -> Optional[str]:
-        """概念锚点模糊解析：去教学修饰尾缀 -> 双向包含 -> difflib 相似度兜底。
+        """概念锚点模糊解析（见 _resolve_entity，限定 Concept 种类）。"""
+        return self._resolve_entity(subject, name, (K_CONCEPT,))
+
+    def _resolve_entity(self, subject: str, name: str, kinds: tuple,
+                        *, ratio_threshold: float = _FUZZY_THRESHOLD,
+                        allow_suffix: bool = False) -> Optional[str]:
+        """实体锚点模糊解析：去教学修饰尾缀 -> 包含/后缀近似 -> difflib 兜底。
 
         意图判定 LLM 输出的锚点名常带"分析/思路/方法"等修饰（如
         "可变电路的分析思路"被缩成"可变电路分析"），与图谱概念名
-        （如"可变电路"）不完全一致。本方法在同科 Concepts 中逐步放宽
-        匹配口径，返回命中的概念名；找不到返回 None。
+        （如"可变电路"）不完全一致。本方法在同科指定种类中逐步放宽
+        匹配口径，返回命中的实体名；找不到返回 None。
+
+        ratio_threshold：difflib 兜底阈值。非概念实体传入更高阈值，因为中文
+        短名的 difflib 过于宽松（"锐角三角函数" 会以 0.667 误命中公式
+        "特殊角三角函数值表"）。
+        allow_suffix：允许「后缀近似」——学生把实体名念长一截时（"三角函数的
+        倍角公式" 与节点名 "二倍角公式" 只差首字），仅靠包含判定抓不住。
+        该判据只在锚点尾部与节点名高度重合时成立，不会像覆盖率那样把
+        "锐角三角函数" 误配到 "特殊角三角函数值表"。
         """
         if not name:
             return None
         candidates = [
             bare_name(n) for n, nd in self.graph.nodes(data=True)
-            if nd.get("subject") == subject and nd.get("type") == K_CONCEPT
+            if nd.get("subject") == subject and nd.get("type") in kinds
         ]
         if not candidates:
             return None
@@ -255,20 +322,88 @@ class ScienceGraphStore:
                 trimmed = name[:-len(suffix)]
                 if trimmed in candidates:
                     return trimmed
-        # 2) 双向包含（锚点名与节点名互为子串），取相似度最高者
-        contained = [
-            cand for cand in candidates
-            if len(cand) >= 2 and len(name) >= 2 and (cand in name or name in cand)
-        ]
+
+        # 2) 双向包含 / 后缀近似，取相似度最高者
+        def _near(cand: str) -> bool:
+            if len(cand) < 2 or len(name) < 2:
+                return False
+            if cand == name:
+                return True
+            # 泛词锚点（"公式""方法"等 2 字集合名词）与任何含该词的节点都构成包含
+            # 关系，会把"公式"误配到"二倍角公式"；真包含要求双方至少 3 字才有区分度。
+            if len(cand) < 3 or len(name) < 3:
+                return False
+            if cand in name or name in cand:
+                return True
+            if not allow_suffix:
+                return False
+            # 锚点尾部或节点名尾部互为近似（仅差首字）
+            return ((len(cand) >= 3 and name.endswith(cand[1:]))
+                    or (len(name) >= 3 and cand.endswith(name[1:])))
+
+        contained = [cand for cand in candidates if _near(cand)]
         if contained:
             return max(contained, key=lambda c: difflib.SequenceMatcher(None, name, c).ratio())
+
         # 3) difflib 相似度兜底（覆盖同义改写等场景）
         best, best_ratio = None, 0.0
         for cand in candidates:
             ratio = difflib.SequenceMatcher(None, name, cand).ratio()
             if ratio > best_ratio:
                 best, best_ratio = cand, ratio
-        return best if best_ratio >= _FUZZY_THRESHOLD else None
+        return best if best_ratio >= ratio_threshold else None
+
+    def _resolve_entity_family(self, subject: str, name: str, kinds: tuple
+                               ) -> Dict[str, List[str]]:
+        """把「集合名词锚点」解析成一族实体名，按种类分组返回。
+
+        场景：学生问"两角和公式"（两角和的正弦、余弦、正切），图谱里没有任何叫
+        "两角和公式"的节点，只有"两角和的正弦公式""两角和的余弦公式"等若干条。
+        此时单点解析必然落空（每条与锚点的 difflib 只有 0.769，低于实体阈值 0.8），
+        需要按「同族」把整批相关实体一次捞回。
+
+        判据：在同科候选名里找出**被至少两个候选共享、且出现在锚点中**的最长前缀
+        （如"两角和"），该前缀开头的候选即同一族。这一判据既能命中
+        "两角和公式"、"三角函数的两角和公式"、"两角和的正弦、余弦、正切公式"
+        等写法，又天然排除单条相近节点（"两角差的正弦公式" 的"两角差"只被一条
+        共享，故不触发族展开，交回单点精确/模糊解析）。
+        """
+        name = (name or "").strip()
+        if len(name) < _FAMILY_MIN_LEN:
+            return {}
+        grouped: Dict[str, List[str]] = {}
+        for kind in kinds:
+            cands = [bare_name(nid) for nid, nd in self.graph.nodes(data=True)
+                     if nd.get("subject") == subject and nd.get("type") == kind]
+            if len(cands) < 2:
+                continue
+            # 统计候选名的前缀出现次数（只看长度 >= 2 的前缀）
+            prefix_count: Dict[str, int] = {}
+            for cand in cands:
+                for i in range(2, len(cand)):
+                    prefix_count[cand[:i]] = prefix_count.get(cand[:i], 0) + 1
+            # 取「共享 >= 2 次」且出现在锚点中的族标记：优先取在锚点中位置最靠后的
+            # （越靠后越具体——"三角函数的两角和公式" 里 "两角和" 比泛化的 "三角函数" 更
+            # 能定位族），同位置再取更长的
+            token, token_pos = "", -1
+            for pfx, cnt in prefix_count.items():
+                if cnt < 2:
+                    continue
+                pos = name.rfind(pfx)
+                if pos < 0:
+                    continue
+                if pos > token_pos or (pos == token_pos and len(pfx) > len(token)):
+                    token, token_pos = pfx, pos
+            if len(token) < _FAMILY_MIN_LEN:
+                continue
+            hits = [c for c in cands if c.startswith(token)]
+            if len(hits) >= 2:
+                grouped[kind] = hits
+                log.debug("[graph_store] 族标记 %r 命中 %d 个 %s", token, len(hits), kind)
+        if grouped:
+            log.info("[graph_store] 集合名词锚点 %r 解析为同族实体: %s", name,
+                     {k: len(v) for k, v in grouped.items()})
+        return grouped
 
     # ------------------------------------------------------------ 概念合并
     def find_similar_concept(self, subject: str, name: str,
@@ -469,49 +604,104 @@ class ScienceGraphStore:
                 "sources": list(nd.get("sources", [])),
             })
         for key, nd in _capped("formulas", hop_buckets[K_FORMULA]):
-            result["formulas"].append({
-                "name": bare_name(key),
-                "expression": nd.get("expression", ""),
-                "symbols": list(nd.get("symbols", [])),
-                "applicable_scope": nd.get("applicable_scope", ""),
-                "derivation": list(nd.get("derivation", [])),
-                "sources": list(nd.get("sources", [])),
-            })
+            result["formulas"].append(_entity_payload(K_FORMULA, key, nd))
         for key, nd in _capped("experiments", hop_buckets[K_EXPERIMENT]):
-            result["experiments"].append({
-                "name": bare_name(key),
-                "purpose": nd.get("purpose", ""),
-                "apparatus": list(nd.get("apparatus", [])),
-                "steps": list(nd.get("steps", [])),
-                "phenomenon": nd.get("phenomenon", ""),
-                "conclusion": nd.get("conclusion", ""),
-                "diagram": nd.get("diagram", ""),
-                "exam_focus": list(nd.get("exam_focus", [])),
-                "sources": list(nd.get("sources", [])),
-            })
+            result["experiments"].append(_entity_payload(K_EXPERIMENT, key, nd))
         for key, nd in _capped("question_types", hop_buckets[K_QUESTION_TYPE]):
-            result["question_types"].append({
-                "name": bare_name(key),
-                "identify_features": list(nd.get("identify_features", [])),
-                "template": list(nd.get("template", [])),
-                "traps": list(nd.get("traps", [])),
-                "sources": list(nd.get("sources", [])),
-            })
+            result["question_types"].append(_entity_payload(K_QUESTION_TYPE, key, nd))
         for key, nd in _capped("methods", hop_buckets[K_METHOD]):
-            result["methods"].append({
-                "name": bare_name(key),
-                "scope": nd.get("scope", ""),
-                "steps": list(nd.get("steps", [])),
-                "sources": list(nd.get("sources", [])),
-            })
+            result["methods"].append(_entity_payload(K_METHOD, key, nd))
         for key, nd in _capped("examples", hop_buckets[K_EXAMPLE]):
-            result["examples"].append({
-                "id": key,  # 与向量库 metadata["id"] 一致，供回表取原题全文
-                "title": nd.get("title", ""),
-                "question_type": nd.get("question_type", ""),
-                "source": nd.get("source", {}),
-                "pdf_id": nd.get("pdf_id", ""),  # 例题所在 PDF（回表组键用）
-            })
+            result["examples"].append(_entity_payload(K_EXAMPLE, key, nd))
+        return result
+
+    def get_entity_subgraph(self, subject: str, name: str,
+                            kinds: tuple = (K_FORMULA, K_QUESTION_TYPE, K_METHOD, K_EXAMPLE),
+                            max_per_kind: Optional[int] = _DEFAULT_MAX_PER_KIND
+                            ) -> Optional[Dict[str, Any]]:
+        """以非概念实体（公式/题型/方法/例题）为锚点做检索。
+
+        场景：学生问的是一条例式（"三角函数的倍角公式"），图谱里它本身是
+        Formula 节点而非 Concept，概念入口必然落空。此时把该实体自身内容
+        放入对应桶，再沿 1 跳邻居把关联概念、兄弟实体、例题一并捞回，
+        保证「知识在库里却检索不到」不再发生。
+
+        锚点解析：
+        1. 精确命中单点（最省、最准）——"二倍角公式"直接返回该节点；
+        2. 未精确命中时，合并「单点模糊解析」（念长一截/同义改写，如
+           "三角函数的倍角公式" -> "二倍角公式"）与「同族展开」（集合名词，
+           如 "两角和公式" -> 图谱里"两角和的正弦/余弦/正切公式"若干条）两路结果，
+           保证既不漏单条、也不漏整族。
+        找不到任何实体时返回 None，由调用方继续下一级兜底。
+        """
+        anchors: List[Tuple[str, str]] = []
+        for kind in kinds:
+            key = node_key(subject, kind, name)
+            if key in self.graph:
+                anchors.append((key, kind))
+        if anchors:
+            return self._build_entity_result(subject, name, anchors, max_per_kind)
+        for kind in kinds:
+            resolved = self._resolve_entity(subject, name, (kind,),
+                                            ratio_threshold=_FUZZY_THRESHOLD_ENTITY,
+                                            allow_suffix=True)
+            if resolved is not None:
+                anchors.append((node_key(subject, kind, resolved), kind))
+        for kind, names in self._resolve_entity_family(subject, name, kinds).items():
+            anchors += [(node_key(subject, kind, n), kind) for n in names]
+        if not anchors:
+            return None
+        return self._build_entity_result(subject, name, anchors, max_per_kind)
+
+    def _build_entity_result(self, subject: str, name: str,
+                             anchors: List[Tuple[str, str]],
+                             max_per_kind: Optional[int]) -> Dict[str, Any]:
+        """以若干非概念实体为锚点聚合检索结果（锚点自身入桶 + 1 跳邻居 + 2 跳例题）。"""
+        result: Dict[str, Any] = {
+            "subject": subject, "concept": None, "prerequisites": [],
+            "follow_ups": [], "related_concepts": [], "formulas": [],
+            "experiments": [], "question_types": [], "methods": [], "examples": [],
+        }
+        seen: set = set()
+        for key, kind in anchors:
+            if key in seen:
+                continue
+            seen.add(key)
+            result[_BUCKET_OF[kind]].append(_entity_payload(kind, key, self.graph.nodes[key]))
+        # 1 跳邻居：概念进关联桶（供下游标注「关联概念」），非概念进各自桶
+        for key, _kind in anchors:
+            for nb in list(self.graph.successors(key)) + list(self.graph.predecessors(key)):
+                if nb in seen:
+                    continue
+                seen.add(nb)
+                nd = self.graph.nodes[nb]
+                t = nd.get("type")
+                if t == K_CONCEPT:
+                    result["related_concepts"].append({
+                        "name": bare_name(nb),
+                        "description": nd.get("description", ""),
+                        "relation": self.graph.get_edge_data(nb, key, {}).get("relation")
+                        or self.graph.get_edge_data(key, nb, {}).get("relation") or REL_EXTRA,
+                        "sources": list(nd.get("sources", [])),
+                    })
+                elif t in _BUCKET_OF and t != K_CONCEPT:
+                    result[_BUCKET_OF[t]].append(_entity_payload(t, nb, nd))
+        # 2 跳：沿题型/方法取挂载例题
+        for qt_key in [n for n in seen
+                       if self.graph.nodes[n].get("type") in (K_QUESTION_TYPE, K_METHOD)]:
+            for ex_key in self.graph.successors(qt_key):
+                if ex_key in seen or self.graph.nodes[ex_key].get("type") != K_EXAMPLE:
+                    continue
+                seen.add(ex_key)
+                result["examples"].append(
+                    _entity_payload(K_EXAMPLE, ex_key, self.graph.nodes[ex_key]))
+        for bucket in ("formulas", "experiments", "question_types", "methods", "examples"):
+            if max_per_kind is not None and len(result[bucket]) > max_per_kind:
+                result[bucket] = result[bucket][:max_per_kind]
+        log.info("[graph_store] 非概念锚点 %s 命中 %d 个实体，聚合到 公式 %d/题型 %d/"
+                 "方法 %d/例题 %d", name, len(anchors), len(result["formulas"]),
+                 len(result["question_types"]), len(result["methods"]),
+                 len(result["examples"]))
         return result
 
     # ----------------------------------------------------------- 章节级检索
