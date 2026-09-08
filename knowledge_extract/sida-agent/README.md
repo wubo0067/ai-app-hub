@@ -187,16 +187,58 @@ LangGraph 状态机（`create_circuit_agent` 编译），节点：
 
 ### 3.8 多轮对话与会话持久化（`chat_session.py` + `workflow.manage_context`）
 
-- `--stage chat` 用 `open_saver()` 打开 **SqliteSaver**（纯同步后端），
-  落盘 `output/chat/checkpoints.sqlite`；每轮以 `{"configurable": {"thread_id": sid}}`
-  调 `agent.stream`，消息按 `thread_id` 逐轮持久化，可随时 `Ctrl+C` / `/exit` 后
-  `--session <id>` 续聊。
+chat 模式**没有自建对话表**，保存职责完全交给 LangGraph 的 **checkpointer** 机制，
+落盘为单个 SQLite 文件。三层机制分别是：
+
+**① 对话保存 = LangGraph Checkpointer 快照（`chat_session.open_saver`）**
+
+```
+main.py --stage chat
+  └─ with open_saver() as saver:                     # 单连接包住整个 REPL 生命周期
+       agent = create_circuit_agent(..., checkpointer=saver)   # workflow.compile(checkpointer=...)
+       └─ 每轮：config = {"configurable": {"thread_id": sid}}
+                agent.stream({"messages": [HumanMessage(提问)]}, config)
+```
+
+- `agent.stream` 带上 `thread_id` 后，LangGraph 在**每个节点执行完**把整个图状态
+  （`channel_values`：`messages`、`history_summary`、意图、检索结果等）序列化成一个
+  checkpoint 写入 `output/chat/checkpoints.sqlite`——每问一句磁盘上就多一层快照，
+  随时 `Ctrl+C` / `/exit` 都不丢已完成轮次。
+- `messages` 是**累积通道**（add 语义）：新一轮提问与各生成节点回写的 AIMessage 逐轮追加；
+  下一轮执行前 checkpointer 自动恢复全部历史消息，模型因此「记得」之前聊过什么。
+- **续聊 = 复用 thread_id**：`--session s-xxxx` 只是把既有 id 传进 config，
+  LangGraph 自动从 sqlite 取该 thread 最新 checkpoint 恢复状态，无需手工加载。
+- 读取快照不依赖 `SqliteSaver.list` 的顺序承诺：`_latest_tuple` 遍历该会话全部
+  checkpoint 按 `ts` 取最大；`--list` 用只读 SQL `SELECT DISTINCT thread_id FROM checkpoints`
+  列会话；`/export` 从最新快照同时取 `messages` 与 `history_summary` 导出 Markdown。
 - REPL 内置命令：`/exit` `/quit` `/q` `退出` `再见`、`/new`、`/export`、`/list`、
   `/session <id>`、`/help`。会话 id 形如 `s-` + uuid 前 12 位（`_new_thread_id`）。
-- **上下文压缩**（`manage_context_node`）：`messages` 累计字符超 `_CHAT_HISTORY_BUDGET_CHARS=12000`
-  时，从末尾往回保留最近消息（保底保留本轮提问），被丢弃的旧对话经 `summary_llm`
-  增量压缩进 `history_summary`（`RemoveMessage` 删旧消息）。摘要失败不阻断主链路，保留旧摘要继续。
-  后续节点以「对话背景」形式注入摘要 + 最近窗口，保证每次 LLM 输入有界。
+
+**② 超预算压缩 = 会话内记忆管理（`manage_context_node`）**
+
+图的入口第一个节点即 `manage_context`（START → manage_context → analyze_intent）：
+
+- `messages` 累计字符超 `_CHAT_HISTORY_BUDGET_CHARS=12000` 时，从末尾往回保留最近消息
+  （保底保留本轮提问），被丢弃的旧消息返回 `RemoveMessage(id=...)` **从通道里真删掉**
+  （下一轮 checkpoint 里就不再有它们）；
+- 被删的对话经独立的 `summary_llm` **增量压缩**进 `history_summary` 通道（同样被
+  checkpointer 持久化）；摘要失败只记 warning、保留旧摘要继续，不阻断主链路；
+- 后续检索 / 生成节点把 `history_summary` 以「对话背景」形式注入 prompt，
+  保证每次 LLM 输入有界。
+- 因此**磁盘上的会话记录 = 未截断的最近消息 + 更早对话的摘要**，两者都在 checkpoint 里，
+  `/export` 时摘要置于导出文件头部。
+
+**③ 对应 Agent memory 模型的哪一层**
+
+| Agent memory 概念 | 本项目对应物 | 性质 |
+|---|---|---|
+| 短期记忆（thread 级会话记忆） | checkpointer 持久化的 `messages` 通道 | 快照式逐轮落盘，`thread_id` 隔离 |
+| 上下文窗口管理（summarization memory） | `manage_context` 预算截断 + `history_summary` 增量摘要 | 会话内压缩记忆 |
+| 长期记忆（跨会话） | **无对话式长期记忆**；跨会话持久层是教材知识库（图谱 + 向量库） | RAG 语料，来自 PDF 建库而非对话 |
+
+注意第三行：换一个 `thread_id` 后，新会话只能用到双库知识，**不会**检索或继承旧会话
+聊过什么（旧会话仅能靠 `--session` 续聊或 `/export` 取回）。单轮模式（`ask`/`all`）
+不传 checkpointer，完全无对话记忆，只把答案存 `output/answers/*.md`。
 
 ### 3.9 成本 / 资源控制（`main.py`）
 
