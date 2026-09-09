@@ -12,6 +12,10 @@
   再由推理模型提炼成概念 / 公式 / 实验 / 题型 / 例题 / 方法等教研实体。
 - **答案能指到教材第几页**：例题正文不由模型抄写，而是在抽取时记下出处页码，
   问答时按页码回向量库取讲义原文，生成的讲解里标注「（见《教材名》第 X 页）」。
+- **问公式名 / 集合名词也能命中**：提问的锚点未必是概念名——可能是公式名
+  （「三角函数的倍角公式」）、也可能是一族实体的统称（「两角和公式」= 正弦/余弦/正切
+  三条）。检索链路对锚点做「精确 → 模糊 → 同族展开」三级解析，把整族内容一次捞回，
+  避免「知识在库里却答未收录」（见 3.8）。
 - <span style="color:red">**三科共享一套双库、可反复累积**：同一份图谱 + 向量库可被物理 / 化学 / 数学、
   多本不同 PDF 多次灌入；同名概念按「越建越全」合并，不同书的同页码 / 同题号靠
   `pdf_id` 前缀隔离，互不覆盖。</span>
@@ -153,6 +157,18 @@ flowchart TD
 - 防幽灵节点：`_write_graph` 里 `extra_relations` / `related_concepts`（经 `_link_concept_refs`）/
   例题 `question_type` 引用不存在的概念时**告警跳过、不盲建空壳**（例外：`prerequisites`
   仍用 `_ensure_entity` 建占位 Concept，作为跨 PDF 分次累积的合理前向声明）。
+- **防孤儿节点（`_resolve_ref_key` 跨种类解析）**：`related_concepts` 名义上填「概念名」，
+  但 LLM 实测常填**兄弟实体名**（如「二倍角公式」→「两角和的正弦公式」）。早期只认
+  `Concept`，这类引用被整体丢弃，公式节点随即成为无任何边的**孤儿**——图谱里看得见、
+  检索链路永远走不到（`get_subgraph` 只从概念节点出发）。现按 `_REF_KINDS`
+  （Concept → Formula → Experiment → QuestionType → Method → Example）**逐个精确查找**，
+  Concept 优先；命中非 Concept 时改用补充关系 `REL_EXTRA` 连边，保住连通性。
+  仍然只做精确匹配、不新建节点（防幽灵与防孤儿两个目标同时成立）。
+- **同块共现兜底**：某实体一个概念邻居都没有时（引用全是兄弟实体、或整段为空），
+  按「同块共现」挂到**本块声明的**概念上（`REL_EXTRA`），保证每个实体都能从概念出发被
+  检索到。日志：`[ingestion] 二倍角公式 无概念邻居，按同块共现挂到 2 个概念: …`。
+  这两项是 3.8 实体锚点检索的**数据前提**：即便仍有历史遗留孤儿，`get_entity_subgraph`
+  也能直接从实体入口命中，不再依赖它是否挂上了概念。
 
 ### 3.7 检索与问答链路（`agent/workflow.py`）
 
@@ -164,11 +180,16 @@ LangGraph 状态机（`create_circuit_agent` 编译），节点：
 - **`analyze_intent`**：一次低温短输出 LLM 调用（`temperature=0.0`、`max_tokens=128`、关思考），
   判定 `{subject, intent, concept, search_text}`；`intent` 三选一 `concept`/`find_problem`/`offtopic`。
   解析用 `_parse_intent`（非标准 JSON 时退回正则提取字段；任何回退到 `physics` 都记 warning）。
-- **`graph_traversal`（concept 链路）三级兜底**：
+- **`graph_traversal`（concept 链路）四级兜底**：
   1. 概念名直接命中 → `get_subgraph` 做 1~2 跳聚合（`_resolve_concept` 内部还有一次
      去教学尾缀 → 双向包含 → `difflib≥0.6` 的模糊解析）；
-  2. 锚点其实是题型 / 方法 / 例题名 → `get_by_name` 反查相邻 Concept 再聚合；
-  3. 命中的是**空壳概念**（无 description/breakdown 且聚合不到题型 / 例题）→
+  2. 返回的 `concept` 为 `None`（图谱里根本没有这个概念节点）→ 把锚点当**非概念实体名**
+     解析：`get_entity_subgraph` 以公式 / 题型 / 方法 / 例题名为入口聚合（见 **「3.8 实体锚点
+     解析与集合名词同族展开」**）。这一级必须排在旧的 `get_by_name` 之前——`get_by_name`
+     要求实体已挂到概念上，历史建库遗留的**孤儿公式节点**恰恰挂不上，会直接漏掉；
+  3. 实体名仍未命中 → 按 题型 → 方法 → 例题 的优先级 `get_by_name` 反查其相邻 Concept，
+     改用该概念重新聚合；
+  4. 命中的是**空壳概念**（无 description/breakdown 且聚合不到题型 / 例题）→
      阶段一按提问原文在 1 跳邻居概念里挑字面命中的内容枢纽重定向；无命中则阶段二用
      `resolve_chapter`（剥教学语气词 + 章节主题词互含判定）做**整章聚合**
      `get_chapter_subgraph` 兜底。
@@ -185,7 +206,97 @@ LangGraph 状态机（`create_circuit_agent` 编译），节点：
   由 `generate_problem_response` 在整页原文里定位目标题、原题呈现并简析。
 - **`respond_chitchat`（offtopic）**：不触发任何检索，一两句轻量回应并引导回学习。
 
-### 3.8 多轮对话与会话持久化（`chat_session.py` + `workflow.manage_context`）
+### 3.8 实体锚点解析与集合名词同族展开（`storage/graph_store.py`）
+
+**要解决的问题**：意图 LLM 提炼出的锚点，未必是图谱里的 Concept 名。实测三类高频失配——
+
+| 提问锚点 | 图谱里的真实节点 | 为什么概念入口落空 |
+|---|---|---|
+| `三角函数的倍角公式` | `Formula:二倍角公式` | 它是**公式**不是概念；且比节点名多了首字 |
+| `两角和公式` | `Formula:两角和的正弦公式`<br/>`两角和的余弦公式` / `正切公式` … | 锚点是**一族实体的统称**，库里根本没有这个名字 |
+| `锐角三角函数` | `QuestionType:锐角三角函数的定义` 等 | 内容挂在题型上，`Concept:锐角三角函数` 无邻居 |
+
+`get_entity_subgraph(subject, name, kinds=(Formula, QuestionType, Method, Example))`
+以非概念实体为入口做检索，锚点解析按「**精确 → 单点模糊 → 同族展开**」推进：
+
+**① 精确同名**：逐个 `kind` 拼 `node_key` 查图，命中即聚合，最准也最省。
+
+**② 单点模糊解析（`_resolve_entity`）**：概念与实体共用同一套三级放宽，靠参数区分口径。
+
+```
+1) 剥教学修饰尾缀（_CONCEPT_SUFFIXES：分析/思路/方法/讲解…）后精确命中
+2) _near() 双向包含 / 后缀近似，取 difflib 最高者
+3) difflib 相似度兜底，阈值 ratio_threshold
+```
+
+两个关键约束（都是踩坑后收紧的）：
+
+- **阈值分档**：概念用 `_FUZZY_THRESHOLD=0.6`，非概念实体用 `_FUZZY_THRESHOLD_ENTITY=0.8`。
+  中文短名的 `difflib` 过于宽松——「锐角三角函数」会以 **0.667** 误配到公式
+  「特殊角三角函数值表」，实体口径必须收紧。
+- **泛词长度闸门**：`_near()` 的真包含判定要求候选名与锚点**双方 ≥3 字**。否则 2 字集合名词
+  （「公式」「方法」）与任何含该词的节点都构成包含关系，会把「公式」误配到「二倍角公式」。
+  完全同名（`cand == name`）不受此限制。
+- **`allow_suffix=True`（仅实体路径开启）**：允许「后缀近似」——只差首字的写法
+  （`三角函数的倍角公式` ↔ `二倍角公式`）靠包含抓不住，用
+  `name.endswith(cand[1:])` / `cand.endswith(name[1:])` 兜住；该判据只在尾部高度重合时
+  成立，不会像覆盖率那样把「锐角三角函数」误配到「特殊角三角函数值表」。
+
+**③ 同族展开（`_resolve_entity_family`）**：处理集合名词。单点相似度在这里必然失效——
+`difflib("两角和公式", "两角和的正弦公式") = 0.769 < 0.8`，而阈值又不能降（见上）。
+改用**结构判据**：
+
+```
+在同科同 kind 的候选名里统计各前缀（长度 ≥2）的出现次数
+→ 取「被 ≥2 个候选共享」且出现在锚点中的前缀作族标记
+→ 多个候选标记时，优先取在锚点中位置最靠后的（越靠后越具体）
+→ 标记长度 ≥ _FAMILY_MIN_LEN=3 且命中 ≥2 条，才认定成族
+```
+
+- 「两角和」被 5 条公式共享 → 一次捞回整族；
+- 「两角差的正弦公式」的「两角差」只被 1 条共享 → **不触发**族展开，交回单点解析，天然排除；
+- 位置最靠后优先，是为了防止 `三角函数的两角和公式` 被泛化的「三角函数」劫持
+  （「三角函数」前缀虽共享，但定位能力远弱于「两角和」）。
+
+②③ 的结果**合并**成锚点集合（不是短路取第一个），保证既不漏单条、也不漏整族。
+
+**④ 聚合（`_build_entity_result`）**：把任意多个锚点摊平进与 `get_subgraph` **同构**的
+结果字典（下游 `fetch_chunks` / `generate_response` 无需分支）：
+
+```
+锚点自身          → 按 _BUCKET_OF 归入 formulas/question_types/methods/examples
+1 跳邻居（出+入）  → Concept 进 related_concepts（带 relation），其余按 _BUCKET_OF 归桶
+2 跳              → 沿题型/方法取挂载的 Example
+各桶按 max_per_kind（默认 _DEFAULT_MAX_PER_KIND=8）截断
+```
+
+日志形如：`非概念锚点 三角函数的两角和公式 命中 8 个实体，聚合到 公式 8/题型 3/方法 0/例题 5`。
+
+**⑤ 命中判据必须覆盖全部区块（`generate_response`）**：这是「库里明明有、却回答未收录」的
+**直接原因**。`retrieval_status` 早期只看 `concept or concepts`，而非概念锚点命中时这两个字段
+恒为 `None` → 状态被判成「未命中」→ 模型严格按输出规范第 6 条拒答。现改为六桶全查：
+
+```python
+graph_hit = bool(concept or concepts or g_ctx.get("formulas")
+                 or g_ctx.get("experiments") or g_ctx.get("question_types")
+                 or g_ctx.get("methods") or g_ctx.get("examples"))
+```
+
+并在输出规范里补一句：图谱「命中」即表示六区块至少一个含实际内容，此时**必须**基于这些
+区块作答，不得因【知识点定位】为空（锚点是公式/题型名而非概念名时属正常）就判定未收录。
+
+**实测**（图谱 1235 节点 / 3331 边）：
+
+| 锚点 | 聚合结果 |
+|---|---|
+| `两角和公式` | 公式 8 |
+| `两角和的正弦、余弦、正切公式` | 公式 7 |
+| `三角函数的两角和公式` | 公式 8 / 题型 3 / 例题 5 |
+| `三角函数的倍角公式` | 公式 1 / 题型 3 / 例题 5 |
+| `锐角三角函数` | 题型 4 / 例题 7 |
+| `量子纠缠` / `公式` | `None`（正确判为未命中） |
+
+### 3.9 多轮对话与会话持久化（`chat_session.py` + `workflow.manage_context`）
 
 chat 模式**没有自建对话表**，保存职责完全交给 LangGraph 的 **checkpointer** 机制，
 落盘为单个 SQLite 文件。三层机制分别是：
@@ -240,7 +351,7 @@ main.py --stage chat
 聊过什么（旧会话仅能靠 `--session` 续聊或 `/export` 取回）。单轮模式（`ask`/`all`）
 不传 checkpointer，完全无对话记忆，只把答案存 `output/answers/*.md`。
 
-### 3.9 成本 / 资源控制（`main.py`）
+### 3.10 成本 / 资源控制（`main.py`）
 
 - **规模预估（干跑）**：`_estimate_build` 只读逐页缓存 + 本地统计，**不调任何模型**，
   按与真实运行相同顺序遍历页，算出视觉侧（已缓存页 / 需新调用 / 因 `--max-new-calls` 被截断的剩余页）
@@ -254,7 +365,7 @@ main.py --stage chat
   取 input/output tokens；建库结束 `_report_meters` 打印视觉 / 推理两路。**服务端未返回 usage
   的调用不计入**（见「已知局限」）。
 
-### 3.10 双库持久化（`storage/`）
+### 3.11 双库持久化（`storage/`）
 
 - **向量库**（`storage/vector_store.get_vector_store`）：`Chroma`，collection 默认 `science_kb`，
   `persist_directory` 默认 `output/vector_db`（PersistentClient 自动落盘 / 加载，显式传 `None` 回退内存库）。
@@ -381,7 +492,7 @@ sida-agent/
 │   ├── state.py               # LangGraph 状态定义（CircuitAgentState）
 │   └── workflow.py            # 阶段③：问答工作流（意图判定/图谱检索/回表/生成/搜题/闲聊/上下文压缩）
 ├── storage/
-│   ├── graph_store.py         # ScienceGraphStore：node_key 规则、增删边、get_subgraph/章节聚合、模糊解析、合并、save/load
+│   ├── graph_store.py         # ScienceGraphStore：node_key 规则、增删边、get_subgraph/get_entity_subgraph/章节聚合、实体+同族模糊解析、合并、save/load
 │   └── vector_store.py        # get_vector_store：Chroma 持久化封装
 ├── pyproject.toml             # 依赖与 Python 版本声明
 ├── uv.lock                    # 锁定依赖版本
@@ -464,9 +575,19 @@ sida-agent/
   → 该页讲义页切片不在向量库（多为对应页还没 `--stage build` 入库，或 `pdf_id` 变了导致键对不上）。
   先对含该页的区间跑一次 build。
 
-- **`[graph_store] 图谱中不存在概念节点 …（模糊解析亦未命中）` + `概念节点未命中，尝试题型/方法锚点定位`**
-  → 意图 LLM 提炼的锚点在图谱里没有对应概念（如问了库中未收录的「地震波」）。属正常兜底路径，
-  若最终六区块全空，回答会按提示词输出「当前教材资料未收录…」——需要扩充建库。
+- **`[graph_store] 图谱中不存在概念节点 …（模糊解析亦未命中）` + `概念节点未命中，尝试实体锚点定位`**
+  → 意图 LLM 提炼的锚点不是概念名，属正常兜底路径。接下来看日志：
+  - 出现 `集合名词锚点 … 解析为同族实体` / `非概念锚点 … 命中 N 个实体` → 已被
+    实体锚点级救回（见 3.8），正常作答；
+  - 四级兜底走完、六区块仍全空 → 库里确实没有（如问了未收录的「地震波」），
+    回答按提示词输出「当前教材资料未收录…」，需要扩充建库。
+
+- **提问明明在讲义里（如「两角和公式」），却回答「未收录」**
+  → 先查 `output/sida_agent.log` 的 `[workflow.graph_traversal] 命中: 公式 N …`。
+  若 `公式 N` 非 0 而回答仍拒答，说明命中判据或输出规范被改坏（见 3.8 ⑤：
+  `graph_hit` 必须覆盖六桶，只看 `concept` 会把命中误报成未命中）；
+  若 `公式 0` 且日志有 `解析为同族实体: {}`，是锚点与节点名结构上无共享前缀，
+  属解析能力边界，考虑补建库或调整 `--subject`。
 
 - **`[graph_store] … 关联 examples 共 94 条，截断至 top-8`**
   → 命中枢纽概念，`get_subgraph` 按 `_DEFAULT_MAX_PER_KIND=8` 截断，讲解只覆盖部分例题，
