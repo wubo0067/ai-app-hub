@@ -17,7 +17,7 @@ import difflib
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import networkx as nx
 from networkx.readwrite import json_graph
@@ -69,6 +69,16 @@ _FUZZY_THRESHOLD_ENTITY = 0.8
 # 又不会把"两角差的正弦公式"（前缀只被一条共享）误拉成族。
 _FAMILY_MIN_LEN = 3
 
+# 锚点中的角度数字（"15°、22.5°三角函数值" -> ["15°","22.5°"]）。度数是比共享前缀
+# 更强的族判别信号：真实题型/公式名常带修饰前缀（"非特殊角（15°/22.5°）三角函数的
+# 几何构造法" 不以 "三角函数" 开头，前缀判族抓不住），只要候选名含锚点度数即同族。
+_DEGREE_RE = re.compile(r"\d+(?:\.\d+)?°")
+
+# 锚点相关性排序用的「判别 token」：角度数字、连续中文、连续西文（长度 >=2）。
+# top-N 截断前按 token 命中数降序排（稳定排序，同分保持插入序），保证与提问直接
+# 相关的实体（锚点 "18°三角函数" 之于公式 "18°角的正弦值"）不被截掉。
+_ANCHOR_TOKEN_RE = re.compile(r"\d+(?:\.\d+)?°|[A-Za-z]+|[\u4e00-\u9fff]+")
+
 # get_subgraph 每类关联实体的默认返回上限：命中"枢纽概念"（关联几十条公式/例题）时
 # 截断至 top-N，防止下游问答 prompt 被撑爆；None 表示不限。
 _DEFAULT_MAX_PER_KIND = 8
@@ -80,6 +90,13 @@ _RETRIEVABLE = (K_CONCEPT, K_FORMULA, K_EXPERIMENT, K_QUESTION_TYPE, K_METHOD, K
 _BUCKET_OF = {
     K_FORMULA: "formulas", K_EXPERIMENT: "experiments",
     K_QUESTION_TYPE: "question_types", K_METHOD: "methods", K_EXAMPLE: "examples",
+}
+
+# 概念级下钻：概念 -> 挂载实体 的出边关系（题型反向通过 TRACES_TO 入边挂在概念上）。
+# 用于把「兄弟概念」名下的实体一并捞回（见 ScienceGraphStore._drill_concept_entities）。
+_DRILL_OUT_REL = {
+    K_FORMULA: REL_HAS_FORMULA, K_EXPERIMENT: REL_HAS_EXPERIMENT,
+    K_METHOD: REL_HAS_METHOD,
 }
 
 # 图谱默认持久化文件（JSON node_link 格式），支持跨进程累积与独立只读问答。
@@ -161,6 +178,24 @@ _PAYLOAD_FIELDS = {
                 "question_type": ("question_type", False), "source": ("source", False),
                 "pdf_id": ("pdf_id", False)},
 }
+
+
+def _anchor_tokens(name: str) -> List[str]:
+    """从锚点名提取判别 token（角度数字 / 连续中文 / 连续西文，长度 >=2）。"""
+    return [t for t in _ANCHOR_TOKEN_RE.findall(name or "") if len(t) >= 2]
+
+
+def _node_relevance(item: Any, tokens: List[str]) -> int:
+    """条目与锚点 token 的相关性 = 命中的 token 数。兼容 (key, nd) 与 payload dict。"""
+    if isinstance(item, tuple):
+        key, nd = item
+        parts = [bare_name(key), nd.get("title", ""),
+                 nd.get("question_type", ""), nd.get("expression", "")]
+    else:
+        parts = [item.get("name", ""), item.get("id", ""), item.get("title", ""),
+                 item.get("question_type", ""), item.get("expression", "")]
+    text = " ".join(str(p) for p in parts if p)
+    return sum(1 for tk in tokens if tk in text)
 
 
 def _entity_payload(kind: str, key: str, nd: dict) -> dict:
@@ -286,6 +321,43 @@ class ScienceGraphStore:
                 info[k_] = v_
         return info
 
+    def _drill_concept_entities(self, concept_keys: List[str],
+                                seen_keys: set) -> List[tuple]:
+        """从给定概念各取一层挂载实体，返回新发现的 [(node_key, kind)]（并入 seen）。
+
+        **为什么需要**：公式/方法/题型只直接挂在**所属概念**上，而检索入口概念常常
+        只是它的**兄弟概念**（锚点 "18°三角函数" 被模糊解析到 "锐角三角函数"，而
+        18° 公式挂在 "特殊角的三角函数" 名下）。原先的二跳只沿题型/方法取例题，
+        不会跨概念邻居，所以这类实体在图上看得见、检索链路永远走不到。
+
+        取边口径与一跳一致：出边 HAS_FORMULA/HAS_EXPERIMENT/HAS_METHOD，
+        入边 TRACES_TO（题型 -TRACES_TO-> 概念，反向即该题型的考点在本概念）。
+        结果**排在调用方已有实体之后**，配合 _capped 的相关性稳定排序：锚点有
+        token 命中时相关实体被顶到前面，无命中时保持"自身实体优先"的原行为。
+        """
+        found: List[tuple] = []
+        for ck in concept_keys:
+            if ck not in self.graph:
+                continue
+            for nb in self.graph.successors(ck):
+                if nb in seen_keys:
+                    continue
+                t = self.graph.nodes[nb].get("type")
+                if not t or _DRILL_OUT_REL.get(t) != self.graph[ck][nb].get("relation"):
+                    continue
+                seen_keys.add(nb)
+                found.append((nb, t))
+            for nb in self.graph.predecessors(ck):
+                if nb in seen_keys:
+                    continue
+                if self.graph.nodes[nb].get("type") != K_QUESTION_TYPE:
+                    continue
+                if self.graph[nb][ck].get("relation") != REL_TRACES_TO:
+                    continue
+                seen_keys.add(nb)
+                found.append((nb, K_QUESTION_TYPE))
+        return found
+
     def _resolve_concept(self, subject: str, name: str) -> Optional[str]:
         """概念锚点模糊解析（见 _resolve_entity，限定 Concept 种类）。"""
         return self._resolve_entity(subject, name, (K_CONCEPT,))
@@ -398,8 +470,24 @@ class ScienceGraphStore:
                 continue
             hits = [c for c in cands if c.startswith(token)]
             if len(hits) >= 2:
-                grouped[kind] = hits
+                grouped.setdefault(kind, []).extend(hits)
                 log.debug("[graph_store] 族标记 %r 命中 %d 个 %s", token, len(hits), kind)
+        # 度数判族：锚点含角度数字（"15°、22.5°三角函数值"）时，候选名**任意位置**
+        # 出现该度数即同族。前缀判族要求 startswith，抓不住带修饰前缀的真实节点
+        # （"非特殊角（15°/22.5°）三角函数的几何构造法" 以"非特殊角"开头）；
+        # 度数是比泛词前缀强得多的判别信号，单条命中也算（不像前缀判族需 >=2）。
+        degrees = _DEGREE_RE.findall(name)
+        if degrees:
+            for kind in kinds:
+                cands = [bare_name(nid) for nid, nd in self.graph.nodes(data=True)
+                         if nd.get("subject") == subject and nd.get("type") == kind]
+                hits = [c for c in cands
+                        if any(d in c for d in degrees)
+                        and c not in grouped.get(kind, [])]
+                if hits:
+                    grouped.setdefault(kind, []).extend(hits)
+                    log.debug("[graph_store] 度数标记 %s 命中 %d 个 %s",
+                              degrees, len(hits), kind)
         if grouped:
             log.info("[graph_store] 集合名词锚点 %r 解析为同族实体: %s", name,
                      {k: len(v) for k, v in grouped.items()})
@@ -505,6 +593,7 @@ class ScienceGraphStore:
             "examples": [],
         }
         ckey = node_key(subject, K_CONCEPT, concept_name)
+        anchor_name = concept_name  # 原始锚点（模糊解析会覆盖 concept_name，token 排序要用它）
         if ckey not in self.graph:
             resolved = self._resolve_concept(subject, concept_name)
             if resolved is not None:
@@ -566,6 +655,16 @@ class ScienceGraphStore:
             elif t in _RETRIEVABLE:
                 hop_buckets[t].append((nb, nd))
 
+        # 概念级下钻：入口概念常常只是目标实体的"兄弟概念"（锚点 "18°三角函数"
+        # 模糊解析到 "锐角三角函数"，而 18° 公式挂在兄弟概念 "特殊角的三角函数" 上）。
+        # 从 1 跳的后续/关联概念各再取一层挂载实体，让这类"图上看得见、二跳走不到"
+        # 的公式/方法/题型进入候选；下钻结果追加在自身实体之后，配合 _capped 相关性
+        # 稳定排序，同分时自身优先，不会稀释原本命中的内容。先修概念不下钻（通常更基础）。
+        for nb, t in self._drill_concept_entities(
+                [k for k, _ in concept_followup] + [k for k, _, _ in concept_related],
+                seen_keys):
+            hop_buckets[t].append((nb, self.graph.nodes[nb]))
+
         # 2 跳：沿题型/方法节点取挂载例题（EXEMPLIFIED_BY）
         for kind in (K_QUESTION_TYPE, K_METHOD):
             for nb, nd in hop_buckets[kind]:
@@ -577,7 +676,15 @@ class ScienceGraphStore:
 
         # ---- 归类输出
         def _capped(kind: str, items: List[Any]) -> List[Any]:
-            """按 max_per_kind 截断某类实体，命中枢纽概念时记 warning。"""
+            """按锚点相关性排序后再截断某类实体，命中枢纽概念时记 warning。
+
+            排序键 = 与锚点 token 的命中数（降序，稳定）：枢纽概念截断到 top-N 时，
+            先保住与提问直接相关的实体（"18°三角函数" 之于 "18°角的正弦值"），
+            再按原顺序保留其余。锚点无 token 命中（如整章聚合）时退化为原截断行为。
+            """
+            tokens = _anchor_tokens(anchor_name)
+            if tokens:
+                items = sorted(items, key=lambda it: -_node_relevance(it, tokens))
             if max_per_kind is not None and len(items) > max_per_kind:
                 log.warning("[graph_store] %s 关联 %s 共 %d 条，截断至 top-%d",
                             ckey, kind, len(items), max_per_kind)
