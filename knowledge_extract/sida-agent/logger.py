@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """日志模块：控制台 + 文件双通道输出。
 
-- 控制台：默认 INFO 及以上，消息尾部附 [源码文件名:行号]，便于定位调用点。
+- 控制台：默认 INFO 及以上，消息头部附时间（时:分:秒），尾部附 [源码文件名:行号]，便于定位调用点。
 - 文件：output/sida_agent.log，记录 DEBUG 及以上（含时间戳/级别/模块名:行号），
   完整保留流水线细节，便于事后调试与问题定位。
 - 每次进程启动会在日志文件里写入一条 "新运行" 分隔行，区分不同次的运行。
@@ -21,9 +21,10 @@ from pathlib import Path
 LOG_DIR = Path(__file__).resolve().parent / "output"   # 日志目录（项目根下 output/）
 LOG_FILE = LOG_DIR / "sida_agent.log"                  # 日志文件路径
 
-_CONSOLE_FMT = "%(message)s  [%(filename)s:%(lineno)d]"
+_CONSOLE_FMT = "%(asctime)s %(message)s  [%(filename)s:%(lineno)d]"
 _FILE_FMT = "%(asctime)s | %(levelname)-7s | %(name)s.%(module)s:%(lineno)d | %(message)s"
 _DATE_FMT = "%Y-%m-%d %H:%M:%S"
+_CONSOLE_DATE_FMT = "%H:%M:%S"
 
 _LEVELS = {
     "debug": logging.DEBUG,
@@ -58,7 +59,7 @@ def get_logger(level: int = logging.INFO) -> logging.Logger:
 
         console_handler = logging.StreamHandler()
         console_handler.setLevel(level)
-        console_handler.setFormatter(logging.Formatter(_CONSOLE_FMT))
+        console_handler.setFormatter(logging.Formatter(_CONSOLE_FMT, _CONSOLE_DATE_FMT))
 
         log.addHandler(file_handler)
         log.addHandler(console_handler)
