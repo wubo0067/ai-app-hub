@@ -265,9 +265,10 @@ def create_circuit_agent(
         except Exception:  # 摘要失败不阻断主链路：保留旧摘要继续走
             log.warning("[workflow.manage_context] 摘要生成失败，保留原摘要",
                         exc_info=True)
-            return {"messages": [RemoveMessage(id=m.id) for m in dropped
-                                 if getattr(m, "id", None)]}
-        removals = [RemoveMessage(id=m.id) for m in dropped if getattr(m, "id", None)]
+            return {"messages": [RemoveMessage(id=mid) for m in dropped
+                                 if (mid := getattr(m, "id", None))]}
+        removals = [RemoveMessage(id=mid) for m in dropped
+                    if (mid := getattr(m, "id", None))]
         log.info("[workflow.manage_context] 摘要完成 %d 字", len(new_summary))
         return {"messages": removals, "history_summary": new_summary}
 
