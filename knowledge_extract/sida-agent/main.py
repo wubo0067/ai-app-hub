@@ -25,6 +25,7 @@
     uv run python main.py --stage chat --session s-xxxx # 续聊既有会话（--list 查看 id）
     uv run python main.py --stage chat --list       # 只列会话清单
     uv run python main.py --stage chat --export s-xxxx # 把会话导出为 Markdown
+    uv run python main.py --list-books              # 列出已导入的教材书名后退出
 --stage: all=提取+建库+问答（默认）；build=仅提取并累加进双库；ask=仅复用已持久化双库问答；
         chat=多轮对话 REPL（内置 /new /export /session /list 等命令，Ctrl+C 退出，
         会话历史按 thread_id 持久化到 output/chat/checkpoints.sqlite，超预算自动压缩进摘要）。
@@ -124,6 +125,8 @@ def parse_args() -> argparse.Namespace:
                         help="chat：列出既有会话清单后退出（不进入对话）。")
     parser.add_argument("--export", dest="chat_export", default=None, metavar="ID",
                         help="chat：把指定会话导出为 Markdown 后退出（不进入对话）。")
+    parser.add_argument("--list-books", dest="list_books", action="store_true",
+                        help="列出已导入双库的教材书名后退出（不执行任何阶段）。")
     parser.add_argument("--max-chars", type=int, default=_CHUNK_MAX_CHARS_DEFAULT,
                         help="知识抽取单子块字符预算（build/all）：输入页超过预算即自动"
                              "切块增量抽取，避免整本书一次喂给推理 LLM 超上下文。")
@@ -206,6 +209,17 @@ def _print_sessions() -> None:
         log.info("  %s | 更新 %s | %d 轮 | %s",
                  s["thread_id"], s["updated_at"][:19].replace("T", " "),
                  s["turns"], s["first_question"] or "（无文字提问）")
+
+
+def _print_books() -> None:
+    """--list-books：打印已登记进图谱库的教材书名清单（PdfSource 注册表）。"""
+    names = ScienceGraphStore.load().pdf_names()
+    if not names:
+        log.info("[main] 暂无已导入教材（build 阶段建库时自动登记）")
+        return
+    log.info("[main] 已导入教材（共 %d 本）:", len(names))
+    for pdf_id, name in sorted(names.items(), key=lambda kv: (kv[1], kv[0])):
+        log.info("  《%s》 (%s)", name or "（未命名）", pdf_id)
 
 
 def _run_chat_repl(saver: Any, agent: Any, initial_session: Optional[str]) -> None:
@@ -495,7 +509,10 @@ def main() -> None:
     # 视觉 VISION_* / 推理 REASONING_* / Embedding OPENAI_*
     args = parse_args()
 
-    # ---- chat 快捷子模式（不依赖双库，先行处理） ----
+    # ---- 快捷子模式（不依赖向量库，先行处理） ----
+    if args.list_books:
+        _print_books()
+        return
     if args.chat_list:
         _print_sessions()
         return
