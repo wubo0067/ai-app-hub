@@ -1,3 +1,16 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Author: calm.wu wubo0067@hotmail.com
+Date: 2026-09-03 11:01:07
+LastEditors: calm.wu wubo0067@hotmail.com
+LastEditTime: 2026-09-14 20:26:44
+FilePath: sida-agent/agent/state.py
+Description: 定义 Agent 工作流状态的类型。
+
+Copyright (c) 2026 by calm.wu, All Rights Reserved.
+"""
+
 from typing import Annotated, Any, Dict, List, Optional, TypedDict
 
 from langchain_core.messages import AnyMessage
