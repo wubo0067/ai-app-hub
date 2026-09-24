@@ -50,6 +50,9 @@ class AgentState(MessagesState):
     vmlinux_path: str
     # 第三方内核调试符号路径列表，用于在缺少主符号时补充符号解析能力。
     debug_symbol_paths: Sequence[str]
+    # 分析报告输出语言："eng"（默认）或 "zh"。
+    # 为 "zh" 时在系统提示词中注入中文输出规则，使报告正文为简体中文。
+    report_language: str
 
     # 当前图执行的累计分析步数。
     # 该字段通过 operator.add 聚合，适合在多个节点返回增量值后自动累加。

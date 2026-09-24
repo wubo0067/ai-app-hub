@@ -312,6 +312,10 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
         force_conclusion=force_conclusion,
     )
     system_prompt += "\n\n" + build_executor_state_section(state)
+    if str(state.get("report_language", "eng")).lower() == "zh":
+        from .prompt_builder import CHINESE_REPORT_RULE
+
+        system_prompt += "\n\n" + CHINESE_REPORT_RULE
 
     # 只发送最小上下文：系统提示 + 待结构化的 reasoning 文本
     messages_to_send = [

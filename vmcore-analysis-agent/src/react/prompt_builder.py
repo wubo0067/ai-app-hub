@@ -16,6 +16,33 @@ from .prompts import build_minimal_schema_enum_contract
 from .schema import CrashSignatureClass, GateEntry, Hypothesis, VMCoreLLMAnalysisStep
 
 
+# 中文报告输出规则：仅当 state["report_language"] == "zh" 时注入到系统提示词。
+# 要求所有自由文本字段用简体中文书写，同时保留技术标识符与枚举值的英文形式，
+# 以免破坏 schema 校验与证据可追溯性。
+CHINESE_REPORT_RULE = """[OUTPUT LANGUAGE RULE]
+Write ALL free-text fields of your JSON output in Simplified Chinese (简体中文). This applies to:
+- reasoning
+- final_diagnosis.root_cause
+- final_diagnosis.detailed_analysis
+- every item in final_diagnosis.evidence
+- fix_suggestion
+- additional_notes
+- any active_hypotheses label/evidence text you emit
+
+Keep the following EXACTLY in English / original form (do NOT translate):
+- All enum values: signature_class, root_cause_class, corruption_mechanism, partial_dump, confidence, gate status, hypothesis status — these must match the schema and stay English.
+- Technical identifiers: function names, struct/type names, field names, register names, addresses, and any crash command or raw tool output you quote.
+- On first mention, give a crash-type term as Chinese with the English term in parentheses, e.g. "空指针解引用（NULL pointer dereference）".
+Do NOT translate or paraphrase quoted evidence lines from the vmcore; reproduce them verbatim and add Chinese explanation around them."""
+
+
+def _select_language_rule(state: AgentState) -> Optional[str]:
+    """根据报告语言配置返回需要注入的语言规则；仅 zh 时注入中文规则。"""
+    if str(state.get("report_language", "eng")).lower() == "zh":
+        return CHINESE_REPORT_RULE
+    return None
+
+
 def build_analysis_system_prompt(state: AgentState, *, is_last_step: bool) -> str:
     """
     构建 VMCore 分析 Agent 的系统提示词（System Prompt）。
@@ -76,6 +103,10 @@ def build_analysis_system_prompt(state: AgentState, *, is_last_step: bool) -> st
     context_overlays = _select_context_overlays(state, recent_text)
     if context_overlays:
         prompt_parts.extend(context_overlays)
+
+    language_rule = _select_language_rule(state)
+    if language_rule:
+        prompt_parts.append(language_rule)
 
     sop_fragments = _select_sop_fragments(state, recent_text)
     if sop_fragments:

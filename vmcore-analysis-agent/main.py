@@ -29,6 +29,10 @@ from src.mcp_tools import initialize_all_mcp_tools
 # 例如：支持 ~30 轮分析 → 1 + 30×3 = 91；支持 ~40 轮 → 1 + 40×3 = 121
 AGENT_RECURSION_LIMIT = 121
 
+# 分析报告输出语言：eng=英文（默认），zh=中文。
+# 由命令行参数 --language 设置；为 zh 时在系统提示词中注入中文输出规则。
+ANALYSIS_LANGUAGE = "eng"
+
 
 # 请求模型
 class VmcoreAnalysisRequest(BaseModel):
@@ -213,6 +217,7 @@ async def analyze_vmcore(request: VmcoreAnalysisRequest):
             "vmlinux_path": request.vmlinux_path,
             "vmcore_dmesg_path": request.vmcore_dmesg_path,
             "debug_symbol_paths": request.debug_symbol_paths,
+            "report_language": ANALYSIS_LANGUAGE,
             "messages": [],
             "step_count": 0,
             "token_usage": 0,
@@ -320,6 +325,7 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
                 "vmlinux_path": request.vmlinux_path,
                 "vmcore_dmesg_path": request.vmcore_dmesg_path,
                 "debug_symbol_paths": request.debug_symbol_paths,
+                "report_language": ANALYSIS_LANGUAGE,
                 "messages": [],
                 "step_count": 0,
                 "token_usage": 0,
@@ -412,7 +418,18 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
 
 
 if __name__ == "__main__":
+    import argparse
     import uvicorn
+
+    parser = argparse.ArgumentParser(description="Vmcore Analysis Agent 服务端")
+    parser.add_argument(
+        "--language",
+        choices=["eng", "zh"],
+        default="eng",
+        help="分析报告语言：eng=英文（默认），zh=中文（在 prompt 中注入中文输出规则）",
+    )
+    args = parser.parse_args()
+    ANALYSIS_LANGUAGE = args.language
 
     # 配置 uvicorn 以支持长时间运行的请求
     uvicorn.run(

@@ -10,13 +10,75 @@
 
 import json
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, SystemMessage
 from .graph_state import AgentState
 from .output_parser import render_action_arguments
 from .schema import VMCoreAnalysisStep
 from src.utils.config import config_manager
 from src.utils.logging import logger
+
+
+# 枚举值的中文显示标签（仅用于报告渲染，schema/校验链路保持英文 canonical 值）。
+_ZH_SIGNATURE_CLASS_LABELS = {
+    "null_deref": "空指针解引用（NULL pointer dereference）",
+    "use_after_free": "释放后使用（use-after-free）",
+    "pointer_corruption": "指针损坏（pointer corruption）",
+    "bug_on": "内核 BUG 断言（BUG_ON）",
+    "warn_on": "内核 WARN 断言（WARN_ON）",
+    "soft_lockup": "软锁死（soft lockup）",
+    "hard_lockup": "硬锁死（hard lockup）",
+    "rcu_stall": "RCU 停滞（RCU stall）",
+    "hung_task": "任务挂起（hung task）",
+    "atomic_sleep": "原子上下文睡眠（scheduling while atomic）",
+    "divide_error": "除零错误（divide error）",
+    "invalid_opcode": "无效操作码（invalid opcode）",
+    "oom_panic": "内存耗尽恐慌（OOM panic）",
+    "mce": "机器检查异常（MCE）",
+    "general_protection_fault": "通用保护故障（#GP）",
+    "stack_corruption": "栈损坏（stack corruption）",
+    "invalid_address_access": "非法地址访问（invalid address access）",
+    "write_protection_violation": "写保护违例（write protection violation）",
+    "page_not_present": "映射缺失（page not present）",
+    "smap_smep_violation": "SMAP/SMEP 违例",
+    "unknown": "未知类型（unknown）",
+}
+
+_ZH_ROOT_CAUSE_CLASS_LABELS = {
+    **_ZH_SIGNATURE_CLASS_LABELS,
+    "out_of_bounds": "越界访问（out-of-bounds）",
+    "double_free": "重复释放（double free）",
+    "wild_pointer": "野指针（wild pointer）",
+    "slab_corruption": "Slab 内存池损坏",
+    "race_condition": "竞态条件（race condition）",
+    "deadlock": "死锁（deadlock）",
+    "rcu_misuse": "RCU 误用（RCU misuse）",
+    "dma_corruption": "DMA 损坏（DMA corruption）",
+    "iommu_fault": "IOMMU 故障（IOMMU fault）",
+    "oom": "内存耗尽（OOM）",
+}
+
+_ZH_CONFIDENCE_LABELS = {"high": "高", "medium": "中", "low": "低"}
+
+_ZH_PARTIAL_DUMP_LABELS = {
+    "full": "完整转储（full）",
+    "partial": "部分转储（partial）",
+    "unknown": "未知（unknown）",
+}
+
+_ZH_HYPOTHESIS_STATUS_LABELS = {
+    "leading": "主导假设",
+    "candidate": "候选假设",
+    "weakened": "被削弱",
+    "ruled_out": "已排除",
+}
+
+
+def _zh(value: Optional[str], mapping: dict) -> str:
+    """枚举值 → 中文显示标签；未命中映射时原样返回。"""
+    if value is None:
+        return ""
+    return mapping.get(str(value), str(value))
 
 
 def generate_markdown_report(state: AgentState) -> str:
@@ -30,6 +92,12 @@ def generate_markdown_report(state: AgentState) -> str:
         str: Markdown 格式的分析报告
     """
     logger.info("Generating markdown analysis report...")
+
+    # 中文报告模式：枚举值在渲染时映射为中文标签（schema 校验链路不受影响）。
+    zh_mode = str(state.get("report_language", "eng")).lower() == "zh"
+
+    def _cls(value, mapping):
+        return _zh(value, mapping) if zh_mode else str(value)
 
     lines = []
 
@@ -126,15 +194,21 @@ def generate_markdown_report(state: AgentState) -> str:
                 lines.append("")
 
                 if analysis.signature_class:
-                    lines.append(f"**早期签名类**: {analysis.signature_class}")
+                    lines.append(
+                        f"**早期签名类**: {_cls(analysis.signature_class, _ZH_SIGNATURE_CLASS_LABELS)}"
+                    )
                     lines.append("")
 
                 if analysis.root_cause_class:
-                    lines.append(f"**最终根因类**: {analysis.root_cause_class}")
+                    lines.append(
+                        f"**最终根因类**: {_cls(analysis.root_cause_class, _ZH_ROOT_CAUSE_CLASS_LABELS)}"
+                    )
                     lines.append("")
 
                 if analysis.partial_dump != "unknown":
-                    lines.append(f"**转储完整性**: {analysis.partial_dump}")
+                    lines.append(
+                        f"**转储完整性**: {_cls(analysis.partial_dump, _ZH_PARTIAL_DUMP_LABELS)}"
+                    )
                     lines.append("")
 
                 # 如果有工具调用
@@ -178,7 +252,9 @@ def generate_markdown_report(state: AgentState) -> str:
                         lines.append(f"**修复建议**: {analysis.fix_suggestion}")
                         lines.append("")
                     if analysis.confidence:
-                        lines.append(f"**可信度**: {analysis.confidence}")
+                        lines.append(
+                            f"**可信度**: {_cls(analysis.confidence, _ZH_CONFIDENCE_LABELS)}"
+                        )
                         lines.append("")
                     if analysis.additional_notes:
                         lines.append(f"**附加说明**: {analysis.additional_notes}")
@@ -272,10 +348,14 @@ def generate_markdown_report(state: AgentState) -> str:
                 lines.append("## 🔍 最佳可用分析（步骤未收敛）")
                 lines.append("")
                 if last_step.signature_class:
-                    lines.append(f"**崩溃类型签名**: {last_step.signature_class}")
+                    lines.append(
+                        f"**崩溃类型签名**: {_cls(last_step.signature_class, _ZH_SIGNATURE_CLASS_LABELS)}"
+                    )
                     lines.append("")
                 if last_step.root_cause_class:
-                    lines.append(f"**初步根因分类**: {last_step.root_cause_class}")
+                    lines.append(
+                        f"**初步根因分类**: {_cls(last_step.root_cause_class, _ZH_ROOT_CAUSE_CLASS_LABELS)}"
+                    )
                     lines.append("")
                 if last_step.reasoning:
                     lines.append("**最后推理摘要**:")
@@ -287,11 +367,13 @@ def generate_markdown_report(state: AgentState) -> str:
                     lines.append("")
                     for h in last_step.active_hypotheses:
                         lines.append(
-                            f"- [{h.status}] **{h.label}**: {h.evidence or '(无证据)'}"
+                            f"- [{_cls(h.status, _ZH_HYPOTHESIS_STATUS_LABELS)}] **{h.label}**: {h.evidence or '(无证据)'}"
                         )
                     lines.append("")
                 if last_step.confidence:
-                    lines.append(f"**可信度**: {last_step.confidence}")
+                    lines.append(
+                        f"**可信度**: {_cls(last_step.confidence, _ZH_CONFIDENCE_LABELS)}"
+                    )
                     lines.append("")
                 if last_step.additional_notes:
                     lines.append(f"**附加说明**: {last_step.additional_notes}")
