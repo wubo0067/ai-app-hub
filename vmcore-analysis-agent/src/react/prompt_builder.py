@@ -175,6 +175,7 @@ def build_executor_state_section(state: AgentState) -> str:
         f"- Current gate objective: {next_gate_objective}",
         f"- Current evidence goal: {evidence_goal} (version={state.get('evidence_goal_version', 0)}, status={state.get('evidence_goal_status', 'unknown')})",
         "- Action evidence contract: declare evidence_goal_id, intended_evidence_type, target_object, and expected_observation for every tool action.",
+        "- Gate closure rule: gate status emitted by the LLM is advisory only; the executor Evidence Evaluator alone may close a gate when its completion criteria are satisfied.",
         "- Action selection rule: if any mandatory gate remains open or blocked, the next action must directly advance the current gate objective or unblock its prerequisite.",
         f"- Reasoning gate contract: {reasoning_gate_contract}",
     ]

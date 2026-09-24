@@ -1,4 +1,4 @@
-#!/usr/bi,/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # report_generator.py - VMCore 分析报告生成模块
 # Author: CalmWU
@@ -289,6 +289,8 @@ def generate_markdown_report(state: AgentState) -> str:
             lines.append("")
             step_number += 1
 
+            _append_gate_audit(lines, state)
+
     # 错误信息
     error = state.get("error")
     if error:
@@ -393,6 +395,46 @@ def generate_markdown_report(state: AgentState) -> str:
     lines.append("")
 
     return "\n".join(lines)
+
+
+def _append_gate_audit(lines: list[str], state: AgentState) -> None:
+    """Render executor-owned gate criteria, evidence, and status transitions."""
+    gates = state.get("managed_gates") or {}
+    history = state.get("gate_transition_history") or []
+    if not gates and not history:
+        return
+
+    lines.extend(["## Gate 审计", ""])
+    for gate_name, raw_gate in gates.items():
+        gate = raw_gate
+        lines.append(f"### {gate_name}")
+        lines.append("")
+        lines.append(f"- **状态**: {getattr(gate, 'status', 'unknown')}")
+        criteria = getattr(gate, "completion_criteria", []) or []
+        lines.append("- **完成条件**:")
+        for criterion in criteria:
+            lines.append(f"  - {criterion}")
+        evidence = getattr(gate, "evidence", None)
+        if evidence:
+            lines.append("- **审核证据**:")
+            for item in str(evidence).splitlines():
+                lines.append(f"  - {item}")
+        lines.append("")
+
+    if history:
+        lines.append("### Gate 状态转换记录")
+        lines.append("")
+        for transition in history:
+            gate_name = transition.get("gate_name", "unknown")
+            from_status = transition.get("from_status", "unknown")
+            to_status = transition.get("to_status", "unknown")
+            event = transition.get("event", "gate_transition")
+            reason = transition.get("reason", "")
+            lines.append(
+                f"- `{gate_name}`: `{from_status}` -> `{to_status}` "
+                f"({event}){': ' + str(reason) if reason else ''}"
+            )
+        lines.append("")
 
 
 def extract_final_diagnosis(state: AgentState) -> str:

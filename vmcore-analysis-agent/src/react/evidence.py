@@ -22,6 +22,121 @@ _SYM_LINE_RE = re.compile(
     rf"^\s*(?P<address>{_HEX})\s+(?P<kind>[A-Za-z?])\s+(?P<symbol>\S+)"
 )
 
+_GATE_COMPLETION_CRITERIA: dict[str, list[str]] = {
+    "register_provenance": [
+        "faulting register value is present",
+        "source object or address evidence is present",
+        "field/offset or symbol relation is independently observed",
+    ],
+    "object_lifetime": [
+        "object memory evidence is present",
+        "a second observation supports the object lifetime classification",
+    ],
+    "local_corruption_exclusion": [
+        "a relevant disassembly observation is present",
+        "a memory observation supports or excludes a local writer",
+    ],
+    "field_type_classification": [
+        "struct field layout evidence is present",
+        "a type or symbol observation corroborates the field classification",
+    ],
+    "external_corruption_gate": [
+        "the local corruption exclusion prerequisite is closed",
+        "at least one concrete external-source observation is present",
+    ],
+}
+
+
+def gate_completion_criteria(gate_name: str) -> list[str]:
+    """Return executor-owned, human-readable completion criteria for a gate."""
+    return list(
+        _GATE_COMPLETION_CRITERIA.get(
+            gate_name, ["at least one concrete structured evidence fact is present"]
+        )
+    )
+
+
+def evaluate_gate_closures(
+    gates: Mapping[str, Any] | None,
+    facts: Iterable[str],
+    prior_gates: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, list[dict[str, object]]]:
+    """Apply executor-owned closure rules and return auditable gate transitions."""
+    if not gates:
+        return None, []
+
+    fact_set = set(facts)
+    prior_gates = prior_gates or {}
+    evaluated: dict[str, Any] = {}
+    transitions: list[dict[str, object]] = []
+    for gate_name, raw_gate in gates.items():
+        gate = raw_gate.model_copy(deep=True) if hasattr(raw_gate, "model_copy") else raw_gate
+        prior = prior_gates.get(gate_name)
+        prior_status = getattr(prior, "status", None)
+        requested_status = getattr(gate, "status", "open")
+        gate.completion_criteria = gate_completion_criteria(gate_name)
+
+        if prior_status in {"closed", "n/a"}:
+            gate.status = prior_status
+        elif _gate_criteria_satisfied(gate_name, fact_set, evaluated):
+            gate.status = "closed"
+        elif requested_status == "closed":
+            if not _gate_criteria_satisfied(gate_name, fact_set, evaluated):
+                gate.status = prior_status or "open"
+                transitions.append(
+                    {
+                        "gate_name": gate_name,
+                        "from_status": prior_status or "open",
+                        "to_status": "open",
+                        "event": "llm_close_rejected",
+                        "reason": "completion criteria not satisfied by structured evidence",
+                        "evidence_facts": sorted(fact_set),
+                    }
+                )
+        evaluated[gate_name] = gate
+
+        current_status = getattr(gate, "status", "open")
+        if prior_status is not None and current_status != prior_status:
+            transitions.append(
+                {
+                    "gate_name": gate_name,
+                    "from_status": prior_status,
+                    "to_status": current_status,
+                    "event": "gate_transition",
+                    "reason": "evidence evaluator",
+                    "evidence_facts": sorted(fact_set),
+                }
+            )
+
+    return evaluated, transitions
+
+
+def _gate_criteria_satisfied(
+    gate_name: str,
+    facts: set[str],
+    evaluated_gates: Mapping[str, Any],
+) -> bool:
+    categories = {
+        "rd": any(fact.startswith("rd_word:") for fact in facts),
+        "struct": any(fact.startswith("struct_") for fact in facts),
+        "dis": any(fact.startswith("dis_") for fact in facts),
+        "sym": any(fact.startswith("sym:") for fact in facts),
+    }
+    required_groups = {
+        "register_provenance": [{"rd"}, {"dis", "sym"}],
+        "object_lifetime": [{"rd", "struct"}],
+        "local_corruption_exclusion": [{"dis"}, {"rd"}],
+        "field_type_classification": [{"struct"}, {"sym"}],
+        "external_corruption_gate": [{"rd", "struct", "dis", "sym"}],
+    }.get(gate_name, [{"rd", "struct", "dis", "sym"}])
+    if gate_name == "external_corruption_gate":
+        prerequisite = evaluated_gates.get("local_corruption_exclusion")
+        if prerequisite is None or getattr(prerequisite, "status", None) not in {"closed", "n/a"}:
+            return False
+    return sum(any(categories[name] for name in group) for group in required_groups) >= len(
+        required_groups
+    )
+
 
 def extract_evidence_facts(
     tool_name: str,

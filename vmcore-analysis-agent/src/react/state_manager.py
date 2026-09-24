@@ -12,6 +12,7 @@ from .schema import (
     VMCoreAnalysisStep,
     VMCoreLLMAnalysisStep,
 )
+from .evidence import evaluate_gate_closures
 
 
 def project_managed_analysis_step(
@@ -67,11 +68,25 @@ def project_managed_analysis_step(
         state.get("managed_gates"),
         llm_step.gates,
     )
+    gates, gate_transitions = evaluate_gate_closures(
+        gates,
+        state.get("evidence_facts", []),
+        state.get("managed_gates"),
+    )
+
+    step_data = llm_step.model_dump()
+    if llm_step.is_conclusive and _has_unresolved_gates(gates):
+        step_data["is_conclusive"] = False
+        step_data["final_diagnosis"] = None
+        step_data["additional_notes"] = (
+            (step_data.get("additional_notes") or "")
+            + " Evidence evaluator kept the result non-conclusive because mandatory gates remain open."
+        ).strip()
 
     # 构造最终的 VMCoreAnalysisStep 对象，将 LLM 的原始数据与补全后的上下文进行合并
     step = VMCoreAnalysisStep.model_validate(
         {
-            **llm_step.model_dump(),
+            **step_data,
             "signature_class": signature_class,
             "root_cause_class": root_cause_class,
             "partial_dump": partial_dump,
@@ -95,6 +110,10 @@ def project_managed_analysis_step(
         "current_partial_dump": partial_dump,
         "managed_active_hypotheses": active_hypotheses,
         "managed_gates": gates,
+        "gate_transition_history": [
+            *state.get("gate_transition_history", []),
+            *gate_transitions,
+        ],
     }
     evidence_goal = _build_evidence_goal(gates)
     previous_goal = state.get("current_evidence_goal")
@@ -105,7 +124,6 @@ def project_managed_analysis_step(
         {
             "current_evidence_goal": evidence_goal,
             "evidence_goal_version": goal_version,
-            "evidence_goal_status": "open" if evidence_goal else "closed",
             "evidence_goal_status": (
                 state.get("evidence_goal_status", "open")
                 if evidence_goal == previous_goal
@@ -126,6 +144,12 @@ def project_managed_analysis_step(
         }
     )
     return step, managed_updates
+
+
+def _has_unresolved_gates(gates: Optional[Dict[str, GateEntry]]) -> bool:
+    if not gates:
+        return False
+    return any(gate.status in {"open", "blocked"} for gate in gates.values())
 
 
 def _build_evidence_goal(

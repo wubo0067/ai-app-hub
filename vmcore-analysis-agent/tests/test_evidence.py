@@ -11,9 +11,16 @@ react_pkg = types.ModuleType("src.react")
 react_pkg.__path__ = [str(root / "src" / "react")]
 sys.modules.setdefault("src.react", react_pkg)
 
-from src.react.evidence import extract_evidence_facts, facts_support_goal
+from src.react.evidence import (
+    evaluate_gate_closures,
+    extract_evidence_facts,
+    facts_support_goal,
+    gate_completion_criteria,
+)
 from src.react.schema import GateEntry
 from src.react.evidence import update_gate_evidence
+from src.react.schema import VMCoreLLMAnalysisStep
+from src.react.state_manager import project_managed_analysis_step
 
 
 class EvidenceExtractionTests(unittest.TestCase):
@@ -83,6 +90,80 @@ class EvidenceExtractionTests(unittest.TestCase):
         self.assertTrue(facts_support_goal(delta, goal))
         self.assertIn("[evidence-delta] struct_field:irqaction.handler@0x0", updated["field_type_classification"].evidence)
         self.assertEqual(updated["field_type_classification"].status, "open")
+
+    def test_llm_close_is_rejected_without_completion_evidence(self) -> None:
+        gates = {
+            "register_provenance": GateEntry(
+                required_for=["pointer_corruption"],
+                status="closed",
+                evidence="LLM claimed the register chain is complete.",
+            )
+        }
+
+        evaluated, transitions = evaluate_gate_closures(gates, [])
+
+        self.assertEqual(evaluated["register_provenance"].status, "open")
+        self.assertTrue(
+            any(item["event"] == "llm_close_rejected" for item in transitions)
+        )
+        self.assertEqual(
+            len(evaluated["register_provenance"].completion_criteria), 3
+        )
+
+    def test_evaluator_closes_gate_and_records_transition(self) -> None:
+        gates = {
+            "register_provenance": GateEntry(
+                required_for=["pointer_corruption"], status="open"
+            )
+        }
+        facts = {
+            "rd_word:0xffff0000=0x10",
+            "dis_instruction:0xffff1000=mov",
+        }
+
+        evaluated, transitions = evaluate_gate_closures(gates, facts, gates)
+
+        self.assertEqual(evaluated["register_provenance"].status, "closed")
+        self.assertEqual(
+            evaluated["register_provenance"].completion_criteria,
+            gate_completion_criteria("register_provenance"),
+        )
+        self.assertTrue(
+            any(item["event"] == "gate_transition" for item in transitions)
+        )
+
+    def test_state_manager_does_not_accept_llm_gate_closure(self) -> None:
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 5,
+                "reasoning": "The model claims register provenance is closed.",
+                "action": None,
+                "is_conclusive": False,
+                "signature_class": "pointer_corruption",
+                "partial_dump": "partial",
+                "gates": {
+                    "register_provenance": {
+                        "required_for": ["pointer_corruption"],
+                        "status": "closed",
+                        "evidence": "model claim only",
+                    }
+                },
+            }
+        )
+
+        _, updates = project_managed_analysis_step(
+            llm_step,
+            {"evidence_facts": [], "gate_transition_history": []},
+            original_reasoning="The model claims register provenance is closed.",
+        )
+
+        self.assertEqual(updates["managed_gates"]["register_provenance"].status, "open")
+        self.assertTrue(
+            any(
+                item["event"] == "llm_close_rejected"
+                for item in updates["gate_transition_history"]
+            )
+        )
 
 
 if __name__ == "__main__":

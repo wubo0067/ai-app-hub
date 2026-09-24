@@ -747,6 +747,10 @@ class GateEntry(BaseModel):
         None,
         description="Specific tool output or observation that closed/blocked/n/a this gate",
     )
+    completion_criteria: List[str] = Field(
+        default_factory=list,
+        description="Executor-defined evidence conditions required before this gate can close",
+    )
 
 
 PartialDumpStatus = Literal[

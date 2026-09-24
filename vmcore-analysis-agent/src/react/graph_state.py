@@ -99,6 +99,7 @@ class AgentState(MessagesState):
     # 当前分析流程中的 gate 状态表。
     # 每个 gate 表示一个分析关卡、判定点或前置条件，用于控制后续推理路径。
     managed_gates: Optional[dict[str, GateEntry]]
+    gate_transition_history: list[dict[str, object]]
     # 当前识别出的 crash 签名分类结果。
     # 用于标识本次 vmcore 更接近哪类崩溃模式或故障签名。
     current_signature_class: Optional[CrashSignatureClass]
