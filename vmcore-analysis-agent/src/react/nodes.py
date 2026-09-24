@@ -400,6 +400,7 @@ async def call_crash_tool(state: AgentState) -> dict:
 
     prior_fingerprints = set(state.get("executed_fingerprints", []))
     prior_tool_outputs = dict(state.get("tool_output_cache", {}))
+    previous_action_fingerprint = state.get("last_action_fingerprint", "")
     crash_path_struct_offsets = state.get("crash_path_struct_offsets")
     struct_layout_cache = dict(state.get("struct_layout_cache", {}))
 
@@ -409,6 +410,9 @@ async def call_crash_tool(state: AgentState) -> dict:
     commands_to_run = []  # List[str]
     new_tool_output_cache: dict[str, str] = {}
     new_fingerprints: list[str] = []
+    duplicate_fingerprints: list[str] = []
+    current_fingerprints: list[str] = []
+    rejected_count = 0
 
     try:
         if isinstance(last_message, AIMessage) and last_message.tool_calls:
@@ -451,6 +455,7 @@ async def call_crash_tool(state: AgentState) -> dict:
                 )
                 # 2. 【拦截逻辑】：如果校验器返回了非空错误 (validation_error != None)
                 if validation_error is not None:
+                    rejected_count += 1
                     # A. 构建一个“拒绝通知”的消息对象 (ToolMessage)
                     # 我们不直接丢弃这个请求，而是将其包装成一个 ToolMessage 返回给 LLM。
                     # 这样做的目的是：让 LLM 明确知道它的指令为什么失败了（即 [executor-guard] 错误信息），
@@ -500,6 +505,8 @@ async def call_crash_tool(state: AgentState) -> dict:
                         f"Command deduplication: '{current_fingerprint[:80]}...' already executed. "
                         f"Returning cached output instead of re-executing."
                     )
+                    duplicate_fingerprints.append(current_fingerprint)
+                    current_fingerprints.append(current_fingerprint)
                     continue
 
                 current_lines = extract_command_lines(name, args)
@@ -514,6 +521,8 @@ async def call_crash_tool(state: AgentState) -> dict:
                 tool_calls_data.append(
                     (tool_call_id, name, full_cmd, current_fingerprint, args)
                 )
+                if current_fingerprint:
+                    current_fingerprints.append(current_fingerprint)
                 commands_to_run.append(
                     {"display": full_cmd, "tool_name": name, "args": args}
                 )
@@ -591,6 +600,38 @@ async def call_crash_tool(state: AgentState) -> dict:
         }
 
     logger.info(f"Generated {len(tool_messages)} tool messages.")
+    all_duplicate = bool(current_fingerprints) and not commands_to_run and bool(
+        duplicate_fingerprints
+    )
+    if all_duplicate:
+        duplicate_streak = (
+            state.get("duplicate_streak", 0) + 1
+            if len(current_fingerprints) == 1
+            and current_fingerprints[0] == previous_action_fingerprint
+            else 1
+        )
+        no_progress_streak = state.get("no_progress_streak", 0) + 1
+        action_status = "duplicate"
+        evidence_delta: list[str] = []
+    elif commands_to_run:
+        duplicate_streak = 0
+        no_progress_streak = 0
+        action_status = "executed"
+        evidence_delta = list(new_fingerprints)
+    elif rejected_count:
+        duplicate_streak = 0
+        no_progress_streak = state.get("no_progress_streak", 0) + 1
+        action_status = "rejected"
+        evidence_delta = []
+    else:
+        duplicate_streak = 0
+        no_progress_streak = state.get("no_progress_streak", 0) + 1
+        action_status = "no_progress"
+        evidence_delta = []
+
+    last_action_fingerprint = (
+        current_fingerprints[0] if len(current_fingerprints) == 1 else ""
+    )
     # 这个返回字典会被 LangGraph 用来更新当前运行中的 AgentState 状态；
     # 它不是更新 nodes.py 里的某个本地变量，而是更新整个状态图在这一轮执行中的共享 state。
     return {
@@ -601,6 +642,12 @@ async def call_crash_tool(state: AgentState) -> dict:
             **state.get("tool_output_cache", {}),
             **new_tool_output_cache,
         },
+        "last_action_status": action_status,
+        "last_action_fingerprint": last_action_fingerprint,
+        "duplicate_streak": duplicate_streak,
+        "no_progress_streak": no_progress_streak,
+        "evidence_delta": evidence_delta,
+        "replan_required": all_duplicate,
         "crash_path_struct_offsets": crash_path_struct_offsets,
         "struct_layout_cache": struct_layout_cache,
         "error": None,

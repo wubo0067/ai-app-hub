@@ -145,6 +145,19 @@ def build_executor_state_section(state: AgentState) -> str:
         f"- Reasoning gate contract: {reasoning_gate_contract}",
     ]
 
+    action_status = state.get("last_action_status")
+    if action_status:
+        lines.append(
+            f"- Last action status: {action_status} "
+            f"(duplicate streak={state.get('duplicate_streak', 0)}, "
+            f"no-progress streak={state.get('no_progress_streak', 0)})"
+        )
+        if state.get("replan_required"):
+            lines.append(
+                "- Replanning required: select a different evidence target or terminate with bounded uncertainty; "
+                "do not emit an equivalent command."
+            )
+
     if recent_commands == "none":
         lines.append("- Commands already run (do not repeat): none")
     else:

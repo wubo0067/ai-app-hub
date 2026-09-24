@@ -30,10 +30,30 @@ nodes_module.llm_analysis_node = "llm_analysis_node"
 nodes_module.structure_reasoning_node = "structure_reasoning_node"
 sys.modules.setdefault("src.react.nodes", nodes_module)
 
-from src.react.edges import should_continue
+from src.react.edges import after_crash_tool, should_continue
 
 
 class EdgeRoutingTests(unittest.TestCase):
+    def test_ends_after_repeated_no_progress_tool_actions(self) -> None:
+        state = {
+            "messages": [],
+            "error": None,
+            "is_last_step": False,
+            "no_progress_streak": 3,
+        }
+
+        self.assertEqual(after_crash_tool(state), "__end__")
+
+    def test_returns_to_llm_before_no_progress_limit(self) -> None:
+        state = {
+            "messages": [],
+            "error": None,
+            "is_last_step": False,
+            "no_progress_streak": 2,
+        }
+
+        self.assertEqual(after_crash_tool(state), "llm_analysis_node")
+
     def test_retries_once_for_non_conclusive_ai_message_without_tool_calls(
         self,
     ) -> None:

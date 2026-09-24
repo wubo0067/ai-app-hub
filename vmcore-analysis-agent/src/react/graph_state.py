@@ -76,6 +76,12 @@ class AgentState(MessagesState):
     # 命令指纹到最近一次工具输出内容的映射缓存。
     # 用于 executor 在遇到相同命令时直接复用结果，减少重复调用外部工具。
     tool_output_cache: dict[str, str]
+    last_action_status: Optional[str]
+    last_action_fingerprint: str
+    duplicate_streak: int
+    no_progress_streak: int
+    evidence_delta: list[str]
+    replan_required: bool
     # 当前仍处于活跃状态的假设列表。
     # 用于在多轮推理过程中持续追踪尚未证伪、尚需进一步验证的根因假设。
     managed_active_hypotheses: Optional[list[Hypothesis]]

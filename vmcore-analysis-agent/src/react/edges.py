@@ -23,6 +23,9 @@ from .nodes import (
 )
 
 
+NO_PROGRESS_STREAK_LIMIT = 3
+
+
 def _parse_analysis_step(message: AIMessage) -> VMCoreAnalysisStep | None:
     try:
         raw = (
@@ -146,6 +149,13 @@ def after_crash_tool(state: AgentState) -> str:
     避免超出 recursion_limit。
     """
     is_last_step = state.get("is_last_step", False)
+    no_progress_streak = state.get("no_progress_streak", 0)
+    if no_progress_streak >= NO_PROGRESS_STREAK_LIMIT:
+        logger.warning(
+            "Stopping analysis after %s consecutive tool actions without evidence progress.",
+            no_progress_streak,
+        )
+        return "__end__"
     if is_last_step:
         logger.warning(
             "crash_tool_node is on the last step. "
