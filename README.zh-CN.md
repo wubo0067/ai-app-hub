@@ -19,7 +19,7 @@ README.md
 - **执行器级安全防护**：内置 `action_guard` 模块，防止 LLM 执行资源消耗过大或高风险的命令（如在大系统上盲目执行 `bt -a`），同时通过命令去重机制确保分析效率，防止推理陷入死循环。
 - **透明的思考链报告**：每一次分析都会生成结构化的 Markdown 报告，完整记录每一步命令的执行意图、假设的验证过程以及基于证据的最终根因定界。
 - **双层分类体系 (Two-tier Crash Classification)**：系统在 `src/react/schema.py` 中规范了清晰的内核诊断双层分类。**表层签名类** (`CrashSignatureClass`) 从 Panic 字符串直接可观测的早期路由标签（如 `null_deref`、`use_after_free`、`stack_corruption`、`soft_lockup`、`hard_lockup`、`rcu_stall` 等），用于匹配对应的诊断剧本 (Playbook)。**深层根因类** (`RootCauseClass`) 则是经过深度调查和证据验证后确定的最终根本原因（如 `out_of_bounds`、`double_free`、`race_condition`、`dma_corruption`、`mce` 等）。
-- **检查点控制门 (Verification Gates)**：为了彻底解决大模型"幻觉"和"浅尝辄止地盲猜"的弊端，系统引入了验证门控制机制。针对不同的崩溃签名，系统硬性规定了必须关闭的"证明门控"（例如 `pointer_corruption` 必须关闭 `register_provenance`（寄存器来源溯源）、`object_lifetime`（对象生命周期审核）、`local_corruption_exclusion` 等门控）。在所有必需的门控达到 `closed`（已通过具体工具输出验证）或 `n/a`（确认不适用）状态前，系统严禁将诊断状态标记为已闭环 (`is_conclusive=true`)。
+- **检查点控制门 (Verification Gates)**：为了彻底解决大模型"幻觉"和"浅尝辄止地盲猜"的弊端，系统引入了验证门控制机制。针对不同的崩溃签名，系统硬性规定了必须关闭的"证明门控"（例如 `pointer_corruption` 必须关闭 `register_provenance`（寄存器来源溯源）、`object_lifetime`（对象生命周期审核）、`local_corruption_exclusion` 等门控）。在所有必需的门控达到 `closed`（已通过具体工具输出验证）或 `n/a`（确认不适用）状态前，系统严禁将诊断状态标记为已闭环 (`is_conclusive=true`)。Gate 的关闭权归属于**执行器**：LLM 输出的 gate 状态仅为建议，证据评估器（`src/react/evidence.py`）仅在其执行器定义的 `completion_criteria` 被结构化证据事实满足时才允许关闭 gate；被拒绝的关闭请求及所有状态转换均记录在 `gate_transition_history` 中，并在报告的 Gate 审计章节呈现。
 - **精准的 e820 BIOS 内存映射验证与相邻页指纹提取**：`memorandum.txt` 证实了本系统的强悍表现——在遇到 `reserved` 物理页时，AI 会在不触发 seek error 的前提下，提取相邻物理页的指纹，进行精细的内存鉴证。系统将崩溃物理地址与 BIOS 内存映射表 (e820) 进行严格数学区间比对，从而判断内存是硬件保留还是启动后被特定设备 DMA 越界覆写，这种分析思路已达到资深内核专家的专业水准。
 - **长时间连接保持与流式传输**：内核 crash 工具在对数 GB 级的 vmcore 镜像进行大面积内存搜索 (search) 或加载庞大模块的调试符号时，耗时通常较长。FastAPI 服务端引入了独立的 Task 队列，以 15 秒为间隔向客户端发送心跳注释 (Keep-Alive Heartbeat)，即使单个底层操作耗时超过 2 分钟，客户端也能稳定连接并实时展示诊断进度节点。
 
@@ -142,7 +142,7 @@ DEFAULT_CRASH_COMMANDS = [
    - JSON 格式错误时尝试修复（[`repair_structured_output`](vmcore-analysis-agent/src/react/output_parser.py#L56-L94)）
    - 纯文本 `reasoning_content` 路由到 [`structure_reasoning_node`](vmcore-analysis-agent/src/react/llm_node.py#L215-L350)
    - 空响应时注入 HumanMessage 强制 LLM 行动或得出结论
-5. **状态管理**：通过 [`project_managed_analysis_step`](vmcore-analysis-agent/src/react/state_manager.py#L123-L198) 将 LLM 输出与托管状态（hypotheses、gates）合并
+5. **状态管理**：通过 [`project_managed_analysis_step`](vmcore-analysis-agent/src/react/state_manager.py#L123-L198) 将 LLM 输出与托管状态（hypotheses、gates）合并——gate 关闭由证据评估器重新校验，只要任意强制 gate 仍处于 open 状态就强制 `is_conclusive=false`
 
 **核心 Prompt 设计**：
 - 内置防止重复执行同一命令的规则（Anti-Repetition Policy）
@@ -225,7 +225,7 @@ DEFAULT_CRASH_COMMANDS = [
 | [`VMCoreLLMAnalysisStep`](vmcore-analysis-agent/src/react/schema.py#L70-L114) | [`VMCoreAnalysisStep`](vmcore-analysis-agent/src/react/schema.py#L230-L373) 的一个最小子集，是 LLM 直接输出的内容。执行器会为其补充托管状态字段。 |
 | [`FinalDiagnosis`](vmcore-analysis-agent/src/react/schema.py#L45-L67) | 最终结论的完整记录，仅在 [`is_conclusive`](vmcore-analysis-agent/src/react/schema.py#L294-L294) 为 `true` 时填充。 |
 | [`Hypothesis`](vmcore-analysis-agent/src/react/schema.py#L165-L192) | 代表代理正在跟踪的一个候选根本原因。[`active_hypotheses`](vmcore-analysis-agent/src/react/schema.py#L326-L333) 列表强制对竞争性理论进行显式管理。 |
-| [`GateEntry`](vmcore-analysis-agent/src/react/schema.py#L195-L220) | 代表一个强制性的验证检查点。[`gates`](vmcore-analysis-agent/src/react/schema.py#L335-L343) 字典确保在允许得出确定性诊断之前，收集到所有必需的证据。 |
+| [`GateEntry`](vmcore-analysis-agent/src/react/schema.py#L195-L220) | 代表一个强制性的验证检查点。[`gates`](vmcore-analysis-agent/src/react/schema.py#L335-L343) 字典确保在允许得出确定性诊断之前，收集到所有必需的证据。每个 gate 携带执行器定义的 `completion_criteria`，由证据评估器据此判定是否可关闭。 |
 
 #### `_REQUIRED_GATES`：验证门控系统
 
@@ -247,6 +247,7 @@ class GateEntry(BaseModel):
     status: Literal["open", "closed", "blocked", "n/a"]
     evidence: Optional[str]  # 必须填写具体的工具输出，不得使用泛泛总结
     prerequisite: Optional[str]  # 前置依赖 gate
+    completion_criteria: List[str]  # 执行器定义的关闭完成条件，由证据评估器判定
 ```
 
 Gate 的四种状态：
@@ -307,6 +308,16 @@ Gates 在整个分析流程中扮演 质量守门人（Quality Gatekeeper）的�
 **四、类比理解**
 
 可以把 gates 想象成飞行检查清单：飞行员在起飞前必须逐项检查并确认（襟翼、燃油、引擎...），全部打勾后才能起飞。同样，分析 Agent 在宣布"找到根因"之前，必须逐个完成对应崩溃类型的检查项，全部 closed 后才能真正输出最终诊断。
+
+**五、Gate 关闭权归属执行器（证据评估器）**
+
+Gate 的关闭决定权属于执行器，而非 LLM：
+
+- **执行器定义的完成条件**：每个 `GateEntry` 携带一个由执行器定义的 `completion_criteria` 列表（例如 `register_provenance` 要求：故障寄存器值已获取、来源对象/地址证据已获取、字段/偏移或符号关系已被独立观测）。
+- **证据评估器是唯一关闭者**：[`evaluate_gate_closures`](vmcore-analysis-agent/src/react/evidence.py) 从工具输出中提取结构化 `evidence_facts`（如 `rd_word:`、`struct_*`、`dis_*`、`sym:`），只有当所需证据类别组全部满足时才关闭 gate；`external_corruption_gate` 还要求其前置 `local_corruption_exclusion` 已先关闭。
+- **LLM 的 gate 状态仅为建议**：若 LLM 在证据不足时输出 `status: closed`，评估器会将该 gate 保持为 `open` 并记录 `llm_close_rejected` 转换；系统提示中明确声明此规则。
+- **结论始终受门控约束**：只要任意强制 gate 仍处于 `open`/`blocked`，[`project_managed_analysis_step`](vmcore-analysis-agent/src/react/state_manager.py) 会强制 `is_conclusive=false` 并剥离过早给出的 `final_diagnosis`。
+- **完整审计轨迹**：每次状态变更都追加到 `AgentState` 的 `gate_transition_history`，Markdown 报告渲染 **Gate 审计** 章节，列出每个 gate 的完成条件、审核证据与状态转换记录。
 
 **核心概念**：
 - **[`CrashSignatureClass`](vmcore-analysis-agent/src/react/schema.py#L117-L134) 与 [`RootCauseClass`](vmcore-analysis-agent/src/react/schema.py#L139-L162)**：前者是从 panic 日志中观察到的症状（例如 `soft_lockup`），后者是推断出的底层机制（例如 `deadlock`）。它们在分析流程中扮演不同的角色。
@@ -377,6 +388,7 @@ vmcore-analysis-agent/
 │   │   ├── __init__.py                # 包初始化文件
 │   │   ├── action_guard.py            # 行动保护和安全验证
 │   │   ├── edges.py                   # 路由逻辑和状态转换
+│   │   ├── evidence.py                # 证据提取与执行器 gate 评估
 │   │   ├── fragment_flags.py          # 片段标志管理
 │   │   ├── graph.py                   # LangGraph 图构建
 │   │   ├── graph_state.py             # AgentState 定义
@@ -427,6 +439,7 @@ vmcore-analysis-agent/
 ├── tests/                             # 测试套件
 │   ├── test_action_guard.py           # 行动保护测试
 │   ├── test_crash_client.py           # Crash 客户端测试
+│   ├── test_evidence.py               # 证据提取与 gate 评估测试
 │   ├── test_llm_runtime.py            # LLM 运行时测试
 │   ├── test_output_parser.py          # 输出解析器测试
 │   ├── test_prompt_builder.py         # Prompt 构建器测试

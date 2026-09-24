@@ -16,7 +16,7 @@ An intelligent Linux kernel crash (vmcore) analysis agent based on LangGraph ReA
 - **Executor-Level Safety Protection**: The built-in `action_guard` module prevents the LLM from executing commands that are overly resource-intensive or high-risk (e.g., blindly running `bt -a` on a large system). Simultaneously, a command deduplication mechanism ensures analysis efficiency and prevents reasoning from falling into infinite loops.
 - **Transparent Chain-of-Thought Reporting**: Each analysis generates a structured Markdown report, fully documenting the intent behind every command execution, the verification process of hypotheses, and the evidence-based final root cause isolation.
 - **Two-tier Crash Classification**: The system defines a rigorous two-tier classification for kernel diagnostics in `src/react/schema.py`. The **surface signature class** (`CrashSignatureClass`) captures immediately observable panic labels (e.g., `null_deref`, `use_after_free`, `stack_corruption`, `soft_lockup`, `hard_lockup`, `rcu_stall`) and routes them to the corresponding diagnostic Playbook. The **deep root cause class** (`RootCauseClass`) represents the final root cause determined after deep investigation and evidence validation (e.g., `out_of_bounds`, `double_free`, `race_condition`, `dma_corruption`, `mce`).
-- **Verification Gate Control Mechanism**: To fundamentally eliminate LLM "hallucination" and superficial guessing, the system introduces a mandatory gate-control mechanism. For each crash signature, the system enforces specific "proof gates" that must be closed (e.g., `pointer_corruption` requires closing `register_provenance`, `object_lifetime`, `local_corruption_exclusion`, etc.). The system strictly prohibits marking the diagnosis as conclusive (`is_conclusive=true`) until all required gates reach the `closed` (verified with concrete tool output) or `n/a` (confirmed not applicable) state.
+- **Verification Gate Control Mechanism**: To fundamentally eliminate LLM "hallucination" and superficial guessing, the system introduces a mandatory gate-control mechanism. For each crash signature, the system enforces specific "proof gates" that must be closed (e.g., `pointer_corruption` requires closing `register_provenance`, `object_lifetime`, `local_corruption_exclusion`, etc.). The system strictly prohibits marking the diagnosis as conclusive (`is_conclusive=true`) until all required gates reach the `closed` (verified with concrete tool output) or `n/a` (confirmed not applicable) state. Gate closure is **executor-owned**: the LLM's reported gate status is advisory only, and the Evidence Evaluator (`src/react/evidence.py`) closes a gate solely when its executor-defined `completion_criteria` are satisfied by structured evidence facts; rejected closures and all status transitions are recorded in `gate_transition_history` and surfaced in the report's Gate Audit section.
 - **Precision e820 BIOS Memory Map Verification & Adjacent Page Fingerprinting**: As confirmed by `memorandum.txt`, the agent demonstrates expert-level memory forensics. When encountering a `reserved` physical page, the AI extracts fingerprints from adjacent physical pages without triggering seek errors, enabling fine-grained memory authentication. It performs rigorous mathematical interval comparison between the crash physical address and the BIOS memory map (e820), determining whether the memory is hardware-reserved or overwritten by a specific device's DMA out-of-bounds access after boot — a diagnostic approach matching the caliber of senior kernel experts.
 - **Long-Connection Keep-Alive & Streaming Transmission**: Kernel crash tools can take extended periods (minutes) when searching large memory regions (GB-scale vmcore images) or loading debug symbols for massive modules. The FastAPI server introduces an independent Task queue with a 15-second heartbeat comment (Keep-Alive Heartbeat) sent to the client via SSE. Even when a single underlying operation exceeds 2 minutes, the client maintains a stable connection and displays diagnostic progress nodes in real time.
 
@@ -139,7 +139,7 @@ Execution results are written to the message queue as `HumanMessage`, serving as
    - Attempts JSON repair on format errors ([`repair_structured_output`](vmcore-analysis-agent/src/react/output_parser.py#L56-L94))
    - Routes plain text `reasoning_content` to [`structure_reasoning_node`](vmcore-analysis-agent/src/react/llm_node.py#L215-L350)
    - Injects HumanMessage on empty response to force LLM action or conclusion
-5. **State Management**: Merges LLM output with managed state (hypotheses, gates) via [`project_managed_analysis_step`](vmcore-analysis-agent/src/react/state_manager.py#L123-L198)
+5. **State Management**: Merges LLM output with managed state (hypotheses, gates) via [`project_managed_analysis_step`](vmcore-analysis-agent/src/react/state_manager.py#L123-L198) — gate closures are re-validated by the Evidence Evaluator, and `is_conclusive` is forced to `false` while any mandatory gate remains open
 
 **Core Prompt Design**:
 - Built-in anti-repetition policy to prevent executing the same command repeatedly
@@ -222,7 +222,7 @@ The agent's reasoning and state are structured around a set of Pydantic models d
 | [`VMCoreLLMAnalysisStep`](vmcore-analysis-agent/src/react/schema.py#L70-L114) | The minimal subset of [`VMCoreAnalysisStep`](vmcore-analysis-agent/src/react/schema.py#L230-L373) that the LLM is expected to output directly. The executor enriches this with the managed state fields. |
 | [`FinalDiagnosis`](vmcore-analysis-agent/src/react/schema.py#L45-L67) | A comprehensive record of the final conclusion, populated only when [`is_conclusive`](vmcore-analysis-agent/src/react/schema.py#L294-L294) is `true`. |
 | [`Hypothesis`](vmcore-analysis-agent/src/react/schema.py#L165-L192) | Represents a single candidate root cause being tracked by the agent. The [`active_hypotheses`](vmcore-analysis-agent/src/react/schema.py#L326-L333) list forces explicit management of competing theories. |
-| [`GateEntry`](vmcore-analysis-agent/src/react/schema.py#L195-L220) | Represents a mandatory verification checkpoint. The [`gates`](vmcore-analysis-agent/src/react/schema.py#L335-L343) dictionary ensures all required evidence is gathered before a conclusive diagnosis is allowed. |
+| [`GateEntry`](vmcore-analysis-agent/src/react/schema.py#L195-L220) | Represents a mandatory verification checkpoint. The [`gates`](vmcore-analysis-agent/src/react/schema.py#L335-L343) dictionary ensures all required evidence is gathered before a conclusive diagnosis is allowed. Each gate carries executor-defined `completion_criteria` used by the Evidence Evaluator to decide closure. |
 
 #### `_REQUIRED_GATES`: The Verification Gatekeeper System
 
@@ -244,6 +244,7 @@ class GateEntry(BaseModel):
     status: Literal["open", "closed", "blocked", "n/a"]
     evidence: Optional[str]  # 必须填写具体的工具输出，不得使用泛泛总结
     prerequisite: Optional[str]  # 前置依赖 gate
+    completion_criteria: List[str]  # 执行器定义的关闭完成条件，由证据评估器判定
 ```
 
 **Gate States:**
@@ -304,6 +305,16 @@ Specifically:
 **Analogy**
 
 Think of gates as an aircraft pre-flight checklist: pilots must systematically check and confirm each item (flaps, fuel, engines...) before takeoff. Similarly, the analysis Agent must complete each required checkpoint for its crash type before announcing "root cause found"—all gates must be closed before the final diagnosis can be truly output.
+
+**Executor-Owned Gate Closure (Evidence Evaluator)**
+
+Gate closure authority belongs to the executor, not the LLM:
+
+- **Executor-defined completion criteria**: Each `GateEntry` carries a `completion_criteria` list defined by the executor (e.g., `register_provenance` requires the faulting register value, source object/address evidence, and an independently observed field/offset or symbol relation).
+- **The Evidence Evaluator is the sole closer**: [`evaluate_gate_closures`](vmcore-analysis-agent/src/react/evidence.py) extracts structured `evidence_facts` from tool outputs (e.g., `rd_word:`, `struct_*`, `dis_*`, `sym:`) and closes a gate only when its required evidence-category groups are all satisfied. `external_corruption_gate` additionally requires its prerequisite `local_corruption_exclusion` to be closed first.
+- **LLM gate status is advisory only**: If the LLM emits `status: closed` without sufficient evidence, the evaluator keeps the gate `open` and records an `llm_close_rejected` transition; the system prompt declares this rule explicitly.
+- **Conclusive answers stay gated**: While any mandatory gate remains `open`/`blocked`, [`project_managed_analysis_step`](vmcore-analysis-agent/src/react/state_manager.py) forces `is_conclusive=false` and strips a premature `final_diagnosis`.
+- **Full audit trail**: Every status change is appended to `gate_transition_history` in `AgentState`, and the Markdown report renders a **Gate Audit** section listing each gate's criteria, review evidence, and status transitions.
 
 **Key Concepts**:
 - **[`CrashSignatureClass`](vmcore-analysis-agent/src/react/schema.py#L117-L134) vs [`RootCauseClass`](vmcore-analysis-agent/src/react/schema.py#L139-L162)**: The former is an observable symptom from the panic log (e.g., `soft_lockup`), while the latter is the inferred underlying mechanism (e.g., `deadlock`). They serve different purposes in the analysis flow.
@@ -374,6 +385,7 @@ vmcore-analysis-agent/
 │   │   ├── __init__.py                # Package initialization
 │   │   ├── action_guard.py            # Action guard and safety validation
 │   │   ├── edges.py                   # Routing logic and state transitions
+│   │   ├── evidence.py                # Evidence extraction and executor-owned gate evaluation
 │   │   ├── fragment_flags.py          # Fragment flags management
 │   │   ├── graph.py                   # LangGraph graph construction
 │   │   ├── graph_state.py             # AgentState definition
@@ -424,6 +436,7 @@ vmcore-analysis-agent/
 ├── tests/                             # Test suite
 │   ├── test_action_guard.py           # Action guard tests
 │   ├── test_crash_client.py           # Crash client tests
+│   ├── test_evidence.py               # Evidence extraction & gate evaluation tests
 │   ├── test_llm_runtime.py            # LLM runtime tests
 │   ├── test_output_parser.py          # Output parser tests
 │   ├── test_prompt_builder.py         # Prompt builder tests
