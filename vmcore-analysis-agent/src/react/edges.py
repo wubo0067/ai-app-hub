@@ -150,6 +150,11 @@ def after_crash_tool(state: AgentState) -> str:
     """
     is_last_step = state.get("is_last_step", False)
     no_progress_streak = state.get("no_progress_streak", 0)
+    if state.get("replan_required") and not state.get("evidence_delta"):
+        logger.info(
+            "Replanning required for evidence goal %s after a duplicate action.",
+            (state.get("current_evidence_goal") or {}).get("goal_id", "unknown"),
+        )
     if no_progress_streak >= NO_PROGRESS_STREAK_LIMIT:
         logger.warning(
             "Stopping analysis after %s consecutive tool actions without evidence progress.",

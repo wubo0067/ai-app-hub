@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bi,/env python3
 # -*- coding: utf-8 -*-
 # report_generator.py - VMCore 分析报告生成模块
 # Author: CalmWU

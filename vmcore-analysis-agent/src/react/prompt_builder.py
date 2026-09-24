@@ -159,6 +159,7 @@ def build_executor_state_section(state: AgentState) -> str:
     reasoning_gate_contract = _format_reasoning_gate_contract(
         state.get("managed_gates")
     )
+    evidence_goal = state.get("current_evidence_goal") or "none"
     recent_commands = _recent_command_summaries(state.get("messages", []))
     stage_name = _infer_stage_name(step_count, state.get("managed_gates"))
 
@@ -172,6 +173,8 @@ def build_executor_state_section(state: AgentState) -> str:
         f"- Gate status: {gates}",
         f"- Unresolved mandatory gates: {unresolved_gates}",
         f"- Current gate objective: {next_gate_objective}",
+        f"- Current evidence goal: {evidence_goal} (version={state.get('evidence_goal_version', 0)}, status={state.get('evidence_goal_status', 'unknown')})",
+        "- Action evidence contract: declare evidence_goal_id, intended_evidence_type, target_object, and expected_observation for every tool action.",
         "- Action selection rule: if any mandatory gate remains open or blocked, the next action must directly advance the current gate objective or unblock its prerequisite.",
         f"- Reasoning gate contract: {reasoning_gate_contract}",
     ]

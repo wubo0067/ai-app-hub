@@ -84,7 +84,15 @@ class AgentState(MessagesState):
     duplicate_streak: int
     no_progress_streak: int
     evidence_delta: list[str]
+    evidence_facts: list[str]
     replan_required: bool
+    current_evidence_goal: Optional[dict[str, object]]
+    evidence_goal_version: int
+    evidence_goal_status: Optional[str]
+    evidence_goal_progress: Optional[str]
+    last_evidence_types: list[str]
+    current_action_intent: Optional[dict[str, object]]
+    last_action_goal_version: Optional[int]
     # 当前仍处于活跃状态的假设列表。
     # 用于在多轮推理过程中持续追踪尚未证伪、尚需进一步验证的根因假设。
     managed_active_hypotheses: Optional[list[Hypothesis]]

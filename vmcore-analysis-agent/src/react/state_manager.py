@@ -1,4 +1,4 @@
-#!/usr/bi,/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 from typing import Any, Dict, List, Optional, cast
@@ -96,7 +96,77 @@ def project_managed_analysis_step(
         "managed_active_hypotheses": active_hypotheses,
         "managed_gates": gates,
     }
+    evidence_goal = _build_evidence_goal(gates)
+    previous_goal = state.get("current_evidence_goal")
+    goal_version = state.get("evidence_goal_version", 0)
+    if evidence_goal != previous_goal:
+        goal_version += 1
+    managed_updates.update(
+        {
+            "current_evidence_goal": evidence_goal,
+            "evidence_goal_version": goal_version,
+            "evidence_goal_status": "open" if evidence_goal else "closed",
+            "evidence_goal_status": (
+                state.get("evidence_goal_status", "open")
+                if evidence_goal == previous_goal
+                else "open"
+            )
+            if evidence_goal
+            else "closed",
+            "evidence_goal_progress": (
+                state.get("evidence_goal_progress")
+                if evidence_goal == previous_goal
+                else None
+            ),
+            "current_action_intent": (
+                llm_step.action.model_dump(exclude_none=True)
+                if llm_step.action
+                else None
+            ),
+        }
+    )
     return step, managed_updates
+
+
+def _build_evidence_goal(
+    gates: Optional[Dict[str, GateEntry]],
+) -> Optional[dict[str, object]]:
+    """Map the next managed gate to an evidence target without prescribing one command."""
+    if not gates:
+        return None
+
+    for gate_name, gate in gates.items():
+        if gate.status not in {"open", "blocked"}:
+            continue
+        if gate.status == "blocked":
+            prerequisite = gate.prerequisite or "missing_prerequisite"
+            return {
+                "goal_id": prerequisite,
+                "gate_name": gate_name,
+                "required_evidence_types": ["gate_prerequisite"],
+                "target_object": prerequisite,
+                "completion_criteria": f"advance prerequisite {prerequisite}",
+            }
+
+        evidence_types = {
+            "register_provenance": [
+                "faulting_register",
+                "source_object_address",
+                "field_offset",
+                "object_register_relation",
+            ],
+            "local_corruption_exclusion": ["local_writer", "stack_or_object_lifetime"],
+            "field_type_classification": ["field_type", "struct_layout"],
+        }.get(gate_name, ["gate_evidence"])
+        return {
+            "goal_id": gate_name,
+            "gate_name": gate_name,
+            "required_evidence_types": evidence_types,
+            "target_object": None,
+            "completion_criteria": f"advance {gate_name} with concrete evidence",
+        }
+
+    return None
 
 
 def _resolve_partial_dump(

@@ -346,6 +346,10 @@ class ToolCall(BaseModel):
             "as a single run_script line instead of tokenized arguments."
         ),
     )
+    evidence_goal_id: Optional[str] = Field(None, description="Evidence goal this action is intended to advance.")
+    intended_evidence_type: Optional[str] = Field(None, description="Evidence type expected from this action.")
+    target_object: Optional[str] = Field(None, description="Object, address, or relation targeted by this action.")
+    expected_observation: Optional[str] = Field(None, description="Observation that would advance the evidence goal.")
 
     @model_validator(mode="before")
     @classmethod

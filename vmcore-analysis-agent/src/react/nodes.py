@@ -35,6 +35,11 @@ from .action_guard import (
     maybe_rewrite_module_symbol_tool_call,
     validate_tool_call_request,
 )
+from .evidence import (
+    extract_evidence_facts,
+    facts_support_goal,
+    update_gate_evidence,
+)
 
 # =========================================================================
 # 节点名称常量定义
@@ -403,6 +408,8 @@ async def call_crash_tool(state: AgentState) -> dict:
     previous_action_fingerprint = state.get("last_action_fingerprint", "")
     crash_path_struct_offsets = state.get("crash_path_struct_offsets")
     struct_layout_cache = dict(state.get("struct_layout_cache", {}))
+    prior_evidence_facts = set(state.get("evidence_facts", []))
+    observed_evidence_facts: set[str] = set()
 
     # 提取所有工具调用的命令，准备批量执行
     # 为了后续能将结果匹配回 tool_call_id，我们需要维护一个映射或顺序
@@ -484,7 +491,12 @@ async def call_crash_tool(state: AgentState) -> dict:
                 current_fingerprint = build_command_fingerprint(name, args)
                 prior_output = prior_tool_outputs.get(current_fingerprint)
 
-                if current_fingerprint and (
+                goal_version_changed = (
+                    state.get("evidence_goal_version") is not None
+                    and state.get("evidence_goal_version")
+                    != state.get("last_action_goal_version")
+                )
+                if current_fingerprint and not goal_version_changed and (
                     current_fingerprint in prior_fingerprints
                     or prior_output is not None
                 ):
@@ -577,6 +589,9 @@ async def call_crash_tool(state: AgentState) -> dict:
                             discovered_layouts = extract_struct_layouts(content)
                             if discovered_layouts:
                                 struct_layout_cache.update(discovered_layouts)
+                            observed_evidence_facts.update(
+                                extract_evidence_facts(tool_name, _raw_args, content)
+                            )
                             found_result = True
                             # 找到一个就可以停止内层循环，进入下一个 tool_call
                             # 实际上这可以处理重复命令的情况：每个 tool_call 都能匹配到结果
@@ -615,9 +630,11 @@ async def call_crash_tool(state: AgentState) -> dict:
         evidence_delta: list[str] = []
     elif commands_to_run:
         duplicate_streak = 0
-        no_progress_streak = 0
+        no_progress_streak = (
+            0 if observed_evidence_facts - prior_evidence_facts else state.get("no_progress_streak", 0) + 1
+        )
         action_status = "executed"
-        evidence_delta = list(new_fingerprints)
+        evidence_delta = sorted(observed_evidence_facts - prior_evidence_facts)
     elif rejected_count:
         duplicate_streak = 0
         no_progress_streak = state.get("no_progress_streak", 0) + 1
@@ -634,6 +651,11 @@ async def call_crash_tool(state: AgentState) -> dict:
     )
     # 这个返回字典会被 LangGraph 用来更新当前运行中的 AgentState 状态；
     # 它不是更新 nodes.py 里的某个本地变量，而是更新整个状态图在这一轮执行中的共享 state。
+    evidence_facts = sorted(prior_evidence_facts | observed_evidence_facts)
+    managed_gates = update_gate_evidence(state.get("managed_gates"), evidence_delta)
+    goal_advanced = facts_support_goal(
+        evidence_delta, state.get("current_evidence_goal")
+    )
     return {
         "step_count": 1,
         "messages": tool_messages,
@@ -647,7 +669,22 @@ async def call_crash_tool(state: AgentState) -> dict:
         "duplicate_streak": duplicate_streak,
         "no_progress_streak": no_progress_streak,
         "evidence_delta": evidence_delta,
-        "replan_required": all_duplicate,
+        "evidence_facts": evidence_facts,
+        "replan_required": all_duplicate
+        or (bool(commands_to_run) and not evidence_delta),
+        "managed_gates": managed_gates,
+        "evidence_goal_status": "advanced" if goal_advanced else state.get("evidence_goal_status"),
+        "evidence_goal_progress": (
+            "new evidence facts extracted"
+            if goal_advanced
+            else state.get("evidence_goal_progress")
+        ),
+        "last_action_goal_version": state.get("evidence_goal_version"),
+        "last_evidence_types": [
+            state.get("current_action_intent", {}).get("intended_evidence_type")
+        ]
+        if state.get("current_action_intent", {}).get("intended_evidence_type")
+        else [],
         "crash_path_struct_offsets": crash_path_struct_offsets,
         "struct_layout_cache": struct_layout_cache,
         "error": None,
