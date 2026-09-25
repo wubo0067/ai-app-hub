@@ -58,45 +58,66 @@ def evaluate_gate_closures(
     facts: Iterable[str],
     prior_gates: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, list[dict[str, object]]]:
-    """Apply executor-owned closure rules and return auditable gate transitions."""
-    if not gates:
+    """
+    应用执行器拥有的闭合规则，并返回可审计的门控状态转换记录。
+
+    该函数通过检查当前证据事实（facts）是否满足每个门控（gate）的预定义完成准则，
+    来决定门控是否应该关闭。如果 LLM 尝试关闭一个证据不足的门控，系统会拒绝该请求。
+
+    Args:
+        gates: 当前所有门控的映射，键为门控名称，值为门控对象。
+        facts: 当前观测到的结构化事实集合。
+        prior_gates: 先前的门控状态映射，用于对比状态变化。
+
+    Returns:
+        tuple[dict[str, Any] | None, list[dict[str, object]]]:
+            - 更新后的门控对象字典。
+            - 记录了所有门控状态转换的列表（包含转换原因和证据事实）。
+    """
+    if not gates:  # 如果没有门控，直接返回
         return None, []
 
-    fact_set = set(facts)
-    prior_gates = prior_gates or {}
-    evaluated: dict[str, Any] = {}
-    transitions: list[dict[str, object]] = []
+    fact_set = set(facts)  # 将事实转换为集合以提高查找效率
+    prior_gates = prior_gates or {}  # 如果没有提供先前的门控，则初始化为空字典
+    evaluated: dict[str, Any] = {}  # 存储评估后的门控对象
+    transitions: list[dict[str, object]] = []  # 记录状态转换事件
+
     for gate_name, raw_gate in gates.items():
+        # 深度拷贝门控对象，以避免修改原始数据
         gate = (
             raw_gate.model_copy(deep=True)
             if hasattr(raw_gate, "model_copy")
             else raw_gate
         )
-        prior = prior_gates.get(gate_name)
-        prior_status = getattr(prior, "status", None)
-        requested_status = getattr(gate, "status", "open")
-        gate.completion_criteria = gate_completion_criteria(gate_name)
+        prior = prior_gates.get(gate_name)  # 获取该门控先前的状态
+        prior_status = getattr(prior, "status", None)  # 先前的状态
+        requested_status = getattr(gate, "status", "open")  # LLM 请求的状态
+        gate.completion_criteria = gate_completion_criteria(gate_name)  # 设置该门控的完成准则
 
         if prior_status in {"closed", "n/a"}:
+            # 如果门控之前已经是关闭或不可用状态，保持现状
             gate.status = prior_status
         elif _gate_criteria_satisfied(gate_name, fact_set, evaluated):
+            # 如果当前证据已满足门控的完成准则，则将其设为关闭
             gate.status = "closed"
         elif requested_status == "closed":
+            # 如果 LLM 请求关闭门控，但证据并不足以满足准则
             if not _gate_criteria_satisfied(gate_name, fact_set, evaluated):
-                gate.status = prior_status or "open"
+                gate.status = prior_status or "open"  # 拒绝关闭，回退到先前状态或 open
                 transitions.append(
                     {
                         "gate_name": gate_name,
                         "from_status": prior_status or "open",
                         "to_status": "open",
-                        "event": "llm_close_rejected",
+                        "event": "llm_close_rejected",  # 记录为 LLM 关闭请求被拒绝
                         "reason": "completion criteria not satisfied by structured evidence",
                         "evidence_facts": sorted(fact_set),
                     }
                 )
-        evaluated[gate_name] = gate
+        evaluated[gate_name] = gate  # 将评估后的门控存入结果字典
 
         current_status = getattr(gate, "status", "open")
+        # 如果门控状态发生了变化，记录一次状态转换事件
         if prior_status is not None and current_status != prior_status:
             transitions.append(
                 {
@@ -256,23 +277,49 @@ def update_gate_evidence(
 
 
 def facts_support_goal(facts: Iterable[str], goal: Mapping[str, Any] | None) -> bool:
-    """Return whether at least one new fact is relevant to the current evidence goal."""
-    if not goal:
+    """
+    判断新发现的事实是否与当前的目标门控相关。
+
+    Args:
+        facts: 一个可迭代的事实字符串集合。
+        goal: 当前的目标字典，通常包含 "gate_name" 键。
+
+    Returns:
+        bool: 如果至少有一个事实支持该门控，则返回 True，否则返回 False。
+    """
+    if not goal:  # 如果目标为空，直接返回 False
         return False
-    gate_name = str(goal.get("gate_name", ""))
+    gate_name = str(goal.get("gate_name", ""))  # 从目标中获取门控名称
+    # 检查事实集合中是否至少有一个事实能支持该门控
     return any(_fact_supports_gate(fact, gate_name) for fact in facts)
 
 
 def _command_lines(tool_name: str, raw_args: Any) -> list[str]:
-    if tool_name != "run_script":
-        if isinstance(raw_args, dict):
-            command = raw_args.get("command", "")
+    """
+    解析工具名称和原始参数，提取出需要执行的命令行列表。
+
+    Args:
+        tool_name: 工具名称。如果是 "run_script"，则表示参数中包含多行脚本。
+        raw_args: 工具的原始参数。
+                - 对于直接命令工具：通常是 {"command": "..."} 或纯字符串。
+                - 对于 run_script：通常是 {"script": "..."} 或包含脚本内容的字符串。
+
+    Returns:
+        list[str]: 提取出的命令行列表，每行作为一个独立的命令。
+    """
+    if tool_name != "run_script":  # 如果不是多行脚本模式，处理单条命令
+        if isinstance(raw_args, dict):  # 如果参数是字典格式
+            command = raw_args.get("command", "")  # 从字典中提取 command 字段
             return [str(command)]
-        return [str(raw_args)]
-    if isinstance(raw_args, dict):
-        script = raw_args.get("script", "")
-    else:
+        return [str(raw_args)]  # 如果参数是直接的字符串，直接转为列表返回
+
+    # 处理 run_script 模式下的多行脚本
+    if isinstance(raw_args, dict):  # 如果参数是字典格式
+        script = raw_args.get("script", "")  # 从字典中提取 script 字段
+    else:  # 如果参数是字符串
         script = raw_args
+
+    # 将脚本按行拆分，去除每行首尾空格，并过滤掉空行
     return [line.strip() for line in str(script).splitlines() if line.strip()]
 
 
