@@ -74,6 +74,23 @@ class EvidenceExtractionTests(unittest.TestCase):
         self.assertTrue(any(fact.startswith("dis_") for fact in facts))
         self.assertTrue(any(fact.startswith("sym:") for fact in facts))
 
+    def test_direct_tools_extract_facts_from_argument_only_payloads(self) -> None:
+        rd_facts = extract_evidence_facts(
+            "rd",
+            {"command": "-x ffffffffc09e7a89 2"},
+            "crash> rd -x ffffffffc09e7a89 2\n"
+            "ffffffffc09e7a89: 63000000000a7325 6d6f72665f79706f",
+        )
+        dis_facts = extract_evidence_facts(
+            "dis",
+            {"command": "-l mxlog_vprintf 2"},
+            "crash> dis -l mxlog_vprintf 2\n"
+            "0xffffffffc08de97c <mxlog_vprintf+60>: mov (%r9),%rax",
+        )
+
+        self.assertIn("rd_word:0xffffffffc09e7a89=0x63000000000a7325", rd_facts)
+        self.assertIn("dis_instruction:0xffffffffc08de97c=mov", dis_facts)
+
     def test_gate_progress_uses_fact_set_difference(self) -> None:
         prior = {"rd_word:0xffff0000=0x10"}
         current = prior | {"struct_field:irqaction.handler@0x0"}
@@ -88,7 +105,10 @@ class EvidenceExtractionTests(unittest.TestCase):
 
         self.assertEqual(delta, {"struct_field:irqaction.handler@0x0"})
         self.assertTrue(facts_support_goal(delta, goal))
-        self.assertIn("[evidence-delta] struct_field:irqaction.handler@0x0", updated["field_type_classification"].evidence)
+        self.assertIn(
+            "[evidence-delta] struct_field:irqaction.handler@0x0",
+            updated["field_type_classification"].evidence,
+        )
         self.assertEqual(updated["field_type_classification"].status, "open")
 
     def test_llm_close_is_rejected_without_completion_evidence(self) -> None:
@@ -106,9 +126,7 @@ class EvidenceExtractionTests(unittest.TestCase):
         self.assertTrue(
             any(item["event"] == "llm_close_rejected" for item in transitions)
         )
-        self.assertEqual(
-            len(evaluated["register_provenance"].completion_criteria), 3
-        )
+        self.assertEqual(len(evaluated["register_provenance"].completion_criteria), 3)
 
     def test_evaluator_closes_gate_and_records_transition(self) -> None:
         gates = {
@@ -128,9 +146,7 @@ class EvidenceExtractionTests(unittest.TestCase):
             evaluated["register_provenance"].completion_criteria,
             gate_completion_criteria("register_provenance"),
         )
-        self.assertTrue(
-            any(item["event"] == "gate_transition" for item in transitions)
-        )
+        self.assertTrue(any(item["event"] == "gate_transition" for item in transitions))
 
     def test_state_manager_does_not_accept_llm_gate_closure(self) -> None:
         llm_step = VMCoreLLMAnalysisStep.model_validate(

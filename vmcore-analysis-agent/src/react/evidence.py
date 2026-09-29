@@ -92,7 +92,9 @@ def evaluate_gate_closures(
         prior = prior_gates.get(gate_name)  # 获取该门控先前的状态
         prior_status = getattr(prior, "status", None)  # 先前的状态
         requested_status = getattr(gate, "status", "open")  # LLM 请求的状态
-        gate.completion_criteria = gate_completion_criteria(gate_name)  # 设置该门控的完成准则
+        gate.completion_criteria = gate_completion_criteria(
+            gate_name
+        )  # 设置该门控的完成准则
 
         if prior_status in {"closed", "n/a"}:
             # 如果门控之前已经是关闭或不可用状态，保持现状
@@ -310,8 +312,14 @@ def _command_lines(tool_name: str, raw_args: Any) -> list[str]:
     if tool_name != "run_script":  # 如果不是多行脚本模式，处理单条命令
         if isinstance(raw_args, dict):  # 如果参数是字典格式
             command = raw_args.get("command", "")  # 从字典中提取 command 字段
-            return [str(command)]
-        return [str(raw_args)]  # 如果参数是直接的字符串，直接转为列表返回
+        else:
+            command = raw_args
+        command = str(command).strip()
+        if not command:
+            return []
+        if command.split(maxsplit=1)[0].lower() != tool_name.lower():
+            command = f"{tool_name} {command}"
+        return [command]
 
     # 处理 run_script 模式下的多行脚本
     if isinstance(raw_args, dict):  # 如果参数是字典格式

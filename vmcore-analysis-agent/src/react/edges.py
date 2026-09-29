@@ -22,7 +22,6 @@ from .nodes import (
     structure_reasoning_node,
 )
 
-
 NO_PROGRESS_STREAK_LIMIT = 3
 
 
@@ -152,8 +151,10 @@ def after_crash_tool(state: AgentState) -> str:
     no_progress_streak = state.get("no_progress_streak", 0)
     if state.get("replan_required") and not state.get("evidence_delta"):
         logger.info(
-            "Replanning required for evidence goal %s after a duplicate action.",
+            "Replanning required for evidence goal %s after action status "
+            "'%s' produced no evidence delta.",
             (state.get("current_evidence_goal") or {}).get("goal_id", "unknown"),
+            state.get("last_action_status", "unknown"),
         )
     if no_progress_streak >= NO_PROGRESS_STREAK_LIMIT:
         logger.warning(
