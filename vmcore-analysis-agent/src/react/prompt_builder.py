@@ -15,7 +15,6 @@ from .prompt_layers import LAYER0_SYSTEM_PROMPT_TEMPLATE, PLAYBOOKS, SOP_FRAGMEN
 from .prompts import build_minimal_schema_enum_contract
 from .schema import CrashSignatureClass, GateEntry, Hypothesis, VMCoreLLMAnalysisStep
 
-
 # 中文报告输出规则：仅当 state["report_language"] == "zh" 时注入到系统提示词。
 # 要求所有自由文本字段用简体中文书写，同时保留技术标识符与枚举值的英文形式，
 # 以免破坏 schema 校验与证据可追溯性。
@@ -542,7 +541,10 @@ def _format_reasoning_gate_contract(raw_gates: object) -> str:
                 return (
                     "name target gate register_provenance, explain which concrete source object and field/offset "
                     "must be identified next, and state how the next action will close the bad-register chain. "
-                    "Do not demand proof of the ultimate overflow writer to close this gate"
+                    "Do not demand proof of the ultimate overflow writer to close this gate. "
+                    "Before claiming the chain is closed, verify that the memory address computed from the "
+                    "faulting instruction's operand registers (using the exception frame values) matches the "
+                    "fault address in the dmesg BUG line; if they do not match, re-examine the operand derivation"
                 )
             return (
                 f"name target gate {gate_name}, explain why the next action advances it, "

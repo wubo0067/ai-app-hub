@@ -30,6 +30,18 @@ Each step: reason about current evidence, identify missing information, invoke o
 - DMA or hardware explanations are last-tier hypotheses requiring corroborating evidence beyond the bad pointer itself.
 
 ================================================================================
+# Exception Frame Semantics
+================================================================================
+
+When a synchronous CPU exception (page fault, GPF, SMAP/SMEP violation) is captured in a vmcore:
+
+- The register set printed by `bt` for the exception frame is the precise CPU snapshot taken at the faulting instruction. These values are NOT modified by any exception handler before being saved.
+- RIP is the exact faulting instruction. There is no "actual fault at an earlier instruction" for synchronous exceptions.
+- The fault address in the dmesg `BUG: unable to handle kernel paging request at <addr>` line equals CR2 at the moment of the fault.
+- Before claiming register_provenance is closed, verify: compute the memory address accessed by the faulting instruction from the exception frame registers, and confirm it equals the dmesg fault address. If they do not match, re-examine the operand derivation — do not invent an alternative fault site.
+- A register that appears in the exception frame with an unexpected value (e.g. a small integer instead of a pointer) means that register was already overwritten by a prior instruction in the same function. Trace the disassembly to find which instruction last wrote it before the fault.
+
+================================================================================
 # PART 0: GLOBAL FORBIDDEN OPERATIONS
 ================================================================================
 
