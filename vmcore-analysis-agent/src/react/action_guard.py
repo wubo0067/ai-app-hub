@@ -202,7 +202,9 @@ def maybe_rewrite_module_symbol_tool_call(
     ):
         return None
 
-    normalized_lines = [canonicalize_command_line(line) for line in lines if line.strip()]
+    normalized_lines = [
+        canonicalize_command_line(line) for line in lines if line.strip()
+    ]
     prelude = build_mod_s_prelude(debug_symbol_paths)
     script = "\n".join([*prelude, *normalized_lines])
     return "run_script", {"script": script}
@@ -439,6 +441,22 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
             return "kmem -a <addr> is forbidden; use kmem -S <addr>."
         if parts[1] == "-S" and len(parts) == 2:
             return "bare kmem -S is forbidden; use kmem -S <addr>."
+        if parts[1] == "-v":
+            if "|" not in parts:
+                return "kmem -v must be piped to grep with a concrete filter."
+            pipe_index = parts.index("|")
+            if pipe_index != 2:
+                return "kmem -v must be immediately piped to grep."
+            if pipe_index == len(parts) - 1 or parts[pipe_index + 1] != "grep":
+                return "kmem -v must be immediately piped to grep."
+
+            grep_pattern_index = pipe_index + 2
+            while grep_pattern_index < len(parts) and parts[
+                grep_pattern_index
+            ].startswith("-"):
+                grep_pattern_index += 1
+            if grep_pattern_index >= len(parts):
+                return "kmem -v grep filter must include a concrete pattern."
 
     # struct 命令检查：禁止裸用 struct -o
     if command == "struct":
@@ -565,11 +583,15 @@ def _module_debug_candidates(path: str) -> set[str]:
 def _line_matches_module_candidate(line: str, candidate: str) -> bool:
     """按标识符边界匹配模块名或其私有符号前缀。"""
     escaped = re.escape(candidate)
-    pattern = re.compile(rf"(?<![A-Za-z0-9_]){escaped}(?:_(?=[A-Za-z0-9_])|(?![A-Za-z0-9_]))")
+    pattern = re.compile(
+        rf"(?<![A-Za-z0-9_]){escaped}(?:_(?=[A-Za-z0-9_])|(?![A-Za-z0-9_]))"
+    )
     return pattern.search(line) is not None
 
 
-def _derive_module_symbol_hints(debug_symbol_paths: Optional[Iterable[str]]) -> set[str]:
+def _derive_module_symbol_hints(
+    debug_symbol_paths: Optional[Iterable[str]],
+) -> set[str]:
     """根据第三方 ko 路径动态推导模块符号前缀/名称提示。"""
     if not debug_symbol_paths:
         return set()
@@ -612,7 +634,9 @@ def _uses_module_specific_symbol(
     for line in lines:
         lowered = canonicalize_command_line(line).lower()
         # 检查是否包含任何模块符号前缀
-        if any(_line_matches_module_candidate(lowered, prefix) for prefix in symbol_hints):
+        if any(
+            _line_matches_module_candidate(lowered, prefix) for prefix in symbol_hints
+        ):
             return True
     return False
 

@@ -410,6 +410,7 @@ async def call_crash_tool(state: AgentState) -> dict:
     struct_layout_cache = dict(state.get("struct_layout_cache", {}))
     prior_evidence_facts = set(state.get("evidence_facts", []))
     observed_evidence_facts: set[str] = set()
+    observed_nonempty_output = False
 
     # 提取所有工具调用的命令，准备批量执行
     # 为了后续能将结果匹配回 tool_call_id，我们需要维护一个映射或顺序
@@ -470,8 +471,8 @@ async def call_crash_tool(state: AgentState) -> dict:
                     tool_messages.append(
                         ToolMessage(
                             content=f"[executor-guard] Rejected action: {validation_error}",
-                            tool_call_id=tool_call_id, # 关联原始的 tool_call_id，确保消息链条完整
-                            name=name,                  # 指明是哪个工具请求被拒绝了
+                            tool_call_id=tool_call_id,  # 关联原始的 tool_call_id，确保消息链条完整
+                            name=name,  # 指明是哪个工具请求被拒绝了
                         )
                     )
                     # B. 记录系统日志
@@ -491,14 +492,18 @@ async def call_crash_tool(state: AgentState) -> dict:
                 current_fingerprint = build_command_fingerprint(name, args)
                 prior_output = prior_tool_outputs.get(current_fingerprint)
 
-                goal_version_changed = (
-                    state.get("evidence_goal_version") is not None
-                    and state.get("evidence_goal_version")
-                    != state.get("last_action_goal_version")
+                goal_version_changed = state.get(
+                    "evidence_goal_version"
+                ) is not None and state.get("evidence_goal_version") != state.get(
+                    "last_action_goal_version"
                 )
-                if current_fingerprint and not goal_version_changed and (
-                    current_fingerprint in prior_fingerprints
-                    or prior_output is not None
+                if (
+                    current_fingerprint
+                    and not goal_version_changed
+                    and (
+                        current_fingerprint in prior_fingerprints
+                        or prior_output is not None
+                    )
                 ):
                     # 命令已执行过，直接返回历史输出 + 提示
                     dedup_msg = (
@@ -566,6 +571,10 @@ async def call_crash_tool(state: AgentState) -> dict:
                             content = str(r_output)
                             if isinstance(r_output, Exception):
                                 content = f"[error] Execution failed: {r_output}"
+                            if content.strip() and not content.startswith(
+                                ("[error]", "[TIMEOUT]")
+                            ):
+                                observed_nonempty_output = True
                             tool_messages.append(
                                 ToolMessage(
                                     content=content,
@@ -615,8 +624,10 @@ async def call_crash_tool(state: AgentState) -> dict:
         }
 
     logger.info(f"Generated {len(tool_messages)} tool messages.")
-    all_duplicate = bool(current_fingerprints) and not commands_to_run and bool(
-        duplicate_fingerprints
+    all_duplicate = (
+        bool(current_fingerprints)
+        and not commands_to_run
+        and bool(duplicate_fingerprints)
     )
     if all_duplicate:
         duplicate_streak = (
@@ -631,7 +642,10 @@ async def call_crash_tool(state: AgentState) -> dict:
     elif commands_to_run:
         duplicate_streak = 0
         no_progress_streak = (
-            0 if observed_evidence_facts - prior_evidence_facts else state.get("no_progress_streak", 0) + 1
+            0
+            if observed_evidence_facts - prior_evidence_facts
+            or observed_nonempty_output
+            else state.get("no_progress_streak", 0) + 1
         )
         action_status = "executed"
         evidence_delta = sorted(observed_evidence_facts - prior_evidence_facts)
@@ -673,18 +687,20 @@ async def call_crash_tool(state: AgentState) -> dict:
         "replan_required": all_duplicate
         or (bool(commands_to_run) and not evidence_delta),
         "managed_gates": managed_gates,
-        "evidence_goal_status": "advanced" if goal_advanced else state.get("evidence_goal_status"),
+        "evidence_goal_status": (
+            "advanced" if goal_advanced else state.get("evidence_goal_status")
+        ),
         "evidence_goal_progress": (
             "new evidence facts extracted"
             if goal_advanced
             else state.get("evidence_goal_progress")
         ),
         "last_action_goal_version": state.get("evidence_goal_version"),
-        "last_evidence_types": [
-            state.get("current_action_intent", {}).get("intended_evidence_type")
-        ]
-        if state.get("current_action_intent", {}).get("intended_evidence_type")
-        else [],
+        "last_evidence_types": (
+            [state.get("current_action_intent", {}).get("intended_evidence_type")]
+            if state.get("current_action_intent", {}).get("intended_evidence_type")
+            else []
+        ),
         "crash_path_struct_offsets": crash_path_struct_offsets,
         "struct_layout_cache": struct_layout_cache,
         "error": None,

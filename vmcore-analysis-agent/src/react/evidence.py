@@ -18,6 +18,18 @@ _DIS_LINE_RE = re.compile(
 _SYM_LINE_RE = re.compile(
     rf"^\s*(?P<address>{_HEX})\s+(?P<kind>[A-Za-z?])\s+(?P<symbol>\S+)"
 )
+_VTOP_UNMAPPED_RE = re.compile(
+    rf"^\s*(?P<address>{_HEX})\s+\(not mapped\)\s*$",
+    re.IGNORECASE,
+)
+_VTOP_PTE_RE = re.compile(
+    rf"^\s*PTE:\s*(?:{_HEX}\s*=>\s*)?(?P<value>{_HEX})\s*$",
+    re.IGNORECASE,
+)
+_KMEM_RANGE_RE = re.compile(
+    rf"^\s*\S+\s+\S+\s+(?P<start>{_HEX})\s+-\s+(?P<end>{_HEX})\s+(?P<size>\d+)\s*$",
+    re.IGNORECASE,
+)
 
 _GATE_COMPLETION_CRITERIA: dict[str, list[str]] = {
     "register_provenance": [
@@ -212,6 +224,10 @@ def extract_evidence_facts(
         elif name == "sym":
             # 解析符号表输出，提取符号名、地址和类型
             facts.update(_parse_sym(output))
+        elif name == "vtop":
+            facts.update(_parse_vtop(output))
+        elif name == "kmem":
+            facts.update(_parse_kmem(output))
     return facts
 
 
@@ -455,16 +471,46 @@ def _parse_sym(output: str) -> set[str]:
     return facts
 
 
+def _parse_vtop(output: str) -> set[str]:
+    """Extract explicit mapping-state facts from ``vtop`` output."""
+    facts: set[str] = set()
+    for line in output.splitlines():
+        unmapped = _VTOP_UNMAPPED_RE.match(line)
+        if unmapped:
+            address = _to_int(unmapped.group("address"))
+            facts.add(f"vtop_unmapped:0x{address:x}")
+            continue
+
+        pte = _VTOP_PTE_RE.match(line)
+        if pte:
+            facts.add(f"vtop_pte:0x{_to_int(pte.group('value')):x}")
+    return facts
+
+
+def _parse_kmem(output: str) -> set[str]:
+    """Extract vmalloc range observations from ``kmem -v`` output."""
+    facts: set[str] = set()
+    for line in output.splitlines():
+        match = _KMEM_RANGE_RE.match(line)
+        if not match:
+            continue
+        start = _to_int(match.group("start"))
+        end = _to_int(match.group("end"))
+        size = int(match.group("size"), 10)
+        facts.add(f"kmem_vmap_range:0x{start:x}-0x{end:x}=0x{size:x}")
+    return facts
+
+
 def _fact_supports_gate(fact: str, gate_name: str) -> bool:
     if gate_name == "register_provenance":
-        return fact.startswith(("rd_word:", "dis_", "sym:"))
+        return fact.startswith(("rd_word:", "dis_", "sym:", "vtop_"))
     if gate_name == "local_corruption_exclusion":
-        return fact.startswith(("dis_", "rd_word:"))
+        return fact.startswith(("dis_", "rd_word:", "vtop_", "kmem_"))
     if gate_name == "field_type_classification":
         return fact.startswith(("struct_", "sym:"))
     if gate_name == "object_lifetime":
-        return fact.startswith(("rd_word:", "struct_"))
-    return fact.startswith(("rd_word:", "struct_", "dis_", "sym:"))
+        return fact.startswith(("rd_word:", "struct_", "vtop_", "kmem_"))
+    return fact.startswith(("rd_word:", "struct_", "dis_", "sym:", "vtop_", "kmem_"))
 
 
 def _to_int(value: str) -> int:

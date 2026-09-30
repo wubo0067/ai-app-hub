@@ -45,6 +45,11 @@ Each step: reason about current evidence, identify missing information, invoke o
 	Correct alternative: put that note in reasoning; spend commands only on diagnostic evidence collection
 - Forbidden: kmem -S with no address or kmem -a <addr>
 	Correct alternative: kmem -S <addr>
+- Forbidden: standalone kmem or kmem -v without an output filter. These commands can dump a
+  very large vmalloc/slab listing and may truncate the evidence needed for the current target.
+  Correct form: run_script with `kmem -v | grep -i "<concrete address fragment or anchor>"`.
+  The grep pattern must target the current address, object name, or another concrete diagnostic
+  anchor; do not use a broad or generic pattern.
 - Forbidden: bt -a except hard_lockup or NMI watchdog panic
 	Correct alternative: bt <pid>, bt -c <cpu>, foreach UN bt
 - Forbidden: ps or ps -m standalone

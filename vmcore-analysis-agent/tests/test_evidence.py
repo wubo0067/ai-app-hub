@@ -91,6 +91,38 @@ class EvidenceExtractionTests(unittest.TestCase):
         self.assertIn("rd_word:0xffffffffc09e7a89=0x63000000000a7325", rd_facts)
         self.assertIn("dis_instruction:0xffffffffc08de97c=mov", dis_facts)
 
+    def test_extracts_mapping_and_vmalloc_facts(self) -> None:
+        vtop_facts = extract_evidence_facts(
+            "vtop",
+            {"command": "ffffb2709a1ac000"},
+            "ffffb2709a1ac000  (not mapped)\nPTE: 118ea7d60 => 0",
+        )
+        kmem_facts = extract_evidence_facts(
+            "kmem",
+            {"command": "-v"},
+            "ffff959a401549a0 ffff959a40003fc0 "
+            "ffffb27080000000 - ffffb27080002000     8192",
+        )
+
+        self.assertIn("vtop_unmapped:0xffffb2709a1ac000", vtop_facts)
+        self.assertIn("vtop_pte:0x0", vtop_facts)
+        self.assertIn(
+            "kmem_vmap_range:0xffffb27080000000-0xffffb27080002000=0x2000",
+            kmem_facts,
+        )
+
+    def test_mapping_facts_support_lifetime_and_local_exclusion(self) -> None:
+        facts = extract_evidence_facts(
+            "vtop",
+            {"command": "ffffb2709a1ac000"},
+            "ffffb2709a1ac000  (not mapped)",
+        )
+
+        self.assertTrue(facts_support_goal(facts, {"gate_name": "object_lifetime"}))
+        self.assertTrue(
+            facts_support_goal(facts, {"gate_name": "local_corruption_exclusion"})
+        )
+
     def test_gate_progress_uses_fact_set_difference(self) -> None:
         prior = {"rd_word:0xffff0000=0x10"}
         current = prior | {"struct_field:irqaction.handler@0x0"}
