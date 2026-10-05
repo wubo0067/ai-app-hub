@@ -220,7 +220,7 @@ evidence, the final suspect code location MUST remain indeterminate.
 If diagnostic checks prove that the corrupted slot is NOT the canary slot (e.g., the true canary is intact but a saved RIP or RBP is corrupted), STOP the Stack Protector Fast Path immediately and switch to the standard `stack_overflow` / Generic Stack Corruption SOP (3.8). Do NOT force non-canary forensics into the Fast Path constraints.
 """.strip(),
     "kasan_ubsan": """
-## 3.11 KASAN / UBSAN Reports
+## 3.15a KASAN / UBSAN Reports
 
 Pattern: BUG: KASAN or UBSAN report.
 
@@ -230,7 +230,7 @@ Analysis:
 3. UBSAN often indicates a logic bug rather than a memory-lifetime bug; keep that distinction explicit.
 """.strip(),
     "dma_corruption": """
-## 3.12 DMA Memory Corruption (Stray DMA Write)
+## 3.15b DMA Memory Corruption (Stray DMA Write)
 
 Preconditions before suspecting DMA:
 Treat these preconditions as the DMA-side realization of S1-S5 exclusion reasoning from the system layer. {DMA_PROMOTION_EVIDENCE_RULE}
@@ -370,7 +370,7 @@ validate the following:
   confidence must remain low until IOMMU bypass or misconfiguration is proven.
 """.strip(),
     "driver_source_correlation": """
-## 3.13 Driver Source Correlation
+## 3.15c Driver Source Correlation
 
 Use this SOP when the crash path is inside a driver, struct -o cannot validate the private type, or offset-only reasoning is stalling.
 

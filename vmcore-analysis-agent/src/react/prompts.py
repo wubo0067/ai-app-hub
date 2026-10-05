@@ -1,4 +1,4 @@
-#!/usr/bin/en, python3,!
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # prompts.py - VMCore 分析 Agent 提示词定义模块
 # Author: CalmWU
@@ -256,6 +256,8 @@ def _select_prompt_playbook(
     recent_text: str,
 ) -> str:
     """
+    DEPRECATED: not called at runtime; use prompt_builder.py instead.
+
     根据识别出的签名类别（signature_class）和最近的文本上下文，
     从预定义的 Playbooks 库中选择最合适的提示词模板（Prompt Playbook）。
 
@@ -292,6 +294,8 @@ def _select_prompt_sop_fragments(
     enabled_gates: set[str],
 ) -> list[str]:
     """
+    DEPRECATED: not called at runtime; use prompt_builder.py instead.
+
     根据当前的分析上下文（签名、最近文本、分析步骤、已启用的检查点等）
     动态选择并组合标准操作程序（SOP）的片段。
 
@@ -399,6 +403,8 @@ def _select_prompt_overlays(
     enabled_gates: set[str],
 ) -> list[str]:
     """
+    DEPRECATED: not called at runtime; use prompt_builder.py instead.
+
     根据当前的分析状态、发现的签名以及分析步骤，决定是否需要在 Prompt 中添加额外的提示层（Overlays）。
 
     Overlays 用于在特定的分析上下文（如发现内存损坏、驱动相关线索或达到一定分析深度）时，

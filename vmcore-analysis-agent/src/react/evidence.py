@@ -152,12 +152,39 @@ def _gate_criteria_satisfied(
     facts: set[str],
     evaluated_gates: Mapping[str, Any],
 ) -> bool:
+    """
+    判断当前提取到的结构化事实是否满足指定门控（gate）的闭合准则。
+
+    不同的分析门控对事实证据的类型有不同的组合要求（例如需要反汇编指令、内存数据、
+    结构体字段或符号等独立维度的交叉验证）。部分门控还存在前置门控依赖关系。
+
+    Args:
+        gate_name: 门控名称（例如 "register_provenance"、"local_corruption_exclusion" 等）。
+        facts: 当前已经观测并提取出的结构化事实字符串集合（如以 "rd_word:"、"struct_" 等开头）。
+        evaluated_gates: 当前已完成评估的门控字典映射，用于检查前置门控的状态。
+
+    Returns:
+        bool: 如果满足该门控的所有证据要求及前置条件则返回 True，否则返回 False。
+    """
+    # 统计当前事实集合中命中了哪些维度的证据类别：
+    # - "rd": 内存读取证据（以 "rd_word:" 开头，记录指定地址的字值）
+    # - "struct": 结构体布局证据（以 "struct_" 开头，记录结构体类型、字段偏移和大小）
+    # - "dis": 反汇编证据（以 "dis_" 开头，记录指令地址、助记符和符号）
+    # - "sym": 符号表证据（以 "sym:" 开头，记录符号名、地址和类型）
     categories = {
         "rd": any(fact.startswith("rd_word:") for fact in facts),
         "struct": any(fact.startswith("struct_") for fact in facts),
         "dis": any(fact.startswith("dis_") for fact in facts),
         "sym": any(fact.startswith("sym:") for fact in facts),
     }
+
+    # 定义各门控闭合所需的证据组（每个子列表为一个要求组，组内任一类别满足即满足该组，
+    # 且所有要求组均须满足）：
+    # - register_provenance（故障寄存器来源）: 需内存读取证据，且需反汇编或符号证据
+    # - object_lifetime（对象生命周期）: 需内存读取或结构体信息
+    # - local_corruption_exclusion（局部内存破坏排除）: 需反汇编指令且需内存读取证据
+    # - field_type_classification（字段类型分类）: 需结构体信息且需符号表证据
+    # - external_corruption_gate（外部破坏门控）: 需至少具备一类结构化证据
     required_groups = {
         "register_provenance": [{"rd"}, {"dis", "sym"}],
         "object_lifetime": [{"rd", "struct"}],
@@ -165,6 +192,9 @@ def _gate_criteria_satisfied(
         "field_type_classification": [{"struct"}, {"sym"}],
         "external_corruption_gate": [{"rd", "struct", "dis", "sym"}],
     }.get(gate_name, [{"rd", "struct", "dis", "sym"}])
+
+    # 外部破坏门控（external_corruption_gate）具有前置依赖：
+    # 必须先确认局部破坏排除门控（local_corruption_exclusion）已关闭（closed）或不适用（n/a）
     if gate_name == "external_corruption_gate":
         prerequisite = evaluated_gates.get("local_corruption_exclusion")
         if prerequisite is None or getattr(prerequisite, "status", None) not in {
@@ -172,6 +202,9 @@ def _gate_criteria_satisfied(
             "n/a",
         }:
             return False
+
+    # 检查是否所有必需的证据组都得到了满足：
+    # 每个 group 只要包含的类别中有至少一项为 True，则该 group 计数加 1
     return sum(
         any(categories[name] for name in group) for group in required_groups
     ) >= len(required_groups)
@@ -348,17 +381,41 @@ def _command_lines(tool_name: str, raw_args: Any) -> list[str]:
 
 
 def _parse_rd(output: str) -> set[str]:
+    """
+    解析 ``rd``（内存读取）命令的输出并提取事实（facts）。
+
+    crash 的 ``rd`` 命令输出格式为每行一个地址后跟若干十六进制字（word），
+    例如::
+
+        ffff0000: 0000000000000010 0000000000000020  ..
+
+    该函数将每个字与其所在地址关联，生成格式为
+    ``rd_word:0x<address>=0x<value>`` 的事实。由于 64 位内核中每个字占 8 字节，
+    第 index 个字的地址为 ``起始地址 + index * 8``。
+
+    Args:
+        output (str): ``rd`` 命令的标准输出字符串。
+
+    Returns:
+        set[str]: 包含提取出的内存字事实的集合。
+    """
     facts: set[str] = set()
     for line in output.splitlines():
+        # 匹配 "地址: 数据..." 格式的行，例如 "ffff0000: 0000000000000010 ..."
         match = _RD_LINE_RE.match(line)
         if not match:
             continue
+        # 该行数据块的起始地址
         address = _to_int(match.group("address"))
+        # 逐个提取十六进制字；遇到非十六进制的 token（如行尾的 ASCII 预览
+        # ".." 或 "<read error>"）即停止，只保留前面有效的字
         words = []
         for token in match.group("words").split():
             if not re.fullmatch(_HEX, token):
                 break
             words.append(token)
+        # 每个字按其实际内存地址（起始地址 + 序号*8字节）记录一条事实，
+        # 数值统一规范化为十六进制输出
         for index, word in enumerate(words):
             facts.add(f"rd_word:0x{address + index * 8:x}=0x{_to_int(word):x}")
     return facts
@@ -472,15 +529,32 @@ def _parse_sym(output: str) -> set[str]:
 
 
 def _parse_vtop(output: str) -> set[str]:
-    """Extract explicit mapping-state facts from ``vtop`` output."""
+    """
+    解析 ``vtop``（虚拟地址转物理地址）命令的输出并提取事实（facts）。
+
+    该函数逐行匹配输出，识别两类映射状态信息：
+    1. 地址未映射（"not mapped"）→ 生成 ``vtop_unmapped:0x<address>`` 事实，
+       说明该虚拟地址在当前页表中没有对应的物理页。
+    2. 页表项（PTE）值 → 生成 ``vtop_pte:0x<value>`` 事实，
+       记录该地址对应的页表项内容（可用于判断页面权限、有效性等）。
+
+    Args:
+        output (str): ``vtop`` 命令的标准输出字符串。
+
+    Returns:
+        set[str]: 包含提取出的映射状态相关事实的集合。
+    """
     facts: set[str] = set()
     for line in output.splitlines():
+        # 尝试匹配 "未映射" 行，例如 "0xffff0000 (not mapped)"
         unmapped = _VTOP_UNMAPPED_RE.match(line)
         if unmapped:
+            # 将地址转换为整数后以十六进制规范化输出
             address = _to_int(unmapped.group("address"))
             facts.add(f"vtop_unmapped:0x{address:x}")
             continue
 
+        # 尝试匹配 PTE 行，例如 "PTE: 0x123456789" 或 "PTE: 0x123 => 0x456"
         pte = _VTOP_PTE_RE.match(line)
         if pte:
             facts.add(f"vtop_pte:0x{_to_int(pte.group('value')):x}")
@@ -488,20 +562,52 @@ def _parse_vtop(output: str) -> set[str]:
 
 
 def _parse_kmem(output: str) -> set[str]:
-    """Extract vmalloc range observations from ``kmem -v`` output."""
+    """
+    解析 ``kmem -v``（vmalloc 信息）命令的输出并提取事实（facts）。
+
+    该函数逐行匹配输出中的 vmalloc 虚拟内存范围记录，生成格式为
+    ``kmem_vmap_range:0x<start>-0x<end>=0x<size>`` 的事实，
+    用于判断某个地址是否落在已知的 vmalloc 区间内（例如判断对象是否
+    来自 vmalloc 分配的内存区域）。
+
+    Args:
+        output (str): ``kmem -v`` 命令的标准输出字符串。
+
+    Returns:
+        set[str]: 包含提取出的 vmalloc 范围相关事实的集合。
+    """
     facts: set[str] = set()
     for line in output.splitlines():
         match = _KMEM_RANGE_RE.match(line)
         if not match:
             continue
+        # 起止地址按十六进制解析
         start = _to_int(match.group("start"))
         end = _to_int(match.group("end"))
+        # 大小字段在输出中为十进制数字
         size = int(match.group("size"), 10)
         facts.add(f"kmem_vmap_range:0x{start:x}-0x{end:x}=0x{size:x}")
     return facts
 
 
 def _fact_supports_gate(fact: str, gate_name: str) -> bool:
+    """
+    判断某个事实（fact）是否与指定的门控（gate）相关，即是否可作为该门控的证据。
+
+    事实与门控的关联通过事实字符串的前缀来判定，不同门控接受不同类型的事实前缀：
+    - register_provenance: 内存读取、反汇编、符号表、虚拟地址映射状态
+    - local_corruption_exclusion: 反汇编、内存读取、映射状态、vmalloc 范围
+    - field_type_classification: 结构体布局、符号表
+    - object_lifetime: 内存读取、结构体布局、映射状态、vmalloc 范围
+    - 其他/未知门控: 接受所有已知类型的事实
+
+    Args:
+        fact (str): 单个事实字符串（例如 "rd_word:0xffff0000=0x10"）。
+        gate_name (str): 门控名称。
+
+    Returns:
+        bool: 如果该事实可作为该门控的证据则返回 True，否则返回 False。
+    """
     if gate_name == "register_provenance":
         return fact.startswith(("rd_word:", "dis_", "sym:", "vtop_"))
     if gate_name == "local_corruption_exclusion":
@@ -510,12 +616,39 @@ def _fact_supports_gate(fact: str, gate_name: str) -> bool:
         return fact.startswith(("struct_", "sym:"))
     if gate_name == "object_lifetime":
         return fact.startswith(("rd_word:", "struct_", "vtop_", "kmem_"))
+    # 兜底：未知门控接受所有已知前缀的事实
     return fact.startswith(("rd_word:", "struct_", "dis_", "sym:", "vtop_", "kmem_"))
 
 
 def _to_int(value: str) -> int:
+    """
+    将十六进制字符串转换为整数。
+
+    crash 输出中的地址/数值通常为十六进制（可能带 "0x" 前缀，也可能不带），
+    因此无论是否带前缀都按十六进制解析。
+
+    Args:
+        value (str): 待转换的字符串，例如 "0xffff0000" 或 "ffff0000"。
+
+    Returns:
+        int: 转换后的整数值。
+    """
     return int(value, 16 if value.lower().startswith("0x") else 16)
 
 
 def _to_struct_int(value: str) -> int:
+    """
+    将结构体输出中的偏移/大小字符串转换为整数。
+
+    与 ``_to_int`` 不同：结构体输出中的数值可能为十进制（不带 "0x" 前缀），
+    因此按以下规则解析：
+    - 带 "0x" 前缀 → 按 16 进制解析
+    - 不带前缀 → 按 10 进制解析
+
+    Args:
+        value (str): 待转换的字符串，例如 "0x10" 或 "32"。
+
+    Returns:
+        int: 转换后的整数值。
+    """
     return int(value, 0) if value.lower().startswith("0x") else int(value, 10)

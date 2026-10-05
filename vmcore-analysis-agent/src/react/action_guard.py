@@ -1,4 +1,4 @@
-#!/usr/bin/env python3,,,,
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # action_guard.py - crash action executor 校验与规范化模块
 # 本模块用于验证和规范化 crash 调试工具的命令执行请求，防止危险操作和错误用法

@@ -1,4 +1,4 @@
-#!/usr/bi,/en, python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 from .prompt_phrases import (
@@ -103,9 +103,9 @@ Analysis:
    First classify the address type when it is not already known: run vtop <address> to determine whether the page is a kernel stack, vmalloc/module mapping, or another non-slab page. If the address resolves to a kernel stack, vmalloc/module area, text mapping, or any other non-slab page, do NOT run kmem -S on that address; continue with vtop or kmem -p based analysis instead.
    Interpret the result immediately and explicitly: a slot marked [ALLOCATED] means the object is currently live; a slot without brackets (listed in the FREE section) means the object has been freed. This distinction determines which mechanisms remain open -- do not defer or skip this interpretation.
 2. Perform a raw memory dump of the corrupted slab object: run rd -x <addr> <object_size_in_words> (e.g., rd -x <addr> 16 for a 128-byte object). Scan the raw content systematically for SLUB free-list poison patterns before interpreting struct fields:
-   - 0x6b6b6b6b6b6b6b6b (repeated): POISON_FREE -- object was freed while SLUB_DEBUG is active; strong evidence of UAF without reallocation.
-   - 0x5a5a5a5a5a5a5a5a (repeated): POISON_END / red-zone boundary marker; indicates overrun into a freed adjacent region.
-   - 0xdead000000000100 or 0xdead000000000200: LIST_POISON1/2 from list_del() debug; list-based UAF or double-unlink.
+   - 0x6b6b6b6b6b6b6b6b (repeated): POISON_FREE (0x6b) -- object was freed while SLUB_DEBUG is active; strong evidence of UAF without reallocation.
+   - 0x5a5a5a5a5a5a5a5a (repeated): POISON_INUSE (0x5a) -- object is allocated under SLUB_DEBUG; the last byte of the object is overwritten with POISON_END (0xa5) as a boundary marker. Seeing 0x5a fill in a slot means the object was live at the time of the debug fill, NOT that it overran into a freed adjacent region.
+   - 0xdead000000000100 or 0xdead000000000200: LIST_POISON1/2 written unconditionally by list_del() (not debug-only); indicates list-based UAF or double-unlink.
    - No poison pattern in an ALLOCATED slot: rules out simple free-list UAF; the slot was overwritten while live (OOB, DMA, or race), or freed and reallocated before observation.
    Also inspect at least one adjacent slab slot (pre-compute offset: addr +/- objsize, emit rd -x <literal_addr> 16): correlated corruption in neighboring slots points to bulk OOB or DMA overwrite; isolated single-slot corruption points to targeted write or single-object UAF.
 3. Distinguish UAF, heap OOB write, and double-free style symptoms:
@@ -160,9 +160,9 @@ Analysis:
    First classify the address type when it is not already known: run vtop <address> to determine whether the page is a kernel stack, vmalloc/module mapping, or another non-slab page. If the address resolves to a kernel stack, vmalloc/module area, text mapping, or any other non-slab page, do NOT run kmem -S on that address; continue with vtop or kmem -p based analysis instead.
    Interpret the result immediately and explicitly: a slot marked [ALLOCATED] means the object is currently live; a slot without brackets (listed in the FREE section) means the object has been freed. This distinction determines which mechanisms remain open -- do not defer or skip this interpretation.
 2. Perform a raw memory dump of the corrupted slab object: run rd -x <addr> <object_size_in_words> (e.g., rd -x <addr> 16 for a 128-byte object). Scan the raw content systematically for SLUB free-list poison patterns before interpreting struct fields:
-   - 0x6b6b6b6b6b6b6b6b (repeated): POISON_FREE -- object was freed while SLUB_DEBUG is active; strong evidence of UAF without reallocation.
-   - 0x5a5a5a5a5a5a5a5a (repeated): POISON_END / red-zone boundary marker; indicates overrun into a freed adjacent region.
-   - 0xdead000000000100 or 0xdead000000000200: LIST_POISON1/2 from list_del() debug; list-based UAF or double-unlink.
+   - 0x6b6b6b6b6b6b6b6b (repeated): POISON_FREE (0x6b) -- object was freed while SLUB_DEBUG is active; strong evidence of UAF without reallocation.
+   - 0x5a5a5a5a5a5a5a5a (repeated): POISON_INUSE (0x5a) -- object is allocated under SLUB_DEBUG; the last byte of the object is overwritten with POISON_END (0xa5) as a boundary marker. Seeing 0x5a fill in a slot means the object was live at the time of the debug fill, NOT that it overran into a freed adjacent region.
+   - 0xdead000000000100 or 0xdead000000000200: LIST_POISON1/2 written unconditionally by list_del() (not debug-only); indicates list-based UAF or double-unlink.
    - No poison pattern in an ALLOCATED slot: rules out simple free-list UAF; the slot was overwritten while live (OOB, DMA, or race), or freed and reallocated before observation.
    Also inspect at least one adjacent slab slot (pre-compute offset: addr +/- objsize, emit rd -x <literal_addr> 16): correlated corruption in neighboring slots points to bulk OOB or DMA overwrite; isolated single-slot corruption points to targeted write or single-object UAF.
 3. Distinguish UAF, heap OOB write, and double-free style symptoms:
@@ -371,16 +371,29 @@ Analysis:
     "smap_smep_violation": """
 ## 3.14 SMAP / SMEP Violation (Privilege Boundary Fault)
 Pattern: unable to handle kernel paging request at <user-space address>; fault address is
-in user-space range (typically < 0x00007fffffffffff); Oops error code with bit 2 (user-mode
-page accessed from CPL=0) set, and/or bit 4 (instruction-fetch fault) set.
+in user-space range (typically < 0x00007fffffffffff); Oops error code with bit 4
+(instruction-fetch fault) set for SMEP, or bit 2 clear and bit 0 set for SMAP.
+
+Oops error code bit layout (arch/x86/include/asm/trap_pf.h):
+  bit 0 (X86_PF_PROT)  = 0 -> no page found; 1 -> protection fault (page present, access denied)
+  bit 1 (X86_PF_WRITE) = 0 -> read fault;    1 -> write fault
+  bit 2 (X86_PF_USER)  = 0 -> fault in kernel mode (CPL=0); 1 -> fault in user mode (CPL=3)
+  bit 4 (X86_PF_INSTR) = 1 -> instruction-fetch fault
 
 Triage -- distinguish SMEP from SMAP before proceeding:
   SMEP violation: kernel attempted to EXECUTE a user-space page.
-    Oops error code bit 4 (instruction-fetch) is set (e.g., 0x0011, 0x0015).
+    Oops error code bit 4 (instruction-fetch) is set AND bit 2 is clear (kernel-mode fetch).
+    Typical error code: 0x0011 (protection + kernel-mode + instr-fetch; the page is
+    present and user-mapped, so bit 0 is set -- a no-page code such as 0x0010 is a
+    plain not-present fetch, not SMEP).
     RIP is at a valid kernel address; the faulting instruction is an indirect call/jmp
     that resolved to a user-space target.
   SMAP violation: kernel accessed (read/write) a user-space DATA page without stac/clac.
-    Oops error code bit 2 set, bit 4 clear (e.g., 0x0004, 0x0005, 0x0006, 0x0007).
+    Oops error code bit 2 is clear (kernel-mode access) and bit 4 is clear (data access).
+    Typical error codes: 0x0001 (protection + kernel-mode read),
+                         0x0003 (protection + kernel-mode write).
+    (The SMAP-violated page is present and user-accessible, so bit 0 is always set;
+    a code with bit 0 clear, e.g. 0x0000, is a plain not-present access, not SMAP.)
     The fault address is a user-space data address; RIP is inside kernel code.
 
 Analysis:
@@ -536,6 +549,8 @@ suspect_frame_addr (address of the suspected overflow source):
 - If suspect_frame_addr > canary_frame_addr (suspect frame is at a higher address, i.e.,
   an earlier/outer caller): the suspect's local overflow writes upward and CANNOT reach the
   canary at a lower address. This attribution is PHYSICALLY IMPOSSIBLE. Reject it immediately.
+  Exception: if a non-standard write primitive (negative index, wrong-pointer memcpy/memmove,
+  arbitrary-write, or UAF) is evidenced, revisit with explicit proof of the write direction.
 - If suspect_frame_addr < canary_frame_addr (suspect frame is at a lower address, i.e.,
   a later/inner callee): the suspect's local overflow writes upward and CAN reach the canary
   at a higher address. This attribution is physically plausible.

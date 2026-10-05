@@ -212,7 +212,7 @@ def _select_playbook(state: AgentState, recent_text: str) -> str:
         state (AgentState): 当前分析状态。
         recent_text (str): 最近消息的合并文本，由调用方预先计算并传入。
 
-    Returns:s
+    Returns:
         str: 对应的剧本内容字符串，如果找不到匹配项则返回空字符串
     """
     signature_class = state.get("current_signature_class")
