@@ -7,7 +7,7 @@
 import json
 import re
 import shlex
-from typing import Any, TypeVar
+from typing import Any, Dict, List, Optional, TypeVar
 
 from json_repair import repair_json
 from pydantic import BaseModel
@@ -42,6 +42,30 @@ _RIP_RE = re.compile(r"\bRIP:\s*(?:[0-9a-fA-F]+:)?(?P<addr>[0-9a-fA-F]{8,16})\b"
 
 # 正则表达式用于提取 Oops 错误代码
 _OOPS_RE = re.compile(r"\bOops:\s*(?P<code>[0-9a-fA-F]{4})\b")
+
+# 寄存器转储行：形如 "RBP: 0000000000000012" 或 "RIP: 0010:ffffffff..."，
+# 名称为 R?? / CR? 系列，值为 8-16 位十六进制（可带段前缀）。
+_REGISTER_DUMP_RE = re.compile(
+    r"\b(?P<name>R[A-Z0-9]{1,3}|CR[0-4])\s*:\s*(?:[0-9a-fA-F]{4}:)?"
+    r"(?P<val>[0-9a-fA-F]{8,16})\b"
+)
+
+# 从 "NULL pointer dereference at 0000000000000062" 提取故障地址
+_NULL_DEREF_ADDR_RE = re.compile(
+    r"NULL pointer dereference at\s+(?P<addr>[0-9a-fA-F]{8,16})",
+    flags=re.IGNORECASE,
+)
+
+# NULL 页区域上限：故障地址低于此值才会被归类为 null_deref
+_NULL_PAGE_REGION_LIMIT = 0x10000
+# 合理结构体成员偏移上限（损坏基址 + 偏移 = 故障地址）
+_MAX_STRUCT_FIELD_OFFSET = 0x1000
+# 内核文本/直接映射地址下界（兼容 LA48 与 LA57 内核虚拟地址布局）
+_KERNEL_TEXT_ADDR_FLOOR = 0xFF00_0000_0000_0000
+# 内核态代码段前缀形式的 RIP 行，如 "RIP: 0010:ffffffffbc3798a0"
+_KERNEL_MODE_RIP_RE = re.compile(r"\bRIP:\s*0010\s*:", re.IGNORECASE)
+# 单个异常帧最多向后扫描的行数（RIP 行 + 若干寄存器行）
+_MAX_FRAME_LINES = 12
 
 # 正则表达式用于提取可能的地址迁移叙述（source -> destination）
 _ADDRESS_FLOW_RE = re.compile(
@@ -1455,6 +1479,149 @@ def _render_structured_action_text(analysis_step: VMCoreLLMAnalysisStep) -> str:
     return action.command_name
 
 
+def _parse_kernel_frame_registers(text: str) -> Dict[str, List[int]]:
+    """解析**内核异常帧**中的寄存器取值，跳过用户态帧。
+
+    一次 Oops 的上下文里通常有两套寄存器：内核异常帧和陷入前的用户态帧，
+    同名寄存器（如 RBP）会出现两次且取值完全不同。用户态帧里的小整数
+    （如 RBX=0x6）会与故障地址凑出假的"基址+偏移"关系，因此必须先定位
+    内核帧再解析。
+
+    定位方式：找到 RIP 为内核地址（>= 0xff00_0000_0000_0000，兼容 LA48/LA57）
+    或带内核代码段前缀（``RIP: 0010:``）的那一行作为帧起点，向后逐行收集，
+    直到遇到下一个 RIP（下一帧）、无寄存器匹配的行（如 ORIG_RAX/CS/SS 行）
+    或超出帧行数上限。
+
+    Returns:
+        name -> [values]；未定位到内核帧时返回空字典（调用方据此放弃升级）。
+    """
+    lines = text.splitlines()
+    start: Optional[int] = None
+    for index, line in enumerate(lines):
+        if _KERNEL_MODE_RIP_RE.search(line):
+            start = index
+            break
+        for match in _REGISTER_DUMP_RE.finditer(line):
+            if match.group("name").upper() != "RIP":
+                continue
+            try:
+                value = int(match.group("val"), 16)
+            except (TypeError, ValueError):
+                continue
+            if value >= _KERNEL_TEXT_ADDR_FLOOR:
+                start = index
+                break
+        if start is not None:
+            break
+
+    if start is None:
+        return {}
+
+    registers: Dict[str, List[int]] = {}
+    for offset in range(_MAX_FRAME_LINES):
+        index = start + offset
+        if index >= len(lines):
+            break
+        matches = list(_REGISTER_DUMP_RE.finditer(lines[index]))
+        if not matches:
+            break
+        # 再次出现 RIP 说明进入了下一个异常帧（通常是用户态帧）。
+        if offset > 0 and any(
+            match.group("name").upper() == "RIP" for match in matches
+        ):
+            break
+        for match in matches:
+            try:
+                value = int(match.group("val"), 16)
+            except (TypeError, ValueError):
+                continue
+            registers.setdefault(match.group("name").upper(), []).append(value)
+    return registers
+
+
+def _detect_corrupted_base_null_deref(text: str) -> Optional[Dict[str, Any]]:
+    """检测"损坏基址 + 结构体偏移"型的 NULL 页解引用。
+
+    判据（三者同时成立）：
+    1. 故障地址非零且落在 NULL 页区域（< 0x10000）——即被归类为 null_deref；
+    2. 内核异常帧中存在某寄存器，其取值同样落在 NULL 页区域，因而不可能是
+       合法指针基址（内核 NULL 页永不映射）；
+    3. ``fault_addr == reg_value + offset``，offset 为合理结构体成员偏移
+       （0 < offset <= 0x1000）。
+
+    满足则说明真正的根因是"基址指针被损坏"而非"基址为 NULL"。
+
+    为避免把普通计数值误判为损坏基址，要求候选**唯一**：若内核帧里有多个
+    寄存器都能凑出该关系，则视为证据不足，放弃升级。
+
+    典型实例：show_interrupts 中 ``mov 0x50(%rbp),%rdx``，异常帧 RBP=0x12
+    （来自 ``mov 0x18(%r15),%rbp`` 读到的损坏 irqaction.next），
+    故障地址 0x12+0x50=0x62。用户态帧的 RBP=0x00005624...、RBX=0x6 因
+    不在内核帧内而被排除，不会造成误报。
+    """
+    addr_match = _NULL_DEREF_ADDR_RE.search(text)
+    if not addr_match:
+        return None
+    try:
+        fault_addr = int(addr_match.group("addr"), 16)
+    except (TypeError, ValueError):
+        return None
+    # 地址 0 是纯 NULL 解引用，不属于损坏基址；超出 NULL 页则不是 null_deref。
+    if fault_addr == 0 or fault_addr >= _NULL_PAGE_REGION_LIMIT:
+        return None
+
+    candidates: List[Dict[str, Any]] = []
+    for name, values in _parse_kernel_frame_registers(text).items():
+        for value in values:
+            # 基址本身必须落在 NULL 页内，才可能是"损坏的指针"而非计数值。
+            if value == 0 or value >= _NULL_PAGE_REGION_LIMIT:
+                continue
+            offset = fault_addr - value
+            if 0 < offset <= _MAX_STRUCT_FIELD_OFFSET:
+                candidates.append(
+                    {
+                        "fault_addr": fault_addr,
+                        "register": name,
+                        "register_value": value,
+                        "offset": offset,
+                    }
+                )
+
+    if len(candidates) != 1:
+        if len(candidates) > 1:
+            logger.info(
+                "[Audit] null_deref corrupted-base check skipped: %d candidate "
+                "registers match fault addr 0x%x (%s); evidence is ambiguous",
+                len(candidates),
+                fault_addr,
+                ", ".join(
+                    f"{c['register']}=0x{c['register_value']:x}" for c in candidates
+                ),
+            )
+        return None
+
+    return candidates[0]
+
+
+def _append_audit_note(
+    analysis_step: VMCoreLLMAnalysisStep,
+    audit_note: str,
+) -> VMCoreLLMAnalysisStep:
+    """将审计说明写入 reasoning（前缀）与 additional_notes（后缀），去重。"""
+    if audit_note not in analysis_step.reasoning:
+        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
+
+    if analysis_step.additional_notes:
+        if audit_note not in analysis_step.additional_notes:
+            analysis_step.additional_notes = (
+                f"{analysis_step.additional_notes} {audit_note}"
+            ).strip()
+    else:
+        analysis_step.additional_notes = audit_note
+
+    return analysis_step
+
+
 def _normalize_signature_class_from_fault_context(
     analysis_step: VMCoreLLMAnalysisStep,
     state: dict[str, Any],
@@ -1472,14 +1639,39 @@ def _normalize_signature_class_from_fault_context(
         VMCoreLLMAnalysisStep: 修正后的分析步骤
 
     逻辑：
-        如果 signature_class 是 general_protection_fault 但上下文显示是页面错误，
-        则修正为 pointer_corruption
+        1. signature_class 是 general_protection_fault 但上下文显示是页面错误，
+           修正为 pointer_corruption。
+        2. signature_class 是 null_deref 但故障地址实为"损坏基址 + 结构体偏移"
+           （见 _detect_corrupted_base_null_deref），升级为 pointer_corruption，
+           以解锁 object_lifetime / local_corruption_exclusion 等门控，
+           驱动 executor 转向调查指针来源而非在 NULL 假设下重复取证。
     """
     prefix = f"{log_prefix}: " if log_prefix else ""
-    if analysis_step.signature_class != "general_protection_fault":
+    if analysis_step.signature_class not in (
+        "general_protection_fault",
+        "null_deref",
+    ):
         return analysis_step
 
     text = _collect_state_text(state)
+
+    if analysis_step.signature_class == "null_deref":
+        corrupted = _detect_corrupted_base_null_deref(text)
+        if not corrupted:
+            return analysis_step
+        analysis_step.signature_class = "pointer_corruption"
+        audit_note = (
+            "Executor audit: fault address 0x{fault_addr:x} equals corrupted base "
+            "{register}=0x{register_value:x} plus struct-field offset 0x{offset:x}; "
+            "the base register holds a non-canonical invalid pointer, so "
+            "signature_class was escalated from null_deref to pointer_corruption. "
+            "Investigate the provenance of {register} (object lifetime, concurrent "
+            "modification, memory corruption) instead of assuming a plain NULL "
+            "dereference.".format(**corrupted)
+        )
+        logger.warning("%s%s", prefix, audit_note)
+        return _append_audit_note(analysis_step, audit_note)
+
     if not _is_kernel_paging_request_page_fault_context(text):
         return analysis_step
 
@@ -1491,18 +1683,7 @@ def _normalize_signature_class_from_fault_context(
     )
     logger.warning("%s%s", prefix, audit_note)
 
-    if audit_note not in analysis_step.reasoning:
-        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
-
-    if analysis_step.additional_notes:
-        if audit_note not in analysis_step.additional_notes:
-            analysis_step.additional_notes = (
-                f"{analysis_step.additional_notes} {audit_note}"
-            ).strip()
-    else:
-        analysis_step.additional_notes = audit_note
-
-    return analysis_step
+    return _append_audit_note(analysis_step, audit_note)
 
 
 def _normalize_final_diagnosis_for_fault_context(

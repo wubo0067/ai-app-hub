@@ -8,7 +8,7 @@ import json
 from typing import Any, cast
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage, HumanMessage
 from .graph_state import AgentState
-from .nodes import llm_analysis_node, structure_reasoning_node
+from .nodes import NO_PROGRESS_STREAK_LIMIT, llm_analysis_node, structure_reasoning_node
 from .output_parser import (
     apply_executor_consistency_audit,
     build_tool_calls,
@@ -69,14 +69,28 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
     # 检查是否是最后一步 (LangGraph recursion_limit 触发前)
     # 如果是最后一步，要求 LLM 停止工具调用并给出终止响应；该响应可以是有界的非结论总结
     is_last_step = state.get("is_last_step", False)
+    # 强制收口：no_progress_streak 达到上限时，after_crash_tool 会把控制权
+    # 交回本节点做最后一次有界总结。此时按"最后一步"语义处理（渲染
+    # CRITICAL WARNING、剥离 tool_calls），并置位 force_terminal_wrapup
+    # 使后续路由直接 __end__，保证本机制最多触发一次。
+    wrapup_triggered = (
+        int(state.get("no_progress_streak", 0)) >= NO_PROGRESS_STREAK_LIMIT
+    )
+    effective_last_step = bool(is_last_step) or wrapup_triggered
     if is_last_step:
         logger.warning(
             f"Agent reached the last step (is_last_step=True). Forcing a terminal response with no further tool calls."
         )
+    elif wrapup_triggered:
+        logger.warning(
+            "no_progress_streak reached %s. Forcing a terminal wrap-up response "
+            "with no further tool calls.",
+            NO_PROGRESS_STREAK_LIMIT,
+        )
 
     system_message = build_analysis_system_prompt(
         state,
-        is_last_step=is_last_step,
+        is_last_step=effective_last_step,
     )
 
     # 压缩消息历史后再发送给 LLM，避免 reasoning_content 累积和大工具输出导致 token 暴增
@@ -123,7 +137,7 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
                     + (
                         "This is the last step: do not call tools; either return a conclusive result with final_diagnosis, "
                         "or return a bounded non-conclusive result with action=null and explicit verification gaps."
-                        if is_last_step
+                        if effective_last_step
                         else "Please EITHER call a compliant tool out of the available options to gather more information, "
                         "OR, if no further tool can reduce uncertainty, return a bounded non-conclusive result with "
                         "action=null and explicit verification gaps. Set 'is_conclusive'=true with final_diagnosis "
@@ -229,9 +243,10 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
 
         # 手动构造 AIMessage 以便 edges.py 识别路由。
         # 如果 LLM 决定调用工具 (action 不为空)，我们需要手动填充 tool_calls
-        # 安全屏障：当 is_last_step=True 时，强制清除 action，阻止生成 tool_calls。
+        # 安全屏障：当 effective_last_step=True（is_last_step 或强制收口）时，
+        # 强制清除 action，阻止生成 tool_calls。
         # 最后一步允许 bounded non-conclusive 结束，但不允许继续请求工具。
-        tool_calls = build_tool_calls(analysis_result, is_last_step=is_last_step)
+        tool_calls = build_tool_calls(analysis_result, is_last_step=effective_last_step)
 
         # 将结构化后的对象序列化存入 content，并携带调用的工具信息
         # 必须保留 additional_kwargs 中的 reasoning_content，否则下一轮对话 DeepSeek-Reasoner 会报错 (Error 400)
@@ -269,6 +284,9 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         "token_usage": curr_token_usage,
         "messages": [response],
         **managed_updates,
+        # 置位后 after_crash_tool / should_continue 不再给予额外轮次，
+        # 保证强制收口最多发生一次。
+        "force_terminal_wrapup": wrapup_triggered,
         "error": None,
     }
 
@@ -291,6 +309,13 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
     original_kwargs = state.get("reasoning_additional_kwargs", {}) or {}
     current_step = state.get("step_count", 0)
     is_last_step = state.get("is_last_step", False)
+    # 与 call_llm_analysis 相同的强制收口判定：本节点可能经由
+    # reasoning_to_structure 早退路径进入，此时 flag 尚未置位，
+    # 因此直接根据 no_progress_streak 重新计算。
+    wrapup_triggered = (
+        int(state.get("no_progress_streak", 0)) >= NO_PROGRESS_STREAK_LIMIT
+    )
+    effective_last_step = bool(is_last_step) or wrapup_triggered
 
     logger.info(
         f"Starting {structure_reasoning_node} node execution (step {current_step})..."
@@ -304,7 +329,7 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
     # 构建简化结构化提示（只提取核心字段）
 
     force_conclusion = build_structure_reasoning_force_conclusion(
-        is_last_step=is_last_step
+        is_last_step=effective_last_step
     )
 
     system_prompt = simplified_structure_reasoning_prompt().format(
@@ -394,7 +419,7 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
         # 构建 tool_calls（与 call_llm_analysis 相同逻辑）
         tool_calls = build_tool_calls(
             analysis_result,
-            is_last_step=is_last_step,
+            is_last_step=effective_last_step,
             log_prefix=structure_reasoning_node,
         )
 
@@ -427,5 +452,7 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
         "reasoning_to_structure": None,
         "reasoning_additional_kwargs": None,
         **managed_updates,
+        # 强制收口标志：保证 should_continue 不再重试，直接 __end__。
+        "force_terminal_wrapup": wrapup_triggered,
         "error": None,
     }

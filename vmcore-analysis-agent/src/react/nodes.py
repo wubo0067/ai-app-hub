@@ -49,6 +49,36 @@ collect_crash_init_data_node = "collect_crash_init_data_node"
 llm_analysis_node = "llm_analysis_node"
 structure_reasoning_node = "structure_reasoning_node"
 
+# 连续无证据进展的工具动作次数上限。达到该上限后，edges.after_crash_tool
+# 会路由到 llm_analysis_node 做一次强制收口（而非直接 __end__），由
+# llm_analysis_node 置位 force_terminal_wrapup，使报告能给出有界的非结论总结。
+# 定义在此处（而非 edges.py）是因为 edges.py 已依赖 nodes.py，反向导入会成环。
+NO_PROGRESS_STREAK_LIMIT = 3
+
+
+def _has_non_echo_output(content: str, command_line: str) -> bool:
+    """判断工具输出是否包含真实内容（而非仅 crash 提示符 echo）。
+
+    crash 工具在执行命令时会先回显命令本身（如 ``crash> log -m | grep foo``），
+    若命令无任何输出，ToolMessage.content 仅含该 echo 行。将此类 echo-only
+    输出误判为"有内容"会错误地清零 no_progress_streak，掩盖真实的无进展状态。
+
+    Args:
+        content: ToolMessage 的原始内容字符串。
+        command_line: 本次执行的命令行字符串（不含 "crash> " 前缀）。
+
+    Returns:
+        True 表示输出中有 echo 之外的实质内容；False 表示仅含 echo 或为空。
+    """
+    stripped = content.strip()
+    if not stripped:
+        return False
+    # crash 回显格式：以 "crash> " 开头，后跟命令本身
+    echo_line = f"crash> {command_line.strip()}"
+    # 去掉 echo 行后，若还有非空内容则认为有实质输出
+    remaining = stripped.removeprefix(echo_line).strip()
+    return bool(remaining)
+
 # =========================================================================
 # 默认 crash 命令集合
 # =========================================================================
@@ -505,24 +535,49 @@ async def call_crash_tool(state: AgentState) -> dict:
                         or prior_output is not None
                     )
                 ):
-                    # 命令已执行过，直接返回历史输出 + 提示
-                    dedup_msg = (
-                        f"[DEDUP] This command was already executed in a prior step. "
-                        f"Reusing prior output to save budget.\n"
-                        f"---\n{prior_output or '[DEDUP] Fingerprint found in state, but no cached output was retained.'}"
+                    # 判断历史输出是否有实质证据内容（排除 echo-only 输出）
+                    cached_has_evidence = bool(prior_output) and _has_non_echo_output(
+                        prior_output, ""
                     )
-                    tool_messages.append(
-                        ToolMessage(
-                            content=dedup_msg,
-                            tool_call_id=tool_call_id,
-                            name=name,
+                    if cached_has_evidence:
+                        # 有证据：回放历史输出，让 LLM 重新利用已有结果
+                        dedup_msg = (
+                            f"[DEDUP] This command was already executed in a prior step. "
+                            f"Reusing prior output to save budget.\n"
+                            f"---\n{prior_output}"
                         )
-                    )
-                    logger.warning(
-                        f"Command deduplication: '{current_fingerprint[:80]}...' already executed. "
-                        f"Returning cached output instead of re-executing."
-                    )
-                    duplicate_fingerprints.append(current_fingerprint)
+                        tool_messages.append(
+                            ToolMessage(
+                                content=dedup_msg,
+                                tool_call_id=tool_call_id,
+                                name=name,
+                            )
+                        )
+                        logger.warning(
+                            "Command deduplication (cached evidence): '%s...' already executed. "
+                            "Returning cached output.",
+                            current_fingerprint[:80],
+                        )
+                        duplicate_fingerprints.append(current_fingerprint)
+                    else:
+                        # 无证据：视为错误，要求 LLM 换方向
+                        dedup_msg = (
+                            f"[DEDUP-BLOCKED] This command was already executed and produced "
+                            f"no usable evidence. It is now unavailable. "
+                            f"You must select a different command or a different evidence target."
+                        )
+                        tool_messages.append(
+                            ToolMessage(
+                                content=dedup_msg,
+                                tool_call_id=tool_call_id,
+                                name=name,
+                            )
+                        )
+                        logger.warning(
+                            "Command deduplication (no evidence): '%s...' blocked, forcing replan.",
+                            current_fingerprint[:80],
+                        )
+                        rejected_count += 1
                     current_fingerprints.append(current_fingerprint)
                     continue
 
@@ -571,9 +626,7 @@ async def call_crash_tool(state: AgentState) -> dict:
                             content = str(r_output)
                             if isinstance(r_output, Exception):
                                 content = f"[error] Execution failed: {r_output}"
-                            if content.strip() and not content.startswith(
-                                ("[error]", "[TIMEOUT]")
-                            ):
+                            if not content.startswith(("[error]", "[TIMEOUT]")) and _has_non_echo_output(content, original_cmd):
                                 observed_nonempty_output = True
                             tool_messages.append(
                                 ToolMessage(
@@ -685,7 +738,11 @@ async def call_crash_tool(state: AgentState) -> dict:
         "evidence_delta": evidence_delta,
         "evidence_facts": evidence_facts,
         "replan_required": all_duplicate
-        or (bool(commands_to_run) and not evidence_delta),
+        or (bool(commands_to_run) and not evidence_delta)
+        # C1：DEDUP-BLOCKED（无证据的重复命令）走 rejected 分支，
+        # 同样需要向 LLM 渲染"Replanning required"advisory，
+        # 提示其更换证据目标而非重复等价命令。
+        or action_status == "rejected",
         "managed_gates": managed_gates,
         "evidence_goal_status": (
             "advanced" if goal_advanced else state.get("evidence_goal_status")

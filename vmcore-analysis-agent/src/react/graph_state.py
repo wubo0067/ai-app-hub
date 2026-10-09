@@ -65,6 +65,10 @@ class AgentState(MessagesState):
     # LangGraph 管理的终止标记。
     # 当图执行达到 recursion_limit 或运行时判定为最后一步时，该值为 True。
     is_last_step: IsLastStep
+    # 由 llm_analysis_node 在 no_progress_streak 达到上限时置位。
+    # 置位后 after_crash_tool 不再路由到 llm_analysis_node，直接 __end__；
+    # should_continue 跳过非结论重试逻辑，确保有界收口而非无限循环。
+    force_terminal_wrapup: bool
     # DeepSeek-Reasoner 等推理模型生成的纯文本 reasoning 内容。
     # 当原始推理结果无法直接作为结构化输出使用时，会先暂存在这里。
     reasoning_to_structure: Optional[str]
