@@ -97,6 +97,12 @@ class ReplanProbeMenuTests(unittest.TestCase):
         )
 
     def test_known_root_cause_steers_to_termination(self) -> None:
+        """L1：根因已定且门控全关时，提示词只能剩下"本轮收尾"这一个指令。
+
+        原先只把"prefer terminating"与转向菜单并列输出，同一份提示词里
+        "继续换方向探测"与"立即收尾"互相矛盾；run D 中模型跟随后者失败，
+        收尾轮被 rd 探测占掉，tool_calls 被剥掉后整轮作废。
+        """
         rendered = _render(
             current_signature_class="null_deref",
             current_root_cause_class="use_after_free",
@@ -108,8 +114,53 @@ class ReplanProbeMenuTests(unittest.TestCase):
             replan_required=True,
             evidence_facts=ALL_DIMENSION_FACTS,
         )
-        self.assertIn("prefer terminating with your conclusion", rendered)
+        self.assertIn("TERMINATE ON THIS TURN", rendered)
+        self.assertIn("is NOT a prerequisite for concluding", rendered)
+        self.assertIn(
+            "terminate on this turn by emitting the final JSON conclusion", rendered
+        )
         self.assertNotIn("root_cause_class is still unset", rendered)
+        # 转向菜单必须被压制，否则又构成"继续探索"的竞争指令
+        self.assertNotIn("Untapped evidence dimensions", rendered)
+        self.assertNotIn("All four structured evidence dimensions", rendered)
+        self.assertNotIn("Pivot requirement", rendered)
+        self.assertNotIn("prefer terminating with your conclusion", rendered)
+
+    def test_root_cause_with_open_gate_still_offers_pivot(self) -> None:
+        """根因已定但门控未全关时不能要求收尾，仍保留转向方向。"""
+        rendered = _render(
+            current_signature_class="null_deref",
+            current_root_cause_class="use_after_free",
+            managed_gates=OPEN_GATE,
+            current_evidence_goal={"goal_id": "register_provenance"},
+            last_action_status="rejected",
+            duplicate_streak=0,
+            no_progress_streak=2,
+            replan_required=True,
+            evidence_facts=["rd_word:0x1=0x2"],
+        )
+        self.assertIn("prefer terminating with your conclusion", rendered)
+        self.assertNotIn("TERMINATE ON THIS TURN", rendered)
+        self.assertIn("Untapped evidence dimensions", rendered)
+        self.assertIn("Pivot requirement", rendered)
+
+    def test_unregistered_gates_never_trigger_terminate_only(self) -> None:
+        """门控尚未注册（None/{}）时不得声称"每个强制门控都已关闭"。"""
+        for unregistered in (None, {}):
+            with self.subTest(managed_gates=unregistered):
+                rendered = _render(
+                    current_signature_class="null_deref",
+                    current_root_cause_class="use_after_free",
+                    managed_gates=unregistered,
+                    current_evidence_goal=None,
+                    last_action_status="rejected",
+                    duplicate_streak=0,
+                    no_progress_streak=2,
+                    replan_required=True,
+                    evidence_facts=["rd_word:0x1=0x2"],
+                )
+                self.assertNotIn("TERMINATE ON THIS TURN", rendered)
+                self.assertIn("Pivot requirement", rendered)
 
     def test_open_gate_replan_never_claims_gates_closed(self) -> None:
         """C1 的 DEDUP-BLOCKED 走 rejected 分支时门控可能仍未关闭。"""

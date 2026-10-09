@@ -25,6 +25,7 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from src.utils.logging import logger
 from src.mcp_tools import get_registered_tool_provider
 from .graph_state import AgentState
+from .schema import GateEntry
 from .consistency import MemoryRead, detect_value_conflicts, parse_memory_reads
 from .prompts import crash_init_data_prompt
 from .action_guard import (
@@ -80,6 +81,91 @@ def _has_non_echo_output(content: str) -> bool:
         if stripped and not stripped.startswith("crash>"):
             return True
     return False
+
+
+# L2：收敛护栏阈值。no_progress_streak 达到 NO_PROGRESS_STREAK_LIMIT(3) 时
+# edges.after_crash_tool 才强制收口，但那已经浪费了三步。护栏在 2 步就介入：
+# 此时 root_cause_class 已确定、强制门控已全部关闭，只读探测命令不可能再改变结论。
+CONVERGENCE_GUARD_STREAK_THRESHOLD = 2
+
+# 只读"取值/解读值"类命令。run D 的死循环完全由这类命令构成：反复 rd/struct 一个
+# 已被证明是被覆盖的字段，试图解读其中残留 ASCII 的协议含义（把覆盖载荷当成 IRQ 号）。
+# log/irq/task/search 等重复读取已捕获状态的命令也在列内——在门控全关的前提下它们
+# 只会再产出一遍同样的字节。刻意不含 mod（加载符号）、bt/sys（收尾轮报告本身需要）。
+_READONLY_VALUE_PROBE_COMMANDS = frozenset(
+    {
+        "rd",
+        "struct",
+        "dis",
+        "sym",
+        "kmem",
+        "log",
+        "irq",
+        "task",
+        "p",
+        "px",
+        "pd",
+        "search",
+        "detailedsearch",
+        "vtop",
+        "ptov",
+        "ptob",
+        "pte",
+        "sbitmapq",
+    }
+)
+
+
+def _gates_all_closed(gates: object) -> bool:
+    """门控已注册且没有任何 open/blocked 门控时返回 True。"""
+    if not gates:
+        return False
+    return not any(
+        GateEntry.model_validate(gate).status in {"open", "blocked"}
+        for gate in gates.values()
+    )
+
+
+def _only_read_only_value_probes(lines: List[str]) -> bool:
+    """命令行的首 token 全部属于只读取值类命令时返回 True。"""
+    commands = []
+    for line in lines:
+        stripped = re.sub(r"^crash>\s*", "", line.strip())
+        if not stripped or stripped.startswith(("#", "echo")):
+            continue
+        commands.append(stripped.split()[0].lower())
+    return bool(commands) and all(
+        command in _READONLY_VALUE_PROBE_COMMANDS for command in commands
+    )
+
+
+def _convergence_guard_error(state: AgentState, lines: List[str]) -> str | None:
+    """判断该动作是否属于"结论已成立却仍在探测"，是则返回拒绝理由。
+
+    三个条件必须同时成立，避免过早掐断正常取证：
+    1. root_cause_class 已确定（结论方向已定）；
+    2. 强制门控全部关闭（没有门控可再推进）；
+    3. 已连续 CONVERGENCE_GUARD_STREAK_THRESHOLD 步无实质进展（确实在原地打转）。
+    """
+    if state.get("no_progress_streak", 0) < CONVERGENCE_GUARD_STREAK_THRESHOLD:
+        return None
+    if not state.get("current_root_cause_class"):
+        return None
+    if not _gates_all_closed(state.get("managed_gates")):
+        return None
+    if not _only_read_only_value_probes(lines):
+        return None
+
+    return (
+        f"root_cause_class={state.get('current_root_cause_class')} is established and every "
+        f"mandatory gate is closed, and the last "
+        f"{state.get('no_progress_streak', 0)} actions produced no new evidence. This read-only "
+        f"value probe cannot strengthen the conclusion: bytes inside memory already proven to be "
+        f"corruption payload are the payload, not live state, so their protocol semantics can "
+        f"never be recovered from the vmcore. Emit the final JSON conclusion now "
+        f"(is_conclusive=true, confidence=\"low\" is acceptable, action=null) and record the "
+        f"residual unknown in final_diagnosis.detailed_analysis."
+    )
 
 # =========================================================================
 # 默认 crash 命令集合
@@ -591,6 +677,29 @@ async def call_crash_tool(state: AgentState) -> dict:
                     continue
 
                 current_lines = extract_command_lines(name, args)
+
+                # ---- 收敛护栏（L2）----
+                # 结论方向已定、门控全关、且已连续多步无进展时，掐断只读取值类
+                # 探测：这类命令只会再产出一段"被覆盖内存里的残留字节"，模型会把
+                # 它当成待解读的协议字段而无限循环（run D 即在此耗尽预算）。
+                convergence_error = _convergence_guard_error(state, current_lines)
+                if convergence_error is not None:
+                    rejected_count += 1
+                    tool_messages.append(
+                        ToolMessage(
+                            content=f"[convergence-guard] Blocked action: {convergence_error}",
+                            tool_call_id=tool_call_id,
+                            name=name,
+                        )
+                    )
+                    logger.warning(
+                        "Convergence guard blocked action '%s' (streak=%s, root_cause_class=%s).",
+                        current_fingerprint[:80] if current_fingerprint else name,
+                        state.get("no_progress_streak", 0),
+                        state.get("current_root_cause_class"),
+                    )
+                    continue
+
                 logger.debug(
                     "Validated tool call %s (ID: %s): lines=%s, fingerprint=%s",
                     name,

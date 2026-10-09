@@ -1,4 +1,4 @@
-#!/usr/bi,/,,v p,thon3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # output_parser.py - LLM 输出解析和修复模块
 # Author: CalmWU
@@ -26,6 +26,8 @@ from .consistency import (
     prune_resolved_value_conflicts,
 )
 from .schema import (
+    FinalDiagnosis,
+    SuspectCode,
     VMCoreAnalysisStep,
     VMCoreLLMAnalysisStep,
     get_corruption_mechanism_aliases,
@@ -883,7 +885,14 @@ def _audit_prefix_overwrite_pattern(
         "Executor audit: the raw object dump shows a dense non-zero prefix with a mostly zero "
         f"tail ({pattern}). In a live kmalloc slot, this is a prefix-overwrite signature: prefer "
         "in-place write corruption, foreign-structure copy, or type confusion over classic UAF or "
-        "bulk adjacent-slot buffer overflow unless separate lifetime or neighboring-slot evidence proves otherwise."
+        "bulk adjacent-slot buffer overflow unless separate lifetime or neighboring-slot evidence proves otherwise. "
+        "Once that signature is established, the bytes inside the overwritten prefix ARE the "
+        "corruption payload and carry no meaning for the original field: never treat readable ASCII "
+        "or plausible-looking numbers there as the original value (e.g. an IRQ number or a name) and "
+        "never try to decode their protocol semantics - the vmcore cannot recover what was overwritten, "
+        "so such decoding is not a prerequisite for concluding. The only open question is writer "
+        "provenance (who wrote the payload); if it cannot be resolved from surviving evidence, state "
+        "that limit in the conclusion instead of probing the payload again."
     )
     logger.warning("%s%s", prefix, audit_note)
 
@@ -2297,3 +2306,377 @@ def _mentions_access_type_mismatch(
         and "contrad" in lowered
         and any(keyword in lowered for keyword in keywords)
     )
+
+
+# =============================================================================
+# 收口兜底：确定性地合成有界结论（fallback conclusion synthesis）
+# =============================================================================
+#
+# 触发场景：收口轮（is_last_step 或强制收口）里模型既没有给出 final_diagnosis，
+# 又被剥掉了 tool_calls，于是整轮被浪费、报告以"未得出正式结论"结束。
+# 此时若"根因类已确定 + 该签名类的强制 gate 全部 closed/n/a"，收敛契约其实已经
+# 满足，缺的只是把已有证据渲染成 FinalDiagnosis 这一步。本模块只做渲染：
+# 不新增任何判断、不改动 gate/假设，因此合成结果不会被 validate_and_patch 降级。
+
+_FALLBACK_CRASH_TYPE_LABELS: Dict[str, tuple] = {
+    "null_deref": ("NULL pointer dereference", "空指针解引用"),
+    "use_after_free": ("use-after-free", "释放后使用（UAF）"),
+    "out_of_bounds": ("out-of-bounds access", "越界访问"),
+    "double_free": ("double free", "重复释放"),
+    "wild_pointer": ("wild pointer dereference", "野指针解引用"),
+    "slab_corruption": ("slab corruption", "slab 内存池损坏"),
+    "race_condition": ("race condition", "竞态条件"),
+    "deadlock": ("deadlock", "死锁"),
+    "rcu_misuse": ("RCU misuse", "RCU 误用"),
+    "atomic_sleep": ("sleeping in atomic context", "原子上下文中睡眠"),
+    "dma_corruption": ("DMA memory corruption", "DMA 内存损坏"),
+    "iommu_fault": ("IOMMU fault", "IOMMU 故障"),
+    "mce": ("machine check exception", "机器检查异常"),
+    "bug_on": ("kernel BUG assertion", "内核 BUG 断言"),
+    "warn_on": ("kernel WARN assertion", "内核 WARN 断言"),
+    "divide_error": ("divide error", "除零错误"),
+    "invalid_opcode": ("invalid opcode", "无效操作码"),
+    "oom": ("out of memory", "内存耗尽"),
+    "oom_panic": ("out-of-memory panic", "内存耗尽恐慌"),
+    "pointer_corruption": ("pointer corruption", "指针损坏"),
+    "stack_corruption": ("stack corruption", "栈损坏"),
+    "write_protection_violation": (
+        "write protection violation",
+        "写保护违例",
+    ),
+    "smap_smep_violation": ("SMAP/SMEP violation", "SMAP/SMEP 违例"),
+}
+
+# 单条证据渲染上限与总条数上限：兜底结论必须"有界"，不能把整段工具输出塞进报告。
+_MAX_FALLBACK_EVIDENCE_ITEMS = 20
+_MAX_FALLBACK_EVIDENCE_CHARS = 300
+
+# panic/oops 标题行：用于回填 FinalDiagnosis.panic_string
+_PANIC_LINE_RE = re.compile(
+    r"^(?P<line>(?:"
+    r"Kernel panic - not syncing"
+    r"|kernel BUG at"
+    r"|BUG:"
+    r"|Oops:"
+    r"|general protection fault"
+    r"|WARNING:"
+    r")[^\n]*)",
+    re.MULTILINE,
+)
+
+# 形如 show_interrupts+0x240/0x5a0 的符号偏移
+_SYMBOL_OFFSET_RE = re.compile(
+    r"(?P<func>[A-Za-z_][A-Za-z0-9_]*)\+0x(?P<offset>[0-9a-fA-F]+)"
+)
+
+# crash dis 输出的一行：0xffffffff81a24240 <show_interrupts+640>:  mov ...
+# 与 _DISASM_LINE_RE 同构，但额外捕获尖括号内的符号名。
+_DISASM_SYMBOL_LINE_RE = re.compile(
+    r"^\s*0x(?P<addr>[0-9a-fA-F]+)\s+<(?P<symbol>[^>:]+)\*?>:\s+(?P<inst>.+)$",
+    re.MULTILINE,
+)
+
+
+def _fallback_report_is_chinese(state: dict[str, Any]) -> bool:
+    return str(state.get("report_language", "eng")).lower() == "zh"
+
+
+def _clip_fallback_text(text: str, limit: int = _MAX_FALLBACK_EVIDENCE_CHARS) -> str:
+    normalized = " ".join(str(text).split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3] + "..."
+
+
+def _unresolved_required_gates(analysis_result: VMCoreAnalysisStep) -> List[str]:
+    """返回该签名类尚未 closed/n/a 的强制 gate 名（与 validate_and_patch 同判据）。"""
+    required = VMCoreAnalysisStep._REQUIRED_GATES.get(
+        analysis_result.signature_class or "", []
+    )
+    gates = analysis_result.gates or {}
+    return [
+        name
+        for name in required
+        if name not in gates or gates[name].status not in {"closed", "n/a"}
+    ]
+
+
+def _mine_panic_string(state_text: str) -> str:
+    match = _PANIC_LINE_RE.search(state_text or "")
+    if match is None:
+        return ""
+    return _clip_fallback_text(match.group("line"), 200)
+
+
+def _mine_faulting_instruction(state_text: str) -> str:
+    """从已收集的文本中还原故障指令；找不到时返回空串由调用方兜底。"""
+    rip_match = _RIP_RE.search(state_text or "")
+    if rip_match is None:
+        return ""
+    rip_addr = int(rip_match.group("addr"), 16)
+    for dis in _DISASM_SYMBOL_LINE_RE.finditer(state_text or ""):
+        if int(dis.group("addr"), 16) != rip_addr:
+            continue
+        return _clip_fallback_text(
+            f"0x{rip_addr:x} <{dis.group('symbol').strip()}>: "
+            f"{' '.join(dis.group('inst').split())}",
+            200,
+        )
+    return f"0x{rip_addr:x}"
+
+
+def _mine_suspect_function(state_text: str, faulting_instruction: str, state: dict) -> str:
+    """可疑函数：故障指令所在符号 → 反汇编事实中的首个符号 → unknown。"""
+    for source in (faulting_instruction, state_text):
+        match = _SYMBOL_OFFSET_RE.search(source or "")
+        if match:
+            return match.group("func")
+        dis_match = _DISASM_SYMBOL_LINE_RE.search(source or "")
+        if dis_match:
+            name = dis_match.group("symbol").split("+", 1)[0].strip()
+            if name:
+                return name
+    for fact in state.get("evidence_facts", []) or []:
+        if isinstance(fact, str) and fact.startswith("dis_symbol:"):
+            symbol = fact[len("dis_symbol:"):]
+            name = symbol.split("+", 1)[0].strip()
+            if name:
+                return name
+    return "unknown"
+
+
+def _build_fallback_evidence(
+    state: dict[str, Any],
+    analysis_result: VMCoreAnalysisStep,
+) -> List[str]:
+    """证据条目 = 已闭合 gate 的判据 + 关键取值事实 + 未解决的取值级矛盾。"""
+    evidence: List[str] = []
+
+    for gate_name, gate in (analysis_result.gates or {}).items():
+        if gate.status not in {"closed", "n/a"}:
+            continue
+        detail = gate.evidence or "(no evidence text recorded)"
+        evidence.append(f"gate {gate_name} [{gate.status}]: {_clip_fallback_text(detail)}")
+
+    for fact in (state.get("evidence_facts", []) or [])[:_MAX_FALLBACK_EVIDENCE_ITEMS]:
+        if isinstance(fact, str) and fact:
+            evidence.append(f"evidence fact: {fact}")
+
+    for conflict in (state.get("value_conflicts", []) or [])[:8]:
+        readable = format_conflict_fact(conflict) if isinstance(conflict, str) else None
+        evidence.append(f"value conflict: {readable or _clip_fallback_text(conflict)}")
+
+    deduped: List[str] = []
+    for item in evidence:
+        if item not in deduped:
+            deduped.append(item)
+    return deduped[:_MAX_FALLBACK_EVIDENCE_ITEMS]
+
+
+def _render_fallback_analysis(
+    state: dict[str, Any],
+    analysis_result: VMCoreAnalysisStep,
+    *,
+    crash_type: str,
+    evidence: List[str],
+) -> str:
+    chinese = _fallback_report_is_chinese(state)
+    gates = analysis_result.gates or {}
+    closed = [name for name, gate in gates.items() if gate.status == "closed"]
+    not_applicable = [name for name, gate in gates.items() if gate.status == "n/a"]
+
+    if chinese:
+        paragraphs = [
+            (
+                f"本报告结论由执行器在收口阶段自动补全：模型已完成全部强制验证关卡，"
+                f"但未输出正式的终止结论结构。崩溃类型为 {crash_type}，"
+                f"根因类为 {analysis_result.root_cause_class}。"
+            ),
+            (
+                "已闭合的验证关卡："
+                + ("、".join(closed) if closed else "无")
+                + ("；判定不适用的关卡：" + "、".join(not_applicable) if not_applicable else "")
+                + "。上述关卡的判据见 evidence 列表。"
+            ),
+        ]
+        if evidence:
+            paragraphs.append("支撑该结论的关键证据：" + "；".join(evidence[:8]) + "。")
+        if analysis_result.additional_notes:
+            paragraphs.append(
+                "执行器审计与遗留事项：" + _clip_fallback_text(analysis_result.additional_notes, 600)
+            )
+        paragraphs.append(
+            "置信度为 low：结论限定在上述已闭合关卡所覆盖的范围，"
+            "未验证的机制（例如被覆盖字节的具体来源）仍属开放问题，"
+            "不应被理解为已完成机制级定位。"
+        )
+        return "\n\n".join(paragraphs)
+
+    paragraphs = [
+        (
+            "This conclusion was completed by the executor during the wrap-up turn: "
+            "every mandatory verification gate had closed, but the model did not emit "
+            "a terminal conclusion structure. Crash type: {crash_type}; root cause class: "
+            "{root_cause}.".format(
+                crash_type=crash_type, root_cause=analysis_result.root_cause_class
+            )
+        ),
+        (
+            "Closed gates: "
+            + (", ".join(closed) if closed else "none")
+            + ("; not-applicable gates: " + ", ".join(not_applicable) if not_applicable else "")
+            + ". Each gate's closure criterion is listed in the evidence array."
+        ),
+    ]
+    if evidence:
+        paragraphs.append("Key supporting evidence: " + "; ".join(evidence[:8]) + ".")
+    if analysis_result.additional_notes:
+        paragraphs.append(
+            "Executor audit notes and open items: "
+            + _clip_fallback_text(analysis_result.additional_notes, 600)
+        )
+    paragraphs.append(
+        "Confidence is low: the conclusion is bounded to the scope covered by the "
+        "closed gates. Mechanisms that were never verified (for example the exact "
+        "writer of the overwritten bytes) remain open questions and must not be read "
+        "as a mechanism-level attribution."
+    )
+    return "\n\n".join(paragraphs)
+
+
+def _synthesize_final_diagnosis(
+    state: dict[str, Any],
+    analysis_result: VMCoreAnalysisStep,
+) -> Optional[FinalDiagnosis]:
+    state_text = _collect_state_text(state)
+    chinese = _fallback_report_is_chinese(state)
+
+    label_pair = _FALLBACK_CRASH_TYPE_LABELS.get(
+        str(analysis_result.root_cause_class),
+        (
+            str(analysis_result.signature_class or "unknown").replace("_", " "),
+            str(analysis_result.signature_class or "unknown").replace("_", " "),
+        ),
+    )
+    crash_type = label_pair[1] if chinese else label_pair[0]
+
+    faulting_instruction = _mine_faulting_instruction(state_text) or "unknown"
+    suspect_function = _mine_suspect_function(state_text, faulting_instruction, state)
+    panic_string = _mine_panic_string(state_text) or (
+        "未在已收集证据中捕获到 panic 字符串（执行器补全结论）"
+        if chinese
+        else "panic string not captured in the collected evidence (executor-synthesized)"
+    )
+    evidence = _build_fallback_evidence(state, analysis_result)
+
+    if chinese:
+        root_cause = (
+            f"{suspect_function} 处发生 {crash_type}：根因类判定为 "
+            f"{analysis_result.root_cause_class}，全部强制验证关卡已闭合。"
+        )
+        suspect_file = "unknown"
+    else:
+        root_cause = (
+            f"{crash_type} at {suspect_function}: the analysis classified the root cause "
+            f"as {analysis_result.root_cause_class} and every mandatory gate closed."
+        )
+        suspect_file = "unknown"
+
+    return FinalDiagnosis(
+        crash_type=crash_type,
+        panic_string=panic_string,
+        faulting_instruction=faulting_instruction,
+        root_cause=root_cause,
+        detailed_analysis=_render_fallback_analysis(
+            state,
+            analysis_result,
+            crash_type=crash_type,
+            evidence=evidence,
+        ),
+        suspect_code=SuspectCode(
+            file=suspect_file, function=suspect_function, line="unknown"
+        ),
+        evidence=evidence or ["(no structured evidence facts were recorded)"],
+        corruption_mechanism=getattr(analysis_result, "corruption_mechanism", None),
+    )
+
+
+def apply_fallback_conclusion_synthesis(
+    analysis_result: VMCoreAnalysisStep,
+    state: dict[str, Any],
+    *,
+    log_prefix: str = "",
+) -> VMCoreAnalysisStep:
+    """收口轮兜底：把已闭合的证据渲染成有界的 FinalDiagnosis，避免整轮空转。
+
+    只在收敛契约确实已满足时生效（根因类已确定 + 强制 gate 全部 closed/n/a），
+    并且合成后会重新走一次模型校验；若仍被降级，则原样返回非结论结果。
+    """
+    if analysis_result.is_conclusive or analysis_result.final_diagnosis is not None:
+        return analysis_result
+    if analysis_result.root_cause_class in {None, "unknown"}:
+        return analysis_result
+
+    unresolved = _unresolved_required_gates(analysis_result)
+    if unresolved:
+        logger.warning(
+            "%sFallback synthesis skipped: required gates not closed/n/a: %s.",
+            log_prefix,
+            ", ".join(unresolved),
+        )
+        return analysis_result
+
+    diagnosis = _synthesize_final_diagnosis(state, analysis_result)
+    if diagnosis is None:
+        return analysis_result
+
+    chinese = _fallback_report_is_chinese(state)
+    audit_note = (
+        "执行器补全：收口轮模型未输出终止结论，已依据全部已闭合的强制关卡"
+        "合成置信度为 low 的有界结论。"
+        if chinese
+        else
+        "Executor fallback: the wrap-up turn produced no terminal conclusion, so a "
+        "low-confidence bounded conclusion was synthesized from the closed mandatory gates."
+    )
+
+    payload = analysis_result.model_dump()
+    notes = payload.get("additional_notes") or ""
+    payload.update(
+        {
+            "is_conclusive": True,
+            "action": None,
+            "confidence": "low",
+            "final_diagnosis": diagnosis.model_dump(),
+            "fix_suggestion": payload.get("fix_suggestion")
+            or (
+                "在已定位的写入路径上补充防护，并针对未验证的机制补充最小化验证。"
+                if chinese
+                else "Add the guard on the identified writer path and run the minimal "
+                "verification for the mechanisms that stayed unverified."
+            ),
+            "additional_notes": (f"{notes} {audit_note}".strip() if notes else audit_note),
+        }
+    )
+
+    try:
+        rebuilt = VMCoreAnalysisStep.model_validate(payload)
+    except Exception as exc:  # pragma: no cover - 防御性：校验异常时保持原结果
+        logger.error("%sFallback synthesis failed validation: %s", log_prefix, exc)
+        return analysis_result
+
+    if not rebuilt.is_conclusive or rebuilt.final_diagnosis is None:
+        logger.warning(
+            "%sFallback synthesis was downgraded by the conclusive contract; "
+            "keeping the non-conclusive result.",
+            log_prefix,
+        )
+        return analysis_result
+
+    logger.warning(
+        "%sFallback synthesis applied: is_conclusive=True with confidence=low "
+        "(root_cause_class=%s).",
+        log_prefix,
+        rebuilt.root_cause_class,
+    )
+    return rebuilt

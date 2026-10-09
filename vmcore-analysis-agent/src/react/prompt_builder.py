@@ -187,6 +187,18 @@ def _observed_evidence_categories(evidence_facts: object) -> set[str]:
     return observed
 
 
+def _gates_exhausted(state: AgentState) -> bool:
+    """强制门控是否已注册且全部关闭。
+
+    注意 `_format_unresolved_gates` 对 None/{} 也返回 "none"，那表示"门控集合尚未注册"
+    （早期步或 _build_managed_gates 返回 None 时），与"全部已关闭"语义相反，
+    故必须先确认门控确实存在。
+    """
+    return bool(state.get("managed_gates")) and (
+        _format_unresolved_gates(state.get("managed_gates")) == "none"
+    )
+
+
 def _build_replan_probe_menu(state: AgentState) -> list[str]:
     """C5：为 "Replanning required" 补充机器生成的具体转向方向。
 
@@ -209,11 +221,7 @@ def _build_replan_probe_menu(state: AgentState) -> list[str]:
     # 另外，`_format_unresolved_gates` 对 None/{} 也返回 "none"，那表示
     # "门控集合尚未注册"（早期步或 _build_managed_gates 返回 None 时），
     # 与"全部已关闭"语义相反，故必须先确认门控确实存在。
-    gates_registered = bool(state.get("managed_gates"))
-    gates_exhausted = (
-        gates_registered
-        and _format_unresolved_gates(state.get("managed_gates")) == "none"
-    )
+    gates_exhausted = _gates_exhausted(state)
 
     value_conflicts = _format_value_conflicts(state.get("value_conflicts"))
     if value_conflicts:
@@ -231,7 +239,25 @@ def _build_replan_probe_menu(state: AgentState) -> list[str]:
             "that marks the contradiction as addressed so it no longer blocks a conclusion."
         )
 
-    if root_cause_class:
+    # L1：root_cause_class 已确定且强制门控全部关闭时，任何后续命令都无法再加强结论，
+    # 此时若仍列出"未探索的证据维度"并强制"换假设"，就等于在同一份提示词里同时要求
+    # "立即收尾"和"继续探索"——真实运行（run D）中模型正是被后半句带走，在收尾轮继续
+    # 发起 rd 探测而被 build_tool_calls 剥掉 tool_calls，整轮作废、报告没有最终结论。
+    # 这里让收敛条件同时压制转向菜单，使提示词只剩一个可执行指令。
+    terminate_only = bool(root_cause_class) and gates_exhausted
+
+    if terminate_only:
+        lines.append(
+            f"- TERMINATE ON THIS TURN: root_cause_class={root_cause_class} is set and every mandatory "
+            f"gate for signature_class={signature_class} is closed. No further crash command can strengthen "
+            f"this conclusion, so do not issue another read-only probe (rd/struct/dis/log/irq/sym). "
+            f"Decoding what an overwritten value 'means' (e.g. reading a corrupted field as an IRQ number, "
+            f"device id or flag) is NOT a prerequisite for concluding: bytes inside memory already proven "
+            f"to be corruption payload are the payload, not live state, and their protocol semantics can "
+            f"never be recovered from the vmcore. Emit the final JSON now with confidence=\"low\" and record "
+            f"the residual unknown in final_diagnosis.detailed_analysis."
+        )
+    elif root_cause_class:
         lines.append(
             f"- root_cause_class={root_cause_class} is already set: "
             f"prefer terminating with your conclusion (bounded uncertainty is acceptable) over further probing."
@@ -250,29 +276,30 @@ def _build_replan_probe_menu(state: AgentState) -> list[str]:
             "directly rather than restating evidence already collected."
         )
 
-    missing = [
-        name
-        for name in _GATE_EVIDENCE_CATEGORIES
-        if name not in _observed_evidence_categories(state.get("evidence_facts"))
-    ]
-    if missing:
-        lines.append(
-            "- Untapped evidence dimensions (pick one that targets a NEW object, "
-            "not an address you have already read):"
-        )
-        lines.extend(f"  - {name}: {_EVIDENCE_CATEGORY_HINTS[name]}" for name in missing)
-    else:
-        lines.append(
-            "- All four structured evidence dimensions (rd/struct/dis/sym) are already observed, "
-            "so a useful next command must change the target object or the hypothesis being tested, "
-            "not the evidence type."
-        )
+    if not terminate_only:
+        missing = [
+            name
+            for name in _GATE_EVIDENCE_CATEGORIES
+            if name not in _observed_evidence_categories(state.get("evidence_facts"))
+        ]
+        if missing:
+            lines.append(
+                "- Untapped evidence dimensions (pick one that targets a NEW object, "
+                "not an address you have already read):"
+            )
+            lines.extend(f"  - {name}: {_EVIDENCE_CATEGORY_HINTS[name]}" for name in missing)
+        else:
+            lines.append(
+                "- All four structured evidence dimensions (rd/struct/dis/sym) are already observed, "
+                "so a useful next command must change the target object or the hypothesis being tested, "
+                "not the evidence type."
+            )
 
-    lines.append(
-        "- Pivot requirement: adopt a different hypothesis from 'Active hypotheses' above, or introduce "
-        "a new one together with the specific observation that would confirm or refute it. If no such "
-        "hypothesis can be justified from the evidence already collected, terminate with bounded uncertainty."
-    )
+        lines.append(
+            "- Pivot requirement: adopt a different hypothesis from 'Active hypotheses' above, or introduce "
+            "a new one together with the specific observation that would confirm or refute it. If no such "
+            "hypothesis can be justified from the evidence already collected, terminate with bounded uncertainty."
+        )
     return lines
 
 
@@ -311,11 +338,21 @@ def build_executor_state_section(state: AgentState) -> str:
     # "no outstanding gate" 与 "Replanning required" 并存却不给方向，
     # LLM 会退化为重复上一条命令。改为显式声明门控已穷尽、需要换假设。
     replan_required = bool(state.get("replan_required"))
+    # L1：与 _build_replan_probe_menu 使用同一个收敛判据，避免状态摘要与转向菜单
+    # 对"该收尾还是该继续挖"给出相反指令。
+    conclusion_ready = bool(state.get("current_root_cause_class")) and _gates_exhausted(state)
     if replan_required and next_gate_objective == "no outstanding gate":
-        next_gate_objective = (
-            "all mandatory gates are closed but no root cause has been established; "
-            "gate closure alone is not proof, so re-confirming a closed gate cannot make progress"
-        )
+        if conclusion_ready:
+            next_gate_objective = (
+                f"all mandatory gates are closed and root_cause_class="
+                f"{state.get('current_root_cause_class')} is established; the only remaining objective "
+                f"is to emit the final conclusion with bounded uncertainty"
+            )
+        else:
+            next_gate_objective = (
+                "all mandatory gates are closed but no root cause has been established; "
+                "gate closure alone is not proof, so re-confirming a closed gate cannot make progress"
+            )
 
     lines = [
         f"## Current Investigation State (Step {step_count})",
@@ -350,10 +387,17 @@ def build_executor_state_section(state: AgentState) -> str:
             f"no-progress streak={state.get('no_progress_streak', 0)})"
         )
         if replan_required:
-            lines.append(
-                "- Replanning required: select a different evidence target or terminate with bounded uncertainty; "
-                "do not emit an equivalent command."
-            )
+            if conclusion_ready:
+                lines.append(
+                    "- Replanning required: the root cause class is already established and every mandatory "
+                    "gate is closed, so terminate on this turn by emitting the final JSON conclusion "
+                    "(confidence=\"low\" is acceptable); do not emit another command."
+                )
+            else:
+                lines.append(
+                    "- Replanning required: select a different evidence target or terminate with bounded uncertainty; "
+                    "do not emit an equivalent command."
+                )
             # C5：把抽象的"换个目标"落成可执行的具体方向。
             lines.extend(_build_replan_probe_menu(state))
 
