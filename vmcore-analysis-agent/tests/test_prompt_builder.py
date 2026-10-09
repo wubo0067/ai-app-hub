@@ -131,6 +131,30 @@ class ReplanProbeMenuTests(unittest.TestCase):
             rendered,
         )
 
+    def test_unregistered_gates_never_claim_gates_closed(self) -> None:
+        """门控集合尚未注册时，`_format_unresolved_gates` 同样返回 "none"。
+
+        这表示"没有门控"，而非"门控已全部关闭"。早期步或
+        `_build_managed_gates` 返回 None 时会走到这里，若误判为门控穷尽，
+        就会把"每个强制门控都已关闭"这条错误事实注入提示词。
+        """
+        for unregistered in (None, {}):
+            with self.subTest(managed_gates=unregistered):
+                rendered = _render(
+                    current_signature_class="null_deref",
+                    current_root_cause_class=None,
+                    managed_gates=unregistered,
+                    current_evidence_goal=None,
+                    last_action_status="rejected",
+                    duplicate_streak=0,
+                    no_progress_streak=1,
+                    replan_required=True,
+                    evidence_facts=["rd_word:0x1=0x2"],
+                )
+                self.assertNotIn("Gate closure is not root-cause proof", rendered)
+                self.assertNotIn("every mandatory gate", rendered)
+                self.assertIn("Mandatory gates are still unresolved", rendered)
+
     def test_untapped_dimensions_exclude_observed_ones(self) -> None:
         rendered = _render(
             current_signature_class="pointer_corruption",

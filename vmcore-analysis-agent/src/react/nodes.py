@@ -56,28 +56,29 @@ structure_reasoning_node = "structure_reasoning_node"
 NO_PROGRESS_STREAK_LIMIT = 3
 
 
-def _has_non_echo_output(content: str, command_line: str) -> bool:
+def _has_non_echo_output(content: str) -> bool:
     """判断工具输出是否包含真实内容（而非仅 crash 提示符 echo）。
 
-    crash 工具在执行命令时会先回显命令本身（如 ``crash> log -m | grep foo``），
-    若命令无任何输出，ToolMessage.content 仅含该 echo 行。将此类 echo-only
+    crash 会话执行命令时会逐行回显命令本身（如 ``crash> log -m | grep foo``），
+    若命令无任何输出，ToolMessage.content 仅含这些 echo 行。将此类 echo-only
     输出误判为"有内容"会错误地清零 no_progress_streak，掩盖真实的无进展状态。
+
+    注意：不能按"本次提交的命令行"做精确匹配。run_script 的提交形式是
+    ``run_script <vmcore> <vmlinux> <script>``，而回显是脚本内的 crash 命令行
+    （``crash> <script line>``），两者永远不相等；多行脚本还会逐行回显。
+    因此改为按前缀剔除所有 ``crash>`` 开头的行，只要还剩非空行即为实质输出。
 
     Args:
         content: ToolMessage 的原始内容字符串。
-        command_line: 本次执行的命令行字符串（不含 "crash> " 前缀）。
 
     Returns:
         True 表示输出中有 echo 之外的实质内容；False 表示仅含 echo 或为空。
     """
-    stripped = content.strip()
-    if not stripped:
-        return False
-    # crash 回显格式：以 "crash> " 开头，后跟命令本身
-    echo_line = f"crash> {command_line.strip()}"
-    # 去掉 echo 行后，若还有非空内容则认为有实质输出
-    remaining = stripped.removeprefix(echo_line).strip()
-    return bool(remaining)
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("crash>"):
+            return True
+    return False
 
 # =========================================================================
 # 默认 crash 命令集合
@@ -535,10 +536,13 @@ async def call_crash_tool(state: AgentState) -> dict:
                         or prior_output is not None
                     )
                 ):
-                    # 判断历史输出是否有实质证据内容（排除 echo-only 输出）
-                    cached_has_evidence = bool(prior_output) and _has_non_echo_output(
-                        prior_output, ""
-                    )
+                    # 判断历史输出是否有实质证据内容：排除 echo-only 输出，并把
+                    # 缓存的 [error]/[TIMEOUT] 失败结果也视为无证据——失败命令不应
+                    # 被当作"有证据"回放，否则 LLM 会反复收到同一份失败输出而
+                    # 得不到"换方向"的信号。
+                    cached_has_evidence = bool(prior_output) and \
+                        not prior_output.startswith(("[error]", "[TIMEOUT]")) and \
+                        _has_non_echo_output(prior_output)
                     if cached_has_evidence:
                         # 有证据：回放历史输出，让 LLM 重新利用已有结果
                         dedup_msg = (
@@ -626,7 +630,7 @@ async def call_crash_tool(state: AgentState) -> dict:
                             content = str(r_output)
                             if isinstance(r_output, Exception):
                                 content = f"[error] Execution failed: {r_output}"
-                            if not content.startswith(("[error]", "[TIMEOUT]")) and _has_non_echo_output(content, original_cmd):
+                            if not content.startswith(("[error]", "[TIMEOUT]")) and _has_non_echo_output(content):
                                 observed_nonempty_output = True
                             tool_messages.append(
                                 ToolMessage(

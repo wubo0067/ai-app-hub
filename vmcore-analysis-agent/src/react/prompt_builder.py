@@ -182,7 +182,14 @@ def _build_replan_probe_menu(state: AgentState) -> list[str]:
     # 门控是否真的已全部关闭：replan 也可能发生在仍有 open/blocked 门控时
     # （例如 C1 的 DEDUP-BLOCKED 走 rejected 分支）。此时不能声称门控已穷尽，
     # 否则会把错误事实注入提示词。
-    gates_exhausted = _format_unresolved_gates(state.get("managed_gates")) == "none"
+    # 另外，`_format_unresolved_gates` 对 None/{} 也返回 "none"，那表示
+    # "门控集合尚未注册"（早期步或 _build_managed_gates 返回 None 时），
+    # 与"全部已关闭"语义相反，故必须先确认门控确实存在。
+    gates_registered = bool(state.get("managed_gates"))
+    gates_exhausted = (
+        gates_registered
+        and _format_unresolved_gates(state.get("managed_gates")) == "none"
+    )
 
     if root_cause_class:
         lines.append(
