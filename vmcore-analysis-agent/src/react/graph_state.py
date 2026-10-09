@@ -89,6 +89,9 @@ class AgentState(MessagesState):
     no_progress_streak: int
     evidence_delta: list[str]
     evidence_facts: list[str]
+    # 取值级矛盾事实（内存内容与结构体布局不符），格式见 consistency.py。
+    # 与 evidence_facts 分开保存：它属于派生关系，不参与门控证据统计。
+    value_conflicts: list[str]
     replan_required: bool
     current_evidence_goal: Optional[dict[str, object]]
     evidence_goal_version: int

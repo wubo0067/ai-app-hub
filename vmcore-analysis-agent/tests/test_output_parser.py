@@ -14,7 +14,44 @@ sys.modules.setdefault("src.react", react_pkg)
 from src.react.output_parser import (
     _detect_corrupted_base_null_deref,
     _parse_kernel_frame_registers,
+    apply_value_conflict_audit,
 )
+
+CONFLICT_FACT = (
+    "conflict:object_does_not_match_type:irqaction@0xff292187ae124a80:"
+    "next@0x18=0x12,thread_fn@0x20=0x5c"
+)
+
+
+def _make_conclusive_step(**overrides: object):
+    from src.react.schema import VMCoreLLMAnalysisStep
+
+    payload: dict[str, object] = {
+        "step_id": 22,
+        "reasoning": "The irq_desc.action object looks like a valid irqaction.",
+        "action": None,
+        "is_conclusive": True,
+        "signature_class": "pointer_corruption",
+        "root_cause_class": "wild_pointer",
+        "partial_dump": "partial",
+        "confidence": "high",
+        "final_diagnosis": {
+            "crash_type": "NULL pointer dereference",
+            "panic_string": "BUG: unable to handle kernel NULL pointer dereference",
+            "faulting_instruction": "ffffffffbc3798a0",
+            "root_cause": "A wild pointer in the irqaction chain.",
+            "detailed_analysis": "The handler field is corrupted.",
+            "suspect_code": {
+                "file": "kernel/irq/manage.c",
+                "function": "setup_irq",
+                "line": "unknown",
+            },
+            "evidence": ["irq_desc.action points at the handler payload"],
+        },
+        "fix_suggestion": "Validate the irqaction pointer before use.",
+    }
+    payload.update(overrides)
+    return VMCoreLLMAnalysisStep.model_validate(payload)
 
 # crash `bt` 风格：RIP 为裸内核地址（失败日志 new 5.txt 的实际格式）。
 CRASH_BT_FRAME = """
@@ -83,6 +120,46 @@ class KernelFrameRegisterParsingTests(unittest.TestCase):
             "Code: 48 8b 95 50 00 00 00 48 89 d8 <48> 8b 92 50 00 00 00\n"
         )
         self.assertEqual(_parse_kernel_frame_registers(text), {})
+
+
+class ValueConflictAuditTests(unittest.TestCase):
+    """[阶段 5] 取值级矛盾审计：已读内存与结构体布局不相容时的降级与提示注入。"""
+
+    def test_downgrades_conclusive_step(self) -> None:
+        step = _make_conclusive_step()
+        audited = apply_value_conflict_audit(
+            step, {"value_conflicts": [CONFLICT_FACT]}, log_prefix="test"
+        )
+
+        self.assertFalse(audited.is_conclusive)
+        self.assertIsNone(audited.final_diagnosis)
+        self.assertIsNone(audited.fix_suggestion)
+        self.assertEqual(audited.root_cause_class, "unknown")
+        self.assertEqual(audited.confidence, "low")
+        self.assertIn("value-level contradiction", audited.reasoning)
+        self.assertIn("next@0x18=0x12", audited.additional_notes)
+
+    def test_noop_when_no_conflicts(self) -> None:
+        step = _make_conclusive_step()
+        audited = apply_value_conflict_audit(step, {"value_conflicts": []}, log_prefix="test")
+
+        self.assertTrue(audited.is_conclusive)
+        self.assertIsNotNone(audited.final_diagnosis)
+        self.assertEqual(audited.root_cause_class, "wild_pointer")
+        self.assertEqual(audited.confidence, "high")
+
+    def test_idempotent_when_model_already_referenced_the_object(self) -> None:
+        """模型已自行写出该对象基址时不再注入审计说明（避免重复唠叨）。"""
+        step = _make_conclusive_step(
+            reasoning="irq_desc.action at 0xff292187ae124a80 does not look like an irqaction."
+        )
+        audited = apply_value_conflict_audit(
+            step, {"value_conflicts": [CONFLICT_FACT]}, log_prefix="test"
+        )
+
+        self.assertTrue(audited.is_conclusive)
+        self.assertEqual(audited.confidence, "high")
+        self.assertNotIn("value-level contradiction", audited.reasoning)
 
 
 if __name__ == "__main__":

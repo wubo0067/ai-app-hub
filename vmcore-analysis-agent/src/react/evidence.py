@@ -5,13 +5,10 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, Mapping
 
+from .consistency import parse_struct_layouts
+
 _HEX = r"(?:0x)?[0-9a-fA-F]+"
 _RD_LINE_RE = re.compile(rf"^\s*(?P<address>{_HEX})\s*:\s*(?P<words>.*)$")
-_STRUCT_HEADER_RE = re.compile(r"^\s*struct\s+(?P<name>\S+)\s*\{")
-_STRUCT_FIELD_RE = re.compile(
-    rf"^\s*\[(?P<offset>{_HEX})\]\s+(?P<field>[A-Za-z_][\w.\[\]-]*)"
-)
-_STRUCT_SIZE_RE = re.compile(rf"^\s*SIZE\s*:\s*(?P<size>{_HEX})")
 _DIS_LINE_RE = re.compile(
     rf"^\s*(?P<address>{_HEX})\s+<(?P<symbol>[^>]+)>:\s+(?P<instruction>\S+.*)$"
 )
@@ -423,9 +420,12 @@ def _parse_rd(output: str) -> set[str]:
 
 def _parse_struct(output: str) -> set[str]:
     """
-    解析由内核调试器（如 gdb/crash）输出的结构体定义文本，并将其转换为事实（facts）集合。
+    解析由内核调试器（如 crash）输出的结构体定义文本，并将其转换为事实（facts）集合。
 
-    该函数通过正则表达式识别结构体的名称、字段及其偏移量，以及结构体的总大小。
+    字段名与偏移的解析委托给 ``consistency.parse_struct_layouts``：crash 的
+    ``struct -o`` 输出形如 ``[112] struct irqaction *action;``，字段名写在声明之后，
+    不能把声明中的第一个标识符当作字段名。
+
     生成的 fact 格式如下：
     - struct_type:<name>: 表示发现了一个结构体类型。
     - struct_field:<name>.<field_name>@0x<offset>: 表示结构体中的一个字段及其偏移量。
@@ -438,38 +438,15 @@ def _parse_struct(output: str) -> set[str]:
         set[str]: 包含解析出的结构体相关事实的集合。
     """
     facts: set[str] = set()
-    current_type: str | None = None
-
-    for line in output.splitlines():
-        # 尝试匹配结构体头部，例如 "struct task_struct {"
-        header = _STRUCT_HEADER_RE.match(line)
-        if header:
-            current_type = header.group("name")
-            facts.add(f"struct_type:{current_type}")
-            continue
-
-        # 如果当前不在任何结构体定义块内，则跳过该行
-        if current_type is None:
-            continue
-
-        # 尝试匹配结构体字段，例如 "    int state; /* offset 0x10 */"
-        field = _STRUCT_FIELD_RE.match(line)
-        if field:
-            offset = _to_struct_int(field.group("offset"))
+    for type_name, layout in parse_struct_layouts(output).items():
+        facts.add(f"struct_type:{type_name}")
+        size = layout.get("size")
+        if isinstance(size, int) and size > 0:
+            facts.add(f"struct_size:{type_name}=0x{size:x}")
+        for field in layout.get("fields", []):
             facts.add(
-                f"struct_field:{current_type}.{field.group('field')}@0x{offset:x}"
+                f"struct_field:{type_name}.{field['name']}@0x{field['offset']:x}"
             )
-            continue
-
-        # 尝试匹配结构体结束时的总大小，例如 "} size: 0x1234"
-        size = _STRUCT_SIZE_RE.match(line)
-        if size:
-            facts.add(
-                f"struct_size:{current_type}=0x{_to_struct_int(size.group('size')):x}"
-            )
-            # 解析完一个结构体，重置当前类型，防止后续行被错误归类
-            current_type = None
-
     return facts
 
 
@@ -634,21 +611,3 @@ def _to_int(value: str) -> int:
         int: 转换后的整数值。
     """
     return int(value, 16 if value.lower().startswith("0x") else 16)
-
-
-def _to_struct_int(value: str) -> int:
-    """
-    将结构体输出中的偏移/大小字符串转换为整数。
-
-    与 ``_to_int`` 不同：结构体输出中的数值可能为十进制（不带 "0x" 前缀），
-    因此按以下规则解析：
-    - 带 "0x" 前缀 → 按 16 进制解析
-    - 不带前缀 → 按 10 进制解析
-
-    Args:
-        value (str): 待转换的字符串，例如 "0x10" 或 "32"。
-
-    Returns:
-        int: 转换后的整数值。
-    """
-    return int(value, 0) if value.lower().startswith("0x") else int(value, 10)

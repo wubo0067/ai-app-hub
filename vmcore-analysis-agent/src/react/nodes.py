@@ -25,6 +25,7 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from src.utils.logging import logger
 from src.mcp_tools import get_registered_tool_provider
 from .graph_state import AgentState
+from .consistency import MemoryRead, detect_value_conflicts, parse_memory_reads
 from .prompts import crash_init_data_prompt
 from .action_guard import (
     build_command_fingerprint,
@@ -442,6 +443,8 @@ async def call_crash_tool(state: AgentState) -> dict:
     prior_evidence_facts = set(state.get("evidence_facts", []))
     observed_evidence_facts: set[str] = set()
     observed_nonempty_output = False
+    # 本步读到的内存快照，用于与已缓存的结构体布局做取值级一致性检查。
+    observed_memory_reads: list[MemoryRead] = []
 
     # 提取所有工具调用的命令，准备批量执行
     # 为了后续能将结果匹配回 tool_call_id，我们需要维护一个映射或顺序
@@ -655,6 +658,7 @@ async def call_crash_tool(state: AgentState) -> dict:
                             discovered_layouts = extract_struct_layouts(content)
                             if discovered_layouts:
                                 struct_layout_cache.update(discovered_layouts)
+                            observed_memory_reads.extend(parse_memory_reads(content))
                             observed_evidence_facts.update(
                                 extract_evidence_facts(tool_name, _raw_args, content)
                             )
@@ -723,6 +727,10 @@ async def call_crash_tool(state: AgentState) -> dict:
     # 这个返回字典会被 LangGraph 用来更新当前运行中的 AgentState 状态；
     # 它不是更新 nodes.py 里的某个本地变量，而是更新整个状态图在这一轮执行中的共享 state。
     evidence_facts = sorted(prior_evidence_facts | observed_evidence_facts)
+    value_conflicts = sorted(
+        set(state.get("value_conflicts", []))
+        | set(detect_value_conflicts(observed_memory_reads, struct_layout_cache))
+    )
     managed_gates = update_gate_evidence(state.get("managed_gates"), evidence_delta)
     goal_advanced = facts_support_goal(
         evidence_delta, state.get("current_evidence_goal")
@@ -741,6 +749,7 @@ async def call_crash_tool(state: AgentState) -> dict:
         "no_progress_streak": no_progress_streak,
         "evidence_delta": evidence_delta,
         "evidence_facts": evidence_facts,
+        "value_conflicts": value_conflicts,
         "replan_required": all_duplicate
         or (bool(commands_to_run) and not evidence_delta)
         # C1：DEDUP-BLOCKED（无证据的重复命令）走 rejected 分支，

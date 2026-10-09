@@ -11,6 +11,7 @@ from .graph_state import AgentState
 from .nodes import NO_PROGRESS_STREAK_LIMIT, llm_analysis_node, structure_reasoning_node
 from .output_parser import (
     apply_executor_consistency_audit,
+    apply_value_conflict_audit,
     build_tool_calls,
     repair_analysis_step,
     repair_structured_output,
@@ -226,6 +227,11 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
             cast(dict[str, Any], state),
             log_prefix=llm_analysis_node,
         )
+        llm_step = apply_value_conflict_audit(
+            llm_step,
+            cast(dict[str, Any], state),
+            log_prefix=llm_analysis_node,
+        )
 
         # 记录 response
         analysis_result, managed_updates = project_managed_analysis_step(
@@ -397,6 +403,11 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
             )
 
         llm_step = apply_executor_consistency_audit(
+            llm_step,
+            cast(dict[str, Any], state),
+            log_prefix=structure_reasoning_node,
+        )
+        llm_step = apply_value_conflict_audit(
             llm_step,
             cast(dict[str, Any], state),
             log_prefix=structure_reasoning_node,

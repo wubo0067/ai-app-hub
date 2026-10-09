@@ -20,6 +20,7 @@ from .action_guard import (
     canonicalize_command_line,
     validate_tool_call_request,
 )
+from .consistency import format_conflict_fact, parse_conflict_fact
 from .schema import (
     VMCoreAnalysisStep,
     VMCoreLLMAnalysisStep,
@@ -514,6 +515,9 @@ def apply_executor_consistency_audit(
         [阶段 2] Action 形态归一化 —— 提升 MCP 工具、对齐提示词、预检命令
         [阶段 3] 根因语义审计 —— slab OOB 方向、已分配槽 UAF、前缀覆盖、DMA 证据门槛
         [阶段 4] 页面错误访问类型矛盾检测 —— 对比错误码方向与指令类型
+        [阶段 5] 取值级矛盾审计 —— 已读内存内容与结构体布局不相容
+                 （因阶段 4 存在提前返回，阶段 5 由 apply_value_conflict_audit
+                  在本函数之后调用，两者共同构成完整管线）
 
     用途：
         确保 LLM 输出与实际 vmcore 上下文保持一致，发现并修正逻辑矛盾
@@ -1635,6 +1639,100 @@ def _append_audit_note(
             ).strip()
     else:
         analysis_step.additional_notes = audit_note
+
+    return analysis_step
+
+
+def _mentions_value_level_conflict(
+    analysis_step: VMCoreLLMAnalysisStep,
+    conflicts: List[str],
+) -> bool:
+    """判断模型是否已经引用过这些取值级矛盾（以矛盾对象基址为准）。
+
+    与 ``_mentions_access_type_mismatch`` 同样的意图：如果模型在 reasoning /
+    诊断文本里已经写出了具体的矛盾对象地址，说明它已经自行完成这一步交叉检查，
+    不需要再注入审计说明。
+    """
+    text = _collect_analysis_text_for_oob_audit(analysis_step).lower()
+    if not text:
+        return False
+
+    for fact in conflicts:
+        parsed = parse_conflict_fact(fact)
+        if parsed is None:
+            continue
+        _, base = parsed
+        if f"{base:x}" in text:
+            return True
+    return False
+
+
+def apply_value_conflict_audit(
+    analysis_step: VMCoreLLMAnalysisStep,
+    state: dict[str, Any],
+    *,
+    log_prefix: str = "",
+) -> VMCoreLLMAnalysisStep:
+    """[阶段 5] 取值级矛盾审计：已读内存内容与结构体布局不相容。
+
+    触发条件：``state["value_conflicts"]`` 非空，即执行器已机械判定
+    "该地址的内存不是该类型的对象"（例如 ``irq_desc.action`` 指向的内容
+    不满足 ``irqaction`` 的指针字段语义），而模型尚未引用该矛盾。
+
+    与阶段 1~4 同属执行器一致性审计管线；因为阶段 4 存在提前返回，
+    阶段 5 以独立入口暴露，由 ``llm_node`` 紧随 ``apply_executor_consistency_audit`` 调用。
+
+    Args:
+        analysis_step: LLM 分析步骤
+        state: 当前状态（读取 value_conflicts）
+        log_prefix: 日志前缀
+
+    Returns:
+        VMCoreLLMAnalysisStep: 审计修正后的分析步骤
+    """
+    prefix = f"{log_prefix}: " if log_prefix else ""
+    conflicts = [
+        fact
+        for fact in state.get("value_conflicts") or []
+        if isinstance(fact, str)
+    ]
+    if not conflicts:
+        return analysis_step
+
+    if _mentions_value_level_conflict(analysis_step, conflicts):
+        logger.debug(
+            "%sExecutor audit found a value-level contradiction, but the model already referenced it.",
+            prefix,
+        )
+        return analysis_step
+
+    rendered = [
+        text
+        for text in (format_conflict_fact(fact) for fact in conflicts)
+        if text is not None
+    ]
+    summary = "; ".join(rendered) if rendered else "; ".join(conflicts)
+    audit_note = (
+        "Executor audit: unresolved value-level contradiction between the memory you read "
+        f"and the declared struct layout. {summary}"
+    )
+    logger.warning("%s%s", prefix, audit_note)
+
+    _append_audit_note(analysis_step, audit_note)
+
+    # 根因降级：对象类型都还没解释清楚时，当前归因不可信任
+    if analysis_step.root_cause_class not in {None, "unknown"}:
+        analysis_step.root_cause_class = "unknown"
+
+    # 撤销定论状态：矛盾未澄清前不能下最终结论
+    if analysis_step.is_conclusive:
+        analysis_step.is_conclusive = False
+        analysis_step.final_diagnosis = None
+        analysis_step.fix_suggestion = None
+
+    # 置信度压制：存在未解决的矛盾时最高只能为 low
+    if analysis_step.confidence not in {None, "low"}:
+        analysis_step.confidence = "low"
 
     return analysis_step
 

@@ -7,6 +7,8 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, List, Optional
 
+from .consistency import parse_struct_layouts
+
 # 匹配 head/tail 管道后缀的正则表达式，用于清理命令输出过滤操作
 _HEAD_TAIL_SUFFIX_RE = re.compile(r"\s*\|\s*(?:head|tail)\s+-\d+\s*$")
 # 匹配宽泛可打印字符 grep 模式，避免把大块内存当作任意 ASCII 文本扫出海量结果
@@ -35,12 +37,7 @@ _MOV_ALIAS_RE = re.compile(
 _MEMORY_OPERAND_RE = re.compile(
     r"(?:(?P<disp>0x[0-9a-fA-F]+))?\(%(?P<base>r(?:1[0-5]|[0-9]|[a-z]{2,3}))"
 )
-# struct 布局头部匹配：识别结构体类型名
-_STRUCT_LAYOUT_HEADER_RE = re.compile(r"^struct\s+(?P<type_name>\S+)\s+\{$")
-# struct 字段偏移匹配：提取字段偏移量
-_STRUCT_FIELD_OFFSET_RE = re.compile(r"^\s*\[(?P<offset>\d+)\]\s+")
-# struct 大小匹配：提取结构体总大小
-_STRUCT_SIZE_RE = re.compile(r"^SIZE:\s+(?P<size>\d+)")
+# struct 布局解析见 consistency.parse_struct_layouts
 
 _MAX_RD_SS_COUNT = 256
 
@@ -711,57 +708,27 @@ def extract_struct_layouts(tool_output: str) -> dict[str, dict[str, Any]]:
     """
     从 crash struct 命令输出中解析结构体布局信息。
 
-    解析格式示例：
-    ```
-    struct task_struct {
-        [0] pid
-        [8] state
-        ...
-        SIZE: 1024
-    }
-    ```
+    字段与偏移的解析复用 ``consistency.parse_struct_layouts``（唯一的结构体布局解析实现），
+    再映射为本模块使用的 {"size", "field_offsets", "fields"} 形状。
+    没有 SIZE 行的布局不会被记录，保持原有行为。
 
     Args:
         tool_output: crash struct 命令的输出文本
 
     Returns:
-        字典：{结构体类型名：{"size": 大小，"field_offsets": [字段偏移列表]}}
+        字典：{结构体类型名：{"size": 大小，"field_offsets": [字段偏移列表]，"fields": 字段详情列表}}
     """
     layouts: dict[str, dict[str, Any]] = {}
-    current_type: Optional[str] = None  # 当前正在解析的结构体类型
-    current_offsets: list[int] = []  # 当前结构体的字段偏移列表
-
-    # 逐行解析
-    for raw_line in tool_output.splitlines():
-        line = raw_line.strip()
-
-        # 检查是否为结构体头部
-        header_match = _STRUCT_LAYOUT_HEADER_RE.match(line)
-        if header_match is not None:
-            current_type = header_match.group("type_name")
-            current_offsets = []
+    for type_name, layout in parse_struct_layouts(tool_output).items():
+        size = layout.get("size")
+        if not isinstance(size, int):
             continue
-
-        # 如果还没有遇到结构体头部，跳过
-        if current_type is None:
-            continue
-
-        # 检查是否为字段行（格式：[offset] field_name）
-        field_match = _STRUCT_FIELD_OFFSET_RE.match(raw_line)
-        if field_match is not None:
-            current_offsets.append(int(field_match.group("offset")))
-            continue
-
-        # 检查是否为结构体尾部（SIZE: xxx）
-        size_match = _STRUCT_SIZE_RE.match(line)
-        if size_match is not None:
-            # 保存解析结果
-            layouts[current_type] = {
-                "size": int(size_match.group("size")),
-                "field_offsets": sorted(set(current_offsets)),  # 去重并排序
-            }
-            current_type = None
-            current_offsets = []
+        fields = list(layout.get("fields", []))
+        layouts[type_name] = {
+            "size": size,
+            "field_offsets": sorted({int(field["offset"]) for field in fields}),
+            "fields": fields,
+        }
 
     return layouts
 

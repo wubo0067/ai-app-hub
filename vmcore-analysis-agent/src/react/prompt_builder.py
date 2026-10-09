@@ -9,6 +9,7 @@ from typing import Iterable, Optional, Sequence, cast
 from langchain_core.messages import AIMessage, BaseMessage
 
 from .action_guard import canonicalize_command_line, extract_command_lines
+from .consistency import format_conflict_fact
 from .graph_state import AgentState
 from .prompt_overlays import DRIVER_OBJECT_OVERLAY, STACK_CORRUPTION_OVERLAY
 from .prompt_layers import LAYER0_SYSTEM_PROMPT_TEMPLATE, PLAYBOOKS, SOP_FRAGMENTS
@@ -143,6 +144,28 @@ _EVIDENCE_CATEGORY_HINTS = {
 }
 
 
+# 提示词中最多展示的矛盾条目数，避免长列表挤占上下文。
+_MAX_RENDERED_VALUE_CONFLICTS = 5
+
+
+def _format_value_conflicts(value_conflicts: object) -> list[str]:
+    """把 value_conflicts 渲染为可读句子列表（最多 _MAX_RENDERED_VALUE_CONFLICTS 条）。
+
+    无内容或全部无法解析时返回空列表，使提示词在"没有矛盾"时与改动前完全一致。
+    """
+    if not isinstance(value_conflicts, (list, tuple, set, frozenset)):
+        return []
+    facts = sorted(fact for fact in value_conflicts if isinstance(fact, str))
+    rendered: list[str] = []
+    for fact in facts:
+        text = format_conflict_fact(fact)
+        if text is not None:
+            rendered.append(text)
+        if len(rendered) >= _MAX_RENDERED_VALUE_CONFLICTS:
+            break
+    return rendered
+
+
 def _observed_evidence_categories(evidence_facts: object) -> set[str]:
     """统计 evidence_facts 中已经出现的结构化证据维度。"""
     if not isinstance(evidence_facts, (list, tuple, set, frozenset)):
@@ -190,6 +213,20 @@ def _build_replan_probe_menu(state: AgentState) -> list[str]:
         gates_registered
         and _format_unresolved_gates(state.get("managed_gates")) == "none"
     )
+
+    value_conflicts = _format_value_conflicts(state.get("value_conflicts"))
+    if value_conflicts:
+        lines.append(
+            "- Unresolved value-level contradictions (highest priority: memory you already read "
+            "contradicts the declared struct layout, so either the object address or the field "
+            "offset interpretation is wrong):"
+        )
+        lines.extend(f"  - {conflict}" for conflict in value_conflicts)
+        lines.append(
+            "  - Resolve this contradiction before collecting more evidence of the same kind: "
+            "re-derive the object address from the instruction that produced it, or re-check the "
+            "layout/offset used to interpret it."
+        )
 
     if root_cause_class:
         lines.append(
@@ -293,6 +330,14 @@ def build_executor_state_section(state: AgentState) -> str:
         "- Action selection rule: if any mandatory gate remains open or blocked, the next action must directly advance the current gate objective or unblock its prerequisite.",
         f"- Reasoning gate contract: {reasoning_gate_contract}",
     ]
+
+    value_conflicts = _format_value_conflicts(state.get("value_conflicts"))
+    if value_conflicts:
+        lines.append(
+            "- Observed value-level conflicts (memory you already read does not match the "
+            "declared struct layout):"
+        )
+        lines.extend(f"  - {conflict}" for conflict in value_conflicts)
 
     action_status = state.get("last_action_status")
     if action_status:
