@@ -212,5 +212,69 @@ class ConflictFactRenderingTests(unittest.TestCase):
         self.assertEqual(evaluated["register_provenance"].status, "open")
 
 
+class ProductionPathRegressionTests(unittest.TestCase):
+    """回归：生产路径 extract_struct_layouts -> detect_value_conflicts -> format_conflict_fact。
+
+    早期缺陷：extract_struct_layouts 产出的布局缺少 "name" 键，detect_value_conflicts
+    把类型名渲染成 "?"，format_conflict_fact 因此返回 None，整条 C7 链路静默失效。
+    这些测试直接跑生产路径，防止再次退化。
+    """
+
+    def test_extract_then_detect_then_format_is_not_none(self) -> None:
+        from src.react.action_guard import extract_struct_layouts
+
+        layouts = extract_struct_layouts(IRQ_DESC_LAYOUT + IRQACTION_LAYOUT)
+        # 生产路径的布局必须带 name，否则下游类型名会变成 "?"
+        self.assertEqual(layouts["irqaction"]["name"], "irqaction")
+
+        reads = parse_memory_reads(
+            "ff292187ae124a80:  0010000904060001 0000000000000000\n"
+            "ff292187ae124a90:  0f00000500000000 0000000000000012\n"
+            "ff292187ae124aa0:  000000000000005c 0000000000000000\n"
+            "ff292187ae124ab0:  0000000000000000 0000000000000000\n"
+            "ff292187ae124ac0:  0000000000000000 0000000000000000\n"
+            "ff292187ae124ad0:  0000000000000000 0000000000000000\n"
+            "ff292187ae124ae0:  0000000000000000 0000000000000000\n"
+            "ff292187ae124af0:  0000000000000000 0000000000000000\n"
+        )
+        conflicts = detect_value_conflicts(reads, layouts)
+        self.assertEqual(len(conflicts), 1)
+        self.assertIn("irqaction@0xff292187ae124a80", conflicts[0])
+
+        rendered = format_conflict_fact(conflicts[0])
+        self.assertIsNotNone(rendered)
+        assert rendered is not None
+        self.assertIn("irqaction", rendered)
+
+    def test_conflict_detection_preserves_discovery_order(self) -> None:
+        """多个矛盾按发现顺序返回（提示词按此顺序展示、保留最后 5 条）。"""
+        from src.react.action_guard import extract_struct_layouts
+
+        layouts = extract_struct_layouts(IRQ_DESC_LAYOUT + IRQACTION_LAYOUT)
+        # 两个 irqaction 实例都损坏，发现顺序即读取顺序
+        reads = parse_memory_reads(
+            "ff000000:  0010000904060001 0000000000000000\n"
+            "ff000010:  0f00000500000000 0000000000000012\n"
+            "ff000020:  000000000000005c 0000000000000000\n"
+            "ff000030:  0000000000000000 0000000000000000\n"
+            "ff000040:  0000000000000000 0000000000000000\n"
+            "ff000050:  0000000000000000 0000000000000000\n"
+            "ff000060:  0000000000000000 0000000000000000\n"
+            "ff000070:  0000000000000000 0000000000000000\n"
+            "ff100000:  0010000904060001 0000000000000000\n"
+            "ff100010:  0f00000500000000 0000000000000012\n"
+            "ff100020:  000000000000005c 0000000000000000\n"
+            "ff100030:  0000000000000000 0000000000000000\n"
+            "ff100040:  0000000000000000 0000000000000000\n"
+            "ff100050:  0000000000000000 0000000000000000\n"
+            "ff100060:  0000000000000000 0000000000000000\n"
+            "ff100070:  0000000000000000 0000000000000000\n"
+        )
+        conflicts = detect_value_conflicts(reads, layouts)
+        self.assertEqual(len(conflicts), 2)
+        self.assertIn("@0xff000000", conflicts[0])
+        self.assertIn("@0xff100000", conflicts[1])
+
+
 if __name__ == "__main__":
     unittest.main()

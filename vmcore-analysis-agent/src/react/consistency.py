@@ -289,17 +289,19 @@ def detect_value_conflicts(
 
     Args:
         reads: 已解析的 ``rd`` 内存快照。
-        layouts: ``parse_struct_layouts`` 的结果（可跨步骤累积）。
+        layouts: 结构体布局（``parse_struct_layouts`` /
+            ``action_guard.extract_struct_layouts`` 的结果，可跨步骤累积）。
+            键为类型名；条目里的 ``name`` 缺省时回退到键名。
         null_page_limit: NULL 页区域上限。
 
     Returns:
-        排序去重后的矛盾事实列表。
+        按发现顺序去重后的矛盾事实列表。
     """
     conflicts: list[str] = []
     seen: set[str] = set()
     read_list = list(reads)
 
-    for layout in layouts.values():
+    for type_name, layout in layouts.items():
         size = layout.get("size")
         if not isinstance(size, int) or size <= 0:
             # 没有 SIZE 的布局无法判断"读取是否覆盖了完整对象"。
@@ -333,14 +335,14 @@ def detect_value_conflicts(
                 for offset, field, value in offending[:_MAX_LISTED_FIELDS]
             )
             fact = (
-                f"conflict:object_does_not_match_type:{layout.get('name', '?')}"
+                f"conflict:object_does_not_match_type:{layout.get('name') or type_name}"
                 f"@0x{read.address:x}:{details}"
             )
             if fact not in seen:
                 seen.add(fact)
                 conflicts.append(fact)
 
-    return sorted(conflicts)
+    return conflicts
 
 
 def parse_conflict_fact(fact: str) -> tuple[str, int] | None:
@@ -366,3 +368,38 @@ def format_conflict_fact(fact: str) -> str | None:
         f"{type_name} @ 0x{match.group('base')} does not look like a valid {type_name}: "
         f"pointer field(s) hold non-pointer values ({fields})"
     )
+
+
+# 模型显式核对某条冲突时应写出的引导短语（与 prompt_builder 的提示词保持一致）。
+# 分析文本里出现"短语 + 对象标识"即视为该冲突已被回应，不再计入未解决冲突。
+RESOLVED_CONFLICT_MARKER = "已核对冲突"
+
+
+def conflict_resolution_phrase(fact: str) -> str | None:
+    """返回模型回应这条冲突时应写出的短语；事实不可解析时返回 None。"""
+    parsed = parse_conflict_fact(fact)
+    if parsed is None:
+        return None
+    type_name, base = parsed
+    return f"{RESOLVED_CONFLICT_MARKER}{type_name}@0x{base:x}"
+
+
+def is_conflict_resolved(fact: str, analysis_text: str) -> bool:
+    """判断分析文本是否显式回应了这条冲突（忽略大小写与空白）。"""
+    phrase = conflict_resolution_phrase(fact)
+    if not phrase or not analysis_text:
+        return False
+    normalized = re.sub(r"\s+", "", analysis_text.lower())
+    return re.sub(r"\s+", "", phrase.lower()) in normalized
+
+
+def prune_resolved_value_conflicts(
+    facts: Iterable[str], analysis_text: str
+) -> list[str]:
+    """剔除模型本次分析已显式核对过的冲突，保持原有顺序。
+
+    冲突要求的是"回应"而不是"永久否决"：模型给出替代解释后应从未解决列表消失。
+    否则追加式的 ``value_conflicts`` 会在剩余步数里持续把根因压回 unknown，agent
+    既无法收敛也无法继续取证。无法解析的事实一律保留。
+    """
+    return [fact for fact in facts if not is_conflict_resolved(fact, analysis_text)]

@@ -155,15 +155,16 @@ def _format_value_conflicts(value_conflicts: object) -> list[str]:
     """
     if not isinstance(value_conflicts, (list, tuple, set, frozenset)):
         return []
-    facts = sorted(fact for fact in value_conflicts if isinstance(fact, str))
+    # 保持发现顺序（最新发现的在最后），只渲染最后 _MAX_RENDERED_VALUE_CONFLICTS 条，
+    # 避免字典序把最新（通常也是当前调查对象）的矛盾挤出渲染窗口。
     rendered: list[str] = []
-    for fact in facts:
+    for fact in value_conflicts:
+        if not isinstance(fact, str):
+            continue
         text = format_conflict_fact(fact)
         if text is not None:
             rendered.append(text)
-        if len(rendered) >= _MAX_RENDERED_VALUE_CONFLICTS:
-            break
-    return rendered
+    return rendered[-_MAX_RENDERED_VALUE_CONFLICTS:]
 
 
 def _observed_evidence_categories(evidence_facts: object) -> set[str]:
@@ -225,7 +226,9 @@ def _build_replan_probe_menu(state: AgentState) -> list[str]:
         lines.append(
             "  - Resolve this contradiction before collecting more evidence of the same kind: "
             "re-derive the object address from the instruction that produced it, or re-check the "
-            "layout/offset used to interpret it."
+            "layout/offset used to interpret it. Once you have explained it, write the phrase "
+            "已核对冲突<Type>@0x<base> (e.g. 已核对冲突irqaction@0x...) with your explanation; "
+            "that marks the contradiction as addressed so it no longer blocks a conclusion."
         )
 
     if root_cause_class:

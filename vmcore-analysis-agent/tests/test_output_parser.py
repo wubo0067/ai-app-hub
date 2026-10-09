@@ -161,6 +161,49 @@ class ValueConflictAuditTests(unittest.TestCase):
         self.assertEqual(audited.confidence, "high")
         self.assertNotIn("value-level contradiction", audited.reasoning)
 
+    def test_force_wrapup_injects_note_without_downgrading(self) -> None:
+        """强制收口/最后一步：注入矛盾告警但不撤销结论，避免只剩 unknown。"""
+        step = _make_conclusive_step()
+        audited = apply_value_conflict_audit(
+            step,
+            {"value_conflicts": [CONFLICT_FACT]},
+            log_prefix="test",
+            force_wrapup=True,
+        )
+
+        # 告警仍写入，让最终结论带上矛盾提示
+        self.assertIn("value-level contradiction", audited.reasoning)
+        # 但结论、根因、置信度保持不变
+        self.assertTrue(audited.is_conclusive)
+        self.assertIsNotNone(audited.final_diagnosis)
+        self.assertEqual(audited.root_cause_class, "wild_pointer")
+        self.assertEqual(audited.confidence, "high")
+
+    def test_explicit_resolution_prunes_conflict(self) -> None:
+        """模型写出"已核对冲突<Type>@0x<base>"后，该矛盾从未解决列表剔除。"""
+        from src.react.output_parser import unresolved_value_conflicts
+
+        step = _make_conclusive_step(
+            reasoning=(
+                "已核对冲突 irqaction@0xff292187ae124a80：该地址是 per-cpu 偏移而非"
+                "真实指针，next/thread_fn 的小值是编码值，不是损坏。"
+            )
+        )
+        remaining = unresolved_value_conflicts(
+            step, {"value_conflicts": [CONFLICT_FACT]}
+        )
+        self.assertEqual(remaining, [])
+
+    def test_unresolved_conflict_is_kept(self) -> None:
+        """未显式核对时矛盾保留在状态中（不会被误剔除）。"""
+        from src.react.output_parser import unresolved_value_conflicts
+
+        step = _make_conclusive_step(reasoning="still investigating the irqaction chain")
+        remaining = unresolved_value_conflicts(
+            step, {"value_conflicts": [CONFLICT_FACT]}
+        )
+        self.assertEqual(remaining, [CONFLICT_FACT])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,6 +16,7 @@ from .output_parser import (
     repair_analysis_step,
     repair_structured_output,
     select_analysis_content,
+    unresolved_value_conflicts,
 )
 from .llm_runtime import ainvoke_with_retry, compress_messages_for_llm
 from .llm_runtime import compute_adaptive_max_tokens
@@ -231,6 +232,12 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
             llm_step,
             cast(dict[str, Any], state),
             log_prefix=llm_analysis_node,
+            force_wrapup=effective_last_step,
+        )
+        # 把模型本次已显式核对的矛盾从状态中剔除，避免追加式列表在后续步数里
+        # 持续把根因压回 unknown、永久阻塞收敛。
+        remaining_value_conflicts = unresolved_value_conflicts(
+            llm_step, cast(dict[str, Any], state)
         )
 
         # 记录 response
@@ -290,6 +297,8 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         "token_usage": curr_token_usage,
         "messages": [response],
         **managed_updates,
+        # 模型已显式核对的取值级矛盾不再保留在状态中（见 unresolved_value_conflicts）。
+        "value_conflicts": remaining_value_conflicts,
         # 置位后 after_crash_tool / should_continue 不再给予额外轮次，
         # 保证强制收口最多发生一次。
         "force_terminal_wrapup": wrapup_triggered,
@@ -411,6 +420,10 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
             llm_step,
             cast(dict[str, Any], state),
             log_prefix=structure_reasoning_node,
+            force_wrapup=effective_last_step,
+        )
+        remaining_value_conflicts = unresolved_value_conflicts(
+            llm_step, cast(dict[str, Any], state)
         )
 
         # 强制覆盖 step_id 为当前实际步数，chat 模型可能输出错误值
@@ -463,6 +476,8 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
         "reasoning_to_structure": None,
         "reasoning_additional_kwargs": None,
         **managed_updates,
+        # 模型已显式核对的取值级矛盾不再保留在状态中（见 unresolved_value_conflicts）。
+        "value_conflicts": remaining_value_conflicts,
         # 强制收口标志：保证 should_continue 不再重试，直接 __end__。
         "force_terminal_wrapup": wrapup_triggered,
         "error": None,

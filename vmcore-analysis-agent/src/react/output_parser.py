@@ -20,7 +20,11 @@ from .action_guard import (
     canonicalize_command_line,
     validate_tool_call_request,
 )
-from .consistency import format_conflict_fact, parse_conflict_fact
+from .consistency import (
+    format_conflict_fact,
+    parse_conflict_fact,
+    prune_resolved_value_conflicts,
+)
 from .schema import (
     VMCoreAnalysisStep,
     VMCoreLLMAnalysisStep,
@@ -1667,11 +1671,32 @@ def _mentions_value_level_conflict(
     return False
 
 
+def unresolved_value_conflicts(
+    analysis_step: VMCoreLLMAnalysisStep,
+    state: dict[str, Any],
+) -> list[str]:
+    """返回模型本次分析尚未回应的取值级矛盾（保持原有顺序）。
+
+    ``state["value_conflicts"]`` 是追加式的：一旦某条矛盾被发现就会一直留在状态里，
+    并把后续每一步的根因压回 unknown、把 is_conclusive 撤销。若模型已经按提示词
+    要求显式核对该矛盾（写出 ``已核对冲突<Type>@0x<base>`` 并给出替代解释），
+    它就不应再阻塞收敛，因此调用方应把本函数结果写回 ``value_conflicts``。
+
+    非字符串条目与无法解析的事实一律保留（宁可多提示，不可漏提示）。
+    """
+    raw = state.get("value_conflicts") or []
+    if not isinstance(raw, (list, tuple)):
+        return []
+    text = _collect_analysis_text_for_oob_audit(analysis_step)
+    return prune_resolved_value_conflicts(list(raw), text)
+
+
 def apply_value_conflict_audit(
     analysis_step: VMCoreLLMAnalysisStep,
     state: dict[str, Any],
     *,
     log_prefix: str = "",
+    force_wrapup: bool = False,
 ) -> VMCoreLLMAnalysisStep:
     """[阶段 5] 取值级矛盾审计：已读内存内容与结构体布局不相容。
 
@@ -1686,16 +1711,15 @@ def apply_value_conflict_audit(
         analysis_step: LLM 分析步骤
         state: 当前状态（读取 value_conflicts）
         log_prefix: 日志前缀
+        force_wrapup: 是否处于强制收口/最后一步。此时仍注入审计说明（让最终结论
+            带上矛盾告警），但不再撤销结论、不再降级根因、不再压制置信度 ——
+            否则步数耗尽时任何残留矛盾都会让 agent 只能输出 unknown。
 
     Returns:
         VMCoreLLMAnalysisStep: 审计修正后的分析步骤
     """
     prefix = f"{log_prefix}: " if log_prefix else ""
-    conflicts = [
-        fact
-        for fact in state.get("value_conflicts") or []
-        if isinstance(fact, str)
-    ]
+    conflicts = unresolved_value_conflicts(analysis_step, state)
     if not conflicts:
         return analysis_step
 
@@ -1719,6 +1743,12 @@ def apply_value_conflict_audit(
     logger.warning("%s%s", prefix, audit_note)
 
     _append_audit_note(analysis_step, audit_note)
+
+    # 强制收口/最后一步：仍注入上面的审计告警，但不再撤销结论、降级根因或压制
+    # 置信度。否则步数耗尽时任何残留矛盾都会把 agent 逼成只能输出 unknown，
+    # 反而丢失了模型本可给出的有界结论。
+    if force_wrapup:
+        return analysis_step
 
     # 根因降级：对象类型都还没解释清楚时，当前归因不可信任
     if analysis_step.root_cause_class not in {None, "unknown"}:

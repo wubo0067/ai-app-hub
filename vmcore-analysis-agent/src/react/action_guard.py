@@ -709,14 +709,14 @@ def extract_struct_layouts(tool_output: str) -> dict[str, dict[str, Any]]:
     从 crash struct 命令输出中解析结构体布局信息。
 
     字段与偏移的解析复用 ``consistency.parse_struct_layouts``（唯一的结构体布局解析实现），
-    再映射为本模块使用的 {"size", "field_offsets", "fields"} 形状。
+    再映射为本模块使用的 {"name", "size", "field_offsets", "fields"} 形状。
     没有 SIZE 行的布局不会被记录，保持原有行为。
 
     Args:
         tool_output: crash struct 命令的输出文本
 
     Returns:
-        字典：{结构体类型名：{"size": 大小，"field_offsets": [字段偏移列表]，"fields": 字段详情列表}}
+        字典：{结构体类型名：{"name": 类型名，"size": 大小，"field_offsets": [字段偏移列表]，"fields": 字段详情列表}}
     """
     layouts: dict[str, dict[str, Any]] = {}
     for type_name, layout in parse_struct_layouts(tool_output).items():
@@ -725,6 +725,7 @@ def extract_struct_layouts(tool_output: str) -> dict[str, dict[str, Any]]:
             continue
         fields = list(layout.get("fields", []))
         layouts[type_name] = {
+            "name": type_name,
             "size": size,
             "field_offsets": sorted({int(field["offset"]) for field in fields}),
             "fields": fields,

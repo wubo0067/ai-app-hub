@@ -444,6 +444,8 @@ async def call_crash_tool(state: AgentState) -> dict:
     observed_evidence_facts: set[str] = set()
     observed_nonempty_output = False
     # 本步读到的内存快照，用于与已缓存的结构体布局做取值级一致性检查。
+    # 局限：只检查“本步新读到”的内存。若某次 rd 早于对应 struct -o 布局查询，
+    # 该次读取不会被回溯检查（需要跨步保留内存读取历史才能覆盖，属后续增强）。
     observed_memory_reads: list[MemoryRead] = []
 
     # 提取所有工具调用的命令，准备批量执行
@@ -727,9 +729,13 @@ async def call_crash_tool(state: AgentState) -> dict:
     # 这个返回字典会被 LangGraph 用来更新当前运行中的 AgentState 状态；
     # 它不是更新 nodes.py 里的某个本地变量，而是更新整个状态图在这一轮执行中的共享 state。
     evidence_facts = sorted(prior_evidence_facts | observed_evidence_facts)
-    value_conflicts = sorted(
-        set(state.get("value_conflicts", []))
-        | set(detect_value_conflicts(observed_memory_reads, struct_layout_cache))
+    # 保留发现顺序：旧矛盾在前、本步新发现的在后，避免字典序把
+    # 高地址（通常是最新调查对象）的矛盾挤出提示词渲染窗口。
+    value_conflicts = list(
+        dict.fromkeys(
+            list(state.get("value_conflicts", []))
+            + detect_value_conflicts(observed_memory_reads, struct_layout_cache)
+        )
     )
     managed_gates = update_gate_evidence(state.get("managed_gates"), evidence_delta)
     goal_advanced = facts_support_goal(
