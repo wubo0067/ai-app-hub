@@ -64,6 +64,9 @@ _MAX_STRUCT_FIELD_OFFSET = 0x1000
 _KERNEL_TEXT_ADDR_FLOOR = 0xFF00_0000_0000_0000
 # 内核态代码段前缀形式的 RIP 行，如 "RIP: 0010:ffffffffbc3798a0"
 _KERNEL_MODE_RIP_RE = re.compile(r"\bRIP:\s*0010\s*:", re.IGNORECASE)
+# 任意异常帧的 RIP 标签行（裸地址 / 段前缀 / 0x 前缀 / 符号形式均可），
+# 用于识别"下一个异常帧"的起点，避免用户态帧寄存器混入内核帧。
+_RIP_LABEL_RE = re.compile(r"\bRIP\s*:", re.IGNORECASE)
 # 单个异常帧最多向后扫描的行数（RIP 行 + 若干寄存器行）
 _MAX_FRAME_LINES = 12
 
@@ -1524,11 +1527,17 @@ def _parse_kernel_frame_registers(text: str) -> Dict[str, List[int]]:
             break
         matches = list(_REGISTER_DUMP_RE.finditer(lines[index]))
         if not matches:
+            # 起点行本身可能以符号形式给出 RIP（dmesg 的
+            # ``RIP: 0010:show_interrupts+0x240/0x5a0``），寄存器匹配必然失败；
+            # 此时应跳到下一行继续收集，而不是把帧起点当成帧结束。
+            if offset == 0:
+                continue
             break
-        # 再次出现 RIP 说明进入了下一个异常帧（通常是用户态帧）。
-        if offset > 0 and any(
-            match.group("name").upper() == "RIP" for match in matches
-        ):
+        # 再次出现 RIP 说明进入了下一个异常帧（通常是用户态帧）。必须按
+        # "RIP 标签"而非"可解析为十六进制的 RIP 值"判断：用户态帧常写成
+        # ``RIP: 0033:0x7f...``，其值带 0x 前缀无法被 _REGISTER_DUMP_RE 匹配，
+        # 若仅依赖寄存器匹配会漏检，导致用户态小整数寄存器混入内核帧。
+        if offset > 0 and _RIP_LABEL_RE.search(lines[index]):
             break
         for match in matches:
             try:
@@ -1536,6 +1545,14 @@ def _parse_kernel_frame_registers(text: str) -> Dict[str, List[int]]:
             except (TypeError, ValueError):
                 continue
             registers.setdefault(match.group("name").upper(), []).append(value)
+    if not registers:
+        # 定位到了内核帧却一个寄存器都没解析出来，说明帧格式超出预期；
+        # 静默放弃升级会让"解析失效"与"证据不足"不可区分，故显式告警。
+        logger.warning(
+            "[Audit] kernel exception frame located at line %d but no registers "
+            "parsed; corrupted-base escalation disabled for this dump",
+            start + 1,
+        )
     return registers
 
 
