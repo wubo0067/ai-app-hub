@@ -10,7 +10,7 @@
 
 import json
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, List, Optional
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, SystemMessage
 from .graph_state import AgentState
 from .output_parser import render_action_arguments
@@ -428,7 +428,7 @@ def generate_markdown_report(state: AgentState) -> str:
     return "\n".join(lines)
 
 
-def _gate_field(raw_gate: object, name: str, default: object = None) -> object:
+def _gate_field(raw_gate: Any, name: str, default: Any = None) -> Any:
     """读取 gate 字段，兼容 GateEntry 对象与序列化后的 dict。"""
     if isinstance(raw_gate, dict):
         return raw_gate.get(name, default)

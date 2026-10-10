@@ -2349,6 +2349,8 @@ def _synthesize_final_diagnosis(
             file=suspect_file, function=suspect_function, line="unknown"
         ),
         evidence=evidence or ["(no structured evidence facts were recorded)"],
+        # 执行器兜底合成没有源码级推断来源，显式置空。
+        driver_source_evidence=None,
         corruption_mechanism=getattr(analysis_result, "corruption_mechanism", None),
     )
 
