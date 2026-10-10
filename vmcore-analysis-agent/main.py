@@ -28,7 +28,7 @@ from src.mcp_tools import initialize_all_mcp_tools
 #   llm_analysis_node (1) + structure_reasoning_node (1) + crash_tool_node (1)
 # 加上初始 collect_crash_init_data_node (1)，公式为：1 + N_rounds × 3
 # 例如：支持 ~30 轮分析 → 1 + 30×3 = 91；支持 ~40 轮 → 1 + 40×3 = 121
-AGENT_RECURSION_LIMIT = 121
+AGENT_RECURSION_LIMIT = 151
 
 # 分析报告输出语言：eng=英文（默认），zh=中文。
 # 由命令行参数 --language 设置；为 zh 时在系统提示词中注入中文输出规则。
