@@ -10,8 +10,13 @@ from langchain_core.messages import AIMessage, BaseMessage
 
 from .action_guard import canonicalize_command_line, extract_command_lines
 from .consistency import format_conflict_fact
-from .graph_state import AgentState
+from .graph_state import (
+    AgentState,
+    CONVERGENCE_GUARD_STREAK_THRESHOLD,
+    has_committed_root_cause,
+)
 from .prompt_overlays import DRIVER_OBJECT_OVERLAY, STACK_CORRUPTION_OVERLAY
+from .prompt_phrases import FORCED_CHOICE_CONVERGENCE_RULE
 from .prompt_layers import LAYER0_SYSTEM_PROMPT_TEMPLATE, PLAYBOOKS, SOP_FRAGMENTS
 from .prompts import build_minimal_schema_enum_contract
 from .schema import CrashSignatureClass, GateEntry, Hypothesis, VMCoreLLMAnalysisStep
@@ -213,7 +218,14 @@ def _build_replan_probe_menu(state: AgentState) -> list[str]:
     不引入新的推断，也不替代门控评估。
     """
     lines: list[str] = []
-    root_cause_class = state.get("current_root_cause_class")
+    # P0-2：`unknown` 是 RootCauseClass 的合法取值，`bool("unknown")` 为 True，
+    # 直接真值判断会把"尚未定论"当成"根因已提交"，让 terminate_only 等通道在
+    # 错误前提上运行。
+    root_cause_class = (
+        state.get("current_root_cause_class")
+        if has_committed_root_cause(state)
+        else None
+    )
     signature_class = state.get("current_signature_class") or "unknown"
     # 门控是否真的已全部关闭：replan 也可能发生在仍有 open/blocked 门控时
     # （例如 C1 的 DEDUP-BLOCKED 走 rejected 分支）。此时不能声称门控已穷尽，
@@ -274,6 +286,18 @@ def _build_replan_probe_menu(state: AgentState) -> list[str]:
             "- Mandatory gates are still unresolved and root_cause_class is unset: the previous action "
             "failed to advance them, so pick a different command that targets the outstanding gate "
             "directly rather than restating evidence already collected."
+        )
+
+    # P0-1：根因尚未提交（含 `unknown`）且已连续多步无新证据时，上面的分支只说
+    # "换个方向"，却不给可执行的收敛出口，预算就在重复的只读探测上耗尽。
+    # 这里把选择压缩成二选一，与 executor 侧 dedup 升级消息使用同一份措辞。
+    if (
+        root_cause_class is None
+        and state.get("no_progress_streak", 0) >= CONVERGENCE_GUARD_STREAK_THRESHOLD
+    ):
+        lines.append(
+            "- No new evidence in the last "
+            f"{state.get('no_progress_streak', 0)} actions: " + FORCED_CHOICE_CONVERGENCE_RULE
         )
 
     if not terminate_only:
@@ -340,7 +364,7 @@ def build_executor_state_section(state: AgentState) -> str:
     replan_required = bool(state.get("replan_required"))
     # L1：与 _build_replan_probe_menu 使用同一个收敛判据，避免状态摘要与转向菜单
     # 对"该收尾还是该继续挖"给出相反指令。
-    conclusion_ready = bool(state.get("current_root_cause_class")) and _gates_exhausted(state)
+    conclusion_ready = has_committed_root_cause(state) and _gates_exhausted(state)
     if replan_required and next_gate_objective == "no outstanding gate":
         if conclusion_ready:
             next_gate_objective = (

@@ -14,10 +14,14 @@ sys.modules.setdefault("src.react", react_pkg)
 from langchain_core.messages import HumanMessage, ToolMessage
 
 from src.react.nodes import (
-    CONVERGENCE_GUARD_STREAK_THRESHOLD,
     _convergence_guard_error,
     _gates_all_closed,
+    _no_new_evidence_directive,
     _only_read_only_value_probes,
+)
+from src.react.graph_state import (
+    CONVERGENCE_GUARD_STREAK_THRESHOLD,
+    has_committed_root_cause,
 )
 from src.react.output_parser import (
     _mine_faulting_instruction,
@@ -89,6 +93,21 @@ class ConvergenceGuardTests(unittest.TestCase):
         state = _converged_state(current_root_cause_class=None)
         self.assertIsNone(_convergence_guard_error(state, RUN_D_PROBE))
 
+    def test_unknown_root_cause_is_not_committed(self) -> None:
+        """P0-2：`unknown` 是 RootCauseClass 的合法取值但表示"未定论"。
+
+        真值判断会把 `bool("unknown")` 当成"根因已提交"，让本通道在错误前提
+        上掐断取证；同时也会让 terminate_only 提示词谎称结论已成立。
+        """
+        self.assertFalse(has_committed_root_cause({"current_root_cause_class": "unknown"}))
+        self.assertFalse(has_committed_root_cause({"current_root_cause_class": None}))
+        self.assertFalse(has_committed_root_cause({}))
+        self.assertTrue(
+            has_committed_root_cause({"current_root_cause_class": "use_after_free"})
+        )
+        state = _converged_state(current_root_cause_class="unknown")
+        self.assertIsNone(_convergence_guard_error(state, RUN_D_PROBE))
+
     def test_allows_probe_with_open_gate(self) -> None:
         state = _converged_state(managed_gates=OPEN_GATES)
         self.assertIsNone(_convergence_guard_error(state, RUN_D_PROBE))
@@ -120,6 +139,46 @@ class ConvergenceGuardTests(unittest.TestCase):
             _only_read_only_value_probes(["crash> RD 0x1 4", "  STRUCT irqaction 0x2  "])
         )
         self.assertFalse(_only_read_only_value_probes(["quit"]))
+
+
+class NoNewEvidenceDirectiveTests(unittest.TestCase):
+    """P0-1：dedup 硬拒升级通道必须与根因/门控状态无关。
+
+    真实耗尽预算的 run 里模型从未提交 root_cause_class，且重复命令在 dedup
+    分支就 `continue`，走不到 `_convergence_guard_error`；若本通道沿用同样的
+    前提，就等于没有第二条通道。
+    """
+
+    def _spin_state(self, **overrides: object) -> dict:
+        state = {
+            "current_root_cause_class": None,
+            "managed_gates": None,
+            "no_progress_streak": CONVERGENCE_GUARD_STREAK_THRESHOLD,
+        }
+        state.update(overrides)
+        return state
+
+    def test_fires_without_root_cause_and_without_gates(self) -> None:
+        reason = _no_new_evidence_directive(self._spin_state(), RUN_D_PROBE)
+        self.assertIsNotNone(reason)
+        self.assertIn("COMMIT A CONCLUSION", reason)
+        self.assertIn("DECLARE A NEW EVIDENCE TARGET", reason)
+        self.assertIn("not \"unknown\"", reason)
+
+    def test_fires_when_root_cause_is_unknown(self) -> None:
+        """`unknown` 不算已提交，但空转通道仍须触发（它不看根因）。"""
+        state = self._spin_state(current_root_cause_class="unknown")
+        self.assertIsNotNone(_no_new_evidence_directive(state, RUN_D_PROBE))
+        self.assertIsNone(_convergence_guard_error(state, RUN_D_PROBE))
+
+    def test_stays_below_streak_threshold(self) -> None:
+        state = self._spin_state(no_progress_streak=CONVERGENCE_GUARD_STREAK_THRESHOLD - 1)
+        self.assertIsNone(_no_new_evidence_directive(state, RUN_D_PROBE))
+
+    def test_stays_for_evidence_changing_commands(self) -> None:
+        for lines in (["mod -s mpt3sas"], ["bt"], ["sys"], []):
+            with self.subTest(lines=lines):
+                self.assertIsNone(_no_new_evidence_directive(self._spin_state(), lines))
 
 
 class GateClosureHelperTests(unittest.TestCase):

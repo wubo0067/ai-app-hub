@@ -77,6 +77,18 @@ validate_tool_call_request      # action_guard：命令合法性、参数校验�
 硬拒（走 `rejected` 分支，`no_progress_streak` 累加并触发 replan advisory）。否则"有证据"的
 重复命令可以无限次骗取同一份输出，只能等 streak 触顶才被掐停。
 
+硬拒消息本身只说"这条命令做过了"，不给出口；当 `no_progress_streak` 达
+`CONVERGENCE_GUARD_STREAK_THRESHOLD` 且被拒命令全部是只读取值探测（`rd`/`struct`/`dis`/`kmem`
+等，见 `_READONLY_VALUE_PROBE_COMMANDS`）时，`[DEDUP-BLOCKED]` 追加 `FORCED_CHOICE_CONVERGENCE_RULE`
+强制二选一：(A) 立即提交结论（`root_cause_class` 必须是真实类，不能是 `unknown`），或
+(B) 声明一个此前未观测过的新证据目标。该通道**刻意不看根因是否已提交、也不看门控是否关闭**，
+因为真实耗尽预算的 run 恰恰是模型从未提交根因、且在 dedup 分支提前 `continue` 而走不到
+`_convergence_guard_error`；`prompt_builder._build_replan_probe_menu` 用同一份措辞镜像到转向菜单。
+
+"根因是否已提交"统一由 `graph_state.has_committed_root_cause` 判定：`None`、`""`、`unknown`
+都算未提交（`unknown` 是 `RootCauseClass` 的合法成员且为真值，直接真值判断会把"尚未定论"
+当成"结论已成立"，让 `TERMINATE ON THIS TURN` 等通道在错误前提上运行）。
+
 ## 一次分析的完整生命周期：从现象到根因
 
 前面三个子系统是"静态结构"；这一节按**时间轴**讲一次 `/analyze` 请求里 agent 如何一步步从
@@ -209,6 +221,7 @@ sequenceDiagram
 | 正常结论 | is_conclusive + final_diagnosis 且门控全关 | `should_continue` 路由 end |
 | 步数耗尽 | LangGraph 运行时在接近 `recursion_limit`（`AGENT_RECURSION_LIMIT=121`）时把内置 `is_last_step` 置 True | prompt 注入 CRITICAL WARNING，`build_tool_calls` 剥掉 tool_calls |
 | 空转收口 | `no_progress_streak≥3` | `after_crash_tool` 触发一次强制收口（`force_terminal_wrapup` 保证只发生一次） |
+| 空转强制二选一 | `no_progress_streak≥CONVERGENCE_GUARD_STREAK_THRESHOLD` 且重复命令均为只读取值探测 | dedup 硬拒与 replan 菜单追加 `FORCED_CHOICE_CONVERGENCE_RULE`（提交结论 / 声明新证据目标），在触顶收口前把模型推向可执行出口 |
 | 收口轮违规 | 收口轮仍请求工具 | 追加 terminal-only 硬性指令，重试且仅重试一次 |
 | 兜底合成 | 收口轮无结论，但根因类已定 + 强制门控全关 | `apply_fallback_conclusion_synthesis` 把已闭合证据确定性地渲染成 confidence=low 的有界结论 |
 

@@ -129,3 +129,24 @@ class AgentState(MessagesState):
     # Agent 当前错误状态。
     # 当某个节点执行失败或出现不可恢复问题时，会在此记录结构化错误信息。
     error: Optional[AgentError]
+
+
+UNCOMMITTED_ROOT_CAUSE_CLASSES = frozenset({None, "", "unknown"})
+
+# L2：收敛护栏阈值。no_progress_streak 达到 NO_PROGRESS_STREAK_LIMIT(3) 时
+# edges.after_crash_tool 才强制收口，但那已经浪费了三步。护栏在 2 步就介入。
+# 定义在 graph_state（nodes.py 与 prompt_builder.py 共同的叶子依赖）以便两处
+# 收敛通道使用同一阈值，反向导入任一方都会成环。
+CONVERGENCE_GUARD_STREAK_THRESHOLD = 2
+
+
+def has_committed_root_cause(state: AgentState) -> bool:
+    """判断 AgentState 中的根因分类是否已经"真正提交"。
+
+    `RootCauseClass` 里 `unknown` 是合法取值，模型在原地打转时经常把它当成
+    兜底值填进来。`bool("unknown")` 为 True，因此各处直接用真值判断会把
+    "尚未定论" 误判成 "结论已成立"，进而让收敛守卫、terminate_only 提示词
+    等通道在错误的前提上运行。只有显式排除 None/空串/unknown 才算已提交。
+    """
+    root_cause_class = cast(Optional[str], state.get("current_root_cause_class", None))
+    return root_cause_class not in UNCOMMITTED_ROOT_CAUSE_CLASSES

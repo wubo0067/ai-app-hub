@@ -18,16 +18,21 @@ import asyncio
 import json
 import re
 from contextlib import AsyncExitStack
-from typing import List, Tuple, Any
+from typing import Any, List, Mapping, Optional, Tuple
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_mcp_adapters.tools import load_mcp_tools
 from src.utils.logging import logger
 from src.mcp_tools import get_registered_tool_provider
-from .graph_state import AgentState
+from .graph_state import (
+    AgentState,
+    CONVERGENCE_GUARD_STREAK_THRESHOLD,
+    has_committed_root_cause,
+)
 from .schema import GateEntry
 from .consistency import MemoryRead, detect_value_conflicts, parse_memory_reads
 from .prompts import crash_init_data_prompt
+from .prompt_phrases import FORCED_CHOICE_CONVERGENCE_RULE
 from .action_guard import (
     build_command_fingerprint,
     extract_crash_path_struct_offsets,
@@ -83,10 +88,8 @@ def _has_non_echo_output(content: str) -> bool:
     return False
 
 
-# L2：收敛护栏阈值。no_progress_streak 达到 NO_PROGRESS_STREAK_LIMIT(3) 时
-# edges.after_crash_tool 才强制收口，但那已经浪费了三步。护栏在 2 步就介入：
-# 此时 root_cause_class 已确定、强制门控已全部关闭，只读探测命令不可能再改变结论。
-CONVERGENCE_GUARD_STREAK_THRESHOLD = 2
+# L2：收敛护栏阈值 CONVERGENCE_GUARD_STREAK_THRESHOLD 定义在 graph_state.py
+#（nodes.py 与 prompt_builder.py 共同的叶子依赖），两条收敛通道共用同一判据。
 
 # 只读"取值/解读值"类命令。run D 的死循环完全由这类命令构成：反复 rd/struct 一个
 # 已被证明是被覆盖的字段，试图解读其中残留 ASCII 的协议含义（把覆盖载荷当成 IRQ 号）。
@@ -116,7 +119,7 @@ _READONLY_VALUE_PROBE_COMMANDS = frozenset(
 )
 
 
-def _gates_all_closed(gates: object) -> bool:
+def _gates_all_closed(gates: Optional[Mapping[str, object]]) -> bool:
     """门控已注册且没有任何 open/blocked 门控时返回 True。"""
     if not gates:
         return False
@@ -149,7 +152,7 @@ def _convergence_guard_error(state: AgentState, lines: List[str]) -> str | None:
     """
     if state.get("no_progress_streak", 0) < CONVERGENCE_GUARD_STREAK_THRESHOLD:
         return None
-    if not state.get("current_root_cause_class"):
+    if not has_committed_root_cause(state):
         return None
     if not _gates_all_closed(state.get("managed_gates")):
         return None
@@ -166,6 +169,37 @@ def _convergence_guard_error(state: AgentState, lines: List[str]) -> str | None:
         f"(is_conclusive=true, confidence=\"low\" is acceptable, action=null) and record the "
         f"residual unknown in final_diagnosis.detailed_analysis."
     )
+
+
+def _forced_choice_directive(state: AgentState) -> str:
+    """P0-1：原地打转时唯一可接受的两种下一步（不依赖根因是否已提交）。
+
+    与 `_convergence_guard_error` 的区别：那条通道要求"根因已提交 + 强制门控
+    全部关闭"，而实际耗尽预算的 run 恰恰是在模型**从未提交根因**的状态下空转，
+    且重复命令在 dedup 分支就 `continue` 了，根本走不到那条通道。因此这里只
+    要求"连续无进展 + 重复的只读取值探测"，把选择压缩成二选一，避免模型继续
+    在同一条命令上索取同一份输出。措辞与 replan 菜单共用
+    `prompt_phrases.FORCED_CHOICE_CONVERGENCE_RULE`（nodes 与 prompt_builder
+    之间已有正向依赖，共享文本只能放在两者都不依赖的叶子模块）。
+    """
+    return (
+        "You have re-requested a read-only value probe that has already been read, and the last "
+        f"{state.get('no_progress_streak', 0)} actions produced no new evidence. "
+        + FORCED_CHOICE_CONVERGENCE_RULE
+    )
+
+
+def _no_new_evidence_directive(state: AgentState, lines: List[str]) -> str | None:
+    """判断 dedup 命中的命令是否属于"无新证据的空转探测"，是则返回强制二选一指令。
+
+    刻意不看 `current_root_cause_class`，也不看门控是否注册/关闭：这两项前提
+    正是既有通道在真实死锁场景里失效的原因。
+    """
+    if state.get("no_progress_streak", 0) < CONVERGENCE_GUARD_STREAK_THRESHOLD:
+        return None
+    if not _only_read_only_value_probes(lines):
+        return None
+    return _forced_choice_directive(state)
 
 # =========================================================================
 # 默认 crash 命令集合
@@ -683,6 +717,21 @@ async def call_crash_tool(state: AgentState) -> dict:
                                 "no usable evidence. It is now unavailable. "
                                 "You must select a different command or a different evidence target."
                             )
+                        # P0-1：硬拒本身不足以止损。模型在"从未提交根因"的状态下
+                        # 反复索取同一条只读探测时，既有收敛护栏（要求根因已提交且
+                        # 门控全部关闭）永远不触发，硬拒措辞又只说"换个方向"而不
+                        # 给出可执行的收敛出口，预算就在重复命令上耗尽。这里追加
+                        # 与根因/门控无关的强制二选一。
+                        spin_directive = _no_new_evidence_directive(
+                            state, extract_command_lines(name, args)
+                        )
+                        if spin_directive is not None:
+                            dedup_msg = f"{dedup_msg}\n\n{spin_directive}"
+                            logger.warning(
+                                "Dedup spin guard escalated to forced choice for '%s...' (streak=%s).",
+                                current_fingerprint[:80],
+                                state.get("no_progress_streak", 0),
+                            )
                         tool_messages.append(
                             ToolMessage(
                                 content=dedup_msg,
@@ -904,9 +953,16 @@ async def call_crash_tool(state: AgentState) -> dict:
             else state.get("evidence_goal_progress")
         ),
         "last_action_goal_version": state.get("evidence_goal_version"),
+        # current_action_intent 可能被显式写入 None（并非只是缺键），因此用
+        # `or {}` 兜底后再取字段，避免在 None 上调用 .get
+        # （reportOptionalMemberAccess）。
         "last_evidence_types": (
-            [state.get("current_action_intent", {}).get("intended_evidence_type")]
-            if state.get("current_action_intent", {}).get("intended_evidence_type")
+            [
+                (state.get("current_action_intent") or {}).get(
+                    "intended_evidence_type"
+                )
+            ]
+            if (state.get("current_action_intent") or {}).get("intended_evidence_type")
             else []
         ),
         "crash_path_struct_offsets": crash_path_struct_offsets,

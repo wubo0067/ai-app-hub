@@ -11,6 +11,7 @@ react_pkg = types.ModuleType("src.react")
 react_pkg.__path__ = [str(root / "src" / "react")]
 sys.modules.setdefault("src.react", react_pkg)
 
+from src.react.graph_state import CONVERGENCE_GUARD_STREAK_THRESHOLD
 from src.react.prompt_builder import build_executor_state_section
 from src.react.schema import GateEntry
 
@@ -223,6 +224,75 @@ class ReplanProbeMenuTests(unittest.TestCase):
         self.assertIn("sym <address>", rendered)
         self.assertNotIn("`rd <address> <count>`", rendered)
         self.assertNotIn("dis -rl <symbol>", rendered)
+
+    def test_unknown_root_cause_never_claims_conclusion(self) -> None:
+        """P0-2：`current_root_cause_class="unknown"` 表示尚未定论。
+
+        `unknown` 是 RootCauseClass 的合法成员，`bool("unknown")` 为 True；
+        若按真值判断，门控全关时会输出 "TERMINATE ON THIS TURN: root_cause_class=unknown
+        is set"，等于告诉模型一个不存在的结论已经成立。
+        """
+        rendered = _render(
+            current_signature_class="null_deref",
+            current_root_cause_class="unknown",
+            managed_gates=CLOSED_GATE,
+            current_evidence_goal=None,
+            last_action_status="rejected",
+            duplicate_streak=0,
+            no_progress_streak=1,
+            replan_required=True,
+            evidence_facts=["rd_word:0x1=0x2"],
+        )
+        self.assertNotIn("TERMINATE ON THIS TURN", rendered)
+        self.assertNotIn("prefer terminating with your conclusion", rendered)
+        self.assertIn("root_cause_class is still unset", rendered)
+
+    def test_no_progress_spin_offers_forced_choice_without_root_cause(self) -> None:
+        """P0-1：空转时提示词必须给出"提交结论 / 声明新取证目标"的二选一。"""
+        rendered = _render(
+            current_signature_class="null_deref",
+            current_root_cause_class=None,
+            managed_gates=CLOSED_GATE,
+            current_evidence_goal=None,
+            last_action_status="rejected",
+            duplicate_streak=0,
+            no_progress_streak=CONVERGENCE_GUARD_STREAK_THRESHOLD,
+            replan_required=True,
+            evidence_facts=ALL_DIMENSION_FACTS,
+        )
+        self.assertIn("COMMIT A CONCLUSION", rendered)
+        self.assertIn("DECLARE A NEW EVIDENCE TARGET", rendered)
+        self.assertIn("Re-reading the same bytes cannot produce new evidence", rendered)
+
+    def test_forced_choice_suppressed_once_root_cause_committed(self) -> None:
+        """已提交根因时走 TERMINATE 通道，不再并列二选一，避免自相矛盾。"""
+        rendered = _render(
+            current_signature_class="null_deref",
+            current_root_cause_class="use_after_free",
+            managed_gates=CLOSED_GATE,
+            current_evidence_goal=None,
+            last_action_status="rejected",
+            duplicate_streak=0,
+            no_progress_streak=CONVERGENCE_GUARD_STREAK_THRESHOLD,
+            replan_required=True,
+            evidence_facts=ALL_DIMENSION_FACTS,
+        )
+        self.assertIn("TERMINATE ON THIS TURN", rendered)
+        self.assertNotIn("COMMIT A CONCLUSION", rendered)
+
+    def test_forced_choice_suppressed_below_streak_threshold(self) -> None:
+        rendered = _render(
+            current_signature_class="null_deref",
+            current_root_cause_class=None,
+            managed_gates=CLOSED_GATE,
+            current_evidence_goal=None,
+            last_action_status="rejected",
+            duplicate_streak=0,
+            no_progress_streak=CONVERGENCE_GUARD_STREAK_THRESHOLD - 1,
+            replan_required=True,
+            evidence_facts=["rd_word:0x1=0x2"],
+        )
+        self.assertNotIn("COMMIT A CONCLUSION", rendered)
 
     def test_malformed_evidence_facts_are_tolerated(self) -> None:
         for facts in (None, "notalist", [None, 42, "rd_word:0x1=0x2"]):
