@@ -49,6 +49,9 @@ EVIDENCE_TOOL_LIMIT_CHARS = 24_000
 # nodes.py 去重后返回的 DEDUP 消息前缀：内容为完整缓存输出，是 LLM 主动重请求
 # 以获得完整证据的结果，绝不截断。
 DEDUP_PREFIX = "[DEDUP]"
+# nodes.py 去重后判定无实质证据时返回的拒绝消息前缀。
+# 此类消息不含历史输出，不应享受完整保留待遇，按普通短消息处理。
+DEDUP_BLOCKED_PREFIX = "[DEDUP-BLOCKED]"
 
 # 最近 DEDUP_FULL_PRESERVE_COUNT 条 DEDUP 消息享受"近似完整保留"（仅受 DEDUP_HARD_CAP_CHARS
 # 硬上限约束，不参与常规的证据预算分配），超出此数量的旧 DEDUP 消息退化为按证据型命令的

@@ -16,7 +16,7 @@ An intelligent Linux kernel crash (vmcore) analysis agent based on LangGraph ReA
 - **Executor-Level Safety Protection**: The built-in `action_guard` module prevents the LLM from executing commands that are overly resource-intensive or high-risk (e.g., blindly running `bt -a` on a large system). Simultaneously, a command deduplication mechanism ensures analysis efficiency and prevents reasoning from falling into infinite loops.
 - **Transparent Chain-of-Thought Reporting**: Each analysis generates a structured Markdown report, fully documenting the intent behind every command execution, the verification process of hypotheses, and the evidence-based final root cause isolation.
 - **Two-tier Crash Classification**: The system defines a rigorous two-tier classification for kernel diagnostics in `src/react/schema.py`. The **surface signature class** (`CrashSignatureClass`) captures immediately observable panic labels (e.g., `null_deref`, `use_after_free`, `stack_corruption`, `soft_lockup`, `hard_lockup`, `rcu_stall`) and routes them to the corresponding diagnostic Playbook. The **deep root cause class** (`RootCauseClass`) represents the final root cause determined after deep investigation and evidence validation (e.g., `out_of_bounds`, `double_free`, `race_condition`, `dma_corruption`, `mce`).
-- **Verification Gate Control Mechanism**: To fundamentally eliminate LLM "hallucination" and superficial guessing, the system introduces a mandatory gate-control mechanism. For each crash signature, the system enforces specific "proof gates" that must be closed (e.g., `pointer_corruption` requires closing `register_provenance`, `object_lifetime`, `local_corruption_exclusion`, etc.). The system strictly prohibits marking the diagnosis as conclusive (`is_conclusive=true`) until all required gates reach the `closed` (verified with concrete tool output) or `n/a` (confirmed not applicable) state.
+- **Verification Gate Control Mechanism**: To fundamentally eliminate LLM "hallucination" and superficial guessing, the system introduces a mandatory gate-control mechanism. For each crash signature, the system enforces specific "proof gates" that must be closed (e.g., `pointer_corruption` requires closing `register_provenance`, `object_lifetime`, `local_corruption_exclusion`, etc.). The system strictly prohibits marking the diagnosis as conclusive (`is_conclusive=true`) until all required gates reach the `closed` (verified with concrete tool output) or `n/a` (confirmed not applicable) state. Gate closure is **executor-owned**: the LLM's reported gate status is advisory only, and the Evidence Evaluator (`src/react/evidence.py`) closes a gate solely when its executor-defined `completion_criteria` are satisfied by structured evidence facts; rejected closures and all status transitions are recorded in `gate_transition_history` and surfaced in the companion Gate Audit document (see [Report & Audit Output](#47-complete-client-parameter-description)). The reader-facing report keeps only a short plain-language **Verification Status** summary.
 - **Precision e820 BIOS Memory Map Verification & Adjacent Page Fingerprinting**: As confirmed by `memorandum.txt`, the agent demonstrates expert-level memory forensics. When encountering a `reserved` physical page, the AI extracts fingerprints from adjacent physical pages without triggering seek errors, enabling fine-grained memory authentication. It performs rigorous mathematical interval comparison between the crash physical address and the BIOS memory map (e820), determining whether the memory is hardware-reserved or overwritten by a specific device's DMA out-of-bounds access after boot — a diagnostic approach matching the caliber of senior kernel experts.
 - **Long-Connection Keep-Alive & Streaming Transmission**: Kernel crash tools can take extended periods (minutes) when searching large memory regions (GB-scale vmcore images) or loading debug symbols for massive modules. The FastAPI server introduces an independent Task queue with a 15-second heartbeat comment (Keep-Alive Heartbeat) sent to the client via SSE. Even when a single underlying operation exceeds 2 minutes, the client maintains a stable connection and displays diagnostic progress nodes in real time.
 
@@ -56,7 +56,8 @@ graph TB
 
     K --> D
     D -->|Markdown report| P[reports]
-```
+        D -->|Gate audit record| P
+    ```
 
 **Architecture Diagram Explanation**:
 - **Solid arrows** represent data flow or invocation relationships
@@ -139,7 +140,7 @@ Execution results are written to the message queue as `HumanMessage`, serving as
    - Attempts JSON repair on format errors ([`repair_structured_output`](vmcore-analysis-agent/src/react/output_parser.py#L56-L94))
    - Routes plain text `reasoning_content` to [`structure_reasoning_node`](vmcore-analysis-agent/src/react/llm_node.py#L215-L350)
    - Injects HumanMessage on empty response to force LLM action or conclusion
-5. **State Management**: Merges LLM output with managed state (hypotheses, gates) via [`project_managed_analysis_step`](vmcore-analysis-agent/src/react/state_manager.py#L123-L198)
+5. **State Management**: Merges LLM output with managed state (hypotheses, gates) via [`project_managed_analysis_step`](vmcore-analysis-agent/src/react/state_manager.py#L123-L198) — gate closures are re-validated by the Evidence Evaluator, and `is_conclusive` is forced to `false` while any mandatory gate remains open
 
 **Core Prompt Design**:
 - Built-in anti-repetition policy to prevent executing the same command repeatedly
@@ -222,7 +223,7 @@ The agent's reasoning and state are structured around a set of Pydantic models d
 | [`VMCoreLLMAnalysisStep`](vmcore-analysis-agent/src/react/schema.py#L70-L114) | The minimal subset of [`VMCoreAnalysisStep`](vmcore-analysis-agent/src/react/schema.py#L230-L373) that the LLM is expected to output directly. The executor enriches this with the managed state fields. |
 | [`FinalDiagnosis`](vmcore-analysis-agent/src/react/schema.py#L45-L67) | A comprehensive record of the final conclusion, populated only when [`is_conclusive`](vmcore-analysis-agent/src/react/schema.py#L294-L294) is `true`. |
 | [`Hypothesis`](vmcore-analysis-agent/src/react/schema.py#L165-L192) | Represents a single candidate root cause being tracked by the agent. The [`active_hypotheses`](vmcore-analysis-agent/src/react/schema.py#L326-L333) list forces explicit management of competing theories. |
-| [`GateEntry`](vmcore-analysis-agent/src/react/schema.py#L195-L220) | Represents a mandatory verification checkpoint. The [`gates`](vmcore-analysis-agent/src/react/schema.py#L335-L343) dictionary ensures all required evidence is gathered before a conclusive diagnosis is allowed. |
+| [`GateEntry`](vmcore-analysis-agent/src/react/schema.py#L195-L220) | Represents a mandatory verification checkpoint. The [`gates`](vmcore-analysis-agent/src/react/schema.py#L335-L343) dictionary ensures all required evidence is gathered before a conclusive diagnosis is allowed. Each gate carries executor-defined `completion_criteria` used by the Evidence Evaluator to decide closure. |
 
 #### `_REQUIRED_GATES`: The Verification Gatekeeper System
 
@@ -244,6 +245,7 @@ class GateEntry(BaseModel):
     status: Literal["open", "closed", "blocked", "n/a"]
     evidence: Optional[str]  # 必须填写具体的工具输出，不得使用泛泛总结
     prerequisite: Optional[str]  # 前置依赖 gate
+    completion_criteria: List[str]  # 执行器定义的关闭完成条件，由证据评估器判定
 ```
 
 **Gate States:**
@@ -304,6 +306,16 @@ Specifically:
 **Analogy**
 
 Think of gates as an aircraft pre-flight checklist: pilots must systematically check and confirm each item (flaps, fuel, engines...) before takeoff. Similarly, the analysis Agent must complete each required checkpoint for its crash type before announcing "root cause found"—all gates must be closed before the final diagnosis can be truly output.
+
+**Executor-Owned Gate Closure (Evidence Evaluator)**
+
+Gate closure authority belongs to the executor, not the LLM:
+
+- **Executor-defined completion criteria**: Each `GateEntry` carries a `completion_criteria` list defined by the executor (e.g., `register_provenance` requires the faulting register value, source object/address evidence, and an independently observed field/offset or symbol relation).
+- **The Evidence Evaluator is the sole closer**: [`evaluate_gate_closures`](vmcore-analysis-agent/src/react/evidence.py) extracts structured `evidence_facts` from tool outputs (e.g., `rd_word:`, `struct_*`, `dis_*`, `sym:`) and closes a gate only when its required evidence-category groups are all satisfied. `external_corruption_gate` additionally requires its prerequisite `local_corruption_exclusion` to be closed first.
+- **LLM gate status is advisory only**: If the LLM emits `status: closed` without sufficient evidence, the evaluator keeps the gate `open` and records an `llm_close_rejected` transition; the system prompt declares this rule explicitly.
+- **Conclusive answers stay gated**: While any mandatory gate remains `open`/`blocked`, [`project_managed_analysis_step`](vmcore-analysis-agent/src/react/state_manager.py) forces `is_conclusive=false` and strips a premature `final_diagnosis`.
+- **Full audit trail**: Every status change is appended to `gate_transition_history` in `AgentState`. This history is rendered into a standalone **Gate Audit** document (written next to the report as `<report>.audit.md`) listing each gate's criteria, review evidence, and status transitions, so the reader-facing report stays focused on the analysis itself.
 
 **Key Concepts**:
 - **[`CrashSignatureClass`](vmcore-analysis-agent/src/react/schema.py#L117-L134) vs [`RootCauseClass`](vmcore-analysis-agent/src/react/schema.py#L139-L162)**: The former is an observable symptom from the panic log (e.g., `soft_lockup`), while the latter is the inferred underlying mechanism (e.g., `deadlock`). They serve different purposes in the analysis flow.
@@ -374,6 +386,7 @@ vmcore-analysis-agent/
 │   │   ├── __init__.py                # Package initialization
 │   │   ├── action_guard.py            # Action guard and safety validation
 │   │   ├── edges.py                   # Routing logic and state transitions
+│   │   ├── evidence.py                # Evidence extraction and executor-owned gate evaluation
 │   │   ├── fragment_flags.py          # Fragment flags management
 │   │   ├── graph.py                   # LangGraph graph construction
 │   │   ├── graph_state.py             # AgentState definition
@@ -424,10 +437,12 @@ vmcore-analysis-agent/
 ├── tests/                             # Test suite
 │   ├── test_action_guard.py           # Action guard tests
 │   ├── test_crash_client.py           # Crash client tests
+│   ├── test_evidence.py               # Evidence extraction & gate evaluation tests
 │   ├── test_llm_runtime.py            # LLM runtime tests
 │   ├── test_output_parser.py          # Output parser tests
 │   ├── test_prompt_builder.py         # Prompt builder tests
 │   ├── test_prompts.py                # Prompt tests
+│   ├── test_report_generator.py       # Report generation & gate audit tests
 │   ├── test_schema.py                 # Schema tests
 │   ├── test_stack_canary_analyzer.py  # Stack canary analyzer tests
 │   ├── test_stack_canary_client.py    # Stack canary client tests
@@ -560,6 +575,9 @@ Parameter description:
 - After analysis completion, markdown reports are automatically saved to the specified directory by default
 - Report filename format: `127.0.0.1-2026-01-30-22-51-43.md` (generated from server IP and timestamp)
 - Reports include complete analysis process, reasoning steps, and final diagnostic conclusions
+- The report ends with a plain-language **Verification Status** section (one line per verification gate) so readers can see at a glance how well-supported the conclusion is
+- The full gate audit — per-gate status, prerequisites, completion criteria, review evidence, and every status transition — is written to a sibling file `127.0.0.1-2026-01-30-22-51-43.audit.md`. This keeps executor-internal bookkeeping out of the analysis report while preserving full traceability. The file is only created when gate data exists; `--no-save` skips both files
+- The same content is available over the API: `POST /analyze` returns `audit_report`, and the `/analyze/stream` SSE `complete` event carries the same field
 
 ## Application Scenarios
 
@@ -574,6 +592,91 @@ Parameter description:
 2. **Multimodal analysis**: Combine logs, metrics, and other multidimensional data
 3. **Real-time analysis**: Support real-time diagnostics for online systems
 4. **Distributed deployment**: Support large-scale concurrent analysis
+
+## Glossary
+
+### Gate (门控 / Verification Gate)
+
+A **Gate** is a mandatory verification checkpoint in the VMCore crash analysis state machine. Before the agent can declare a conclusive diagnosis (`is_conclusive=true`), all gates required for the current crash signature class must reach a terminal state (`closed` or `n/a`).
+
+**Purpose**: Prevents the LLM from drawing premature or unsupported conclusions by enforcing that specific diagnostic evidence (e.g., register provenance, object lifetime, corruption exclusion) is collected and verified before the analysis is allowed to terminate.
+
+**States**:
+
+| State | Meaning |
+|-------|---------|
+| `open` | Not yet investigated or investigation incomplete |
+| `closed` | Verified with concrete tool output evidence |
+| `blocked` | A prerequisite gate has not been closed yet |
+| `n/a` | Confirmed not applicable (with justification) |
+
+**Key properties**:
+- **Executor-owned closure**: The LLM's reported gate status is advisory only. The Evidence Evaluator (`src/react/evidence.py`) is the sole authority that closes a gate, and only when the executor-defined `completion_criteria` are satisfied by structured evidence facts extracted from tool outputs.
+- **Signature-class specific**: Each `CrashSignatureClass` maps to a different set of required gates via `_REQUIRED_GATES` in `src/react/schema.py`. Simple signatures (e.g., `null_deref`) require 1–2 gates; complex ones (e.g., `pointer_corruption`) require 5.
+- **Auditable**: Every status transition is recorded in `gate_transition_history` and rendered in the standalone **Gate Audit** document (`<report>.audit.md`). The report itself only carries a short **Verification Status** summary.
+
+> See the detailed section [`_REQUIRED_GATES`: The Verification Gatekeeper System](#_required_gates-the-verification-gatekeeper-system) for full implementation details.
+
+### register_provenance (寄存器溯源)
+
+A gate that answers: **Where did the bad value in the faulting register come from?**
+
+Before this gate can be closed, the agent must establish a complete **bad-value propagation chain**: identify the faulting register's value, trace it back to the exact source object/field/offset that produced the operand, and independently verify the field/offset or symbol relation.
+
+**Completion criteria** (all must be satisfied):
+| # | Criterion | Typical evidence |
+|---|-----------|-----------------|
+| 1 | Faulting register value is present | `rd` read of the register or exception frame |
+| 2 | Source object or address evidence is present | `rd` / `struct` read of the source memory location |
+| 3 | Field/offset or symbol relation is independently observed | `struct -o` (field offset) + `sym` (symbol resolution) |
+
+**Required evidence types**: `rd` (memory read) **AND** (`dis` (disassembly) **OR** `sym` (symbol table))
+
+**Applicable signatures**: `pointer_corruption`, `null_deref`, `use_after_free`, `general_protection_fault`, `invalid_address_access`, `write_protection_violation`, `smap_smep_violation`
+
+### object_lifetime (Object and Slot State)
+
+A gate that answers: **What does the dump establish about the slot now, and what lifetime history remains unknown?**
+
+`kmem -S` reports the slot's state at dump time. `[ALLOCATED]` means it is allocated now; it does not prove that the current allocation is the original object. A stale pointer can still reference a slot that was freed and reused, so `ALLOCATED` does not exclude use-after-free (UAF) with reuse. A type mismatch supports that possibility but does not uniquely prove it; in-place corruption and traversal/owner errors remain alternatives.
+
+**Completion criteria**:
+- Observe the current slab-slot state and the relevant object contents/layout, or obtain direct temporal evidence such as a KASAN use-after-free report.
+- Do not interpret current allocation state or a dense-prefix/zero-tail byte pattern as proof for or against historical reuse.
+
+**Required evidence types**: `kmem -S` slot state plus `rd`/`struct` object evidence, or direct temporal lifetime evidence such as KASAN.
+
+**Applicable signatures**: `pointer_corruption`, `use_after_free`, `page_not_present`
+
+### local_corruption_exclusion (本地损坏排除)
+
+A gate that answers: **Was the bad value written by the local function/CPU, or by an external source (DMA, another CPU, hardware)?**
+
+This gate applies the **method of exclusion**: the agent disassembles the relevant function and checks whether any local instruction (`mov`, `st`, etc.) could have written the bad value to the faulting address. If **no local write path exists**, local corruption is excluded, and suspicion shifts to **external sources** (DMA out-of-bounds, cross-CPU race, hardware MCE, etc.). This is the critical pivot from "local" to "external" in the corruption analysis.
+
+**Completion criteria** (all must be satisfied):
+| # | Criterion | Typical evidence |
+|---|-----------|-----------------|
+| 1 | A relevant disassembly observation is present | `dis` of the function containing the faulting instruction |
+| 2 | A memory observation supports or excludes a local writer | `rd` of the target memory region, cross-referenced with the disassembly |
+
+**Required evidence types**: `dis` (disassembly) **AND** `rd` (memory read)
+
+**Applicable signatures**: `pointer_corruption` (also serves as a **prerequisite** for `external_corruption_gate`)
+
+**Progressive relationship of the three gates**:
+
+```
+register_provenance          object_lifetime           local_corruption_exclusion
+"Where did the bad value   "Was the source object    "Did the local function
+ come from?"                still alive?"             write it, or was it
+    │                          │                       external?"
+    ▼                          ▼                       ▼
+ rd + dis/sym              rd + struct               dis + rd
+ (locate source)         (classify lifetime)      (exclude/confirm writer)
+```
+
+All three must be `closed` before the agent can proceed to `external_corruption_gate` and `field_type_classification`, completing the full evidence chain for `pointer_corruption`.
 
 ## Appendix: Third-party Driver Debug Symbol Compilation Guide (mlx5_core example)
 

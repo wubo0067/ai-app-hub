@@ -1,4 +1,4 @@
-#!/usr/bi,/en, python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 from .prompt_phrases import (
@@ -101,17 +101,17 @@ Pattern: paging request at a non-NULL address or a KASAN-style report.
 Analysis:
 1. Run kmem -S <address> only when the candidate address is expected to be a slab object or heap allocation; if the address may belong to a kernel stack, text, or non-slab page, use vtop or kmem -p on the translated page instead.
    First classify the address type when it is not already known: run vtop <address> to determine whether the page is a kernel stack, vmalloc/module mapping, or another non-slab page. If the address resolves to a kernel stack, vmalloc/module area, text mapping, or any other non-slab page, do NOT run kmem -S on that address; continue with vtop or kmem -p based analysis instead.
-   Interpret the result immediately and explicitly: a slot marked [ALLOCATED] means the object is currently live; a slot without brackets (listed in the FREE section) means the object has been freed. This distinction determines which mechanisms remain open -- do not defer or skip this interpretation.
+   Interpret the result as snapshot state only: [ALLOCATED] means the slot is allocated now, not that the pointer still refers to the allocation that originally occupied it. It rules out only a slot that is currently free; it does NOT rule out a stale pointer whose slot was freed and reused. A different object type in an allocated slot is compatible with reuse, but can also result from in-place corruption or a wrong traversal/owner. Keep these mechanisms open unless other evidence distinguishes them.
 2. Perform a raw memory dump of the corrupted slab object: run rd -x <addr> <object_size_in_words> (e.g., rd -x <addr> 16 for a 128-byte object). Scan the raw content systematically for SLUB free-list poison patterns before interpreting struct fields:
-   - 0x6b6b6b6b6b6b6b6b (repeated): POISON_FREE -- object was freed while SLUB_DEBUG is active; strong evidence of UAF without reallocation.
-   - 0x5a5a5a5a5a5a5a5a (repeated): POISON_END / red-zone boundary marker; indicates overrun into a freed adjacent region.
-   - 0xdead000000000100 or 0xdead000000000200: LIST_POISON1/2 from list_del() debug; list-based UAF or double-unlink.
-   - No poison pattern in an ALLOCATED slot: rules out simple free-list UAF; the slot was overwritten while live (OOB, DMA, or race), or freed and reallocated before observation.
-   Also inspect at least one adjacent slab slot (pre-compute offset: addr +/- objsize, emit rd -x <literal_addr> 16): correlated corruption in neighboring slots points to bulk OOB or DMA overwrite; isolated single-slot corruption points to targeted write or single-object UAF.
+   - 0x6b6b6b6b6b6b6b6b (repeated): POISON_FREE (0x6b) -- object was freed while SLUB_DEBUG is active; strong evidence of UAF without reallocation.
+   - 0x5a5a5a5a5a5a5a5a (repeated): POISON_INUSE (0x5a) -- object is allocated under SLUB_DEBUG; the last byte of the object is overwritten with POISON_END (0xa5) as a boundary marker. Seeing 0x5a fill in a slot means the object was live at the time of the debug fill, NOT that it overran into a freed adjacent region.
+   - 0xdead000000000100 or 0xdead000000000200: LIST_POISON1/2 written unconditionally by list_del() (not debug-only); indicates list-based UAF or double-unlink.
+   - No poison pattern in an ALLOCATED slot: this does not rule out UAF with reuse and does not prove an in-place overwrite; it only means the current bytes do not show that poison pattern.
+   Also inspect at least one adjacent slab slot (pre-compute offset: addr +/- objsize, emit rd -x <literal_addr> 16): correlated corruption can support a bulk OOB or DMA hypothesis; an isolated slot does not distinguish targeted overwrite from UAF with reuse.
 3. Distinguish UAF, heap OOB write, and double-free style symptoms:
    - UAF without reallocation: kmem -S shows FREE, poison values (0x6b6b..) visible.
-   - UAF with reallocation: kmem -S may still show ALLOCATED at observation time, but type-identity mismatch alone is NOT enough. Require positive lifetime evidence that the pointer survived a free and now references a replacement object instance, such as free-path evidence, alloc/free-stack evidence, refcount/lifetime transition evidence, or a parent/head pointer that demonstrably retained a stale reference across reuse. Without that evidence, treat the slot as a live object whose contents were overwritten, type-confused, or otherwise corrupted.
-   - OOB overwrite: kmem -S shows ALLOCATED, all fields garbled with no recognizable type patterns; check whether adjacent slab slots are also corrupted.
+   - UAF with reallocation: kmem -S can show ALLOCATED because the slot may have been reused. A type-identity mismatch plus a pointer chain that still references the slot supports this hypothesis, but does not uniquely prove it; weigh it against in-place overwrite and traversal/owner corruption. Do not exclude UAF merely because allocation/free history is unavailable.
+   - OOB overwrite: an allocated slot with garbled fields is compatible with an overwrite, but allocation state alone does not identify the writer or distinguish it from reuse; check adjacent slots and seek independent write-path evidence.
    - DMA overwrite: kmem -S shows ALLOCATED, physical-address overlap with device DMA range confirmed.
    Do not collapse any of these scenarios into memory_corruption without first classifying the mechanism.
 4. When KASAN is present, prioritize allocation and free stacks from dmesg.
@@ -123,7 +123,7 @@ Analysis:
 ## Pointer Corruption Playbook
 
 - Treat pointer corruption as a provenance-first workflow, not a device-attribution workflow.
-- {S1_S5_DMA_GATE_RULE} At minimum in this playbook: close register provenance first (S1), object lifetime and ordinary object-state validation next (S2), stack or snapshot artifact exclusion when relevant (S3), local corruption exclusion after that (S4), and only then assess whether any affirmative device-side evidence exists (S5).
+- {S1_S5_DMA_GATE_RULE} At minimum in this playbook: close register provenance first (S1), object lifetime and ordinary object-state validation next (S2), stack or snapshot artifact exclusion when relevant (S3), local corruption discrimination after that (S4), and only then assess whether any affirmative device-side evidence exists (S5).
 - S2 (object-state validation) for slab objects: if the corrupted object's slab cache (e.g., kmalloc-128) is routinely used by the suspected hardware driver, check whether the suspicious values could be residue from a prior allocation of that cache by the same driver. kmalloc caches are NOT zeroed on free or re-allocation; a prior valid allocation can leave its entire content as stale data in the returned slab slot.
 - S5 (device-side evidence): {DMA_PROMOTION_EVIDENCE_RULE} {DMA_MINIMUM_EVIDENCE_GATE_RULE} Before naming a specific device as the DMA source, you MUST either: (a) confirm a DMA-range overlap between the corrupted page's physical address and the device's DMA buffers, OR (b) explicitly document why range overlap cannot be verified AND provide a protocol-level bit-layout verification of the payload. Additionally, you must consider ALL DMA-capable devices present in the system (check lspci-equivalent output or device tree). Name the suspected device only after other DMA-capable devices (e.g., mlx5 NICs, other HBAs, NVMe controllers) have been explicitly evaluated and found less likely, even if the evaluation is brief.
 - If the only apparent support is a driver-specific value inside a neighboring slab slot or elsewhere on the slab page, DMA remains unproven. That observation may support prior allocation, stale residue, or adjacent-object software corruption and cannot by itself close S5.
@@ -136,11 +136,11 @@ Analysis:
 ### Corruption Mechanism Gate (mandatory before setting final_root_cause)
 
 A corrupted slab object with garbled fields is a SYMPTOM observation, not a root cause mechanism. Apply this gate explicitly before setting final_root_cause:
-1. Interpret kmem -S explicitly: [ALLOCATED] means the object is currently live (in-place overwrite, DMA, or UAF-with-reuse are candidates); not-bracketed or FREE means freed before access (classic UAF confirmed).
-2. Check type-identity field consistency: if a field that identifies the object's role (e.g., irqaction.irq, type code, magic number) does not match the current traversal context, the slot does not belong in the current traversal. Treat that first as live-slot overwrite or type confusion. Escalate to UAF with reuse only when separate lifetime evidence shows the pointer outlived a free and now references a replacement object instance.
+1. Interpret kmem -S as snapshot state only: [ALLOCATED] means the slot is allocated now; it does not identify the current allocation as the original object and does not exclude UAF with reuse. A free slot is consistent with classic UAF when the faulting pointer still reaches it, but correlate the address and crash-time context.
+2. Check type-identity field consistency: if a field that identifies the object's role (e.g., irqaction.irq, type code, magic number) does not match the current traversal context, the slot contents do not match the expected object. This is compatible with a stale pointer to a replacement allocation, in-place corruption, type confusion, or traversal/owner corruption. Do not use ALLOCATED status to prefer the in-place-overwrite hypothesis.
 3. Check neighboring slab slots: if adjacent slots show the same corruption pattern, suspect bulk overwrite (OOB or DMA); if only one slot is corrupted, suspect targeted write or pointer misdirection.
-4. Pattern-shape check for raw dumps of larger slab objects: if a 128-byte style object dump shows a dense non-zero prefix in the first half and an all-zero or near-zero trailing half, treat that as a prefix-only overwrite signature. This pattern is more consistent with a smaller foreign object being copied into the start of the slot, targeted live-slot write corruption, or type confusion than with whole-object stale residue or classic free-list UAF. Do not oscillate between UAF and generic buffer overflow once this pattern is observed unless adjacent-slot evidence or explicit lifetime evidence re-opens those mechanisms.
-5. If classic UAF is excluded by kmem -S and no adjacent-slot propagation is shown, you may converge at mechanism-family level as root_cause_class=pointer_corruption with corruption_mechanism=write_corruption even if the exact writer is still unknown. In that case, explicitly state why UAF and bulk adjacent-slot overflow were weakened.
+4. A dense non-zero prefix with a zero tail is not a mechanism signature. It may reflect zero-initialization, a smaller object copied into a reused slot, partial corruption, or other causes. Do not rank overwrite, UAF, or OOB from this shape alone.
+5. If available evidence supports pointer corruption but does not distinguish UAF-with-reuse, in-place overwrite, or another mechanism, preserve that uncertainty in the conclusion. Do not state that UAF was excluded based only on kmem -S or the byte pattern.
 Set final_root_cause to a mechanism label -- use_after_free, out_of_bounds, dma_corruption, or wild_pointer -- never to memory_corruption.
 
 ### Data Structure Traversal Rule (mandatory when crash occurs during iterator traversal)
@@ -149,7 +149,7 @@ When the crash occurs inside a function iterating a kernel data structure (irqac
 1. Identify how the iterator register was populated: from a HEAD pointer in a parent struct (e.g., irq_desc->action) or from a ->next field in a previous element.
 2. HEAD pointer case: identify the parent struct by its register address and verify it matches the expected parent via diagnostic commands (e.g., run irq <N> to confirm irq_desc address). A register value that does not match the diagnostic output means either a different context is being processed than expected, or the parent struct itself is corrupted.
 3. ->next pointer case: identify which preceding element carried the corrupted ->next field and inspect that element's allocation state and field values separately.
-4. Verify type-identity field consistency in the accessed object: for example, irqaction.irq should normally match the IRQ being processed. A mismatch means the object does not belong in this chain, but it does NOT by itself prove UAF-with-reuse. If kmem -S shows the slot is currently ALLOCATED, prefer live-slot overwrite, type confusion, or stale-owner hypotheses unless separate lifetime evidence proves a stale pointer survived free and reuse.
+4. Verify type-identity field consistency in the accessed object: for example, irqaction.irq should normally match the IRQ being processed. A mismatch means the object does not match the expected traversal element; it can support UAF-with-reuse, in-place corruption, type confusion, or a stale/wrong owner. If kmem -S shows ALLOCATED, treat that as current slot state only and do not prefer live-slot overwrite over UAF-with-reuse on that basis.
 5. In show_interrupts specifically, do NOT treat the loop/index register as the authoritative IRQ identity. The iterator value passed into irq_to_desc may be a seq index or traversal input, but the authoritative IRQ number after lookup is irq_desc->irq_data.irq (or the equivalent `irq <N>` diagnostic output). If R13 or another iterator register appears to disagree with irq_desc->irq_data.irq, trust the resolved descriptor identity, not the raw loop register.
 
 ## 3.4 Use-After-Free / Memory Corruption
@@ -158,17 +158,17 @@ Pattern: paging request at a non-NULL address or a KASAN-style report.
 Analysis:
 1. Run kmem -S <address> only when the candidate address is expected to be a slab object or heap allocation; if the address may belong to a kernel stack, text, or non-slab page, use vtop or kmem -p on the translated page instead.
    First classify the address type when it is not already known: run vtop <address> to determine whether the page is a kernel stack, vmalloc/module mapping, or another non-slab page. If the address resolves to a kernel stack, vmalloc/module area, text mapping, or any other non-slab page, do NOT run kmem -S on that address; continue with vtop or kmem -p based analysis instead.
-   Interpret the result immediately and explicitly: a slot marked [ALLOCATED] means the object is currently live; a slot without brackets (listed in the FREE section) means the object has been freed. This distinction determines which mechanisms remain open -- do not defer or skip this interpretation.
+   Interpret the result as snapshot state only: [ALLOCATED] means the slot is allocated now, not that the pointer still refers to the allocation that originally occupied it. It rules out only a slot that is currently free; it does NOT rule out a stale pointer whose slot was freed and reused. A different object type in an allocated slot is compatible with reuse, but can also result from in-place corruption or a wrong traversal/owner. Keep these mechanisms open unless other evidence distinguishes them.
 2. Perform a raw memory dump of the corrupted slab object: run rd -x <addr> <object_size_in_words> (e.g., rd -x <addr> 16 for a 128-byte object). Scan the raw content systematically for SLUB free-list poison patterns before interpreting struct fields:
-   - 0x6b6b6b6b6b6b6b6b (repeated): POISON_FREE -- object was freed while SLUB_DEBUG is active; strong evidence of UAF without reallocation.
-   - 0x5a5a5a5a5a5a5a5a (repeated): POISON_END / red-zone boundary marker; indicates overrun into a freed adjacent region.
-   - 0xdead000000000100 or 0xdead000000000200: LIST_POISON1/2 from list_del() debug; list-based UAF or double-unlink.
-   - No poison pattern in an ALLOCATED slot: rules out simple free-list UAF; the slot was overwritten while live (OOB, DMA, or race), or freed and reallocated before observation.
-   Also inspect at least one adjacent slab slot (pre-compute offset: addr +/- objsize, emit rd -x <literal_addr> 16): correlated corruption in neighboring slots points to bulk OOB or DMA overwrite; isolated single-slot corruption points to targeted write or single-object UAF.
+   - 0x6b6b6b6b6b6b6b6b (repeated): POISON_FREE (0x6b) -- object was freed while SLUB_DEBUG is active; strong evidence of UAF without reallocation.
+   - 0x5a5a5a5a5a5a5a5a (repeated): POISON_INUSE (0x5a) -- object is allocated under SLUB_DEBUG; the last byte of the object is overwritten with POISON_END (0xa5) as a boundary marker. Seeing 0x5a fill in a slot means the object was live at the time of the debug fill, NOT that it overran into a freed adjacent region.
+   - 0xdead000000000100 or 0xdead000000000200: LIST_POISON1/2 written unconditionally by list_del() (not debug-only); indicates list-based UAF or double-unlink.
+   - No poison pattern in an ALLOCATED slot: this does not rule out UAF with reuse and does not prove an in-place overwrite; it only means the current bytes do not show that poison pattern.
+   Also inspect at least one adjacent slab slot (pre-compute offset: addr +/- objsize, emit rd -x <literal_addr> 16): correlated corruption can support a bulk OOB or DMA hypothesis; an isolated slot does not distinguish targeted overwrite from UAF with reuse.
 3. Distinguish UAF, heap OOB write, and double-free style symptoms:
    - UAF without reallocation: kmem -S shows FREE, poison values (0x6b6b..) visible.
-   - UAF with reallocation: kmem -S may still show ALLOCATED at observation time, but type-identity mismatch alone is NOT enough. Require positive lifetime evidence that the pointer survived a free and now references a replacement object instance, such as free-path evidence, alloc/free-stack evidence, refcount/lifetime transition evidence, or a parent/head pointer that demonstrably retained a stale reference across reuse. Without that evidence, treat the slot as a live object whose contents were overwritten, type-confused, or otherwise corrupted.
-   - OOB overwrite: kmem -S shows ALLOCATED, all fields garbled with no recognizable type patterns; check whether adjacent slab slots are also corrupted.
+   - UAF with reallocation: kmem -S can show ALLOCATED because the slot may have been reused. A type-identity mismatch plus a pointer chain that still references the slot supports this hypothesis, but does not uniquely prove it; weigh it against in-place overwrite and traversal/owner corruption. Do not exclude UAF merely because allocation/free history is unavailable.
+   - OOB overwrite: an allocated slot with garbled fields is compatible with an overwrite, but allocation state alone does not identify the writer or distinguish it from reuse; check adjacent slots and seek independent write-path evidence.
    - DMA overwrite: kmem -S shows ALLOCATED, physical-address overlap with device DMA range confirmed.
    Do not collapse any of these scenarios into memory_corruption without first classifying the mechanism.
 4. When KASAN is present, prioritize allocation and free stacks from dmesg.
@@ -371,16 +371,29 @@ Analysis:
     "smap_smep_violation": """
 ## 3.14 SMAP / SMEP Violation (Privilege Boundary Fault)
 Pattern: unable to handle kernel paging request at <user-space address>; fault address is
-in user-space range (typically < 0x00007fffffffffff); Oops error code with bit 2 (user-mode
-page accessed from CPL=0) set, and/or bit 4 (instruction-fetch fault) set.
+in user-space range (typically < 0x00007fffffffffff); Oops error code with bit 4
+(instruction-fetch fault) set for SMEP, or bit 2 clear and bit 0 set for SMAP.
+
+Oops error code bit layout (arch/x86/include/asm/trap_pf.h):
+  bit 0 (X86_PF_PROT)  = 0 -> no page found; 1 -> protection fault (page present, access denied)
+  bit 1 (X86_PF_WRITE) = 0 -> read fault;    1 -> write fault
+  bit 2 (X86_PF_USER)  = 0 -> fault in kernel mode (CPL=0); 1 -> fault in user mode (CPL=3)
+  bit 4 (X86_PF_INSTR) = 1 -> instruction-fetch fault
 
 Triage -- distinguish SMEP from SMAP before proceeding:
   SMEP violation: kernel attempted to EXECUTE a user-space page.
-    Oops error code bit 4 (instruction-fetch) is set (e.g., 0x0011, 0x0015).
+    Oops error code bit 4 (instruction-fetch) is set AND bit 2 is clear (kernel-mode fetch).
+    Typical error code: 0x0011 (protection + kernel-mode + instr-fetch; the page is
+    present and user-mapped, so bit 0 is set -- a no-page code such as 0x0010 is a
+    plain not-present fetch, not SMEP).
     RIP is at a valid kernel address; the faulting instruction is an indirect call/jmp
     that resolved to a user-space target.
   SMAP violation: kernel accessed (read/write) a user-space DATA page without stac/clac.
-    Oops error code bit 2 set, bit 4 clear (e.g., 0x0004, 0x0005, 0x0006, 0x0007).
+    Oops error code bit 2 is clear (kernel-mode access) and bit 4 is clear (data access).
+    Typical error codes: 0x0001 (protection + kernel-mode read),
+                         0x0003 (protection + kernel-mode write).
+    (The SMAP-violated page is present and user-accessible, so bit 0 is always set;
+    a code with bit 0 clear, e.g. 0x0000, is a plain not-present access, not SMAP.)
     The fault address is a user-space data address; RIP is inside kernel code.
 
 Analysis:
@@ -536,6 +549,8 @@ suspect_frame_addr (address of the suspected overflow source):
 - If suspect_frame_addr > canary_frame_addr (suspect frame is at a higher address, i.e.,
   an earlier/outer caller): the suspect's local overflow writes upward and CANNOT reach the
   canary at a lower address. This attribution is PHYSICALLY IMPOSSIBLE. Reject it immediately.
+  Exception: if a non-standard write primitive (negative index, wrong-pointer memcpy/memmove,
+  arbitrary-write, or UAF) is evidenced, revisit with explicit proof of the write direction.
 - If suspect_frame_addr < canary_frame_addr (suspect frame is at a lower address, i.e.,
   a later/inner callee): the suspect's local overflow writes upward and CAN reach the canary
   at a higher address. This attribution is physically plausible.

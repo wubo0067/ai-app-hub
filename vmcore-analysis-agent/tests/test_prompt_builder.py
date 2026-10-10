@@ -1,21 +1,7 @@
-import json
-import unittest
-from pathlib import Path
 import sys
 import types
-
-from langchain_core.messages import AIMessage, HumanMessage
-
-langgraph_module = types.ModuleType("langgraph")
-graph_module = types.ModuleType("langgraph.graph")
-graph_module.MessagesState = dict
-managed_module = types.ModuleType("langgraph.managed")
-managed_module.IsLastStep = bool
-langgraph_module.graph = graph_module
-langgraph_module.managed = managed_module
-sys.modules.setdefault("langgraph", langgraph_module)
-sys.modules.setdefault("langgraph.graph", graph_module)
-sys.modules.setdefault("langgraph.managed", managed_module)
+import unittest
+from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
 src_pkg = types.ModuleType("src")
@@ -25,534 +11,304 @@ react_pkg = types.ModuleType("src.react")
 react_pkg.__path__ = [str(root / "src" / "react")]
 sys.modules.setdefault("src.react", react_pkg)
 
-from src.react.prompt_builder import (
-    build_analysis_system_prompt,
-    build_executor_state_section,
+from src.react.graph_state import CONVERGENCE_GUARD_STREAK_THRESHOLD
+from src.react.prompt_builder import build_executor_state_section
+from src.react.schema import GateEntry
+
+OPEN_GATE = {
+    "register_provenance": GateEntry(
+        status="open", evidence="pending", required_for=["null_deref"]
+    )
+}
+CLOSED_GATE = {
+    "register_provenance": GateEntry(
+        status="closed", evidence="rd+dis", required_for=["null_deref"]
+    )
+}
+ALL_DIMENSION_FACTS = [
+    "rd_word:0xff292187ae124a80=0x12",
+    "struct_type:irqaction",
+    "dis_symbol:show_interrupts",
+    "sym:show_interrupts@0xffffffffbc379660:t",
+]
+
+BASE_STATE = {
+    "step_count": 30,
+    "current_partial_dump": "partial",
+    "managed_active_hypotheses": [],
+    "messages": [],
+    "evidence_goal_version": 3,
+    "evidence_goal_status": "closed",
+}
+
+MENU_MARKERS = (
+    "Gate closure is not root-cause proof",
+    "Mandatory gates are still unresolved",
+    "prefer terminating with your conclusion",
+    "Untapped evidence dimensions",
+    "All four structured evidence dimensions",
+    "Pivot requirement",
 )
-from src.react.prompt_layers import LAYER0_SYSTEM_PROMPT_TEMPLATE
-from src.react.prompts import analysis_crash_prompt
-from src.react.schema import GateEntry, Hypothesis
 
 
-class PromptBuilderTests(unittest.TestCase):
-    def test_executor_state_section_includes_managed_state(self) -> None:
-        state = {
-            "step_count": 12,
-            "current_signature_class": "pointer_corruption",
-            "current_root_cause_class": "unknown",
-            "current_partial_dump": "partial",
-            "managed_active_hypotheses": [
-                Hypothesis(
-                    id="H1",
-                    label="pointer_corruption",
-                    rank=1,
-                    status="leading",
-                    evidence="latest provenance chain remains unresolved",
+def _render(**overrides: object) -> str:
+    state = dict(BASE_STATE)
+    state.update(overrides)
+    return build_executor_state_section(state)
+
+
+class ReplanProbeMenuTests(unittest.TestCase):
+    """C5：门控全部关闭但无根因时，提示词必须给出可执行的转向方向。"""
+
+    def test_dead_end_replaces_no_outstanding_gate(self) -> None:
+        rendered = _render(
+            current_signature_class="null_deref",
+            current_root_cause_class=None,
+            managed_gates=CLOSED_GATE,
+            current_evidence_goal=None,
+            last_action_status="duplicate",
+            duplicate_streak=3,
+            no_progress_streak=3,
+            replan_required=True,
+            evidence_facts=ALL_DIMENSION_FACTS,
+        )
+        self.assertNotIn("Current gate objective: no outstanding gate", rendered)
+        self.assertIn("all mandatory gates are closed but no root cause", rendered)
+        self.assertIn("Gate closure is not root-cause proof", rendered)
+        self.assertIn("signature_class=null_deref", rendered)
+        self.assertIn("Pivot requirement", rendered)
+
+    def test_no_menu_without_replan(self) -> None:
+        rendered = _render(
+            current_signature_class="null_deref",
+            current_root_cause_class=None,
+            managed_gates=OPEN_GATE,
+            current_evidence_goal={"goal_id": "register_provenance"},
+            last_action_status="executed",
+            duplicate_streak=0,
+            no_progress_streak=0,
+            replan_required=False,
+            evidence_facts=["rd_word:0x1=0x2"],
+        )
+        for marker in MENU_MARKERS:
+            self.assertNotIn(marker, rendered)
+        self.assertIn(
+            "Current gate objective: close register_provenance by tracing the bad register back",
+            rendered,
+        )
+
+    def test_known_root_cause_steers_to_termination(self) -> None:
+        """L1：根因已定且门控全关时，提示词只能剩下"本轮收尾"这一个指令。
+
+        原先只把"prefer terminating"与转向菜单并列输出，同一份提示词里
+        "继续换方向探测"与"立即收尾"互相矛盾；run D 中模型跟随后者失败，
+        收尾轮被 rd 探测占掉，tool_calls 被剥掉后整轮作废。
+        """
+        rendered = _render(
+            current_signature_class="null_deref",
+            current_root_cause_class="use_after_free",
+            managed_gates=CLOSED_GATE,
+            current_evidence_goal=None,
+            last_action_status="executed",
+            duplicate_streak=0,
+            no_progress_streak=1,
+            replan_required=True,
+            evidence_facts=ALL_DIMENSION_FACTS,
+        )
+        self.assertIn("TERMINATE ON THIS TURN", rendered)
+        self.assertIn("is NOT a prerequisite for concluding", rendered)
+        self.assertIn(
+            "terminate on this turn by emitting the final JSON conclusion", rendered
+        )
+        self.assertNotIn("root_cause_class is still unset", rendered)
+        # 转向菜单必须被压制，否则又构成"继续探索"的竞争指令
+        self.assertNotIn("Untapped evidence dimensions", rendered)
+        self.assertNotIn("All four structured evidence dimensions", rendered)
+        self.assertNotIn("Pivot requirement", rendered)
+        self.assertNotIn("prefer terminating with your conclusion", rendered)
+
+    def test_root_cause_with_open_gate_still_offers_pivot(self) -> None:
+        """根因已定但门控未全关时不能要求收尾，仍保留转向方向。"""
+        rendered = _render(
+            current_signature_class="null_deref",
+            current_root_cause_class="use_after_free",
+            managed_gates=OPEN_GATE,
+            current_evidence_goal={"goal_id": "register_provenance"},
+            last_action_status="rejected",
+            duplicate_streak=0,
+            no_progress_streak=2,
+            replan_required=True,
+            evidence_facts=["rd_word:0x1=0x2"],
+        )
+        self.assertIn("prefer terminating with your conclusion", rendered)
+        self.assertNotIn("TERMINATE ON THIS TURN", rendered)
+        self.assertIn("Untapped evidence dimensions", rendered)
+        self.assertIn("Pivot requirement", rendered)
+
+    def test_unregistered_gates_never_trigger_terminate_only(self) -> None:
+        """门控尚未注册（None/{}）时不得声称"每个强制门控都已关闭"。"""
+        for unregistered in (None, {}):
+            with self.subTest(managed_gates=unregistered):
+                rendered = _render(
+                    current_signature_class="null_deref",
+                    current_root_cause_class="use_after_free",
+                    managed_gates=unregistered,
+                    current_evidence_goal=None,
+                    last_action_status="rejected",
+                    duplicate_streak=0,
+                    no_progress_streak=2,
+                    replan_required=True,
+                    evidence_facts=["rd_word:0x1=0x2"],
                 )
-            ],
-            "managed_gates": {
-                "register_provenance": GateEntry(
-                    required_for=["pointer_corruption"],
-                    status="open",
-                    evidence="awaiting last-writer trace",
-                ),
-            },
-            "messages": [
-                AIMessage(
-                    content=json.dumps(
-                        {
-                            "step_id": 11,
-                            "reasoning": "Need a disassembly next.",
-                            "action": {
-                                "command_name": "run_script",
-                                "arguments": ["dis -rl ffffffff81000000"],
-                            },
-                            "is_conclusive": False,
-                            "signature_class": "pointer_corruption",
-                            "root_cause_class": None,
-                            "partial_dump": "partial",
-                        }
-                    )
+                self.assertNotIn("TERMINATE ON THIS TURN", rendered)
+                self.assertIn("Pivot requirement", rendered)
+
+    def test_open_gate_replan_never_claims_gates_closed(self) -> None:
+        """C1 的 DEDUP-BLOCKED 走 rejected 分支时门控可能仍未关闭。"""
+        rendered = _render(
+            current_signature_class="null_deref",
+            current_root_cause_class=None,
+            managed_gates=OPEN_GATE,
+            current_evidence_goal={"goal_id": "register_provenance"},
+            last_action_status="rejected",
+            duplicate_streak=0,
+            no_progress_streak=1,
+            replan_required=True,
+            evidence_facts=[],
+        )
+        self.assertNotIn("Gate closure is not root-cause proof", rendered)
+        self.assertIn("Mandatory gates are still unresolved", rendered)
+        self.assertIn(
+            "Current gate objective: close register_provenance by tracing",
+            rendered,
+        )
+
+    def test_unregistered_gates_never_claim_gates_closed(self) -> None:
+        """门控集合尚未注册时，`_format_unresolved_gates` 同样返回 "none"。
+
+        这表示"没有门控"，而非"门控已全部关闭"。早期步或
+        `_build_managed_gates` 返回 None 时会走到这里，若误判为门控穷尽，
+        就会把"每个强制门控都已关闭"这条错误事实注入提示词。
+        """
+        for unregistered in (None, {}):
+            with self.subTest(managed_gates=unregistered):
+                rendered = _render(
+                    current_signature_class="null_deref",
+                    current_root_cause_class=None,
+                    managed_gates=unregistered,
+                    current_evidence_goal=None,
+                    last_action_status="rejected",
+                    duplicate_streak=0,
+                    no_progress_streak=1,
+                    replan_required=True,
+                    evidence_facts=["rd_word:0x1=0x2"],
                 )
-            ],
-        }
+                self.assertNotIn("Gate closure is not root-cause proof", rendered)
+                self.assertNotIn("every mandatory gate", rendered)
+                self.assertIn("Mandatory gates are still unresolved", rendered)
 
-        section = build_executor_state_section(state)
-
-        self.assertIn("Current Investigation State (Step 12)", section)
-        self.assertIn("Signature class: pointer_corruption", section)
-        self.assertIn("register_provenance=open", section)
-        self.assertIn(
-            "Unresolved mandatory gates: register_provenance=open",
-            section,
+    def test_untapped_dimensions_exclude_observed_ones(self) -> None:
+        rendered = _render(
+            current_signature_class="pointer_corruption",
+            current_root_cause_class=None,
+            managed_gates=CLOSED_GATE,
+            current_evidence_goal=None,
+            last_action_status="duplicate",
+            duplicate_streak=3,
+            no_progress_streak=3,
+            replan_required=True,
+            evidence_facts=["rd_word:0x1=0x2", "dis_symbol:show_interrupts"],
         )
-        self.assertIn(
-            "Current gate objective: close register_provenance by tracing the bad register back to the exact source object and field/offset that produced the operand",
-            section,
+        self.assertIn("Untapped evidence dimensions", rendered)
+        self.assertIn("struct -o <type>", rendered)
+        self.assertIn("sym <address>", rendered)
+        self.assertNotIn("`rd <address> <count>`", rendered)
+        self.assertNotIn("dis -rl <symbol>", rendered)
+
+    def test_unknown_root_cause_never_claims_conclusion(self) -> None:
+        """P0-2：`current_root_cause_class="unknown"` 表示尚未定论。
+
+        `unknown` 是 RootCauseClass 的合法成员，`bool("unknown")` 为 True；
+        若按真值判断，门控全关时会输出 "TERMINATE ON THIS TURN: root_cause_class=unknown
+        is set"，等于告诉模型一个不存在的结论已经成立。
+        """
+        rendered = _render(
+            current_signature_class="null_deref",
+            current_root_cause_class="unknown",
+            managed_gates=CLOSED_GATE,
+            current_evidence_goal=None,
+            last_action_status="rejected",
+            duplicate_streak=0,
+            no_progress_streak=1,
+            replan_required=True,
+            evidence_facts=["rd_word:0x1=0x2"],
         )
-        self.assertIn(
-            "Action selection rule: if any mandatory gate remains open or blocked",
-            section,
+        self.assertNotIn("TERMINATE ON THIS TURN", rendered)
+        self.assertNotIn("prefer terminating with your conclusion", rendered)
+        self.assertIn("root_cause_class is still unset", rendered)
+
+    def test_no_progress_spin_offers_forced_choice_without_root_cause(self) -> None:
+        """P0-1：空转时提示词必须给出"提交结论 / 声明新取证目标"的二选一。"""
+        rendered = _render(
+            current_signature_class="null_deref",
+            current_root_cause_class=None,
+            managed_gates=CLOSED_GATE,
+            current_evidence_goal=None,
+            last_action_status="rejected",
+            duplicate_streak=0,
+            no_progress_streak=CONVERGENCE_GUARD_STREAK_THRESHOLD,
+            replan_required=True,
+            evidence_facts=ALL_DIMENSION_FACTS,
         )
-        self.assertIn(
-            "Reasoning gate contract: name target gate register_provenance, explain which concrete source object and field/offset must be identified next, and state how the next action will close the bad-register chain.",
-            section,
+        self.assertIn("COMMIT A CONCLUSION", rendered)
+        self.assertIn("DECLARE A NEW EVIDENCE TARGET", rendered)
+        self.assertIn("Re-reading the same bytes cannot produce new evidence", rendered)
+
+    def test_forced_choice_suppressed_once_root_cause_committed(self) -> None:
+        """已提交根因时走 TERMINATE 通道，不再并列二选一，避免自相矛盾。"""
+        rendered = _render(
+            current_signature_class="null_deref",
+            current_root_cause_class="use_after_free",
+            managed_gates=CLOSED_GATE,
+            current_evidence_goal=None,
+            last_action_status="rejected",
+            duplicate_streak=0,
+            no_progress_streak=CONVERGENCE_GUARD_STREAK_THRESHOLD,
+            replan_required=True,
+            evidence_facts=ALL_DIMENSION_FACTS,
         )
-        self.assertIn("Commands already run (do not repeat):", section)
-        self.assertIn("1. dis -rl ffffffff81000000", section)
+        self.assertIn("TERMINATE ON THIS TURN", rendered)
+        self.assertNotIn("COMMIT A CONCLUSION", rendered)
 
-    def test_executor_state_section_aggregates_command_families(self) -> None:
-        state = {
-            "step_count": 14,
-            "current_signature_class": "stack_corruption",
-            "current_root_cause_class": "unknown",
-            "current_partial_dump": "partial",
-            "managed_active_hypotheses": None,
-            "managed_gates": None,
-            "messages": [
-                AIMessage(
-                    content=json.dumps(
-                        {
-                            "step_id": 10,
-                            "reasoning": "Inspect stack region.",
-                            "action": {
-                                "command_name": "rd",
-                                "arguments": ["-x", "ffff8b817de179f0", "4"],
-                            },
-                            "is_conclusive": False,
-                        }
-                    )
-                ),
-                AIMessage(
-                    content=json.dumps(
-                        {
-                            "step_id": 11,
-                            "reasoning": "Inspect the next stack window.",
-                            "action": {
-                                "command_name": "rd",
-                                "arguments": ["-x", "ffff8b817de179e0", "8"],
-                            },
-                            "is_conclusive": False,
-                        }
-                    )
-                ),
-                AIMessage(
-                    content=json.dumps(
-                        {
-                            "step_id": 12,
-                            "reasoning": "Check the disassembly around the canary test.",
-                            "action": {
-                                "command_name": "dis",
-                                "arguments": ["-rl", "0xffffffffb4b1f419"],
-                            },
-                            "is_conclusive": False,
-                        }
-                    )
-                ),
-                AIMessage(
-                    content=json.dumps(
-                        {
-                            "step_id": 13,
-                            "reasoning": "Check one more stack window.",
-                            "action": {
-                                "command_name": "rd",
-                                "arguments": ["-x", "ffff8b817de17a80", "12"],
-                            },
-                            "is_conclusive": False,
-                        }
-                    )
-                ),
-            ],
-        }
-
-        section = build_executor_state_section(state)
-
-        self.assertIn(
-            "Commands already run (do not repeat):",
-            section,
+    def test_forced_choice_suppressed_below_streak_threshold(self) -> None:
+        rendered = _render(
+            current_signature_class="null_deref",
+            current_root_cause_class=None,
+            managed_gates=CLOSED_GATE,
+            current_evidence_goal=None,
+            last_action_status="rejected",
+            duplicate_streak=0,
+            no_progress_streak=CONVERGENCE_GUARD_STREAK_THRESHOLD - 1,
+            replan_required=True,
+            evidence_facts=["rd_word:0x1=0x2"],
         )
-        self.assertIn("1. rd -x ffff8b817de179f0 4", section)
-        self.assertIn("2. rd -x ffff8b817de179e0 8", section)
-        self.assertIn("3. dis -rl 0xffffffffb4b1f419", section)
-        self.assertIn("4. rd -x ffff8b817de17a80 12", section)
+        self.assertNotIn("COMMIT A CONCLUSION", rendered)
 
-    def test_dynamic_prompt_for_pointer_corruption_excludes_unrelated_overlays(
-        self,
-    ) -> None:
-        state = {
-            "step_count": 8,
-            "current_signature_class": "pointer_corruption",
-            "current_root_cause_class": "unknown",
-            "current_partial_dump": "partial",
-            "managed_active_hypotheses": None,
-            "managed_gates": {
-                "register_provenance": GateEntry(
-                    required_for=["pointer_corruption"],
-                    status="open",
-                    evidence="awaiting provenance closure",
-                ),
-                "local_corruption_exclusion": GateEntry(
-                    required_for=["pointer_corruption"],
-                    status="blocked",
-                    prerequisite="register_provenance",
-                    evidence="awaiting prerequisite",
-                ),
-            },
-            "messages": [HumanMessage(content="Initial Context")],
-        }
-
-        layered_prompt = build_analysis_system_prompt(state, is_last_step=False)
-
-        self.assertIn("Pointer Corruption Playbook", layered_prompt)
-        self.assertNotIn(
-            "## 3.12 DMA Memory Corruption (Stray DMA Write)", layered_prompt
-        )
-        self.assertNotIn("## Stack-Corruption Overlay", layered_prompt)
-        self.assertNotIn("## 3.8b Stack Protector Fast Path", layered_prompt)
-
-    def test_executor_state_section_advances_to_object_validation_with_open_gate(
-        self,
-    ) -> None:
-        state = {
-            "step_count": 12,
-            "current_signature_class": "stack_corruption",
-            "current_root_cause_class": "unknown",
-            "current_partial_dump": "partial",
-            "managed_active_hypotheses": None,
-            "managed_gates": {
-                "local_corruption_exclusion": GateEntry(
-                    required_for=["stack_corruption"],
-                    status="open",
-                    evidence="partial dump cannot fully exclude local overwrite",
-                ),
-            },
-            "messages": [HumanMessage(content="stack frames remain incomplete")],
-        }
-
-        section = build_executor_state_section(state)
-
-        self.assertIn(
-            "Current stage: Stage 4-5: object validation and source exclusion "
-            "(local_corruption_exclusion still pending)",
-            section,
-        )
-        self.assertIn(
-            "Current gate objective: advance local_corruption_exclusion toward closed or n/a with concrete evidence",
-            section,
-        )
-
-    def test_executor_state_section_advances_to_convergence_with_open_gate(
-        self,
-    ) -> None:
-        state = {
-            "step_count": 18,
-            "current_signature_class": "stack_corruption",
-            "current_root_cause_class": "unknown",
-            "current_partial_dump": "partial",
-            "managed_active_hypotheses": None,
-            "managed_gates": {
-                "local_corruption_exclusion": GateEntry(
-                    required_for=["stack_corruption"],
-                    status="open",
-                    evidence="partial dump cannot fully exclude local overwrite",
-                ),
-            },
-            "messages": [HumanMessage(content="stack frames remain incomplete")],
-        }
-
-        section = build_executor_state_section(state)
-
-        self.assertIn(
-            "Current stage: Stage 6: convergence and bounded conclusion "
-            "(local_corruption_exclusion still pending)",
-            section,
-        )
-
-    def test_executor_state_section_prioritizes_blocked_gate_prerequisite(self) -> None:
-        state = {
-            "step_count": 15,
-            "current_signature_class": "pointer_corruption",
-            "current_root_cause_class": "unknown",
-            "current_partial_dump": "partial",
-            "managed_active_hypotheses": None,
-            "managed_gates": {
-                "local_corruption_exclusion": GateEntry(
-                    required_for=["pointer_corruption"],
-                    status="closed",
-                    evidence="local object shape validated",
-                ),
-                "external_corruption_gate": GateEntry(
-                    required_for=["pointer_corruption"],
-                    status="blocked",
-                    prerequisite="field_type_classification",
-                    evidence="awaiting field typing before external attribution",
-                ),
-                "field_type_classification": GateEntry(
-                    required_for=["pointer_corruption"],
-                    status="open",
-                    evidence="driver-private field type remains unknown",
-                ),
-            },
-            "messages": [
-                HumanMessage(content="driver-private object remains unresolved")
-            ],
-        }
-
-        section = build_executor_state_section(state)
-
-        self.assertIn(
-            "Unresolved mandatory gates: external_corruption_gate=blocked, field_type_classification=open",
-            section,
-        )
-        self.assertIn(
-            "Current gate objective: unblock external_corruption_gate by advancing prerequisite field_type_classification",
-            section,
-        )
-        self.assertIn(
-            "Reasoning gate contract: name target gate external_corruption_gate, explain why the next action advances prerequisite field_type_classification, and state the expected evidence needed to unblock or advance the gate",
-            section,
-        )
-
-    def test_layer0_prompt_comes_from_explicit_prompt_layers_template(self) -> None:
-        state = {
-            "step_count": 4,
-            "current_signature_class": None,
-            "current_root_cause_class": None,
-            "current_partial_dump": "unknown",
-            "managed_active_hypotheses": None,
-            "managed_gates": None,
-            "messages": [HumanMessage(content="Initial Context")],
-        }
-
-        layered_prompt = build_analysis_system_prompt(state, is_last_step=False)
-
-        self.assertIn("# PART 0: GLOBAL FORBIDDEN OPERATIONS", layered_prompt)
-        self.assertIn("## 2.3 Analysis Flowchart (Layered Summary)", layered_prompt)
-        self.assertIn("## 3.1 Disassembly", layered_prompt)
-        self.assertIn("Next-action gate discipline:", layered_prompt)
-        self.assertIn(
-            "reasoning MUST explicitly name the target gate",
-            layered_prompt,
-        )
-        self.assertIn(
-            LAYER0_SYSTEM_PROMPT_TEMPLATE.splitlines()[0],
-            layered_prompt,
-        )
-
-    def test_dma_fragment_is_injected_only_when_state_supports_it(self) -> None:
-        state = {
-            "step_count": 14,
-            "current_signature_class": "pointer_corruption",
-            "current_root_cause_class": "dma_corruption",
-            "current_partial_dump": "full",
-            "managed_active_hypotheses": None,
-            "managed_gates": {
-                "local_corruption_exclusion": GateEntry(
-                    required_for=["pointer_corruption"],
-                    status="closed",
-                    evidence="task_struct and stack validated",
-                ),
-                "external_corruption_gate": GateEntry(
-                    required_for=["pointer_corruption"],
-                    status="open",
-                    prerequisite="local_corruption_exclusion",
-                    evidence="device-side overlap under investigation",
-                ),
-            },
-            "messages": [
-                HumanMessage(content="vmcore-dmesg includes iommu=pt and dma clues")
-            ],
-        }
-
-        layered_prompt = build_analysis_system_prompt(state, is_last_step=False)
-
-        self.assertIn("## 3.12 DMA Memory Corruption (Stray DMA Write)", layered_prompt)
-        self.assertIn("Current Investigation State (Step 14)", layered_prompt)
-
-    def test_driver_source_fragment_is_injected_when_function_pointer_cues_appear(
-        self,
-    ) -> None:
-        state = {
-            "step_count": 12,
-            "current_signature_class": "pointer_corruption",
-            "current_root_cause_class": "unknown",
-            "current_partial_dump": "partial",
-            "managed_active_hypotheses": None,
-            "managed_gates": {
-                "field_type_classification": GateEntry(
-                    required_for=["pointer_corruption"],
-                    status="open",
-                    evidence="awaiting source-level field typing",
+    def test_malformed_evidence_facts_are_tolerated(self) -> None:
+        for facts in (None, "notalist", [None, 42, "rd_word:0x1=0x2"]):
+            with self.subTest(evidence_facts=facts):
+                rendered = _render(
+                    current_signature_class="null_deref",
+                    current_root_cause_class=None,
+                    managed_gates=CLOSED_GATE,
+                    current_evidence_goal=None,
+                    last_action_status="duplicate",
+                    duplicate_streak=1,
+                    no_progress_streak=1,
+                    replan_required=True,
+                    evidence_facts=facts,
                 )
-            },
-            "messages": [
-                HumanMessage(
-                    content=(
-                        "object dump shows function pointer ffffffffc051ad40, use mod -s and sym "
-                        "to anchor _base_interrupt before guessing the type"
-                    )
-                )
-            ],
-        }
-
-        layered_prompt = build_analysis_system_prompt(state, is_last_step=False)
-
-        self.assertIn("## 3.13 Driver Source Correlation", layered_prompt)
-        self.assertIn("Function-pointer anchor", layered_prompt)
-        self.assertIn("Open-source cross-reference", layered_prompt)
-        self.assertIn("## Driver-Private Object Overlay", layered_prompt)
-
-    def test_layered_prompt_injects_dynamic_enum_contract(self) -> None:
-        state = {
-            "step_count": 6,
-            "current_signature_class": "stack_corruption",
-            "current_root_cause_class": "unknown",
-            "current_partial_dump": "partial",
-            "managed_active_hypotheses": None,
-            "managed_gates": None,
-            "messages": [HumanMessage(content="Initial Context")],
-        }
-
-        layered_prompt = build_analysis_system_prompt(state, is_last_step=False)
-
-        self.assertIn("[ENUM CONTRACT]", layered_prompt)
-        self.assertIn("'stack_corruption'", layered_prompt)
-        self.assertIn("'stack_protector' -> 'stack_corruption'", layered_prompt)
-        self.assertIn("'type_misuse' -> 'field_type_misuse'", layered_prompt)
-
-    def test_last_step_prompt_allows_bounded_nonconclusive_exit(self) -> None:
-        state = {
-            "step_count": 24,
-            "current_signature_class": "pointer_corruption",
-            "current_root_cause_class": "unknown",
-            "current_partial_dump": "partial",
-            "managed_active_hypotheses": None,
-            "managed_gates": {
-                "external_corruption_gate": GateEntry(
-                    required_for=["pointer_corruption"],
-                    status="open",
-                    evidence="module debuginfo is missing and DMA overlap remains unverified",
-                ),
-            },
-            "messages": [
-                HumanMessage(content="partial dump and missing debuginfo block closure")
-            ],
-        }
-
-        layered_prompt = build_analysis_system_prompt(state, is_last_step=True)
-
-        self.assertIn("This is your LAST STEP", layered_prompt)
-        self.assertIn(
-            "If mandatory verification gaps remain, set is_conclusive to false",
-            layered_prompt,
-        )
-        self.assertIn("leave final_diagnosis null", layered_prompt)
-        self.assertIn(
-            "you MAY emit gate updates for the specific required gates you are closing",
-            layered_prompt,
-        )
-        self.assertNotIn(
-            "Set is_conclusive to true and do NOT request any further tool calls",
-            layered_prompt,
-        )
-
-    def test_stack_protector_runtime_prompt_injects_stack_overlay_and_fast_path(
-        self,
-    ) -> None:
-        state = {
-            "step_count": 8,
-            "current_signature_class": "stack_corruption",
-            "current_root_cause_class": "unknown",
-            "current_partial_dump": "partial",
-            "managed_active_hypotheses": None,
-            "managed_gates": None,
-            "messages": [
-                HumanMessage(
-                    content=(
-                        "Kernel panic - not syncing: stack-protector: Kernel stack is corrupted in: "
-                        "search_module_extables\n"
-                        "stack corruption\n"
-                        "zone_statistics\n"
-                        "link_path_walk"
-                    )
-                )
-            ],
-        }
-
-        layered_prompt = build_analysis_system_prompt(state, is_last_step=False)
-
-        self.assertIn("## 3.8b Stack Protector Fast Path", layered_prompt)
-        self.assertIn(
-            "Call `resolve_stack_canary_slot <function>` as the DEFAULT and PREFERRED action",
-            layered_prompt,
-        )
-        # stack_protector_canary playbook Blame Guardrails should be present
-        self.assertIn(
-            "Do not blame link_path_walk, zone_statistics, handle_mm_fault, or any interrupted-path frame",
-            layered_prompt,
-        )
-        self.assertNotIn(
-            "The corruption source must be sought WITHIN the exception handler call chain itself",
-            layered_prompt,
-        )
-        # STACK_CORRUPTION_OVERLAY must be suppressed for stack_protector cases to avoid
-        # priority conflicts between S1-S5 generic methodology and the canary fast path
-        self.assertNotIn("## Stack-Corruption Overlay", layered_prompt)
-        self.assertNotIn(
-            "## 3.12 DMA Memory Corruption (Stray DMA Write)",
-            layered_prompt,
-        )
-        self.assertNotIn("## Driver-Private Object Overlay", layered_prompt)
-
-    def test_pointer_corruption_runtime_prompt_excludes_stack_overlay(self) -> None:
-        state = {
-            "step_count": 10,
-            "current_signature_class": "pointer_corruption",
-            "current_root_cause_class": "unknown",
-            "current_partial_dump": "partial",
-            "managed_active_hypotheses": None,
-            "managed_gates": None,
-            "messages": [
-                HumanMessage(
-                    content=(
-                        "pointer corruption with function pointer anchor and mod -s cue in a third-party driver"
-                    )
-                )
-            ],
-        }
-
-        layered_prompt = build_analysis_system_prompt(state, is_last_step=False)
-
-        self.assertIn("Pointer Corruption Playbook", layered_prompt)
-        self.assertIn("## Driver-Private Object Overlay", layered_prompt)
-        self.assertNotIn("## Stack-Corruption Overlay", layered_prompt)
-        self.assertNotIn(
-            "When the panic string explicitly says stack-protector failure in function F",
-            layered_prompt,
-        )
-
-    def test_null_deref_runtime_prompt_injects_driver_source_guidance(self) -> None:
-        state = {
-            "step_count": 7,
-            "current_signature_class": "null_deref",
-            "current_root_cause_class": "unknown",
-            "current_partial_dump": "partial",
-            "managed_active_hypotheses": None,
-            "managed_gates": None,
-            "messages": [
-                HumanMessage(
-                    content=(
-                        "irq_desc ownership shows struct device.driver = mlx5_core_driver, "
-                        "msi_desc points to a third-party device, and a dma write remains plausible"
-                    )
-                )
-            ],
-        }
-
-        layered_prompt = build_analysis_system_prompt(state, is_last_step=False)
-
-        self.assertIn("## 3.13 Driver Source Correlation", layered_prompt)
-        self.assertIn("## Driver-Private Object Overlay", layered_prompt)
+                self.assertIn("Pivot requirement", rendered)
 
 
 if __name__ == "__main__":

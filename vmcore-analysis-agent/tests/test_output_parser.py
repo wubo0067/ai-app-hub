@@ -1,915 +1,208 @@
+import sys
+import types
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
+from pathlib import Path
 
-from langchain_core.messages import HumanMessage, ToolMessage
+root = Path(__file__).resolve().parents[1]
+src_pkg = types.ModuleType("src")
+src_pkg.__path__ = [str(root / "src")]
+sys.modules.setdefault("src", src_pkg)
+react_pkg = types.ModuleType("src.react")
+react_pkg.__path__ = [str(root / "src" / "react")]
+sys.modules.setdefault("src.react", react_pkg)
 
 from src.react.output_parser import (
-    apply_executor_consistency_audit,
-    build_tool_calls,
-    repair_structured_output,
-    render_action_arguments,
+    _detect_corrupted_base_null_deref,
+    _parse_kernel_frame_registers,
+    apply_value_conflict_audit,
 )
-from src.react.schema import FinalDiagnosis, SuspectCode, VMCoreLLMAnalysisStep
+
+CONFLICT_FACT = (
+    "conflict:object_does_not_match_type:irqaction@0xff292187ae124a80:"
+    "next@0x18=0x12,thread_fn@0x20=0x5c"
+)
 
 
-class OutputParserAuditTests(unittest.TestCase):
-    def test_promotes_standalone_mcp_tool_out_of_run_script(self) -> None:
-        llm_step = VMCoreLLMAnalysisStep.model_validate(
-            {
-                "step_id": 3,
-                "reasoning": "The next diagnostic action is to resolve the canary slot using the tool.",
-                "action": {
-                    "command_name": "run_script",
-                    "arguments": ["resolve_stack_canary_slot search_module_extables"],
-                },
-                "is_conclusive": False,
-                "signature_class": "stack_corruption",
-                "root_cause_class": None,
-                "partial_dump": "partial",
-            }
+def _make_conclusive_step(**overrides: object):
+    from src.react.schema import VMCoreLLMAnalysisStep
+
+    payload: dict[str, object] = {
+        "step_id": 22,
+        "reasoning": "The irq_desc.action object looks like a valid irqaction.",
+        "action": None,
+        "is_conclusive": True,
+        "signature_class": "pointer_corruption",
+        "root_cause_class": "wild_pointer",
+        "partial_dump": "partial",
+        "confidence": "high",
+        "final_diagnosis": {
+            "crash_type": "NULL pointer dereference",
+            "panic_string": "BUG: unable to handle kernel NULL pointer dereference",
+            "faulting_instruction": "ffffffffbc3798a0",
+            "root_cause": "A wild pointer in the irqaction chain.",
+            "detailed_analysis": "The handler field is corrupted.",
+            "suspect_code": {
+                "file": "kernel/irq/manage.c",
+                "function": "setup_irq",
+                "line": "unknown",
+            },
+            "evidence": ["irq_desc.action points at the handler payload"],
+        },
+        "fix_suggestion": "Validate the irqaction pointer before use.",
+    }
+    payload.update(overrides)
+    return VMCoreLLMAnalysisStep.model_validate(payload)
+
+# crash `bt` 风格：RIP 为裸内核地址（失败日志 new 5.txt 的实际格式）。
+CRASH_BT_FRAME = """
+[exception RIP: show_interrupts+576]
+RIP: ffffffffbc3798a0  RSP: ff52052b5eecbe10  RFLAGS: 00010006
+RAX: 0000000000000000  RBX: ff2922871e6c1c00  RCX: 00100a00ffffff04
+RDX: ff292288830d2000  RSI: 0000000000000000  RDI: ff292288830d086a
+RBP: 0000000000000012   R8: 0000000000002000   R9: 0000000000000000
+R10: ff292288830d2000  R11: ff292288830d0859  R12: ffffffffbd50e585
+R13: 00000000000000c0  R14: ff2921879ce79000  R15: ff292187ae124a80
+ORIG_RAX: ffffffffffffffff  CS: 0010  SS: 0018
+"""
+
+# dmesg Oops 风格：RIP 为段前缀 + 符号（``RIP: 0010:sym+off``），该行本身
+# 无法被寄存器正则匹配；随后紧跟用户态帧，其 RIP 带 0x 前缀（``0033:0x7f...``）
+# 同样无法被寄存器正则匹配。修复前：起点行匹配失败导致整帧解析为 0 个寄存器；
+# 且用户态帧边界漏检，其小整数寄存器（RAX/RBX=0x6）混入内核帧，与故障地址
+# 凑出多个假候选，升级被误判为"证据不足"而放弃。
+DMESG_FRAME_WITH_USER_FRAME = """
+BUG: unable to handle kernel NULL pointer dereference at 0000000000000062
+RIP: 0010:show_interrupts+0x240/0x5a0
+RSP: 0018:ffffae024a1c3d98  EFLAGS: 00010286
+RAX: 0000000000000000 RBX: ffff912345678000 RCX: 0000000000000000
+RDX: 0000000000000000 RSI: 0000000000000000 RDI: ffff912345671000
+RBP: 0000000000000012 R08: 0000000000002000 R09: 0000000000000000
+R10: 0000000000000000 R11: 0000000000000000 R12: ffffffffa1234567
+RIP: 0033:0x7f8a12345678  RSP: 002b:00007ffd12340000 EFLAGS: 00000246
+RAX: 0000000000000006 RBX: 0000000000000006 RCX: 00007f8a12345678
+"""
+
+
+class KernelFrameRegisterParsingTests(unittest.TestCase):
+    def test_crash_bt_bare_hex_rip(self) -> None:
+        regs = _parse_kernel_frame_registers(CRASH_BT_FRAME)
+        self.assertEqual(regs.get("RBP"), [0x12])
+        self.assertIn("R15", regs)
+
+    def test_dmesg_symbol_rip_still_collects_registers(self) -> None:
+        """回归：RIP 为 ``0010:sym+off`` 时起点行无法匹配寄存器，
+        修复前整帧解析为 0 个寄存器，损坏基址升级被静默禁用。"""
+        regs = _parse_kernel_frame_registers(DMESG_FRAME_WITH_USER_FRAME)
+        self.assertEqual(regs.get("RBP"), [0x12])
+        self.assertGreater(len(regs), 10)
+
+    def test_user_frame_excluded_despite_unparseable_rip(self) -> None:
+        """回归：用户态帧 ``RIP: 0033:0x7f...`` 无法被寄存器正则匹配，
+        修复前帧边界漏检，用户态小整数寄存器混入内核帧。"""
+        regs = _parse_kernel_frame_registers(DMESG_FRAME_WITH_USER_FRAME)
+        self.assertNotIn(0x6, regs.get("RBX", []))
+        self.assertNotIn(0x6, regs.get("RAX", []))
+
+    def test_dmesg_format_escalates_corrupted_base(self) -> None:
+        det = _detect_corrupted_base_null_deref(DMESG_FRAME_WITH_USER_FRAME)
+        self.assertIsNotNone(det)
+        assert det is not None
+        self.assertEqual(det["register"], "RBP")
+        self.assertEqual(det["register_value"], 0x12)
+        self.assertEqual(det["fault_addr"], 0x62)
+        self.assertEqual(det["offset"], 0x50)
+
+    def test_unparseable_frame_returns_empty(self) -> None:
+        """定位到内核帧但完全解析不出寄存器时返回空字典（调用方放弃升级）。"""
+        text = (
+            "BUG: unable to handle kernel NULL pointer dereference at 0000000000000062\n"
+            "RIP: 0010:show_interrupts+0x240/0x5a0\n"
+            "Code: 48 8b 95 50 00 00 00 48 89 d8 <48> 8b 92 50 00 00 00\n"
         )
+        self.assertEqual(_parse_kernel_frame_registers(text), {})
 
-        with patch(
-            "src.react.output_parser.get_registered_tool_provider",
-            return_value=SimpleNamespace(package_name="stack_canary"),
-        ):
-            audited = apply_executor_consistency_audit(llm_step, state={})
 
-        self.assertEqual(audited.action.command_name, "resolve_stack_canary_slot")
-        self.assertEqual(audited.action.arguments, ["search_module_extables"])
-        self.assertIn(
-            "run_script wrapped a standalone MCP tool call",
-            audited.additional_notes,
+class ValueConflictAuditTests(unittest.TestCase):
+    """[阶段 5] 取值级矛盾审计：已读内存与结构体布局不相容时的降级与提示注入。"""
+
+    def test_downgrades_conclusive_step(self) -> None:
+        step = _make_conclusive_step()
+        audited = apply_value_conflict_audit(
+            step, {"value_conflicts": [CONFLICT_FACT]}, log_prefix="test"
         )
-
-    def test_keeps_real_crash_run_script_unchanged(self) -> None:
-        llm_step = VMCoreLLMAnalysisStep.model_validate(
-            {
-                "step_id": 4,
-                "reasoning": "Bundle two crash commands in one session.",
-                "action": {
-                    "command_name": "run_script",
-                    "arguments": ["sym ffffffffb4b1f419\ndis -rl ffffffffb4b1f419"],
-                },
-                "is_conclusive": False,
-                "signature_class": "stack_corruption",
-                "root_cause_class": None,
-                "partial_dump": "partial",
-            }
-        )
-
-        audited = apply_executor_consistency_audit(llm_step, state={})
-
-        self.assertEqual(audited.action.command_name, "run_script")
-        self.assertEqual(
-            audited.action.arguments,
-            ["sym ffffffffb4b1f419\ndis -rl ffffffffb4b1f419"],
-        )
-
-    def test_corrects_gpf_signature_for_oops_0000_kernel_paging_request(self) -> None:
-        state = {
-            "messages": [
-                HumanMessage(
-                    content=(
-                        "BUG: unable to handle kernel paging request at 000000e500080008\n"
-                        "Oops: 0000 [#1] SMP NOPTI\n"
-                        "RIP: 0010:ffffffffc051a3c4\n"
-                    )
-                )
-            ]
-        }
-        llm_step = VMCoreLLMAnalysisStep.model_validate(
-            {
-                "step_id": 2,
-                "reasoning": "The crash should be treated as a protection fault first.",
-                "action": {
-                    "command_name": "dis",
-                    "arguments": ["-rl", "ffffffffc051a3c4"],
-                },
-                "is_conclusive": False,
-                "signature_class": "general_protection_fault",
-                "root_cause_class": None,
-                "partial_dump": "partial",
-            }
-        )
-
-        audited = apply_executor_consistency_audit(llm_step, state)
-
-        self.assertEqual(audited.signature_class, "pointer_corruption")
-        self.assertIn(
-            "corrected from general_protection_fault to pointer_corruption",
-            audited.reasoning,
-        )
-        self.assertIn("page-fault context", audited.additional_notes)
-
-    def test_normalizes_final_diagnosis_page_fault_wording(self) -> None:
-        state = {
-            "messages": [
-                HumanMessage(
-                    content=(
-                        "BUG: unable to handle kernel paging request at 000000e500080008\n"
-                        "Oops: 0000 [#1] SMP NOPTI\n"
-                        "RIP: 0010:ffffffffc051a3c4\n"
-                    )
-                )
-            ]
-        }
-        llm_step = VMCoreLLMAnalysisStep.model_validate(
-            {
-                "step_id": 12,
-                "reasoning": "The evidence chain has converged.",
-                "action": None,
-                "is_conclusive": True,
-                "signature_class": "pointer_corruption",
-                "root_cause_class": "wild_pointer",
-                "partial_dump": "partial",
-                "confidence": "high",
-                "final_diagnosis": FinalDiagnosis(
-                    crash_type="general protection fault",
-                    panic_string="BUG: unable to handle kernel paging request at 000000e500080008",
-                    faulting_instruction="movzbl (%rcx,%rax,1),%eax",
-                    root_cause=(
-                        "A wild pointer led to a general protection fault in interrupt context."
-                    ),
-                    detailed_analysis=(
-                        "The register provenance points to a corrupted queue pointer, and the final "
-                        "failure manifests as a general protection fault during queue processing."
-                    ),
-                    suspect_code=SuspectCode(
-                        file="drivers/scsi/mpt3sas/mpt3sas_base.c",
-                        function="_base_process_reply_queue",
-                        line="unknown",
-                    ),
-                    evidence=[
-                        "Oops: 0000",
-                        "BUG: unable to handle kernel paging request",
-                    ],
-                ),
-            }
-        )
-
-        audited = apply_executor_consistency_audit(llm_step, state)
-
-        self.assertEqual(
-            audited.final_diagnosis.crash_type,
-            "kernel paging request",
-        )
-        self.assertIn("page fault", audited.final_diagnosis.root_cause.lower())
-        self.assertNotIn(
-            "general protection fault",
-            audited.final_diagnosis.detailed_analysis.lower(),
-        )
-        self.assertIn(
-            "page-fault context wording corrected in final_diagnosis.crash_type",
-            audited.additional_notes,
-        )
-
-    def test_downgrades_reverse_slab_oob_claim(self) -> None:
-        llm_step = VMCoreLLMAnalysisStep.model_validate(
-            {
-                "step_id": 18,
-                "reasoning": (
-                    "In kmalloc slab, object 0xff1148f4a2171f00 performed OOB overwrite "
-                    "into previous slot 0xff1148f4a2171e80 at lower address."
-                ),
-                "action": None,
-                "is_conclusive": True,
-                "signature_class": "pointer_corruption",
-                "root_cause_class": "out_of_bounds",
-                "partial_dump": "partial",
-                "confidence": "high",
-                "final_diagnosis": FinalDiagnosis(
-                    crash_type="kernel paging request",
-                    panic_string="BUG: unable to handle kernel paging request",
-                    faulting_instruction="mov (%rax),%rbx",
-                    root_cause=(
-                        "mpt3sas reverse-direction slab OOB from 0xff1148f4a2171f00 "
-                        "to 0xff1148f4a2171e80 overwrote irqaction."
-                    ),
-                    detailed_analysis="Address adjacency proves reverse overwrite.",
-                    suspect_code=SuspectCode(
-                        file="drivers/scsi/mpt3sas/mpt3sas_base.c",
-                        function="_base_interrupt",
-                        line="unknown",
-                    ),
-                    evidence=["slab OOB", "0xff1148f4a2171f00 -> 0xff1148f4a2171e80"],
-                ),
-            }
-        )
-
-        audited = apply_executor_consistency_audit(llm_step, state={})
 
         self.assertFalse(audited.is_conclusive)
         self.assertIsNone(audited.final_diagnosis)
+        self.assertIsNone(audited.fix_suggestion)
         self.assertEqual(audited.root_cause_class, "unknown")
         self.assertEqual(audited.confidence, "low")
-        self.assertIn("reverse slab OOB causality claim", audited.additional_notes)
+        self.assertIn("value-level contradiction", audited.reasoning)
+        self.assertIn("next@0x18=0x12", audited.additional_notes)
 
-    def test_keeps_non_reverse_slab_oob_claim_unchanged(self) -> None:
-        llm_step = VMCoreLLMAnalysisStep.model_validate(
-            {
-                "step_id": 19,
-                "reasoning": (
-                    "In kmalloc slab, object 0xff1148f4a2171e80 overflowed into adjacent "
-                    "slot 0xff1148f4a2171f00 at higher address."
-                ),
-                "action": None,
-                "is_conclusive": True,
-                "signature_class": "pointer_corruption",
-                "root_cause_class": "out_of_bounds",
-                "partial_dump": "partial",
-                "confidence": "high",
-            }
-        )
-
-        audited = apply_executor_consistency_audit(llm_step, state={})
+    def test_noop_when_no_conflicts(self) -> None:
+        step = _make_conclusive_step()
+        audited = apply_value_conflict_audit(step, {"value_conflicts": []}, log_prefix="test")
 
         self.assertTrue(audited.is_conclusive)
-        self.assertEqual(audited.root_cause_class, "out_of_bounds")
+        self.assertIsNotNone(audited.final_diagnosis)
+        self.assertEqual(audited.root_cause_class, "wild_pointer")
         self.assertEqual(audited.confidence, "high")
 
-    def test_downgrades_dma_conclusion_without_minimum_evidence_gate(self) -> None:
-        llm_step = VMCoreLLMAnalysisStep.model_validate(
-            {
-                "step_id": 20,
-                "reasoning": (
-                    "No software buffer overflow from adjacent objects can explain the presence "
-                    "of a precise mpt3sas log-info code deep within the slab page. DMA range "
-                    "overlap proof is missing, but stray DMA is still the most likely root cause."
-                ),
-                "action": None,
-                "is_conclusive": True,
-                "signature_class": "pointer_corruption",
-                "root_cause_class": "dma_corruption",
-                "partial_dump": "partial",
-                "confidence": "medium",
-                "final_diagnosis": FinalDiagnosis(
-                    crash_type="pointer_corruption",
-                    panic_string="BUG: unable to handle kernel paging request",
-                    faulting_instruction="mov 0x50(%rbp),%rdx",
-                    root_cause="Stray DMA write from mpt3sas corrupted irqaction.",
-                    detailed_analysis=(
-                        "A matching log_info value appears in the slab page, but no DMA-range "
-                        "overlap or IOMMU evidence was verified."
-                    ),
-                    suspect_code=SuspectCode(
-                        file="drivers/scsi/mpt3sas/mpt3sas_base.c",
-                        function="unknown",
-                        line="unknown",
-                    ),
-                    evidence=["0x30030109 appears in adjacent slab slot"],
-                ),
-            }
+    def test_idempotent_when_model_already_referenced_the_object(self) -> None:
+        """模型已自行写出该对象基址时不再注入审计说明（避免重复唠叨）。"""
+        step = _make_conclusive_step(
+            reasoning="irq_desc.action at 0xff292187ae124a80 does not look like an irqaction."
         )
-
-        audited = apply_executor_consistency_audit(llm_step, state={})
-
-        self.assertFalse(audited.is_conclusive)
-        self.assertIsNone(audited.final_diagnosis)
-        self.assertEqual(audited.root_cause_class, "unknown")
-        self.assertEqual(audited.confidence, "low")
-        self.assertIn("DMA promotion gate not satisfied", audited.additional_notes)
-        self.assertIn("possible hypothesis", audited.reasoning)
-
-    def test_keeps_dma_conclusion_with_two_evidence_families(self) -> None:
-        llm_step = VMCoreLLMAnalysisStep.model_validate(
-            {
-                "step_id": 21,
-                "reasoning": (
-                    "vtop confirmed physical-page overlap with reply_frames_dma, and an IOMMU "
-                    "fault log tied the remapping error to the same controller."
-                ),
-                "action": None,
-                "is_conclusive": True,
-                "signature_class": "pointer_corruption",
-                "root_cause_class": "dma_corruption",
-                "partial_dump": "partial",
-                "confidence": "high",
-            }
+        audited = apply_value_conflict_audit(
+            step, {"value_conflicts": [CONFLICT_FACT]}, log_prefix="test"
         )
-
-        audited = apply_executor_consistency_audit(llm_step, state={})
 
         self.assertTrue(audited.is_conclusive)
-        self.assertEqual(audited.root_cause_class, "dma_corruption")
         self.assertEqual(audited.confidence, "high")
+        self.assertNotIn("value-level contradiction", audited.reasoning)
 
-    def test_downgrades_uaf_claim_when_kmem_slot_is_allocated(self) -> None:
-        state = {
-            "messages": [
-                HumanMessage(
-                    content=(
-                        "crash> kmem -S ff1148f4a2171e80\n"
-                        "CACHE             OBJSIZE  ALLOCATED     TOTAL  SLABS  SSIZE  NAME\n"
-                        "ff1148f440004c40      128      78879    211008   3297     8k  kmalloc-128\n"
-                        "  FREE / [ALLOCATED]\n"
-                        "  [ff1148f4a2171e80]\n"
-                    )
-                )
-            ]
-        }
-        llm_step = VMCoreLLMAnalysisStep.model_validate(
-            {
-                "step_id": 22,
-                "reasoning": (
-                    "This is consistent with a use-after-free: the original irqaction was "
-                    "freed and its memory reused for another kmalloc-128 allocation. The slab "
-                    "shows the page fully allocated, but the pointer in irq_desc->action is stale."
-                ),
-                "action": None,
-                "is_conclusive": True,
-                "signature_class": "pointer_corruption",
-                "root_cause_class": "use_after_free",
-                "partial_dump": "partial",
-                "confidence": "high",
-                "final_diagnosis": FinalDiagnosis(
-                    crash_type="kernel paging request",
-                    panic_string="BUG: unable to handle kernel paging request",
-                    faulting_instruction="mov 0x50(%rbp),%rdx",
-                    root_cause="A freed irqaction was reused and later dereferenced.",
-                    detailed_analysis="Allocated slot was treated as stale UAF without free evidence.",
-                    suspect_code=SuspectCode(
-                        file="kernel/irq/proc.c",
-                        function="show_interrupts",
-                        line="unknown",
-                    ),
-                    evidence=["kmem -S ff1148f4a2171e80", "FREE / [ALLOCATED]"],
-                ),
-            }
+    def test_force_wrapup_injects_note_without_downgrading(self) -> None:
+        """强制收口/最后一步：注入矛盾告警但不撤销结论，避免只剩 unknown。"""
+        step = _make_conclusive_step()
+        audited = apply_value_conflict_audit(
+            step,
+            {"value_conflicts": [CONFLICT_FACT]},
+            log_prefix="test",
+            force_wrapup=True,
         )
 
-        audited = apply_executor_consistency_audit(llm_step, state)
-
-        self.assertFalse(audited.is_conclusive)
-        self.assertIsNone(audited.final_diagnosis)
-        self.assertEqual(audited.root_cause_class, "pointer_corruption")
-        self.assertEqual(audited.corruption_mechanism, "write_corruption")
-        self.assertEqual(audited.confidence, "low")
-        self.assertIn(
-            "candidate slab slot is currently allocated", audited.additional_notes
-        )
-
-    def test_keeps_allocated_slot_uaf_when_lifetime_evidence_exists(self) -> None:
-        state = {
-            "messages": [
-                HumanMessage(
-                    content=(
-                        "crash> kmem -S ff1148f4a2171e80\n"
-                        "  FREE / [ALLOCATED]\n"
-                        "  [ff1148f4a2171e80]\n"
-                    )
-                )
-            ]
-        }
-        llm_step = VMCoreLLMAnalysisStep.model_validate(
-            {
-                "step_id": 23,
-                "reasoning": (
-                    "The slot is currently allocated, but alloc/free-stack evidence shows the "
-                    "pointer survived free and now references a replacement object instance after reuse; "
-                    "the retained stale reference confirms use-after-free with reallocation."
-                ),
-                "action": None,
-                "is_conclusive": True,
-                "signature_class": "pointer_corruption",
-                "root_cause_class": "use_after_free",
-                "partial_dump": "partial",
-                "confidence": "high",
-            }
-        )
-
-        audited = apply_executor_consistency_audit(llm_step, state)
-
+        # 告警仍写入，让最终结论带上矛盾提示
+        self.assertIn("value-level contradiction", audited.reasoning)
+        # 但结论、根因、置信度保持不变
         self.assertTrue(audited.is_conclusive)
-        self.assertEqual(audited.root_cause_class, "use_after_free")
+        self.assertIsNotNone(audited.final_diagnosis)
+        self.assertEqual(audited.root_cause_class, "wild_pointer")
         self.assertEqual(audited.confidence, "high")
 
-    def test_prefix_overwrite_pattern_steers_mechanism_away_from_uaf(self) -> None:
-        state = {
-            "messages": [
-                HumanMessage(
-                    content=(
-                        "crash> kmem -S ff1148f4a2171e80\n"
-                        "  FREE / [ALLOCATED]\n"
-                        "  [ff1148f4a2171e80]\n"
-                    )
-                ),
-                ToolMessage(
-                    content=(
-                        "crash> rd -x ff1148f4a2171e80 16\n"
-                        "ff1148f4a2171e80:  0000000004060001 0000000000000000\n"
-                        "ff1148f4a2171e90:  0100070000000000 0000800c00000010\n"
-                        "ff1148f4a2171ea0:  0008002004690002 0001000000010000\n"
-                        "ff1148f4a2171eb0:  0020ffe000080002 0000000200000003\n"
-                        "ff1148f4a2171ec0:  0000000000000000 0000000000000000\n"
-                        "ff1148f4a2171ed0:  0000000000000000 0000000000000000\n"
-                        "ff1148f4a2171ee0:  0000000000000000 0000000000000000\n"
-                        "ff1148f4a2171ef0:  0000000000000000 0000000000000000\n"
-                    ),
-                    tool_call_id="call_9",
-                    name="rd",
-                ),
-            ]
-        }
-        llm_step = VMCoreLLMAnalysisStep.model_validate(
-            {
-                "step_id": 24,
-                "reasoning": (
-                    "This still looks like use-after-free or an adjacent buffer overflow, because the "
-                    "irqaction does not match the traversal context."
-                ),
-                "action": None,
-                "is_conclusive": False,
-                "signature_class": "pointer_corruption",
-                "root_cause_class": "unknown",
-                "partial_dump": "partial",
-            }
+    def test_explicit_resolution_prunes_conflict(self) -> None:
+        """模型写出"已核对冲突<Type>@0x<base>"后，该矛盾从未解决列表剔除。"""
+        from src.react.output_parser import unresolved_value_conflicts
+
+        step = _make_conclusive_step(
+            reasoning=(
+                "已核对冲突 irqaction@0xff292187ae124a80：该地址是 per-cpu 偏移而非"
+                "真实指针，next/thread_fn 的小值是编码值，不是损坏。"
+            )
         )
-
-        audited = apply_executor_consistency_audit(llm_step, state)
-
-        self.assertEqual(audited.root_cause_class, "pointer_corruption")
-        self.assertEqual(audited.corruption_mechanism, "write_corruption")
-        self.assertIn("prefix-overwrite signature", audited.additional_notes)
-
-    def test_does_not_retrigger_allocated_uaf_audit_for_hedged_candidate_list(
-        self,
-    ) -> None:
-        state = {
-            "messages": [
-                HumanMessage(
-                    content=(
-                        "crash> kmem -S ff1148f4a2171e80\n"
-                        "  FREE / [ALLOCATED]\n"
-                        "  [ff1148f4a2171e80]\n"
-                    )
-                )
-            ]
-        }
-        llm_step = VMCoreLLMAnalysisStep.model_validate(
-            {
-                "step_id": 26,
-                "reasoning": (
-                    "Executor audit: kmem -S context shows the candidate slab slot is currently allocated, "
-                    "but the analysis still asserted freed/stale-pointer UAF or free-then-reuse without separate "
-                    "positive lifetime evidence. ALLOCATED rules out a simple freed-object explanation; absent "
-                    "independent lifetime evidence, treat this as live-slot overwrite, type confusion, or another "
-                    "non-UAF mechanism instead of concluding use-after-free. "
-                    "The exact corruption mechanism (use-after-free, out-of-bounds, or DMA) cannot be determined from this partial dump."
-                ),
-                "action": None,
-                "is_conclusive": False,
-                "signature_class": "pointer_corruption",
-                "root_cause_class": "pointer_corruption",
-                "partial_dump": "partial",
-            }
+        remaining = unresolved_value_conflicts(
+            step, {"value_conflicts": [CONFLICT_FACT]}
         )
+        self.assertEqual(remaining, [])
 
-        audited = apply_executor_consistency_audit(llm_step, state)
+    def test_unresolved_conflict_is_kept(self) -> None:
+        """未显式核对时矛盾保留在状态中（不会被误剔除）。"""
+        from src.react.output_parser import unresolved_value_conflicts
 
-        self.assertEqual(audited.reasoning, llm_step.reasoning)
-        self.assertIsNone(audited.additional_notes)
-
-    def test_render_action_arguments_quotes_grep_alternation_pattern(self) -> None:
-        rendered = render_action_arguments(
-            ["-m", "|", "grep", "-Ei", "dma|iommu|mapping|buffer"]
+        step = _make_conclusive_step(reasoning="still investigating the irqaction chain")
+        remaining = unresolved_value_conflicts(
+            step, {"value_conflicts": [CONFLICT_FACT]}
         )
-
-        self.assertEqual(rendered, '-m | grep -Ei "dma|iommu|mapping|buffer"')
-
-    def test_render_action_arguments_quotes_plain_grep_pattern_with_pipe_chars(
-        self,
-    ) -> None:
-        rendered = render_action_arguments(
-            ["-m", "|", "grep", "-i", "dma|iommu|mapping|buffer", "|", "head", "-10"]
-        )
-
-        self.assertEqual(
-            rendered,
-            '-m | grep -i "dma|iommu|mapping|buffer" | head -10',
-        )
-
-    def test_render_action_arguments_preserves_existing_grep_quotes(self) -> None:
-        rendered = render_action_arguments(
-            [
-                "-m",
-                "|",
-                "grep",
-                "-i",
-                "mpt3sas",
-                "|",
-                "grep",
-                "-Ei",
-                '"fail|error|timeout|fault|xid|mmu|fifo|dma|map|reset"',
-            ]
-        )
-
-        self.assertEqual(
-            rendered,
-            '-m | grep -i mpt3sas | grep -Ei "fail|error|timeout|fault|xid|mmu|fifo|dma|map|reset"',
-        )
-
-    def test_build_tool_calls_preserves_grep_pattern_quoting(self) -> None:
-        llm_step = VMCoreLLMAnalysisStep.model_validate(
-            {
-                "step_id": 8,
-                "reasoning": "Need a filtered log query next.",
-                "action": {
-                    "command_name": "log",
-                    "arguments": [
-                        "-m",
-                        "|",
-                        "grep",
-                        "-Ei",
-                        "dma|iommu|mapping|buffer",
-                    ],
-                },
-                "is_conclusive": False,
-                "signature_class": "pointer_corruption",
-                "root_cause_class": None,
-                "partial_dump": "partial",
-            }
-        )
-
-        tool_calls = build_tool_calls(llm_step, is_last_step=False)
-
-        self.assertEqual(tool_calls[0]["name"], "log")
-        self.assertEqual(
-            tool_calls[0]["args"]["command"],
-            '-m | grep -Ei "dma|iommu|mapping|buffer"',
-        )
-
-    def test_build_tool_calls_quotes_plain_grep_pattern_with_pipe_chars(self) -> None:
-        llm_step = VMCoreLLMAnalysisStep.model_validate(
-            {
-                "step_id": 9,
-                "reasoning": "Need a broader filtered log query next.",
-                "action": {
-                    "command_name": "log",
-                    "arguments": [
-                        "-m",
-                        "|",
-                        "grep",
-                        "-i",
-                        "dma|iommu|mapping|buffer",
-                        "|",
-                        "head",
-                        "-10",
-                    ],
-                },
-                "is_conclusive": False,
-                "signature_class": "pointer_corruption",
-                "root_cause_class": None,
-                "partial_dump": "partial",
-            }
-        )
-
-        tool_calls = build_tool_calls(llm_step, is_last_step=False)
-
-        self.assertEqual(
-            tool_calls[0]["args"]["command"],
-            '-m | grep -i "dma|iommu|mapping|buffer" | head -10',
-        )
-
-    def test_build_tool_calls_preserves_existing_grep_quotes(self) -> None:
-        llm_step = VMCoreLLMAnalysisStep.model_validate(
-            {
-                "step_id": 10,
-                "reasoning": "Need a quoted filtered driver log query next.",
-                "action": {
-                    "command_name": "log",
-                    "arguments": [
-                        "-m",
-                        "|",
-                        "grep",
-                        "-i",
-                        "mpt3sas",
-                        "|",
-                        "grep",
-                        "-Ei",
-                        '"fail|error|timeout|fault|xid|mmu|fifo|dma|map|reset"',
-                    ],
-                },
-                "is_conclusive": False,
-                "signature_class": "pointer_corruption",
-                "root_cause_class": None,
-                "partial_dump": "partial",
-            }
-        )
-
-        tool_calls = build_tool_calls(llm_step, is_last_step=False)
-
-        self.assertEqual(
-            tool_calls[0]["args"]["command"],
-            '-m | grep -i mpt3sas | grep -Ei "fail|error|timeout|fault|xid|mmu|fifo|dma|map|reset"',
-        )
-
-    def test_repair_structured_output_normalizes_mechanism_into_root_cause_class(
-        self,
-    ) -> None:
-        repaired = repair_structured_output(
-            (
-                "{"
-                '"step_id": 22,'
-                '"reasoning": "source typing confirms a dma field misuse",'
-                '"action": null,'
-                '"is_conclusive": true,'
-                '"signature_class": "pointer_corruption",'
-                '"root_cause_class": "field_type_misuse",'
-                '"partial_dump": "partial"'
-                "}"
-            ),
-            model_class=VMCoreLLMAnalysisStep,
-        )
-
-        self.assertIsNotNone(repaired)
-        self.assertEqual(repaired.root_cause_class, "dma_corruption")
-        self.assertEqual(repaired.corruption_mechanism, "field_type_misuse")
-
-    def test_repair_structured_output_lifts_stack_corruption_from_mechanism(
-        self,
-    ) -> None:
-        repaired = repair_structured_output(
-            (
-                "{"
-                '"step_id": 23,'
-                '"reasoning": "stack canary overwrite is confirmed",'
-                '"action": null,'
-                '"is_conclusive": false,'
-                '"signature_class": "stack_corruption",'
-                '"root_cause_class": "memory_corruption",'
-                '"corruption_mechanism": "stack_corruption",'
-                '"partial_dump": "partial"'
-                "}"
-            ),
-            model_class=VMCoreLLMAnalysisStep,
-        )
-
-        self.assertIsNotNone(repaired)
-        self.assertEqual(repaired.root_cause_class, "stack_corruption")
-        self.assertEqual(repaired.corruption_mechanism, "unknown")
-
-    def test_top_level_step_accepts_explicit_corruption_mechanism(self) -> None:
-        llm_step = VMCoreLLMAnalysisStep.model_validate(
-            {
-                "step_id": 22,
-                "reasoning": "The driver dereferenced a DMA-side field as a virtual pointer.",
-                "action": None,
-                "is_conclusive": True,
-                "signature_class": "pointer_corruption",
-                "root_cause_class": "dma_corruption",
-                "corruption_mechanism": "field_type_misuse",
-                "partial_dump": "partial",
-            }
-        )
-
-        self.assertEqual(llm_step.root_cause_class, "dma_corruption")
-        self.assertEqual(llm_step.corruption_mechanism, "field_type_misuse")
-
-    def test_repair_structured_output_moves_out_of_bounds_to_root_cause_class(
-        self,
-    ) -> None:
-        repaired = repair_structured_output(
-            (
-                "{"
-                '"step_id": 24,'
-                '"reasoning": "stack text suggests an upward overwrite into older frames",'
-                '"action": null,'
-                '"is_conclusive": true,'
-                '"signature_class": "bug_on",'
-                '"root_cause_class": "memory_corruption",'
-                '"corruption_mechanism": "out_of_bounds",'
-                '"partial_dump": "partial",'
-                '"final_diagnosis": {'
-                '"crash_type": "stack protector",'
-                '"panic_string": "Kernel stack is corrupted",'
-                '"faulting_instruction": "search_module_extables+0x99",'
-                '"root_cause": "A stack overwrite is the most likely cause.",'
-                '"detailed_analysis": "The stack contains text-like payload and corrupted older frames.",'
-                '"suspect_code": {'
-                '"file": "fs/namei.c",'
-                '"function": "link_path_walk",'
-                '"line": "unknown"},'
-                '"evidence": ["ASCII text on stack"],'
-                '"corruption_mechanism": "out_of_bounds"'
-                "}"
-                "}"
-            ),
-            model_class=VMCoreLLMAnalysisStep,
-        )
-
-        self.assertIsNotNone(repaired)
-        self.assertEqual(repaired.root_cause_class, "out_of_bounds")
-        self.assertEqual(repaired.corruption_mechanism, "unknown")
-        self.assertIsNotNone(repaired.final_diagnosis)
-        self.assertEqual(repaired.final_diagnosis.corruption_mechanism, "unknown")
-
-    def test_repair_structured_output_accepts_stack_corruption_root_cause(
-        self,
-    ) -> None:
-        repaired = repair_structured_output(
-            (
-                "{"
-                '"step_id": 24,'
-                '"reasoning": "stack canary overwrite confirms stack damage but not the exact overwrite primitive",'
-                '"action": null,'
-                '"is_conclusive": false,'
-                '"signature_class": "stack_corruption",'
-                '"root_cause_class": "stack_corruption",'
-                '"partial_dump": "partial"'
-                "}"
-            ),
-            model_class=VMCoreLLMAnalysisStep,
-        )
-
-        self.assertIsNotNone(repaired)
-        self.assertEqual(repaired.root_cause_class, "stack_corruption")
-
-    def test_repair_structured_output_maps_stack_protector_root_cause_alias(
-        self,
-    ) -> None:
-        repaired = repair_structured_output(
-            (
-                "{"
-                '"step_id": 24,'
-                '"reasoning": "legacy stack-protector wording should not break structured output",'
-                '"action": null,'
-                '"is_conclusive": false,'
-                '"signature_class": "stack_corruption",'
-                '"root_cause_class": "stack_protector",'
-                '"partial_dump": "partial"'
-                "}"
-            ),
-            model_class=VMCoreLLMAnalysisStep,
-        )
-
-        self.assertIsNotNone(repaired)
-        self.assertEqual(repaired.root_cause_class, "stack_corruption")
-
-    def test_downgrades_conclusion_when_write_fault_is_attributed_to_plain_read(
-        self,
-    ) -> None:
-        state = {
-            "messages": [
-                HumanMessage(
-                    content=(
-                        "Oops: 0002 [#1] SMP NOPTI\n" "RIP: 0010:ffffffff8656bf75\n"
-                    )
-                ),
-                ToolMessage(
-                    content=(
-                        "0xffffffff8656bf63 <cpu_idle_poll+35>:\tmov    %gs:0x1b440,%rax\n"
-                        "0xffffffff8656bf6c <cpu_idle_poll+44>:\tmov    (%rax),%rax\n"
-                        "0xffffffff8656bf75 <cpu_idle_poll+53>:\tpause\n"
-                    ),
-                    tool_call_id="call_1",
-                    name="dis",
-                ),
-            ]
-        }
-        llm_step = VMCoreLLMAnalysisStep.model_validate(
-            {
-                "step_id": 4,
-                "reasoning": "The most likely explanation is DMA corruption of the current pointer.",
-                "action": None,
-                "is_conclusive": True,
-                "signature_class": "pointer_corruption",
-                "root_cause_class": "dma_corruption",
-                "partial_dump": "partial",
-                "confidence": "medium",
-                "final_diagnosis": FinalDiagnosis(
-                    crash_type="kernel paging request",
-                    panic_string="BUG: unable to handle kernel paging request",
-                    faulting_instruction="mov (%rax),%rax",
-                    root_cause="DMA corruption is the root cause.",
-                    detailed_analysis="The report concludes DMA corruption without discussing the access-type contradiction.",
-                    suspect_code=SuspectCode(
-                        file="kernel/sched/idle.c",
-                        function="cpu_idle_poll",
-                        line="unknown",
-                    ),
-                    evidence=["Oops: 0002", "mov (%rax),%rax", "pause"],
-                ),
-            }
-        )
-
-        audited = apply_executor_consistency_audit(llm_step, state)
-
-        self.assertFalse(audited.is_conclusive)
-        self.assertIsNone(audited.final_diagnosis)
-        self.assertEqual(audited.root_cause_class, "unknown")
-        self.assertIn("access-type contradiction", audited.reasoning)
-        self.assertIn("Oops 0x0002 decodes to write fault", audited.additional_notes)
-
-    def test_leaves_step_unchanged_when_reasoning_already_discusses_mismatch(
-        self,
-    ) -> None:
-        state = {
-            "messages": [
-                HumanMessage(
-                    content="Oops: 0002 [#1] SMP NOPTI\nRIP: 0010:ffffffff8656bf75\n"
-                ),
-                ToolMessage(
-                    content=(
-                        "0xffffffff8656bf6c <cpu_idle_poll+44>:\tmov    (%rax),%rax\n"
-                        "0xffffffff8656bf75 <cpu_idle_poll+53>:\tpause\n"
-                    ),
-                    tool_call_id="call_2",
-                    name="dis",
-                ),
-            ]
-        }
-        llm_step = VMCoreLLMAnalysisStep.model_validate(
-            {
-                "step_id": 5,
-                "reasoning": (
-                    "Oops error code 0002 indicates a write fault, but mov (%rax), %rax is a read; "
-                    "this contradiction remains unresolved, so I need more evidence before concluding."
-                ),
-                "action": {
-                    "command_name": "rd",
-                    "arguments": ["0xffff8cd9befdb440", "1"],
-                },
-                "is_conclusive": False,
-                "signature_class": "pointer_corruption",
-                "root_cause_class": None,
-                "partial_dump": "partial",
-            }
-        )
-
-        audited = apply_executor_consistency_audit(llm_step, state)
-
-        self.assertEqual(
-            audited.reasoning,
-            llm_step.reasoning,
-        )
-        self.assertIsNone(audited.additional_notes)
-
-    def test_rebuilds_structured_action_from_explicit_piped_action_hint(self) -> None:
-        state = {"messages": [HumanMessage(content="BUG: stack protector triggered\n")]}
-        llm_step = VMCoreLLMAnalysisStep.model_validate(
-            {
-                "step_id": 16,
-                "reasoning": (
-                    "The next diagnostic step should search the kernel log for BUG markers.\n"
-                    'Action: log -m | grep -Ei "BUG|page fault|kernel BUG" | head -30'
-                ),
-                "action": {
-                    "command_name": "log",
-                    "arguments": ["-m"],
-                },
-                "is_conclusive": False,
-                "signature_class": "stack_corruption",
-                "root_cause_class": None,
-                "partial_dump": "partial",
-            }
-        )
-
-        audited = apply_executor_consistency_audit(llm_step, state)
-
-        self.assertEqual(audited.action.command_name, "run_script")
-        self.assertEqual(
-            audited.action.arguments,
-            ['log -m | grep -Ei "BUG|page fault|kernel BUG" | head -30'],
-        )
-        self.assertIn(
-            "structured action dropped the pipeline", audited.additional_notes
-        )
-
-    def test_preflight_inserts_required_mod_s_prelude(self) -> None:
-        state = {
-            "debug_symbol_paths": [
-                "/home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko",
-                "/tmp/mpt3sas.ko.debug",
-            ]
-        }
-        llm_step = VMCoreLLMAnalysisStep.model_validate(
-            {
-                "step_id": 30,
-                "reasoning": "Need to disassemble a third-party module function.",
-                "action": {
-                    "command_name": "run_script",
-                    "arguments": ["dis -l rcu_stall_thread"],
-                },
-                "is_conclusive": False,
-                "signature_class": "pointer_corruption",
-                "root_cause_class": None,
-                "partial_dump": "partial",
-            }
-        )
-
-        audited = apply_executor_consistency_audit(llm_step, state)
-
-        self.assertEqual(
-            audited.action.arguments[0],
-            "mod -s rcu_stall_mod /home/calmwu/Program/vmcore-analysis-agent/simulate-crash/rcu_stall/rcu_stall_mod.ko",
-        )
-        self.assertEqual(
-            audited.action.arguments[1], "mod -s mpt3sas /tmp/mpt3sas.ko.debug"
-        )
-        self.assertEqual(audited.action.arguments[-1], "dis -l rcu_stall_thread")
-        self.assertIn("Inserted 2 mod -s prelude line(s)", audited.additional_notes)
+        self.assertEqual(remaining, [CONFLICT_FACT])
 
 
 if __name__ == "__main__":

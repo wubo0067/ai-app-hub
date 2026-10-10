@@ -18,14 +18,21 @@ import asyncio
 import json
 import re
 from contextlib import AsyncExitStack
-from typing import List, Tuple, Any
+from typing import Any, List, Mapping, Optional, Tuple
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_mcp_adapters.tools import load_mcp_tools
 from src.utils.logging import logger
 from src.mcp_tools import get_registered_tool_provider
-from .graph_state import AgentState
+from .graph_state import (
+    AgentState,
+    CONVERGENCE_GUARD_STREAK_THRESHOLD,
+    has_committed_root_cause,
+)
+from .schema import GateEntry
+from .consistency import MemoryRead, detect_value_conflicts, parse_memory_reads
 from .prompts import crash_init_data_prompt
+from .prompt_phrases import FORCED_CHOICE_CONVERGENCE_RULE
 from .action_guard import (
     build_command_fingerprint,
     extract_crash_path_struct_offsets,
@@ -35,6 +42,11 @@ from .action_guard import (
     maybe_rewrite_module_symbol_tool_call,
     validate_tool_call_request,
 )
+from .evidence import (
+    extract_evidence_facts,
+    facts_support_goal,
+    update_gate_evidence,
+)
 
 # =========================================================================
 # 节点名称常量定义
@@ -43,6 +55,151 @@ crash_tool_node = "crash_tool_node"
 collect_crash_init_data_node = "collect_crash_init_data_node"
 llm_analysis_node = "llm_analysis_node"
 structure_reasoning_node = "structure_reasoning_node"
+
+# 连续无证据进展的工具动作次数上限。达到该上限后，edges.after_crash_tool
+# 会路由到 llm_analysis_node 做一次强制收口（而非直接 __end__），由
+# llm_analysis_node 置位 force_terminal_wrapup，使报告能给出有界的非结论总结。
+# 定义在此处（而非 edges.py）是因为 edges.py 已依赖 nodes.py，反向导入会成环。
+NO_PROGRESS_STREAK_LIMIT = 3
+
+
+def _has_non_echo_output(content: str) -> bool:
+    """判断工具输出是否包含真实内容（而非仅 crash 提示符 echo）。
+
+    crash 会话执行命令时会逐行回显命令本身（如 ``crash> log -m | grep foo``），
+    若命令无任何输出，ToolMessage.content 仅含这些 echo 行。将此类 echo-only
+    输出误判为"有内容"会错误地清零 no_progress_streak，掩盖真实的无进展状态。
+
+    注意：不能按"本次提交的命令行"做精确匹配。run_script 的提交形式是
+    ``run_script <vmcore> <vmlinux> <script>``，而回显是脚本内的 crash 命令行
+    （``crash> <script line>``），两者永远不相等；多行脚本还会逐行回显。
+    因此改为按前缀剔除所有 ``crash>`` 开头的行，只要还剩非空行即为实质输出。
+
+    Args:
+        content: ToolMessage 的原始内容字符串。
+
+    Returns:
+        True 表示输出中有 echo 之外的实质内容；False 表示仅含 echo 或为空。
+    """
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("crash>"):
+            return True
+    return False
+
+
+# L2：收敛护栏阈值 CONVERGENCE_GUARD_STREAK_THRESHOLD 定义在 graph_state.py
+#（nodes.py 与 prompt_builder.py 共同的叶子依赖），两条收敛通道共用同一判据。
+
+# 只读"取值/解读值"类命令。run D 的死循环完全由这类命令构成：反复 rd/struct 一个
+# 已被证明是被覆盖的字段，试图解读其中残留 ASCII 的协议含义（把覆盖载荷当成 IRQ 号）。
+# log/irq/task/search 等重复读取已捕获状态的命令也在列内——在门控全关的前提下它们
+# 只会再产出一遍同样的字节。刻意不含 mod（加载符号）、bt/sys（收尾轮报告本身需要）。
+_READONLY_VALUE_PROBE_COMMANDS = frozenset(
+    {
+        "rd",
+        "struct",
+        "dis",
+        "sym",
+        "kmem",
+        "log",
+        "irq",
+        "task",
+        "p",
+        "px",
+        "pd",
+        "search",
+        "detailedsearch",
+        "vtop",
+        "ptov",
+        "ptob",
+        "pte",
+        "sbitmapq",
+    }
+)
+
+
+def _gates_all_closed(gates: Optional[Mapping[str, object]]) -> bool:
+    """门控已注册且没有任何 open/blocked 门控时返回 True。"""
+    if not gates:
+        return False
+    return not any(
+        GateEntry.model_validate(gate).status in {"open", "blocked"}
+        for gate in gates.values()
+    )
+
+
+def _only_read_only_value_probes(lines: List[str]) -> bool:
+    """命令行的首 token 全部属于只读取值类命令时返回 True。"""
+    commands = []
+    for line in lines:
+        stripped = re.sub(r"^crash>\s*", "", line.strip())
+        if not stripped or stripped.startswith(("#", "echo")):
+            continue
+        commands.append(stripped.split()[0].lower())
+    return bool(commands) and all(
+        command in _READONLY_VALUE_PROBE_COMMANDS for command in commands
+    )
+
+
+def _convergence_guard_error(state: AgentState, lines: List[str]) -> str | None:
+    """判断该动作是否属于"结论已成立却仍在探测"，是则返回拒绝理由。
+
+    三个条件必须同时成立，避免过早掐断正常取证：
+    1. root_cause_class 已确定（结论方向已定）；
+    2. 强制门控全部关闭（没有门控可再推进）；
+    3. 已连续 CONVERGENCE_GUARD_STREAK_THRESHOLD 步无实质进展（确实在原地打转）。
+    """
+    if state.get("no_progress_streak", 0) < CONVERGENCE_GUARD_STREAK_THRESHOLD:
+        return None
+    if not has_committed_root_cause(state):
+        return None
+    if not _gates_all_closed(state.get("managed_gates")):
+        return None
+    if not _only_read_only_value_probes(lines):
+        return None
+
+    return (
+        f"root_cause_class={state.get('current_root_cause_class')} is established and every "
+        f"mandatory gate is closed, and the last "
+        f"{state.get('no_progress_streak', 0)} actions produced no new evidence. This read-only "
+        f"value probe cannot strengthen the conclusion: bytes inside memory already proven to be "
+        f"corruption payload are the payload, not live state, so their protocol semantics can "
+        f"never be recovered from the vmcore. Emit the final JSON conclusion now "
+        f"(is_conclusive=true, confidence=\"low\" is acceptable, action=null) and record the "
+        f"residual unknown in final_diagnosis.detailed_analysis."
+    )
+
+
+def _forced_choice_directive(state: AgentState) -> str:
+    """P0-1：原地打转时唯一可接受的两种下一步（不依赖根因是否已提交）。
+
+    与 `_convergence_guard_error` 的区别：那条通道要求"根因已提交 + 强制门控
+    全部关闭"，而实际耗尽预算的 run 恰恰是在模型**从未提交根因**的状态下空转，
+    且重复命令在 dedup 分支就 `continue` 了，根本走不到那条通道。因此这里只
+    要求"连续无进展 + 重复的只读取值探测"，把选择压缩成二选一，避免模型继续
+    在同一条命令上索取同一份输出。措辞与 replan 菜单共用
+    `prompt_phrases.FORCED_CHOICE_CONVERGENCE_RULE`（nodes 与 prompt_builder
+    之间已有正向依赖，共享文本只能放在两者都不依赖的叶子模块）。
+    """
+    return (
+        "You have re-requested a read-only value probe that has already been read, and the last "
+        f"{state.get('no_progress_streak', 0)} actions produced no new evidence. "
+        + FORCED_CHOICE_CONVERGENCE_RULE
+    )
+
+
+def _no_new_evidence_directive(state: AgentState, lines: List[str]) -> str | None:
+    """判断 dedup 命中的命令是否属于"无新证据的空转探测"，是则返回强制二选一指令。
+
+    刻意不看 `current_root_cause_class`，也不看门控是否注册/关闭：这两项前提
+    正是既有通道在真实死锁场景里失效的原因。
+    """
+    if state.get("no_progress_streak", 0) < CONVERGENCE_GUARD_STREAK_THRESHOLD:
+        return None
+    if not _only_read_only_value_probes(lines):
+        return None
+    return _forced_choice_directive(state)
 
 # =========================================================================
 # 默认 crash 命令集合
@@ -400,9 +557,18 @@ async def call_crash_tool(state: AgentState) -> dict:
 
     prior_fingerprints = set(state.get("executed_fingerprints", []))
     prior_tool_outputs = dict(state.get("tool_output_cache", {}))
+    # 已经回放过一次的指纹：第二次命中同一命令时不再回放，改发硬拒。
+    prior_replayed = set(state.get("replayed_fingerprints", []))
     previous_action_fingerprint = state.get("last_action_fingerprint", "")
     crash_path_struct_offsets = state.get("crash_path_struct_offsets")
     struct_layout_cache = dict(state.get("struct_layout_cache", {}))
+    prior_evidence_facts = set(state.get("evidence_facts", []))
+    observed_evidence_facts: set[str] = set()
+    observed_nonempty_output = False
+    # 本步读到的内存快照，用于与已缓存的结构体布局做取值级一致性检查。
+    # 局限：只检查“本步新读到”的内存。若某次 rd 早于对应 struct -o 布局查询，
+    # 该次读取不会被回溯检查（需要跨步保留内存读取历史才能覆盖，属后续增强）。
+    observed_memory_reads: list[MemoryRead] = []
 
     # 提取所有工具调用的命令，准备批量执行
     # 为了后续能将结果匹配回 tool_call_id，我们需要维护一个映射或顺序
@@ -411,6 +577,8 @@ async def call_crash_tool(state: AgentState) -> dict:
     new_tool_output_cache: dict[str, str] = {}
     new_fingerprints: list[str] = []
     duplicate_fingerprints: list[str] = []
+    # 本步首次回放的指纹，写入 replayed_fingerprints 供后续步骤判定"第二次索取"
+    new_replayed_fingerprints: list[str] = []
     current_fingerprints: list[str] = []
     rejected_count = 0
 
@@ -463,8 +631,8 @@ async def call_crash_tool(state: AgentState) -> dict:
                     tool_messages.append(
                         ToolMessage(
                             content=f"[executor-guard] Rejected action: {validation_error}",
-                            tool_call_id=tool_call_id, # 关联原始的 tool_call_id，确保消息链条完整
-                            name=name,                  # 指明是哪个工具请求被拒绝了
+                            tool_call_id=tool_call_id,  # 关联原始的 tool_call_id，确保消息链条完整
+                            name=name,  # 指明是哪个工具请求被拒绝了
                         )
                     )
                     # B. 记录系统日志
@@ -484,32 +652,125 @@ async def call_crash_tool(state: AgentState) -> dict:
                 current_fingerprint = build_command_fingerprint(name, args)
                 prior_output = prior_tool_outputs.get(current_fingerprint)
 
-                if current_fingerprint and (
-                    current_fingerprint in prior_fingerprints
-                    or prior_output is not None
-                ):
-                    # 命令已执行过，直接返回历史输出 + 提示
-                    dedup_msg = (
-                        f"[DEDUP] This command was already executed in a prior step. "
-                        f"Reusing prior output to save budget.\n"
-                        f"---\n{prior_output or '[DEDUP] Fingerprint found in state, but no cached output was retained.'}"
+                goal_version_changed = state.get(
+                    "evidence_goal_version"
+                ) is not None and state.get("evidence_goal_version") != state.get(
+                    "last_action_goal_version"
+                )
+                if (
+                    current_fingerprint
+                    and not goal_version_changed
+                    and (
+                        current_fingerprint in prior_fingerprints
+                        or prior_output is not None
                     )
+                ):
+                    # 判断历史输出是否有实质证据内容：排除 echo-only 输出，并把
+                    # 缓存的 [error]/[TIMEOUT] 失败结果也视为无证据——失败命令不应
+                    # 被当作"有证据"回放，否则 LLM 会反复收到同一份失败输出而
+                    # 得不到"换方向"的信号。
+                    cached_has_evidence = bool(prior_output) and \
+                        not prior_output.startswith(("[error]", "[TIMEOUT]")) and \
+                        _has_non_echo_output(prior_output)
+                    # 同一指纹已经回放过一次，说明 LLM 拿到过这份输出又原样索取。
+                    # 此时不再回放（否则"有证据"的重复命令可以无限次骗取同一份输出），
+                    # 而是与"无证据"分支一样硬拒，强制其更换命令或证据目标。
+                    # 依据：run D 在步骤 60/62/64 连续三次索取同一条
+                    # `rd -x ff292187ae124a80 16`，直到 no_progress_streak 触顶才被掐停。
+                    already_replayed = current_fingerprint in prior_replayed
+                    if cached_has_evidence and not already_replayed:
+                        # 有证据：首次重复时回放历史输出，让 LLM 重新利用已有结果
+                        dedup_msg = (
+                            f"[DEDUP] This command was already executed in a prior step. "
+                            f"Reusing prior output to save budget.\n"
+                            f"---\n{prior_output}"
+                        )
+                        tool_messages.append(
+                            ToolMessage(
+                                content=dedup_msg,
+                                tool_call_id=tool_call_id,
+                                name=name,
+                            )
+                        )
+                        logger.warning(
+                            "Command deduplication (cached evidence): '%s...' already executed. "
+                            "Returning cached output.",
+                            current_fingerprint[:80],
+                        )
+                        duplicate_fingerprints.append(current_fingerprint)
+                        prior_replayed.add(current_fingerprint)
+                        new_replayed_fingerprints.append(current_fingerprint)
+                    else:
+                        # 无证据、或有证据但已回放过：视为错误，要求 LLM 换方向
+                        if already_replayed:
+                            dedup_msg = (
+                                "[DEDUP-BLOCKED] This command was already executed, and its cached "
+                                "output was already replayed to you once. Requesting it a second time "
+                                "is refused: re-reading the same bytes cannot produce new evidence. "
+                                "Select a different command, a different address/length, or a "
+                                "different evidence target (see the replan menu), or terminate with "
+                                "bounded uncertainty."
+                            )
+                        else:
+                            dedup_msg = (
+                                "[DEDUP-BLOCKED] This command was already executed and produced "
+                                "no usable evidence. It is now unavailable. "
+                                "You must select a different command or a different evidence target."
+                            )
+                        # P0-1：硬拒本身不足以止损。模型在"从未提交根因"的状态下
+                        # 反复索取同一条只读探测时，既有收敛护栏（要求根因已提交且
+                        # 门控全部关闭）永远不触发，硬拒措辞又只说"换个方向"而不
+                        # 给出可执行的收敛出口，预算就在重复命令上耗尽。这里追加
+                        # 与根因/门控无关的强制二选一。
+                        spin_directive = _no_new_evidence_directive(
+                            state, extract_command_lines(name, args)
+                        )
+                        if spin_directive is not None:
+                            dedup_msg = f"{dedup_msg}\n\n{spin_directive}"
+                            logger.warning(
+                                "Dedup spin guard escalated to forced choice for '%s...' (streak=%s).",
+                                current_fingerprint[:80],
+                                state.get("no_progress_streak", 0),
+                            )
+                        tool_messages.append(
+                            ToolMessage(
+                                content=dedup_msg,
+                                tool_call_id=tool_call_id,
+                                name=name,
+                            )
+                        )
+                        logger.warning(
+                            "Command deduplication (no evidence): '%s...' blocked, forcing replan.",
+                            current_fingerprint[:80],
+                        )
+                        rejected_count += 1
+                    current_fingerprints.append(current_fingerprint)
+                    continue
+
+                current_lines = extract_command_lines(name, args)
+
+                # ---- 收敛护栏（L2）----
+                # 结论方向已定、门控全关、且已连续多步无进展时，掐断只读取值类
+                # 探测：这类命令只会再产出一段"被覆盖内存里的残留字节"，模型会把
+                # 它当成待解读的协议字段而无限循环（run D 即在此耗尽预算）。
+                convergence_error = _convergence_guard_error(state, current_lines)
+                if convergence_error is not None:
+                    rejected_count += 1
                     tool_messages.append(
                         ToolMessage(
-                            content=dedup_msg,
+                            content=f"[convergence-guard] Blocked action: {convergence_error}",
                             tool_call_id=tool_call_id,
                             name=name,
                         )
                     )
                     logger.warning(
-                        f"Command deduplication: '{current_fingerprint[:80]}...' already executed. "
-                        f"Returning cached output instead of re-executing."
+                        "Convergence guard blocked action '%s' (streak=%s, root_cause_class=%s).",
+                        current_fingerprint[:80] if current_fingerprint else name,
+                        state.get("no_progress_streak", 0),
+                        state.get("current_root_cause_class"),
                     )
-                    duplicate_fingerprints.append(current_fingerprint)
-                    current_fingerprints.append(current_fingerprint)
                     continue
 
-                current_lines = extract_command_lines(name, args)
                 logger.debug(
                     "Validated tool call %s (ID: %s): lines=%s, fingerprint=%s",
                     name,
@@ -554,6 +815,8 @@ async def call_crash_tool(state: AgentState) -> dict:
                             content = str(r_output)
                             if isinstance(r_output, Exception):
                                 content = f"[error] Execution failed: {r_output}"
+                            if not content.startswith(("[error]", "[TIMEOUT]")) and _has_non_echo_output(content):
+                                observed_nonempty_output = True
                             tool_messages.append(
                                 ToolMessage(
                                     content=content,
@@ -577,6 +840,10 @@ async def call_crash_tool(state: AgentState) -> dict:
                             discovered_layouts = extract_struct_layouts(content)
                             if discovered_layouts:
                                 struct_layout_cache.update(discovered_layouts)
+                            observed_memory_reads.extend(parse_memory_reads(content))
+                            observed_evidence_facts.update(
+                                extract_evidence_facts(tool_name, _raw_args, content)
+                            )
                             found_result = True
                             # 找到一个就可以停止内层循环，进入下一个 tool_call
                             # 实际上这可以处理重复命令的情况：每个 tool_call 都能匹配到结果
@@ -600,8 +867,10 @@ async def call_crash_tool(state: AgentState) -> dict:
         }
 
     logger.info(f"Generated {len(tool_messages)} tool messages.")
-    all_duplicate = bool(current_fingerprints) and not commands_to_run and bool(
-        duplicate_fingerprints
+    all_duplicate = (
+        bool(current_fingerprints)
+        and not commands_to_run
+        and bool(duplicate_fingerprints)
     )
     if all_duplicate:
         duplicate_streak = (
@@ -615,9 +884,14 @@ async def call_crash_tool(state: AgentState) -> dict:
         evidence_delta: list[str] = []
     elif commands_to_run:
         duplicate_streak = 0
-        no_progress_streak = 0
+        no_progress_streak = (
+            0
+            if observed_evidence_facts - prior_evidence_facts
+            or observed_nonempty_output
+            else state.get("no_progress_streak", 0) + 1
+        )
         action_status = "executed"
-        evidence_delta = list(new_fingerprints)
+        evidence_delta = sorted(observed_evidence_facts - prior_evidence_facts)
     elif rejected_count:
         duplicate_streak = 0
         no_progress_streak = state.get("no_progress_streak", 0) + 1
@@ -634,10 +908,24 @@ async def call_crash_tool(state: AgentState) -> dict:
     )
     # 这个返回字典会被 LangGraph 用来更新当前运行中的 AgentState 状态；
     # 它不是更新 nodes.py 里的某个本地变量，而是更新整个状态图在这一轮执行中的共享 state。
+    evidence_facts = sorted(prior_evidence_facts | observed_evidence_facts)
+    # 保留发现顺序：旧矛盾在前、本步新发现的在后，避免字典序把
+    # 高地址（通常是最新调查对象）的矛盾挤出提示词渲染窗口。
+    value_conflicts = list(
+        dict.fromkeys(
+            list(state.get("value_conflicts", []))
+            + detect_value_conflicts(observed_memory_reads, struct_layout_cache)
+        )
+    )
+    managed_gates = update_gate_evidence(state.get("managed_gates"), evidence_delta)
+    goal_advanced = facts_support_goal(
+        evidence_delta, state.get("current_evidence_goal")
+    )
     return {
         "step_count": 1,
         "messages": tool_messages,
         "executed_fingerprints": new_fingerprints,
+        "replayed_fingerprints": new_replayed_fingerprints,
         "tool_output_cache": {
             **state.get("tool_output_cache", {}),
             **new_tool_output_cache,
@@ -647,7 +935,36 @@ async def call_crash_tool(state: AgentState) -> dict:
         "duplicate_streak": duplicate_streak,
         "no_progress_streak": no_progress_streak,
         "evidence_delta": evidence_delta,
-        "replan_required": all_duplicate,
+        "evidence_facts": evidence_facts,
+        "value_conflicts": value_conflicts,
+        "replan_required": all_duplicate
+        or (bool(commands_to_run) and not evidence_delta)
+        # C1：DEDUP-BLOCKED（无证据的重复命令）走 rejected 分支，
+        # 同样需要向 LLM 渲染"Replanning required"advisory，
+        # 提示其更换证据目标而非重复等价命令。
+        or action_status == "rejected",
+        "managed_gates": managed_gates,
+        "evidence_goal_status": (
+            "advanced" if goal_advanced else state.get("evidence_goal_status")
+        ),
+        "evidence_goal_progress": (
+            "new evidence facts extracted"
+            if goal_advanced
+            else state.get("evidence_goal_progress")
+        ),
+        "last_action_goal_version": state.get("evidence_goal_version"),
+        # current_action_intent 可能被显式写入 None（并非只是缺键），因此用
+        # `or {}` 兜底后再取字段，避免在 None 上调用 .get
+        # （reportOptionalMemberAccess）。
+        "last_evidence_types": (
+            [
+                (state.get("current_action_intent") or {}).get(
+                    "intended_evidence_type"
+                )
+            ]
+            if (state.get("current_action_intent") or {}).get("intended_evidence_type")
+            else []
+        ),
         "crash_path_struct_offsets": crash_path_struct_offsets,
         "struct_layout_cache": struct_layout_cache,
         "error": None,

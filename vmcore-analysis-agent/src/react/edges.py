@@ -17,13 +17,11 @@ from .graph_state import AgentState
 from .schema import VMCoreAnalysisStep
 from src.utils.logging import logger
 from .nodes import (
+    NO_PROGRESS_STREAK_LIMIT,
     crash_tool_node,
     llm_analysis_node,
     structure_reasoning_node,
 )
-
-
-NO_PROGRESS_STREAK_LIMIT = 3
 
 
 def _parse_analysis_step(message: AIMessage) -> VMCoreAnalysisStep | None:
@@ -87,7 +85,10 @@ def should_continue(state: AgentState) -> str:
             # allow at most one retry. A repeated no-tool/non-conclusive AIMessage means
             # the retry prompt did not unblock progress, so keep the bounded non-conclusive
             # result instead of looping until recursion_limit.
-            if not is_last_step:
+            # force_terminal_wrapup=True 表示 llm_analysis_node 已执行过强制收口
+            # （CRITICAL WARNING + 剥离 tool_calls），其输出即最终有界结果，
+            # 不再重试，直接结束。
+            if not is_last_step and not state.get("force_terminal_wrapup"):
                 step_obj = _parse_analysis_step(last_message)
                 if step_obj is not None and not step_obj.is_conclusive:
                     # Sometimes json_repair fixes a truncated model output and sets is_conclusive=False
@@ -150,9 +151,29 @@ def after_crash_tool(state: AgentState) -> str:
     """
     is_last_step = state.get("is_last_step", False)
     no_progress_streak = state.get("no_progress_streak", 0)
+    if state.get("replan_required") and not state.get("evidence_delta"):
+        logger.info(
+            "Replanning required for evidence goal %s after action status "
+            "'%s' produced no evidence delta.",
+            (state.get("current_evidence_goal") or {}).get("goal_id", "unknown"),
+            state.get("last_action_status", "unknown"),
+        )
     if no_progress_streak >= NO_PROGRESS_STREAK_LIMIT:
+        # 强制收口：给 llm_analysis_node 最后一次机会输出有界的非结论总结
+        # （渲染 CRITICAL WARNING、剥离 tool_calls），而不是静默 __end__。
+        # llm_analysis_node 会置位 force_terminal_wrapup，因此本分支最多
+        # 触发一次，不会形成循环。
+        if not state.get("force_terminal_wrapup"):
+            logger.warning(
+                "Stopping analysis after %s consecutive tool actions without "
+                "evidence progress. Routing to %s for a forced terminal wrap-up.",
+                no_progress_streak,
+                llm_analysis_node,
+            )
+            return llm_analysis_node
         logger.warning(
-            "Stopping analysis after %s consecutive tool actions without evidence progress.",
+            "Terminal wrap-up already performed after %s no-progress actions. "
+            "Routing to __end__.",
             no_progress_streak,
         )
         return "__end__"

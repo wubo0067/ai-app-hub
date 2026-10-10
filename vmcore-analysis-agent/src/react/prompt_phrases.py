@@ -35,7 +35,7 @@ LITERAL_ADDRESS_RULE = (
 
 S1_S5_DMA_GATE_RULE = (
     "Before considering or promoting DMA or hardware, explicitly close the system-layer S1-S5 "
-    "exclusion reasoning."
+    "gating reasoning."
 )
 
 DMA_PROMOTION_EVIDENCE_RULE = (
@@ -67,6 +67,23 @@ STACK_CAUSALITY_RED_LINE_RULE = (
     "lower-address active callees, or overwritten-canary-value provenance, and revisit the higher-address "
     "frame only for saved-RIP provenance, exception-entry classification, or a newly supported non-local "
     "write mechanism."
+)
+
+# P0-1：无新证据空转时的强制二选一。放在 prompt_phrases（叶子模块）以便
+# nodes.py 与 prompt_builder.py 共用同一份措辞——两者之间已有正向依赖，
+# 任一方导入对方都会成环。
+FORCED_CHOICE_CONVERGENCE_RULE = (
+    "There are exactly two acceptable next moves; anything else will be refused:\n"
+    "  (A) COMMIT A CONCLUSION: emit the final JSON with root_cause_class set to a concrete "
+    "class (not \"unknown\"), is_conclusive=true, action=null, confidence=\"low\" is fully "
+    "acceptable, and state the residual unknown plus what evidence would have resolved it in "
+    "final_diagnosis.detailed_analysis. A bounded low-confidence conclusion is required over "
+    "an unfinished exploration.\n"
+    "  (B) DECLARE A NEW EVIDENCE TARGET: name a specific gate objective that is still open, "
+    "and a different object/structure/command family (not the same address or field again) "
+    "that can produce evidence you do not already have.\n"
+    "Re-reading the same bytes cannot produce new evidence: whatever a probe already returned "
+    "is what the vmcore contains, so choosing (A) is correct whenever (B) has no concrete answer."
 )
 
 SLAB_OOB_DIRECTION_RULE = (

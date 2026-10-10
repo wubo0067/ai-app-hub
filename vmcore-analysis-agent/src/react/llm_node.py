@@ -8,13 +8,16 @@ import json
 from typing import Any, cast
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage, HumanMessage
 from .graph_state import AgentState
-from .nodes import llm_analysis_node, structure_reasoning_node
+from .nodes import NO_PROGRESS_STREAK_LIMIT, llm_analysis_node, structure_reasoning_node
 from .output_parser import (
     apply_executor_consistency_audit,
+    apply_fallback_conclusion_synthesis,
+    apply_value_conflict_audit,
     build_tool_calls,
     repair_analysis_step,
     repair_structured_output,
     select_analysis_content,
+    unresolved_value_conflicts,
 )
 from .llm_runtime import ainvoke_with_retry, compress_messages_for_llm
 from .llm_runtime import compute_adaptive_max_tokens
@@ -69,14 +72,28 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
     # 检查是否是最后一步 (LangGraph recursion_limit 触发前)
     # 如果是最后一步，要求 LLM 停止工具调用并给出终止响应；该响应可以是有界的非结论总结
     is_last_step = state.get("is_last_step", False)
+    # 强制收口：no_progress_streak 达到上限时，after_crash_tool 会把控制权
+    # 交回本节点做最后一次有界总结。此时按"最后一步"语义处理（渲染
+    # CRITICAL WARNING、剥离 tool_calls），并置位 force_terminal_wrapup
+    # 使后续路由直接 __end__，保证本机制最多触发一次。
+    wrapup_triggered = (
+        int(state.get("no_progress_streak", 0)) >= NO_PROGRESS_STREAK_LIMIT
+    )
+    effective_last_step = bool(is_last_step) or wrapup_triggered
     if is_last_step:
         logger.warning(
             f"Agent reached the last step (is_last_step=True). Forcing a terminal response with no further tool calls."
         )
+    elif wrapup_triggered:
+        logger.warning(
+            "no_progress_streak reached %s. Forcing a terminal wrap-up response "
+            "with no further tool calls.",
+            NO_PROGRESS_STREAK_LIMIT,
+        )
 
     system_message = build_analysis_system_prompt(
         state,
-        is_last_step=is_last_step,
+        is_last_step=effective_last_step,
     )
 
     # 压缩消息历史后再发送给 LLM，避免 reasoning_content 累积和大工具输出导致 token 暴增
@@ -123,7 +140,7 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
                     + (
                         "This is the last step: do not call tools; either return a conclusive result with final_diagnosis, "
                         "or return a bounded non-conclusive result with action=null and explicit verification gaps."
-                        if is_last_step
+                        if effective_last_step
                         else "Please EITHER call a compliant tool out of the available options to gather more information, "
                         "OR, if no further tool can reduce uncertainty, return a bounded non-conclusive result with "
                         "action=null and explicit verification gaps. Set 'is_conclusive'=true with final_diagnosis "
@@ -132,6 +149,32 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
                 )
             )
         )
+
+    def _audit_and_project(step: VMCoreLLMAnalysisStep, raw_msg: AIMessage):
+        """一致性审计 + 状态投影：首次解析与收口强制重试共用同一条链路。"""
+        step = apply_executor_consistency_audit(
+            step,
+            cast(dict[str, Any], state),
+            log_prefix=llm_analysis_node,
+        )
+        step = apply_value_conflict_audit(
+            step,
+            cast(dict[str, Any], state),
+            log_prefix=llm_analysis_node,
+            force_wrapup=effective_last_step,
+        )
+        # 模型已显式核对的矛盾从状态中剔除，避免追加式列表在后续步数里
+        # 持续把根因压回 unknown、永久阻塞收敛。
+        remaining = unresolved_value_conflicts(step, cast(dict[str, Any], state))
+        projected, updates = project_managed_analysis_step(
+            step,
+            cast(dict[str, Any], state),
+            original_reasoning=raw_msg.additional_kwargs.get(
+                "reasoning_content", ""
+            )
+            or str(raw_msg.content),
+        )
+        return step, remaining, projected, updates
 
     # 结构化输出，设置 include_raw=True 以获取 token 消耗等元数据
     llm_analysis = llm_with_tools.bind(
@@ -207,21 +250,12 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
                 logger.error(error_msg)
                 raise ValueError(error_msg)
 
-        llm_step = apply_executor_consistency_audit(
+        (
             llm_step,
-            cast(dict[str, Any], state),
-            log_prefix=llm_analysis_node,
-        )
-
-        # 记录 response
-        analysis_result, managed_updates = project_managed_analysis_step(
-            llm_step,
-            cast(dict[str, Any], state),
-            original_reasoning=raw_message.additional_kwargs.get(
-                "reasoning_content", ""
-            )
-            or str(raw_message.content),
-        )
+            remaining_value_conflicts,
+            analysis_result,
+            managed_updates,
+        ) = _audit_and_project(llm_step, raw_message)
 
         logger.debug(
             f"LLM Analysis Result: {analysis_result.model_dump_json(indent=2)}"
@@ -229,9 +263,71 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
 
         # 手动构造 AIMessage 以便 edges.py 识别路由。
         # 如果 LLM 决定调用工具 (action 不为空)，我们需要手动填充 tool_calls
-        # 安全屏障：当 is_last_step=True 时，强制清除 action，阻止生成 tool_calls。
+        # 安全屏障：当 effective_last_step=True（is_last_step 或强制收口）时，
+        # 强制清除 action，阻止生成 tool_calls。
         # 最后一步允许 bounded non-conclusive 结束，但不允许继续请求工具。
-        tool_calls = build_tool_calls(analysis_result, is_last_step=is_last_step)
+        requested_action = analysis_result.action is not None
+        tool_calls = build_tool_calls(analysis_result, is_last_step=effective_last_step)
+
+        # 收口轮强制重试：在已经明令"禁止调用工具"的这一轮里模型仍请求工具，
+        # 说明它并未真正进入终止状态。若就此结束，整轮被浪费、报告只能以
+        # "未得出正式结论"收尾，因此追加一条硬性指令后再给且仅给一次机会。
+        if effective_last_step and requested_action:
+            logger.warning(
+                "Wrap-up turn still requested a tool call. Retrying once with a "
+                "terminal-only directive."
+            )
+            retry_messages = [
+                *messages_to_send,
+                raw_message,
+                HumanMessage(
+                    content=(
+                        "You violated the explicit no-tools directive of this wrap-up "
+                        "turn by requesting another tool call. No further tool output "
+                        "will ever be provided. Respond again with a terminal structured "
+                        "result only: action=null, and either is_conclusive=true with a "
+                        "complete final_diagnosis, or a bounded non-conclusive result "
+                        "with explicit verification gaps. Confidence 'low' is acceptable "
+                        "and preferred over another request for evidence. Interpreting "
+                        "the semantics of already-overwritten memory contents is never a "
+                        "prerequisite for concluding."
+                    )
+                ),
+            ]
+            retry_data = await ainvoke_with_retry(llm_analysis, retry_messages)
+            retry_step = (
+                cast(VMCoreLLMAnalysisStep, retry_data.get("parsed"))
+                if retry_data is not None
+                else None
+            )
+            if retry_step is not None:
+                retry_raw = cast(AIMessage, retry_data.get("raw"))
+                retry_usage = getattr(retry_raw, "usage_metadata", {}) or {}
+                curr_token_usage += retry_usage.get("total_tokens", 0)
+                (
+                    llm_step,
+                    remaining_value_conflicts,
+                    analysis_result,
+                    managed_updates,
+                ) = _audit_and_project(retry_step, retry_raw)
+                raw_message = retry_raw
+                tool_calls = build_tool_calls(
+                    analysis_result, is_last_step=effective_last_step
+                )
+            else:
+                logger.warning(
+                    "Wrap-up retry produced no parseable result; keeping the "
+                    "original wrap-up response."
+                )
+
+        # 收口轮兜底：重试后仍没有终止结论时，把已闭合的证据确定性地渲染成
+        # 有界的 low-confidence 结论（仅当收敛契约确实已满足时生效）。
+        if effective_last_step and not tool_calls:
+            analysis_result = apply_fallback_conclusion_synthesis(
+                analysis_result,
+                cast(dict[str, Any], state),
+                log_prefix=f"{llm_analysis_node}:",
+            )
 
         # 将结构化后的对象序列化存入 content，并携带调用的工具信息
         # 必须保留 additional_kwargs 中的 reasoning_content，否则下一轮对话 DeepSeek-Reasoner 会报错 (Error 400)
@@ -269,6 +365,11 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         "token_usage": curr_token_usage,
         "messages": [response],
         **managed_updates,
+        # 模型已显式核对的取值级矛盾不再保留在状态中（见 unresolved_value_conflicts）。
+        "value_conflicts": remaining_value_conflicts,
+        # 置位后 after_crash_tool / should_continue 不再给予额外轮次，
+        # 保证强制收口最多发生一次。
+        "force_terminal_wrapup": wrapup_triggered,
         "error": None,
     }
 
@@ -291,6 +392,13 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
     original_kwargs = state.get("reasoning_additional_kwargs", {}) or {}
     current_step = state.get("step_count", 0)
     is_last_step = state.get("is_last_step", False)
+    # 与 call_llm_analysis 相同的强制收口判定：本节点可能经由
+    # reasoning_to_structure 早退路径进入，此时 flag 尚未置位，
+    # 因此直接根据 no_progress_streak 重新计算。
+    wrapup_triggered = (
+        int(state.get("no_progress_streak", 0)) >= NO_PROGRESS_STREAK_LIMIT
+    )
+    effective_last_step = bool(is_last_step) or wrapup_triggered
 
     logger.info(
         f"Starting {structure_reasoning_node} node execution (step {current_step})..."
@@ -304,7 +412,7 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
     # 构建简化结构化提示（只提取核心字段）
 
     force_conclusion = build_structure_reasoning_force_conclusion(
-        is_last_step=is_last_step
+        is_last_step=effective_last_step
     )
 
     system_prompt = simplified_structure_reasoning_prompt().format(
@@ -376,6 +484,15 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
             cast(dict[str, Any], state),
             log_prefix=structure_reasoning_node,
         )
+        llm_step = apply_value_conflict_audit(
+            llm_step,
+            cast(dict[str, Any], state),
+            log_prefix=structure_reasoning_node,
+            force_wrapup=effective_last_step,
+        )
+        remaining_value_conflicts = unresolved_value_conflicts(
+            llm_step, cast(dict[str, Any], state)
+        )
 
         # 强制覆盖 step_id 为当前实际步数，chat 模型可能输出错误值
         llm_step.step_id = current_step
@@ -394,9 +511,18 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
         # 构建 tool_calls（与 call_llm_analysis 相同逻辑）
         tool_calls = build_tool_calls(
             analysis_result,
-            is_last_step=is_last_step,
+            is_last_step=effective_last_step,
             log_prefix=structure_reasoning_node,
         )
+
+        # 收口轮兜底：本节点是"纯文本 reasoning → 结构化"的降级通路，
+        # 更容易丢失终止字段；此处不再追加 LLM 调用，只做确定性合成。
+        if effective_last_step and not tool_calls:
+            analysis_result = apply_fallback_conclusion_synthesis(
+                analysis_result,
+                cast(dict[str, Any], state),
+                log_prefix=f"{structure_reasoning_node}:",
+            )
 
         # 使用原始的 additional_kwargs（含 reasoning_content）以确保
         # 下一轮 DeepSeek-Reasoner 调用时 assistant 消息包含 reasoning_content
@@ -427,5 +553,9 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
         "reasoning_to_structure": None,
         "reasoning_additional_kwargs": None,
         **managed_updates,
+        # 模型已显式核对的取值级矛盾不再保留在状态中（见 unresolved_value_conflicts）。
+        "value_conflicts": remaining_value_conflicts,
+        # 强制收口标志：保证 should_continue 不再重试，直接 __end__。
+        "force_terminal_wrapup": wrapup_triggered,
         "error": None,
     }

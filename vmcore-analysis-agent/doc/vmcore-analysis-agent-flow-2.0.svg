@@ -98,7 +98,7 @@
 
   <rect x="492" y="702" width="300" height="112" rx="12" fill="#ede9fe" stroke="#8b5cf6"/>
   <text x="520" y="733" class="box-title">llm_analysis_node</text>
-  <text x="520" y="760" class="box-text">analysis_crash_prompt()</text>
+  <text x="520" y="760" class="box-text">build_analysis_system_prompt()</text>
   <text x="520" y="782" class="box-text">结构化输出 VMCoreAnalysisStep</text>
   <text x="520" y="804" class="box-text">生成 AIMessage / tool_calls</text>
 

@@ -65,6 +65,10 @@ class AgentState(MessagesState):
     # LangGraph 管理的终止标记。
     # 当图执行达到 recursion_limit 或运行时判定为最后一步时，该值为 True。
     is_last_step: IsLastStep
+    # 由 llm_analysis_node 在 no_progress_streak 达到上限时置位。
+    # 置位后 after_crash_tool 不再路由到 llm_analysis_node，直接 __end__；
+    # should_continue 跳过非结论重试逻辑，确保有界收口而非无限循环。
+    force_terminal_wrapup: bool
     # DeepSeek-Reasoner 等推理模型生成的纯文本 reasoning 内容。
     # 当原始推理结果无法直接作为结构化输出使用时，会先暂存在这里。
     reasoning_to_structure: Optional[str]
@@ -79,18 +83,34 @@ class AgentState(MessagesState):
     # 命令指纹到最近一次工具输出内容的映射缓存。
     # 用于 executor 在遇到相同命令时直接复用结果，减少重复调用外部工具。
     tool_output_cache: dict[str, str]
+    # 已经通过 [DEDUP] 回放过一次输出的命令指纹（append-only，按 set 语义读取）。
+    # 回放是给 LLM 一次"复用已有结果"的机会；同一指纹第二次命中时不再回放，
+    # 而是升级为 [DEDUP-BLOCKED] 硬拒，避免 LLM 靠反复索取同一份输出无限空转。
+    replayed_fingerprints: Annotated[list[str], add]
     last_action_status: Optional[str]
     last_action_fingerprint: str
     duplicate_streak: int
     no_progress_streak: int
     evidence_delta: list[str]
+    evidence_facts: list[str]
+    # 取值级矛盾事实（内存内容与结构体布局不符），格式见 consistency.py。
+    # 与 evidence_facts 分开保存：它属于派生关系，不参与门控证据统计。
+    value_conflicts: list[str]
     replan_required: bool
+    current_evidence_goal: Optional[dict[str, object]]
+    evidence_goal_version: int
+    evidence_goal_status: Optional[str]
+    evidence_goal_progress: Optional[str]
+    last_evidence_types: list[str]
+    current_action_intent: Optional[dict[str, object]]
+    last_action_goal_version: Optional[int]
     # 当前仍处于活跃状态的假设列表。
     # 用于在多轮推理过程中持续追踪尚未证伪、尚需进一步验证的根因假设。
     managed_active_hypotheses: Optional[list[Hypothesis]]
     # 当前分析流程中的 gate 状态表。
     # 每个 gate 表示一个分析关卡、判定点或前置条件，用于控制后续推理路径。
     managed_gates: Optional[dict[str, GateEntry]]
+    gate_transition_history: list[dict[str, object]]
     # 当前识别出的 crash 签名分类结果。
     # 用于标识本次 vmcore 更接近哪类崩溃模式或故障签名。
     current_signature_class: Optional[CrashSignatureClass]
@@ -109,3 +129,24 @@ class AgentState(MessagesState):
     # Agent 当前错误状态。
     # 当某个节点执行失败或出现不可恢复问题时，会在此记录结构化错误信息。
     error: Optional[AgentError]
+
+
+UNCOMMITTED_ROOT_CAUSE_CLASSES = frozenset({None, "", "unknown"})
+
+# L2：收敛护栏阈值。no_progress_streak 达到 NO_PROGRESS_STREAK_LIMIT(3) 时
+# edges.after_crash_tool 才强制收口，但那已经浪费了三步。护栏在 2 步就介入。
+# 定义在 graph_state（nodes.py 与 prompt_builder.py 共同的叶子依赖）以便两处
+# 收敛通道使用同一阈值，反向导入任一方都会成环。
+CONVERGENCE_GUARD_STREAK_THRESHOLD = 2
+
+
+def has_committed_root_cause(state: AgentState) -> bool:
+    """判断 AgentState 中的根因分类是否已经"真正提交"。
+
+    `RootCauseClass` 里 `unknown` 是合法取值，模型在原地打转时经常把它当成
+    兜底值填进来。`bool("unknown")` 为 True，因此各处直接用真值判断会把
+    "尚未定论" 误判成 "结论已成立"，进而让收敛守卫、terminate_only 提示词
+    等通道在错误的前提上运行。只有显式排除 None/空串/unknown 才算已提交。
+    """
+    root_cause_class = cast(Optional[str], state.get("current_root_cause_class", None))
+    return root_cause_class not in UNCOMMITTED_ROOT_CAUSE_CLASSES

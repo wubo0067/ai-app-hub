@@ -220,7 +220,7 @@ evidence, the final suspect code location MUST remain indeterminate.
 If diagnostic checks prove that the corrupted slot is NOT the canary slot (e.g., the true canary is intact but a saved RIP or RBP is corrupted), STOP the Stack Protector Fast Path immediately and switch to the standard `stack_overflow` / Generic Stack Corruption SOP (3.8). Do NOT force non-canary forensics into the Fast Path constraints.
 """.strip(),
     "kasan_ubsan": """
-## 3.11 KASAN / UBSAN Reports
+## 3.15a KASAN / UBSAN Reports
 
 Pattern: BUG: KASAN or UBSAN report.
 
@@ -230,12 +230,12 @@ Analysis:
 3. UBSAN often indicates a logic bug rather than a memory-lifetime bug; keep that distinction explicit.
 """.strip(),
     "dma_corruption": """
-## 3.12 DMA Memory Corruption (Stray DMA Write)
+## 3.15b DMA Memory Corruption (Stray DMA Write)
 
 Preconditions before suspecting DMA:
-Treat these preconditions as the DMA-side realization of S1-S5 exclusion reasoning from the system layer. {DMA_PROMOTION_EVIDENCE_RULE}
-1. Exclude use-after-free with kmem -S and poison-pattern checks. This is part of S4.
-2. Exclude race or double-free style explanations. This is part of S4.
+Treat these preconditions as the DMA-side realization of S1-S5 gating reasoning from the system layer. {DMA_PROMOTION_EVIDENCE_RULE}
+1. Assess use-after-free as part of S4. Treat kmem -S as snapshot state only: ALLOCATED does not exclude a stale pointer to a reused slot, and absence of poison is not proof against UAF.
+2. Assess race or double-free style explanations as part of S4; rule them out only with mechanism-specific positive evidence.
 3. Confirm the corrupted memory is DMA-reachable. This is part of S5.
 4. Check whether corruption correlates with I/O pressure. This is part of S5.
 5. Prioritize dma_map or unmap violations if DMA API debug evidence exists. This is part of S5.
@@ -247,7 +247,7 @@ Non-indicators:
 - A bus-address-like value is not enough by itself. First prove whether the exact source field really contains that value.
 - Do not call a value a DMA physical address until you have checked whether it fits the actual system physical-memory range and stated the current IOMMU context.
 
-Before or alongside this DMA fragment, ensure the other S1-S4 gates are already closed: instruction-level provenance (S1), ordinary object-state validation (S2), and stack or snapshot artifact exclusion where applicable (S3), plus stronger software corruption-source exclusion (S4).
+Before or alongside this DMA fragment, ensure the other S1-S4 gates are already closed: instruction-level provenance (S1), ordinary object-state validation (S2), and stack or snapshot artifact exclusion where applicable (S3), plus stronger software corruption-source discrimination (S4).
 
 ### Step 0: Stale Data Exclusion (MANDATORY before any value-match evidence)
 The kmalloc/slab allocator does NOT zero memory on allocation. Any value found in an allocated
@@ -370,7 +370,7 @@ validate the following:
   confidence must remain low until IOMMU bypass or misconfiguration is proven.
 """.strip(),
     "driver_source_correlation": """
-## 3.13 Driver Source Correlation
+## 3.15c Driver Source Correlation
 
 Use this SOP when the crash path is inside a driver, struct -o cannot validate the private type, or offset-only reasoning is stalling.
 

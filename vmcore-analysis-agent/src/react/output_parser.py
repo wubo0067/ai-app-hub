@@ -1,4 +1,4 @@
-#!/usr/bi,/,,v p,thon3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # output_parser.py - LLM 输出解析和修复模块
 # Author: CalmWU
@@ -7,7 +7,7 @@
 import json
 import re
 import shlex
-from typing import Any, TypeVar
+from typing import Any, Dict, List, Optional, TypeVar
 
 from json_repair import repair_json
 from pydantic import BaseModel
@@ -20,7 +20,14 @@ from .action_guard import (
     canonicalize_command_line,
     validate_tool_call_request,
 )
+from .consistency import (
+    format_conflict_fact,
+    parse_conflict_fact,
+    prune_resolved_value_conflicts,
+)
 from .schema import (
+    FinalDiagnosis,
+    SuspectCode,
     VMCoreAnalysisStep,
     VMCoreLLMAnalysisStep,
     get_corruption_mechanism_aliases,
@@ -42,6 +49,33 @@ _RIP_RE = re.compile(r"\bRIP:\s*(?:[0-9a-fA-F]+:)?(?P<addr>[0-9a-fA-F]{8,16})\b"
 
 # 正则表达式用于提取 Oops 错误代码
 _OOPS_RE = re.compile(r"\bOops:\s*(?P<code>[0-9a-fA-F]{4})\b")
+
+# 寄存器转储行：形如 "RBP: 0000000000000012" 或 "RIP: 0010:ffffffff..."，
+# 名称为 R?? / CR? 系列，值为 8-16 位十六进制（可带段前缀）。
+_REGISTER_DUMP_RE = re.compile(
+    r"\b(?P<name>R[A-Z0-9]{1,3}|CR[0-4])\s*:\s*(?:[0-9a-fA-F]{4}:)?"
+    r"(?P<val>[0-9a-fA-F]{8,16})\b"
+)
+
+# 从 "NULL pointer dereference at 0000000000000062" 提取故障地址
+_NULL_DEREF_ADDR_RE = re.compile(
+    r"NULL pointer dereference at\s+(?P<addr>[0-9a-fA-F]{8,16})",
+    flags=re.IGNORECASE,
+)
+
+# NULL 页区域上限：故障地址低于此值才会被归类为 null_deref
+_NULL_PAGE_REGION_LIMIT = 0x10000
+# 合理结构体成员偏移上限（损坏基址 + 偏移 = 故障地址）
+_MAX_STRUCT_FIELD_OFFSET = 0x1000
+# 内核文本/直接映射地址下界（兼容 LA48 与 LA57 内核虚拟地址布局）
+_KERNEL_TEXT_ADDR_FLOOR = 0xFF00_0000_0000_0000
+# 内核态代码段前缀形式的 RIP 行，如 "RIP: 0010:ffffffffbc3798a0"
+_KERNEL_MODE_RIP_RE = re.compile(r"\bRIP:\s*0010\s*:", re.IGNORECASE)
+# 任意异常帧的 RIP 标签行（裸地址 / 段前缀 / 0x 前缀 / 符号形式均可），
+# 用于识别"下一个异常帧"的起点，避免用户态帧寄存器混入内核帧。
+_RIP_LABEL_RE = re.compile(r"\bRIP\s*:", re.IGNORECASE)
+# 单个异常帧最多向后扫描的行数（RIP 行 + 若干寄存器行）
+_MAX_FRAME_LINES = 12
 
 # 正则表达式用于提取可能的地址迁移叙述（source -> destination）
 _ADDRESS_FLOW_RE = re.compile(
@@ -485,8 +519,11 @@ def apply_executor_consistency_audit(
     审计管线（按执行顺序）：
         [阶段 1] 故障上下文归一化 —— 修正签名/诊断术语与 Oops 类型一致
         [阶段 2] Action 形态归一化 —— 提升 MCP 工具、对齐提示词、预检命令
-        [阶段 3] 根因语义审计 —— slab OOB 方向、已分配槽 UAF、前缀覆盖、DMA 证据门槛
+        [阶段 3] 根因语义审计 —— slab OOB 方向、DMA 证据门槛
         [阶段 4] 页面错误访问类型矛盾检测 —— 对比错误码方向与指令类型
+        [阶段 5] 取值级矛盾审计 —— 已读内存内容与结构体布局不相容
+                 （因阶段 4 存在提前返回，阶段 5 由 apply_value_conflict_audit
+                  在本函数之后调用，两者共同构成完整管线）
 
     用途：
         确保 LLM 输出与实际 vmcore 上下文保持一致，发现并修正逻辑矛盾
@@ -537,31 +574,17 @@ def apply_executor_consistency_audit(
 
     # ------------------------------------------------------------
     # 阶段 3：根因语义审计
-    # 目标：基于 vmcore 中的客观证据（slab 分配状态、对象覆盖模式、
-    #       DMA 证据族等）对 LLM 的根因归因做交叉验证，发现并修正
+    # 目标：基于 vmcore 中的客观证据（slab OOB 方向、DMA 证据族等）
+    #       对 LLM 的根因归因做交叉验证，发现并修正
     #       LLM 可能产生的逻辑矛盾。
     #
     #   3a. reverse_slab_oob：拦截"高地址 OOB 写低地址"的反向归因
     #       （标准 kmalloc OOB 只能从低向高延伸）。
-    #   3b. allocated_slot_uaf：如果 kmem -S 显示 slot 当前已分配，
-    #       则反对"已释放/野指针 UAF"归因（除非有独立生命周期证据）。
-    #   3c. prefix_overwrite：当对象 dump 显示前缀密集非零 + 尾部
-    #       大面积为零时，优先归因于原位置写覆盖而非 UAF/OOB。
-    #   3d. dma_promotion_gate：判定 DMA 破坏需要至少 2 个独立的
+    #   3b. dma_promotion_gate：判定 DMA 破坏需要至少 2 个独立的
     #       设备侧证据族，否则降级为 unknown。
     # ------------------------------------------------------------
     analysis_step = _audit_reverse_slab_oob_claim(
         analysis_step,
-        log_prefix=log_prefix,
-    )
-    analysis_step = _audit_allocated_slot_uaf_claim(
-        analysis_step,
-        state,
-        log_prefix=log_prefix,
-    )
-    analysis_step = _audit_prefix_overwrite_pattern(
-        analysis_step,
-        state,
         log_prefix=log_prefix,
     )
     analysis_step = _audit_dma_promotion_gate(
@@ -752,131 +775,6 @@ def _audit_dma_promotion_gate(
     return analysis_step
 
 
-def _audit_allocated_slot_uaf_claim(
-    analysis_step: VMCoreLLMAnalysisStep,
-    state: dict[str, Any],
-    *,
-    log_prefix: str = "",
-) -> VMCoreLLMAnalysisStep:
-    """拦截与 kmem -S 已分配结论相冲突的 UAF/free-then-reuse 归因。"""
-    text = _collect_analysis_text_for_oob_audit(analysis_step)
-    if not text:
-        return analysis_step
-
-    lowered = _strip_allocated_uaf_audit_text(text).lower()
-    if not _looks_like_uaf_claim(lowered):
-        return analysis_step
-
-    if _looks_like_hedged_uaf_mention(lowered):
-        return analysis_step
-
-    state_text = _collect_state_text(state)
-    if not _looks_like_allocated_slab_observation(state_text.lower()):
-        return analysis_step
-
-    if _has_positive_lifetime_reuse_evidence(lowered):
-        return analysis_step
-
-    prefix = f"{log_prefix}: " if log_prefix else ""
-    audit_note = (
-        "Executor audit: kmem -S context shows the candidate slab slot is currently allocated, "
-        "but the analysis still asserted freed/stale-pointer UAF or free-then-reuse without separate "
-        "positive lifetime evidence. ALLOCATED rules out a simple freed-object explanation; absent "
-        "independent lifetime evidence, treat this as live-slot overwrite, type confusion, or another "
-        "non-UAF mechanism instead of concluding use-after-free."
-    )
-    logger.warning("%s%s", prefix, audit_note)
-
-    if audit_note not in analysis_step.reasoning:
-        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
-
-    if analysis_step.additional_notes:
-        if audit_note not in analysis_step.additional_notes:
-            analysis_step.additional_notes = (
-                f"{analysis_step.additional_notes} {audit_note}"
-            ).strip()
-    else:
-        analysis_step.additional_notes = audit_note
-
-    if analysis_step.root_cause_class == "use_after_free":
-        analysis_step.root_cause_class = "pointer_corruption"
-        if analysis_step.corruption_mechanism in {None, "unknown"}:
-            analysis_step.corruption_mechanism = "write_corruption"
-
-    if analysis_step.is_conclusive:
-        analysis_step.is_conclusive = False
-        analysis_step.final_diagnosis = None
-        analysis_step.fix_suggestion = None
-
-    if analysis_step.confidence not in {None, "low"}:
-        analysis_step.confidence = "low"
-
-    return analysis_step
-
-
-def _audit_prefix_overwrite_pattern(
-    analysis_step: VMCoreLLMAnalysisStep,
-    state: dict[str, Any],
-    *,
-    log_prefix: str = "",
-) -> VMCoreLLMAnalysisStep:
-    """识别前缀覆盖/零尾部模式，避免在 UAF 与 OOB 之间无谓摇摆。"""
-    state_text = _collect_state_text(state)
-    pattern = _find_dense_prefix_zero_tail_pattern(state_text)
-    if pattern is None:
-        return analysis_step
-
-    text = _collect_analysis_text_for_oob_audit(analysis_step).lower()
-    if not any(
-        marker in text
-        for marker in (
-            "use-after-free",
-            "use after free",
-            "uaf",
-            "out-of-bounds",
-            "out of bounds",
-            "overflow",
-            "stale pointer",
-            "type confusion",
-            "pointer corruption",
-        )
-    ):
-        return analysis_step
-
-    prefix = f"{log_prefix}: " if log_prefix else ""
-    audit_note = (
-        "Executor audit: the raw object dump shows a dense non-zero prefix with a mostly zero "
-        f"tail ({pattern}). In a live kmalloc slot, this is a prefix-overwrite signature: prefer "
-        "in-place write corruption, foreign-structure copy, or type confusion over classic UAF or "
-        "bulk adjacent-slot buffer overflow unless separate lifetime or neighboring-slot evidence proves otherwise."
-    )
-    logger.warning("%s%s", prefix, audit_note)
-
-    if audit_note not in analysis_step.reasoning:
-        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
-
-    if analysis_step.additional_notes:
-        if audit_note not in analysis_step.additional_notes:
-            analysis_step.additional_notes = (
-                f"{analysis_step.additional_notes} {audit_note}"
-            ).strip()
-    else:
-        analysis_step.additional_notes = audit_note
-
-    if analysis_step.root_cause_class in {
-        None,
-        "unknown",
-        "use_after_free",
-        "out_of_bounds",
-    }:
-        analysis_step.root_cause_class = "pointer_corruption"
-
-    if analysis_step.corruption_mechanism in {None, "unknown"}:
-        analysis_step.corruption_mechanism = "write_corruption"
-
-    return analysis_step
-
-
 def _collect_dma_evidence_families(lowered_text: str) -> set[str]:
     """提取 DMA 结论中已经满足的独立设备侧证据族。"""
     family_markers: dict[str, tuple[str, ...]] = {
@@ -956,108 +854,6 @@ def _collect_dma_evidence_families(lowered_text: str) -> set[str]:
             break
 
     return matched
-
-
-def _looks_like_uaf_claim(lowered_text: str) -> bool:
-    """判断文本是否在主张 freed/stale-pointer 风格的 UAF。"""
-    strong_markers = (
-        "this is consistent with a use-after-free",
-        "this is consistent with use-after-free",
-        "confirms use-after-free",
-        "confirming use-after-free",
-        "retained stale reference confirms use-after-free",
-        "freed and its memory reused",
-        "pointer survived free",
-        "stale pointer is the root cause",
-        "use-after-free is the root cause",
-        "uaf is the root cause",
-    )
-    generic_markers = (
-        "use-after-free",
-        "use after free",
-        "uaf",
-        "stale pointer",
-        "freed and reallocated",
-        "freed and reused",
-        "original object was freed",
-    )
-    return any(marker in lowered_text for marker in strong_markers) or (
-        any(marker in lowered_text for marker in generic_markers)
-        and not _looks_like_hedged_uaf_mention(lowered_text)
-    )
-
-
-def _looks_like_hedged_uaf_mention(lowered_text: str) -> bool:
-    """区分把 UAF 当候选项列举，与把 UAF 当结论断言。"""
-    if not any(
-        marker in lowered_text for marker in ("use-after-free", "use after free", "uaf")
-    ):
-        return False
-
-    hedged_markers = (
-        "cannot be determined",
-        "cannot determine",
-        "could not determine",
-        "exact corruption mechanism",
-        "possible",
-        "candidate",
-        "one possibility",
-        "whether",
-        "or dma",
-        "or out-of-bounds",
-        "or out of bounds",
-    )
-    return any(marker in lowered_text for marker in hedged_markers)
-
-
-def _strip_allocated_uaf_audit_text(text: str) -> str:
-    """移除上一次 injected audit 文本，避免 audit 自己触发自己。"""
-    audit_prefix = "Executor audit: kmem -S context shows the candidate slab slot is currently allocated"
-    if audit_prefix not in text:
-        return text
-    return " ".join(segment for segment in text.split(audit_prefix) if segment.strip())
-
-
-def _looks_like_allocated_slab_observation(lowered_text: str) -> bool:
-    """判断状态文本是否明确给出了 kmem -S 的 ALLOCATED 观察。"""
-    return "kmem -s" in lowered_text and "free / [allocated]" in lowered_text
-
-
-def _has_positive_lifetime_reuse_evidence(lowered_text: str) -> bool:
-    """判断文本是否给出了超越类型不一致的正向生命周期复用证据。"""
-    evidence_markers = (
-        "free stack",
-        "alloc stack",
-        "allocation stack",
-        "free path",
-        "kfree",
-        "kmem_cache_free",
-        "refcount reached zero",
-        "lifetime transition",
-        "rcu callback",
-        "retained stale reference",
-        "survived free",
-        "after reuse",
-    )
-    return any(marker in lowered_text for marker in evidence_markers)
-
-
-def _find_dense_prefix_zero_tail_pattern(state_text: str) -> str | None:
-    """检测 128-byte 对象中前缀密集非零、尾部大面积为零的覆盖模式。"""
-    words = re.findall(r"\b[0-9a-fA-F]{16}\b", state_text)
-    if len(words) < 16:
-        return None
-
-    zero_word = "0000000000000000"
-    for start in range(0, len(words) - 15):
-        window = words[start : start + 16]
-        first_half = window[:8]
-        second_half = window[8:]
-        first_nonzero = sum(word != zero_word for word in first_half)
-        second_zero = sum(word == zero_word for word in second_half)
-        if first_nonzero >= 6 and second_zero >= 6:
-            return f"first_half_nonzero={first_nonzero}/8, second_half_zero={second_zero}/8"
-    return None
 
 
 def _collect_analysis_text_for_oob_audit(analysis_step: VMCoreLLMAnalysisStep) -> str:
@@ -1455,6 +1251,283 @@ def _render_structured_action_text(analysis_step: VMCoreLLMAnalysisStep) -> str:
     return action.command_name
 
 
+def _parse_kernel_frame_registers(text: str) -> Dict[str, List[int]]:
+    """解析**内核异常帧**中的寄存器取值，跳过用户态帧。
+
+    一次 Oops 的上下文里通常有两套寄存器：内核异常帧和陷入前的用户态帧，
+    同名寄存器（如 RBP）会出现两次且取值完全不同。用户态帧里的小整数
+    （如 RBX=0x6）会与故障地址凑出假的"基址+偏移"关系，因此必须先定位
+    内核帧再解析。
+
+    定位方式：找到 RIP 为内核地址（>= 0xff00_0000_0000_0000，兼容 LA48/LA57）
+    或带内核代码段前缀（``RIP: 0010:``）的那一行作为帧起点，向后逐行收集，
+    直到遇到下一个 RIP（下一帧）、无寄存器匹配的行（如 ORIG_RAX/CS/SS 行）
+    或超出帧行数上限。
+
+    Returns:
+        name -> [values]；未定位到内核帧时返回空字典（调用方据此放弃升级）。
+    """
+    lines = text.splitlines()
+    start: Optional[int] = None
+    for index, line in enumerate(lines):
+        if _KERNEL_MODE_RIP_RE.search(line):
+            start = index
+            break
+        for match in _REGISTER_DUMP_RE.finditer(line):
+            if match.group("name").upper() != "RIP":
+                continue
+            try:
+                value = int(match.group("val"), 16)
+            except (TypeError, ValueError):
+                continue
+            if value >= _KERNEL_TEXT_ADDR_FLOOR:
+                start = index
+                break
+        if start is not None:
+            break
+
+    if start is None:
+        return {}
+
+    registers: Dict[str, List[int]] = {}
+    for offset in range(_MAX_FRAME_LINES):
+        index = start + offset
+        if index >= len(lines):
+            break
+        matches = list(_REGISTER_DUMP_RE.finditer(lines[index]))
+        if not matches:
+            # 起点行本身可能以符号形式给出 RIP（dmesg 的
+            # ``RIP: 0010:show_interrupts+0x240/0x5a0``），寄存器匹配必然失败；
+            # 此时应跳到下一行继续收集，而不是把帧起点当成帧结束。
+            if offset == 0:
+                continue
+            break
+        # 再次出现 RIP 说明进入了下一个异常帧（通常是用户态帧）。必须按
+        # "RIP 标签"而非"可解析为十六进制的 RIP 值"判断：用户态帧常写成
+        # ``RIP: 0033:0x7f...``，其值带 0x 前缀无法被 _REGISTER_DUMP_RE 匹配，
+        # 若仅依赖寄存器匹配会漏检，导致用户态小整数寄存器混入内核帧。
+        if offset > 0 and _RIP_LABEL_RE.search(lines[index]):
+            break
+        for match in matches:
+            try:
+                value = int(match.group("val"), 16)
+            except (TypeError, ValueError):
+                continue
+            registers.setdefault(match.group("name").upper(), []).append(value)
+    if not registers:
+        # 定位到了内核帧却一个寄存器都没解析出来，说明帧格式超出预期；
+        # 静默放弃升级会让"解析失效"与"证据不足"不可区分，故显式告警。
+        logger.warning(
+            "[Audit] kernel exception frame located at line %d but no registers "
+            "parsed; corrupted-base escalation disabled for this dump",
+            start + 1,
+        )
+    return registers
+
+
+def _detect_corrupted_base_null_deref(text: str) -> Optional[Dict[str, Any]]:
+    """检测"损坏基址 + 结构体偏移"型的 NULL 页解引用。
+
+    判据（三者同时成立）：
+    1. 故障地址非零且落在 NULL 页区域（< 0x10000）——即被归类为 null_deref；
+    2. 内核异常帧中存在某寄存器，其取值同样落在 NULL 页区域，因而不可能是
+       合法指针基址（内核 NULL 页永不映射）；
+    3. ``fault_addr == reg_value + offset``，offset 为合理结构体成员偏移
+       （0 < offset <= 0x1000）。
+
+    满足则说明真正的根因是"基址指针被损坏"而非"基址为 NULL"。
+
+    为避免把普通计数值误判为损坏基址，要求候选**唯一**：若内核帧里有多个
+    寄存器都能凑出该关系，则视为证据不足，放弃升级。
+
+    典型实例：show_interrupts 中 ``mov 0x50(%rbp),%rdx``，异常帧 RBP=0x12
+    （来自 ``mov 0x18(%r15),%rbp`` 读到的损坏 irqaction.next），
+    故障地址 0x12+0x50=0x62。用户态帧的 RBP=0x00005624...、RBX=0x6 因
+    不在内核帧内而被排除，不会造成误报。
+    """
+    addr_match = _NULL_DEREF_ADDR_RE.search(text)
+    if not addr_match:
+        return None
+    try:
+        fault_addr = int(addr_match.group("addr"), 16)
+    except (TypeError, ValueError):
+        return None
+    # 地址 0 是纯 NULL 解引用，不属于损坏基址；超出 NULL 页则不是 null_deref。
+    if fault_addr == 0 or fault_addr >= _NULL_PAGE_REGION_LIMIT:
+        return None
+
+    candidates: List[Dict[str, Any]] = []
+    for name, values in _parse_kernel_frame_registers(text).items():
+        for value in values:
+            # 基址本身必须落在 NULL 页内，才可能是"损坏的指针"而非计数值。
+            if value == 0 or value >= _NULL_PAGE_REGION_LIMIT:
+                continue
+            offset = fault_addr - value
+            if 0 < offset <= _MAX_STRUCT_FIELD_OFFSET:
+                candidates.append(
+                    {
+                        "fault_addr": fault_addr,
+                        "register": name,
+                        "register_value": value,
+                        "offset": offset,
+                    }
+                )
+
+    if len(candidates) != 1:
+        if len(candidates) > 1:
+            logger.info(
+                "[Audit] null_deref corrupted-base check skipped: %d candidate "
+                "registers match fault addr 0x%x (%s); evidence is ambiguous",
+                len(candidates),
+                fault_addr,
+                ", ".join(
+                    f"{c['register']}=0x{c['register_value']:x}" for c in candidates
+                ),
+            )
+        return None
+
+    return candidates[0]
+
+
+def _append_audit_note(
+    analysis_step: VMCoreLLMAnalysisStep,
+    audit_note: str,
+) -> VMCoreLLMAnalysisStep:
+    """将审计说明写入 reasoning（前缀）与 additional_notes（后缀），去重。"""
+    if audit_note not in analysis_step.reasoning:
+        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
+
+    if analysis_step.additional_notes:
+        if audit_note not in analysis_step.additional_notes:
+            analysis_step.additional_notes = (
+                f"{analysis_step.additional_notes} {audit_note}"
+            ).strip()
+    else:
+        analysis_step.additional_notes = audit_note
+
+    return analysis_step
+
+
+def _mentions_value_level_conflict(
+    analysis_step: VMCoreLLMAnalysisStep,
+    conflicts: List[str],
+) -> bool:
+    """判断模型是否已经引用过这些取值级矛盾（以矛盾对象基址为准）。
+
+    与 ``_mentions_access_type_mismatch`` 同样的意图：如果模型在 reasoning /
+    诊断文本里已经写出了具体的矛盾对象地址，说明它已经自行完成这一步交叉检查，
+    不需要再注入审计说明。
+    """
+    text = _collect_analysis_text_for_oob_audit(analysis_step).lower()
+    if not text:
+        return False
+
+    for fact in conflicts:
+        parsed = parse_conflict_fact(fact)
+        if parsed is None:
+            continue
+        _, base = parsed
+        if f"{base:x}" in text:
+            return True
+    return False
+
+
+def unresolved_value_conflicts(
+    analysis_step: VMCoreLLMAnalysisStep,
+    state: dict[str, Any],
+) -> list[str]:
+    """返回模型本次分析尚未回应的取值级矛盾（保持原有顺序）。
+
+    ``state["value_conflicts"]`` 是追加式的：一旦某条矛盾被发现就会一直留在状态里，
+    并把后续每一步的根因压回 unknown、把 is_conclusive 撤销。若模型已经按提示词
+    要求显式核对该矛盾（写出 ``已核对冲突<Type>@0x<base>`` 并给出替代解释），
+    它就不应再阻塞收敛，因此调用方应把本函数结果写回 ``value_conflicts``。
+
+    非字符串条目与无法解析的事实一律保留（宁可多提示，不可漏提示）。
+    """
+    raw = state.get("value_conflicts") or []
+    if not isinstance(raw, (list, tuple)):
+        return []
+    text = _collect_analysis_text_for_oob_audit(analysis_step)
+    return prune_resolved_value_conflicts(list(raw), text)
+
+
+def apply_value_conflict_audit(
+    analysis_step: VMCoreLLMAnalysisStep,
+    state: dict[str, Any],
+    *,
+    log_prefix: str = "",
+    force_wrapup: bool = False,
+) -> VMCoreLLMAnalysisStep:
+    """[阶段 5] 取值级矛盾审计：已读内存内容与结构体布局不相容。
+
+    触发条件：``state["value_conflicts"]`` 非空，即执行器已机械判定
+    "该地址的内存不是该类型的对象"（例如 ``irq_desc.action`` 指向的内容
+    不满足 ``irqaction`` 的指针字段语义），而模型尚未引用该矛盾。
+
+    与阶段 1~4 同属执行器一致性审计管线；因为阶段 4 存在提前返回，
+    阶段 5 以独立入口暴露，由 ``llm_node`` 紧随 ``apply_executor_consistency_audit`` 调用。
+
+    Args:
+        analysis_step: LLM 分析步骤
+        state: 当前状态（读取 value_conflicts）
+        log_prefix: 日志前缀
+        force_wrapup: 是否处于强制收口/最后一步。此时仍注入审计说明（让最终结论
+            带上矛盾告警），但不再撤销结论、不再降级根因、不再压制置信度 ——
+            否则步数耗尽时任何残留矛盾都会让 agent 只能输出 unknown。
+
+    Returns:
+        VMCoreLLMAnalysisStep: 审计修正后的分析步骤
+    """
+    prefix = f"{log_prefix}: " if log_prefix else ""
+    conflicts = unresolved_value_conflicts(analysis_step, state)
+    if not conflicts:
+        return analysis_step
+
+    if _mentions_value_level_conflict(analysis_step, conflicts):
+        logger.debug(
+            "%sExecutor audit found a value-level contradiction, but the model already referenced it.",
+            prefix,
+        )
+        return analysis_step
+
+    rendered = [
+        text
+        for text in (format_conflict_fact(fact) for fact in conflicts)
+        if text is not None
+    ]
+    summary = "; ".join(rendered) if rendered else "; ".join(conflicts)
+    audit_note = (
+        "Executor audit: unresolved value-level contradiction between the memory you read "
+        f"and the declared struct layout. {summary}"
+    )
+    logger.warning("%s%s", prefix, audit_note)
+
+    _append_audit_note(analysis_step, audit_note)
+
+    # 强制收口/最后一步：仍注入上面的审计告警，但不再撤销结论、降级根因或压制
+    # 置信度。否则步数耗尽时任何残留矛盾都会把 agent 逼成只能输出 unknown，
+    # 反而丢失了模型本可给出的有界结论。
+    if force_wrapup:
+        return analysis_step
+
+    # 根因降级：对象类型都还没解释清楚时，当前归因不可信任
+    if analysis_step.root_cause_class not in {None, "unknown"}:
+        analysis_step.root_cause_class = "unknown"
+
+    # 撤销定论状态：矛盾未澄清前不能下最终结论
+    if analysis_step.is_conclusive:
+        analysis_step.is_conclusive = False
+        analysis_step.final_diagnosis = None
+        analysis_step.fix_suggestion = None
+
+    # 置信度压制：存在未解决的矛盾时最高只能为 low
+    if analysis_step.confidence not in {None, "low"}:
+        analysis_step.confidence = "low"
+
+    return analysis_step
+
+
 def _normalize_signature_class_from_fault_context(
     analysis_step: VMCoreLLMAnalysisStep,
     state: dict[str, Any],
@@ -1472,14 +1545,39 @@ def _normalize_signature_class_from_fault_context(
         VMCoreLLMAnalysisStep: 修正后的分析步骤
 
     逻辑：
-        如果 signature_class 是 general_protection_fault 但上下文显示是页面错误，
-        则修正为 pointer_corruption
+        1. signature_class 是 general_protection_fault 但上下文显示是页面错误，
+           修正为 pointer_corruption。
+        2. signature_class 是 null_deref 但故障地址实为"损坏基址 + 结构体偏移"
+           （见 _detect_corrupted_base_null_deref），升级为 pointer_corruption，
+           以解锁 object_lifetime / local_corruption_exclusion 等门控，
+           驱动 executor 转向调查指针来源而非在 NULL 假设下重复取证。
     """
     prefix = f"{log_prefix}: " if log_prefix else ""
-    if analysis_step.signature_class != "general_protection_fault":
+    if analysis_step.signature_class not in (
+        "general_protection_fault",
+        "null_deref",
+    ):
         return analysis_step
 
     text = _collect_state_text(state)
+
+    if analysis_step.signature_class == "null_deref":
+        corrupted = _detect_corrupted_base_null_deref(text)
+        if not corrupted:
+            return analysis_step
+        analysis_step.signature_class = "pointer_corruption"
+        audit_note = (
+            "Executor audit: fault address 0x{fault_addr:x} equals corrupted base "
+            "{register}=0x{register_value:x} plus struct-field offset 0x{offset:x}; "
+            "the base register holds a non-canonical invalid pointer, so "
+            "signature_class was escalated from null_deref to pointer_corruption. "
+            "Investigate the provenance of {register} (object lifetime, concurrent "
+            "modification, memory corruption) instead of assuming a plain NULL "
+            "dereference.".format(**corrupted)
+        )
+        logger.warning("%s%s", prefix, audit_note)
+        return _append_audit_note(analysis_step, audit_note)
+
     if not _is_kernel_paging_request_page_fault_context(text):
         return analysis_step
 
@@ -1491,18 +1589,7 @@ def _normalize_signature_class_from_fault_context(
     )
     logger.warning("%s%s", prefix, audit_note)
 
-    if audit_note not in analysis_step.reasoning:
-        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
-
-    if analysis_step.additional_notes:
-        if audit_note not in analysis_step.additional_notes:
-            analysis_step.additional_notes = (
-                f"{analysis_step.additional_notes} {audit_note}"
-            ).strip()
-    else:
-        analysis_step.additional_notes = audit_note
-
-    return analysis_step
+    return _append_audit_note(analysis_step, audit_note)
 
 
 def _normalize_final_diagnosis_for_fault_context(
@@ -1971,3 +2058,379 @@ def _mentions_access_type_mismatch(
         and "contrad" in lowered
         and any(keyword in lowered for keyword in keywords)
     )
+
+
+# =============================================================================
+# 收口兜底：确定性地合成有界结论（fallback conclusion synthesis）
+# =============================================================================
+#
+# 触发场景：收口轮（is_last_step 或强制收口）里模型既没有给出 final_diagnosis，
+# 又被剥掉了 tool_calls，于是整轮被浪费、报告以"未得出正式结论"结束。
+# 此时若"根因类已确定 + 该签名类的强制 gate 全部 closed/n/a"，收敛契约其实已经
+# 满足，缺的只是把已有证据渲染成 FinalDiagnosis 这一步。本模块只做渲染：
+# 不新增任何判断、不改动 gate/假设，因此合成结果不会被 validate_and_patch 降级。
+
+_FALLBACK_CRASH_TYPE_LABELS: Dict[str, tuple] = {
+    "null_deref": ("NULL pointer dereference", "空指针解引用"),
+    "use_after_free": ("use-after-free", "释放后使用（UAF）"),
+    "out_of_bounds": ("out-of-bounds access", "越界访问"),
+    "double_free": ("double free", "重复释放"),
+    "wild_pointer": ("wild pointer dereference", "野指针解引用"),
+    "slab_corruption": ("slab corruption", "slab 内存池损坏"),
+    "race_condition": ("race condition", "竞态条件"),
+    "deadlock": ("deadlock", "死锁"),
+    "rcu_misuse": ("RCU misuse", "RCU 误用"),
+    "atomic_sleep": ("sleeping in atomic context", "原子上下文中睡眠"),
+    "dma_corruption": ("DMA memory corruption", "DMA 内存损坏"),
+    "iommu_fault": ("IOMMU fault", "IOMMU 故障"),
+    "mce": ("machine check exception", "机器检查异常"),
+    "bug_on": ("kernel BUG assertion", "内核 BUG 断言"),
+    "warn_on": ("kernel WARN assertion", "内核 WARN 断言"),
+    "divide_error": ("divide error", "除零错误"),
+    "invalid_opcode": ("invalid opcode", "无效操作码"),
+    "oom": ("out of memory", "内存耗尽"),
+    "oom_panic": ("out-of-memory panic", "内存耗尽恐慌"),
+    "pointer_corruption": ("pointer corruption", "指针损坏"),
+    "stack_corruption": ("stack corruption", "栈损坏"),
+    "write_protection_violation": (
+        "write protection violation",
+        "写保护违例",
+    ),
+    "smap_smep_violation": ("SMAP/SMEP violation", "SMAP/SMEP 违例"),
+}
+
+# 单条证据渲染上限与总条数上限：兜底结论必须"有界"，不能把整段工具输出塞进报告。
+_MAX_FALLBACK_EVIDENCE_ITEMS = 20
+_MAX_FALLBACK_EVIDENCE_CHARS = 300
+
+# panic/oops 标题行：用于回填 FinalDiagnosis.panic_string
+_PANIC_LINE_RE = re.compile(
+    r"^(?P<line>(?:"
+    r"Kernel panic - not syncing"
+    r"|kernel BUG at"
+    r"|BUG:"
+    r"|Oops:"
+    r"|general protection fault"
+    r"|WARNING:"
+    r")[^\n]*)",
+    re.MULTILINE,
+)
+
+# 形如 show_interrupts+0x240/0x5a0 的符号偏移
+_SYMBOL_OFFSET_RE = re.compile(
+    r"(?P<func>[A-Za-z_][A-Za-z0-9_]*)\+0x(?P<offset>[0-9a-fA-F]+)"
+)
+
+# crash dis 输出的一行：0xffffffff81a24240 <show_interrupts+640>:  mov ...
+# 与 _DISASM_LINE_RE 同构，但额外捕获尖括号内的符号名。
+_DISASM_SYMBOL_LINE_RE = re.compile(
+    r"^\s*0x(?P<addr>[0-9a-fA-F]+)\s+<(?P<symbol>[^>:]+)\*?>:\s+(?P<inst>.+)$",
+    re.MULTILINE,
+)
+
+
+def _fallback_report_is_chinese(state: dict[str, Any]) -> bool:
+    return str(state.get("report_language", "eng")).lower() == "zh"
+
+
+def _clip_fallback_text(text: str, limit: int = _MAX_FALLBACK_EVIDENCE_CHARS) -> str:
+    normalized = " ".join(str(text).split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3] + "..."
+
+
+def _unresolved_required_gates(analysis_result: VMCoreAnalysisStep) -> List[str]:
+    """返回该签名类尚未 closed/n/a 的强制 gate 名（与 validate_and_patch 同判据）。"""
+    required = VMCoreAnalysisStep._REQUIRED_GATES.get(
+        analysis_result.signature_class or "", []
+    )
+    gates = analysis_result.gates or {}
+    return [
+        name
+        for name in required
+        if name not in gates or gates[name].status not in {"closed", "n/a"}
+    ]
+
+
+def _mine_panic_string(state_text: str) -> str:
+    match = _PANIC_LINE_RE.search(state_text or "")
+    if match is None:
+        return ""
+    return _clip_fallback_text(match.group("line"), 200)
+
+
+def _mine_faulting_instruction(state_text: str) -> str:
+    """从已收集的文本中还原故障指令；找不到时返回空串由调用方兜底。"""
+    rip_match = _RIP_RE.search(state_text or "")
+    if rip_match is None:
+        return ""
+    rip_addr = int(rip_match.group("addr"), 16)
+    for dis in _DISASM_SYMBOL_LINE_RE.finditer(state_text or ""):
+        if int(dis.group("addr"), 16) != rip_addr:
+            continue
+        return _clip_fallback_text(
+            f"0x{rip_addr:x} <{dis.group('symbol').strip()}>: "
+            f"{' '.join(dis.group('inst').split())}",
+            200,
+        )
+    return f"0x{rip_addr:x}"
+
+
+def _mine_suspect_function(state_text: str, faulting_instruction: str, state: dict) -> str:
+    """可疑函数：故障指令所在符号 → 反汇编事实中的首个符号 → unknown。"""
+    for source in (faulting_instruction, state_text):
+        match = _SYMBOL_OFFSET_RE.search(source or "")
+        if match:
+            return match.group("func")
+        dis_match = _DISASM_SYMBOL_LINE_RE.search(source or "")
+        if dis_match:
+            name = dis_match.group("symbol").split("+", 1)[0].strip()
+            if name:
+                return name
+    for fact in state.get("evidence_facts", []) or []:
+        if isinstance(fact, str) and fact.startswith("dis_symbol:"):
+            symbol = fact[len("dis_symbol:"):]
+            name = symbol.split("+", 1)[0].strip()
+            if name:
+                return name
+    return "unknown"
+
+
+def _build_fallback_evidence(
+    state: dict[str, Any],
+    analysis_result: VMCoreAnalysisStep,
+) -> List[str]:
+    """证据条目 = 已闭合 gate 的判据 + 关键取值事实 + 未解决的取值级矛盾。"""
+    evidence: List[str] = []
+
+    for gate_name, gate in (analysis_result.gates or {}).items():
+        if gate.status not in {"closed", "n/a"}:
+            continue
+        detail = gate.evidence or "(no evidence text recorded)"
+        evidence.append(f"gate {gate_name} [{gate.status}]: {_clip_fallback_text(detail)}")
+
+    for fact in (state.get("evidence_facts", []) or [])[:_MAX_FALLBACK_EVIDENCE_ITEMS]:
+        if isinstance(fact, str) and fact:
+            evidence.append(f"evidence fact: {fact}")
+
+    for conflict in (state.get("value_conflicts", []) or [])[:8]:
+        readable = format_conflict_fact(conflict) if isinstance(conflict, str) else None
+        evidence.append(f"value conflict: {readable or _clip_fallback_text(conflict)}")
+
+    deduped: List[str] = []
+    for item in evidence:
+        if item not in deduped:
+            deduped.append(item)
+    return deduped[:_MAX_FALLBACK_EVIDENCE_ITEMS]
+
+
+def _render_fallback_analysis(
+    state: dict[str, Any],
+    analysis_result: VMCoreAnalysisStep,
+    *,
+    crash_type: str,
+    evidence: List[str],
+) -> str:
+    chinese = _fallback_report_is_chinese(state)
+    gates = analysis_result.gates or {}
+    closed = [name for name, gate in gates.items() if gate.status == "closed"]
+    not_applicable = [name for name, gate in gates.items() if gate.status == "n/a"]
+
+    if chinese:
+        paragraphs = [
+            (
+                f"本报告结论由执行器在收口阶段自动补全：模型已完成全部强制验证关卡，"
+                f"但未输出正式的终止结论结构。崩溃类型为 {crash_type}，"
+                f"根因类为 {analysis_result.root_cause_class}。"
+            ),
+            (
+                "已闭合的验证关卡："
+                + ("、".join(closed) if closed else "无")
+                + ("；判定不适用的关卡：" + "、".join(not_applicable) if not_applicable else "")
+                + "。上述关卡的判据见 evidence 列表。"
+            ),
+        ]
+        if evidence:
+            paragraphs.append("支撑该结论的关键证据：" + "；".join(evidence[:8]) + "。")
+        if analysis_result.additional_notes:
+            paragraphs.append(
+                "执行器审计与遗留事项：" + _clip_fallback_text(analysis_result.additional_notes, 600)
+            )
+        paragraphs.append(
+            "置信度为 low：结论限定在上述已闭合关卡所覆盖的范围，"
+            "未验证的机制（例如被覆盖字节的具体来源）仍属开放问题，"
+            "不应被理解为已完成机制级定位。"
+        )
+        return "\n\n".join(paragraphs)
+
+    paragraphs = [
+        (
+            "This conclusion was completed by the executor during the wrap-up turn: "
+            "every mandatory verification gate had closed, but the model did not emit "
+            "a terminal conclusion structure. Crash type: {crash_type}; root cause class: "
+            "{root_cause}.".format(
+                crash_type=crash_type, root_cause=analysis_result.root_cause_class
+            )
+        ),
+        (
+            "Closed gates: "
+            + (", ".join(closed) if closed else "none")
+            + ("; not-applicable gates: " + ", ".join(not_applicable) if not_applicable else "")
+            + ". Each gate's closure criterion is listed in the evidence array."
+        ),
+    ]
+    if evidence:
+        paragraphs.append("Key supporting evidence: " + "; ".join(evidence[:8]) + ".")
+    if analysis_result.additional_notes:
+        paragraphs.append(
+            "Executor audit notes and open items: "
+            + _clip_fallback_text(analysis_result.additional_notes, 600)
+        )
+    paragraphs.append(
+        "Confidence is low: the conclusion is bounded to the scope covered by the "
+        "closed gates. Mechanisms that were never verified (for example the exact "
+        "writer of the overwritten bytes) remain open questions and must not be read "
+        "as a mechanism-level attribution."
+    )
+    return "\n\n".join(paragraphs)
+
+
+def _synthesize_final_diagnosis(
+    state: dict[str, Any],
+    analysis_result: VMCoreAnalysisStep,
+) -> Optional[FinalDiagnosis]:
+    state_text = _collect_state_text(state)
+    chinese = _fallback_report_is_chinese(state)
+
+    label_pair = _FALLBACK_CRASH_TYPE_LABELS.get(
+        str(analysis_result.root_cause_class),
+        (
+            str(analysis_result.signature_class or "unknown").replace("_", " "),
+            str(analysis_result.signature_class or "unknown").replace("_", " "),
+        ),
+    )
+    crash_type = label_pair[1] if chinese else label_pair[0]
+
+    faulting_instruction = _mine_faulting_instruction(state_text) or "unknown"
+    suspect_function = _mine_suspect_function(state_text, faulting_instruction, state)
+    panic_string = _mine_panic_string(state_text) or (
+        "未在已收集证据中捕获到 panic 字符串（执行器补全结论）"
+        if chinese
+        else "panic string not captured in the collected evidence (executor-synthesized)"
+    )
+    evidence = _build_fallback_evidence(state, analysis_result)
+
+    if chinese:
+        root_cause = (
+            f"{suspect_function} 处发生 {crash_type}：根因类判定为 "
+            f"{analysis_result.root_cause_class}，全部强制验证关卡已闭合。"
+        )
+        suspect_file = "unknown"
+    else:
+        root_cause = (
+            f"{crash_type} at {suspect_function}: the analysis classified the root cause "
+            f"as {analysis_result.root_cause_class} and every mandatory gate closed."
+        )
+        suspect_file = "unknown"
+
+    return FinalDiagnosis(
+        crash_type=crash_type,
+        panic_string=panic_string,
+        faulting_instruction=faulting_instruction,
+        root_cause=root_cause,
+        detailed_analysis=_render_fallback_analysis(
+            state,
+            analysis_result,
+            crash_type=crash_type,
+            evidence=evidence,
+        ),
+        suspect_code=SuspectCode(
+            file=suspect_file, function=suspect_function, line="unknown"
+        ),
+        evidence=evidence or ["(no structured evidence facts were recorded)"],
+        # 执行器兜底合成没有源码级推断来源，显式置空。
+        driver_source_evidence=None,
+        corruption_mechanism=getattr(analysis_result, "corruption_mechanism", None),
+    )
+
+
+def apply_fallback_conclusion_synthesis(
+    analysis_result: VMCoreAnalysisStep,
+    state: dict[str, Any],
+    *,
+    log_prefix: str = "",
+) -> VMCoreAnalysisStep:
+    """收口轮兜底：把已闭合的证据渲染成有界的 FinalDiagnosis，避免整轮空转。
+
+    只在收敛契约确实已满足时生效（根因类已确定 + 强制 gate 全部 closed/n/a），
+    并且合成后会重新走一次模型校验；若仍被降级，则原样返回非结论结果。
+    """
+    if analysis_result.is_conclusive or analysis_result.final_diagnosis is not None:
+        return analysis_result
+    if analysis_result.root_cause_class in {None, "unknown"}:
+        return analysis_result
+
+    unresolved = _unresolved_required_gates(analysis_result)
+    if unresolved:
+        logger.warning(
+            "%sFallback synthesis skipped: required gates not closed/n/a: %s.",
+            log_prefix,
+            ", ".join(unresolved),
+        )
+        return analysis_result
+
+    diagnosis = _synthesize_final_diagnosis(state, analysis_result)
+    if diagnosis is None:
+        return analysis_result
+
+    chinese = _fallback_report_is_chinese(state)
+    audit_note = (
+        "执行器补全：收口轮模型未输出终止结论，已依据全部已闭合的强制关卡"
+        "合成置信度为 low 的有界结论。"
+        if chinese
+        else
+        "Executor fallback: the wrap-up turn produced no terminal conclusion, so a "
+        "low-confidence bounded conclusion was synthesized from the closed mandatory gates."
+    )
+
+    payload = analysis_result.model_dump()
+    notes = payload.get("additional_notes") or ""
+    payload.update(
+        {
+            "is_conclusive": True,
+            "action": None,
+            "confidence": "low",
+            "final_diagnosis": diagnosis.model_dump(),
+            "fix_suggestion": payload.get("fix_suggestion")
+            or (
+                "在已定位的写入路径上补充防护，并针对未验证的机制补充最小化验证。"
+                if chinese
+                else "Add the guard on the identified writer path and run the minimal "
+                "verification for the mechanisms that stayed unverified."
+            ),
+            "additional_notes": (f"{notes} {audit_note}".strip() if notes else audit_note),
+        }
+    )
+
+    try:
+        rebuilt = VMCoreAnalysisStep.model_validate(payload)
+    except Exception as exc:  # pragma: no cover - 防御性：校验异常时保持原结果
+        logger.error("%sFallback synthesis failed validation: %s", log_prefix, exc)
+        return analysis_result
+
+    if not rebuilt.is_conclusive or rebuilt.final_diagnosis is None:
+        logger.warning(
+            "%sFallback synthesis was downgraded by the conclusive contract; "
+            "keeping the non-conclusive result.",
+            log_prefix,
+        )
+        return analysis_result
+
+    logger.warning(
+        "%sFallback synthesis applied: is_conclusive=True with confidence=low "
+        "(root_cause_class=%s).",
+        log_prefix,
+        rebuilt.root_cause_class,
+    )
+    return rebuilt

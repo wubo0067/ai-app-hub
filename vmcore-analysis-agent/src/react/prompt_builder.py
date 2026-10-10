@@ -9,12 +9,17 @@ from typing import Iterable, Optional, Sequence, cast
 from langchain_core.messages import AIMessage, BaseMessage
 
 from .action_guard import canonicalize_command_line, extract_command_lines
-from .graph_state import AgentState
+from .consistency import format_conflict_fact
+from .graph_state import (
+    AgentState,
+    CONVERGENCE_GUARD_STREAK_THRESHOLD,
+    has_committed_root_cause,
+)
 from .prompt_overlays import DRIVER_OBJECT_OVERLAY, STACK_CORRUPTION_OVERLAY
+from .prompt_phrases import FORCED_CHOICE_CONVERGENCE_RULE
 from .prompt_layers import LAYER0_SYSTEM_PROMPT_TEMPLATE, PLAYBOOKS, SOP_FRAGMENTS
 from .prompts import build_minimal_schema_enum_contract
 from .schema import CrashSignatureClass, GateEntry, Hypothesis, VMCoreLLMAnalysisStep
-
 
 # 中文报告输出规则：仅当 state["report_language"] == "zh" 时注入到系统提示词。
 # 要求所有自由文本字段用简体中文书写，同时保留技术标识符与枚举值的英文形式，
@@ -132,6 +137,196 @@ def build_analysis_system_prompt(state: AgentState, *, is_last_step: bool) -> st
     return "\n\n".join(part for part in prompt_parts if part)
 
 
+# C5：replan 转向菜单使用的证据维度与建议命令族。
+# 类别前缀与 evidence.py `_gate_criteria_satisfied` 的判据保持一致，
+# 避免提示词与门控评估对"已经掌握了哪些证据"产生分歧。
+_GATE_EVIDENCE_CATEGORIES = ("rd", "struct", "dis", "sym")
+_EVIDENCE_CATEGORY_HINTS = {
+    "rd": "read the concrete object bytes (`rd <address> <count>`)",
+    "struct": "obtain the struct layout (`struct -o <type>`) so field offsets can be interpreted",
+    "dis": "disassemble the faulting path (`dis -rl <symbol>`)",
+    "sym": "resolve addresses to symbols (`sym <address>`)",
+}
+
+
+# 提示词中最多展示的矛盾条目数，避免长列表挤占上下文。
+_MAX_RENDERED_VALUE_CONFLICTS = 5
+
+
+def _format_value_conflicts(value_conflicts: object) -> list[str]:
+    """把 value_conflicts 渲染为可读句子列表（最多 _MAX_RENDERED_VALUE_CONFLICTS 条）。
+
+    无内容或全部无法解析时返回空列表，使提示词在"没有矛盾"时与改动前完全一致。
+    """
+    if not isinstance(value_conflicts, (list, tuple, set, frozenset)):
+        return []
+    # 保持发现顺序（最新发现的在最后），只渲染最后 _MAX_RENDERED_VALUE_CONFLICTS 条，
+    # 避免字典序把最新（通常也是当前调查对象）的矛盾挤出渲染窗口。
+    rendered: list[str] = []
+    for fact in value_conflicts:
+        if not isinstance(fact, str):
+            continue
+        text = format_conflict_fact(fact)
+        if text is not None:
+            rendered.append(text)
+    return rendered[-_MAX_RENDERED_VALUE_CONFLICTS:]
+
+
+def _observed_evidence_categories(evidence_facts: object) -> set[str]:
+    """统计 evidence_facts 中已经出现的结构化证据维度。"""
+    if not isinstance(evidence_facts, (list, tuple, set, frozenset)):
+        return set()
+
+    observed: set[str] = set()
+    for fact in evidence_facts:
+        if not isinstance(fact, str):
+            continue
+        if fact.startswith("rd_word:"):
+            observed.add("rd")
+        elif fact.startswith("struct_"):
+            observed.add("struct")
+        elif fact.startswith("dis_"):
+            observed.add("dis")
+        elif fact.startswith("sym:"):
+            observed.add("sym")
+    return observed
+
+
+def _gates_exhausted(state: AgentState) -> bool:
+    """强制门控是否已注册且全部关闭。
+
+    注意 `_format_unresolved_gates` 对 None/{} 也返回 "none"，那表示"门控集合尚未注册"
+    （早期步或 _build_managed_gates 返回 None 时），与"全部已关闭"语义相反，
+    故必须先确认门控确实存在。
+    """
+    return bool(state.get("managed_gates")) and (
+        _format_unresolved_gates(state.get("managed_gates")) == "none"
+    )
+
+
+def _build_replan_probe_menu(state: AgentState) -> list[str]:
+    """C5：为 "Replanning required" 补充机器生成的具体转向方向。
+
+    背景：`state_manager._build_evidence_goal` 只在存在 open/blocked 门控时返回目标。
+    当某签名类的强制门控全部关闭后（例如 null_deref 仅要求 register_provenance，
+    而该门控在 rd + dis/sym 证据齐备时即被评估器关闭），evidence goal 变为 None，
+    提示词会同时呈现 "Current gate objective: no outstanding gate" 与
+    "Replanning required"，却不给出任何可执行的替代方向 —— LLM 因此倾向于重复
+    上一条"曾经成功"的命令直到 streak 触限。
+
+    本函数只使用已有的确定性状态（门控、root_cause_class、evidence_facts）生成方向，
+    不引入新的推断，也不替代门控评估。
+    """
+    lines: list[str] = []
+    # P0-2：`unknown` 是 RootCauseClass 的合法取值，`bool("unknown")` 为 True，
+    # 直接真值判断会把"尚未定论"当成"根因已提交"，让 terminate_only 等通道在
+    # 错误前提上运行。
+    root_cause_class = (
+        state.get("current_root_cause_class")
+        if has_committed_root_cause(state)
+        else None
+    )
+    signature_class = state.get("current_signature_class") or "unknown"
+    # 门控是否真的已全部关闭：replan 也可能发生在仍有 open/blocked 门控时
+    # （例如 C1 的 DEDUP-BLOCKED 走 rejected 分支）。此时不能声称门控已穷尽，
+    # 否则会把错误事实注入提示词。
+    # 另外，`_format_unresolved_gates` 对 None/{} 也返回 "none"，那表示
+    # "门控集合尚未注册"（早期步或 _build_managed_gates 返回 None 时），
+    # 与"全部已关闭"语义相反，故必须先确认门控确实存在。
+    gates_exhausted = _gates_exhausted(state)
+
+    value_conflicts = _format_value_conflicts(state.get("value_conflicts"))
+    if value_conflicts:
+        lines.append(
+            "- Unresolved value-level contradictions (highest priority: memory you already read "
+            "contradicts the declared struct layout, so either the object address or the field "
+            "offset interpretation is wrong):"
+        )
+        lines.extend(f"  - {conflict}" for conflict in value_conflicts)
+        lines.append(
+            "  - Resolve this contradiction before collecting more evidence of the same kind: "
+            "re-derive the object address from the instruction that produced it, or re-check the "
+            "layout/offset used to interpret it. Once you have explained it, write the phrase "
+            "已核对冲突<Type>@0x<base> (e.g. 已核对冲突irqaction@0x...) with your explanation; "
+            "that marks the contradiction as addressed so it no longer blocks a conclusion."
+        )
+
+    # L1：root_cause_class 已确定且强制门控全部关闭时，任何后续命令都无法再加强结论，
+    # 此时若仍列出"未探索的证据维度"并强制"换假设"，就等于在同一份提示词里同时要求
+    # "立即收尾"和"继续探索"——真实运行（run D）中模型正是被后半句带走，在收尾轮继续
+    # 发起 rd 探测而被 build_tool_calls 剥掉 tool_calls，整轮作废、报告没有最终结论。
+    # 这里让收敛条件同时压制转向菜单，使提示词只剩一个可执行指令。
+    terminate_only = bool(root_cause_class) and gates_exhausted
+
+    if terminate_only:
+        lines.append(
+            f"- TERMINATE ON THIS TURN: root_cause_class={root_cause_class} is set and every mandatory "
+            f"gate for signature_class={signature_class} is closed. No further crash command can strengthen "
+            f"this conclusion, so do not issue another read-only probe (rd/struct/dis/log/irq/sym). "
+            f"Decoding what an overwritten value 'means' (e.g. reading a corrupted field as an IRQ number, "
+            f"device id or flag) is NOT a prerequisite for concluding: bytes inside memory already proven "
+            f"to be corruption payload are the payload, not live state, and their protocol semantics can "
+            f"never be recovered from the vmcore. Emit the final JSON now with confidence=\"low\" and record "
+            f"the residual unknown in final_diagnosis.detailed_analysis."
+        )
+    elif root_cause_class:
+        lines.append(
+            f"- root_cause_class={root_cause_class} is already set: "
+            f"prefer terminating with your conclusion (bounded uncertainty is acceptable) over further probing."
+        )
+    elif gates_exhausted:
+        lines.append(
+            f"- Gate closure is not root-cause proof: every mandatory gate for "
+            f"signature_class={signature_class} is closed, yet root_cause_class is still unset. "
+            f"The gate set for this signature class is too weak to support a conclusion, so "
+            f"re-running commands that only re-confirm a closed gate cannot make progress."
+        )
+    else:
+        lines.append(
+            "- Mandatory gates are still unresolved and root_cause_class is unset: the previous action "
+            "failed to advance them, so pick a different command that targets the outstanding gate "
+            "directly rather than restating evidence already collected."
+        )
+
+    # P0-1：根因尚未提交（含 `unknown`）且已连续多步无新证据时，上面的分支只说
+    # "换个方向"，却不给可执行的收敛出口，预算就在重复的只读探测上耗尽。
+    # 这里把选择压缩成二选一，与 executor 侧 dedup 升级消息使用同一份措辞。
+    if (
+        root_cause_class is None
+        and state.get("no_progress_streak", 0) >= CONVERGENCE_GUARD_STREAK_THRESHOLD
+    ):
+        lines.append(
+            "- No new evidence in the last "
+            f"{state.get('no_progress_streak', 0)} actions: " + FORCED_CHOICE_CONVERGENCE_RULE
+        )
+
+    if not terminate_only:
+        missing = [
+            name
+            for name in _GATE_EVIDENCE_CATEGORIES
+            if name not in _observed_evidence_categories(state.get("evidence_facts"))
+        ]
+        if missing:
+            lines.append(
+                "- Untapped evidence dimensions (pick one that targets a NEW object, "
+                "not an address you have already read):"
+            )
+            lines.extend(f"  - {name}: {_EVIDENCE_CATEGORY_HINTS[name]}" for name in missing)
+        else:
+            lines.append(
+                "- All four structured evidence dimensions (rd/struct/dis/sym) are already observed, "
+                "so a useful next command must change the target object or the hypothesis being tested, "
+                "not the evidence type."
+            )
+
+        lines.append(
+            "- Pivot requirement: adopt a different hypothesis from 'Active hypotheses' above, or introduce "
+            "a new one together with the specific observation that would confirm or refute it. If no such "
+            "hypothesis can be justified from the evidence already collected, terminate with bounded uncertainty."
+        )
+    return lines
+
+
 def build_executor_state_section(state: AgentState) -> str:
     """
     构建执行器当前状态信息的格式化字符串。
@@ -159,8 +354,29 @@ def build_executor_state_section(state: AgentState) -> str:
     reasoning_gate_contract = _format_reasoning_gate_contract(
         state.get("managed_gates")
     )
+    evidence_goal = state.get("current_evidence_goal") or "none"
     recent_commands = _recent_command_summaries(state.get("messages", []))
     stage_name = _infer_stage_name(step_count, state.get("managed_gates"))
+
+    # C5：门控全部关闭后 evidence goal 为 None，此时若又处于 replan 状态，
+    # "no outstanding gate" 与 "Replanning required" 并存却不给方向，
+    # LLM 会退化为重复上一条命令。改为显式声明门控已穷尽、需要换假设。
+    replan_required = bool(state.get("replan_required"))
+    # L1：与 _build_replan_probe_menu 使用同一个收敛判据，避免状态摘要与转向菜单
+    # 对"该收尾还是该继续挖"给出相反指令。
+    conclusion_ready = has_committed_root_cause(state) and _gates_exhausted(state)
+    if replan_required and next_gate_objective == "no outstanding gate":
+        if conclusion_ready:
+            next_gate_objective = (
+                f"all mandatory gates are closed and root_cause_class="
+                f"{state.get('current_root_cause_class')} is established; the only remaining objective "
+                f"is to emit the final conclusion with bounded uncertainty"
+            )
+        else:
+            next_gate_objective = (
+                "all mandatory gates are closed but no root cause has been established; "
+                "gate closure alone is not proof, so re-confirming a closed gate cannot make progress"
+            )
 
     lines = [
         f"## Current Investigation State (Step {step_count})",
@@ -172,9 +388,20 @@ def build_executor_state_section(state: AgentState) -> str:
         f"- Gate status: {gates}",
         f"- Unresolved mandatory gates: {unresolved_gates}",
         f"- Current gate objective: {next_gate_objective}",
+        f"- Current evidence goal: {evidence_goal} (version={state.get('evidence_goal_version', 0)}, status={state.get('evidence_goal_status', 'unknown')})",
+        "- Action evidence contract: declare evidence_goal_id, intended_evidence_type, target_object, and expected_observation for every tool action.",
+        "- Gate closure rule: gate status emitted by the LLM is advisory only; the executor Evidence Evaluator alone may close a gate when its completion criteria are satisfied.",
         "- Action selection rule: if any mandatory gate remains open or blocked, the next action must directly advance the current gate objective or unblock its prerequisite.",
         f"- Reasoning gate contract: {reasoning_gate_contract}",
     ]
+
+    value_conflicts = _format_value_conflicts(state.get("value_conflicts"))
+    if value_conflicts:
+        lines.append(
+            "- Observed value-level conflicts (memory you already read does not match the "
+            "declared struct layout):"
+        )
+        lines.extend(f"  - {conflict}" for conflict in value_conflicts)
 
     action_status = state.get("last_action_status")
     if action_status:
@@ -183,11 +410,20 @@ def build_executor_state_section(state: AgentState) -> str:
             f"(duplicate streak={state.get('duplicate_streak', 0)}, "
             f"no-progress streak={state.get('no_progress_streak', 0)})"
         )
-        if state.get("replan_required"):
-            lines.append(
-                "- Replanning required: select a different evidence target or terminate with bounded uncertainty; "
-                "do not emit an equivalent command."
-            )
+        if replan_required:
+            if conclusion_ready:
+                lines.append(
+                    "- Replanning required: the root cause class is already established and every mandatory "
+                    "gate is closed, so terminate on this turn by emitting the final JSON conclusion "
+                    "(confidence=\"low\" is acceptable); do not emit another command."
+                )
+            else:
+                lines.append(
+                    "- Replanning required: select a different evidence target or terminate with bounded uncertainty; "
+                    "do not emit an equivalent command."
+                )
+            # C5：把抽象的"换个目标"落成可执行的具体方向。
+            lines.extend(_build_replan_probe_menu(state))
 
     if recent_commands == "none":
         lines.append("- Commands already run (do not repeat): none")
@@ -209,7 +445,7 @@ def _select_playbook(state: AgentState, recent_text: str) -> str:
         state (AgentState): 当前分析状态。
         recent_text (str): 最近消息的合并文本，由调用方预先计算并传入。
 
-    Returns:s
+    Returns:
         str: 对应的剧本内容字符串，如果找不到匹配项则返回空字符串
     """
     signature_class = state.get("current_signature_class")
@@ -538,7 +774,10 @@ def _format_reasoning_gate_contract(raw_gates: object) -> str:
                 return (
                     "name target gate register_provenance, explain which concrete source object and field/offset "
                     "must be identified next, and state how the next action will close the bad-register chain. "
-                    "Do not demand proof of the ultimate overflow writer to close this gate"
+                    "Do not demand proof of the ultimate overflow writer to close this gate. "
+                    "Before claiming the chain is closed, verify that the memory address computed from the "
+                    "faulting instruction's operand registers (using the exception frame values) matches the "
+                    "fault address in the dmesg BUG line; if they do not match, re-examine the operand derivation"
                 )
             return (
                 f"name target gate {gate_name}, explain why the next action advances it, "

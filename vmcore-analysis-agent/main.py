@@ -1,4 +1,4 @@
-# main.py,!
+#!/usr/bin/env python3
 import uuid
 import yaml
 import json
@@ -17,6 +17,7 @@ from src.llm.model import create_reasoning_llm, create_structured_llm
 from src.react import (
     AgentState,
     create_agent_graph,
+    generate_gate_audit_report,
     generate_markdown_report,
     graph_logging_callback,
 )
@@ -27,7 +28,7 @@ from src.mcp_tools import initialize_all_mcp_tools
 #   llm_analysis_node (1) + structure_reasoning_node (1) + crash_tool_node (1)
 # 加上初始 collect_crash_init_data_node (1)，公式为：1 + N_rounds × 3
 # 例如：支持 ~30 轮分析 → 1 + 30×3 = 91；支持 ~40 轮 → 1 + 40×3 = 121
-AGENT_RECURSION_LIMIT = 121
+AGENT_RECURSION_LIMIT = 151
 
 # 分析报告输出语言：eng=英文（默认），zh=中文。
 # 由命令行参数 --language 设置；为 zh 时在系统提示词中注入中文输出规则。
@@ -51,6 +52,7 @@ class VmcoreAnalysisResponse(BaseModel):
     agent_answer: str
     token_usage: int
     error: Optional[str] = None
+    audit_report: Optional[str] = None
 
 
 def validate_file_paths(request: VmcoreAnalysisRequest) -> Optional[str]:
@@ -226,9 +228,27 @@ async def analyze_vmcore(request: VmcoreAnalysisRequest):
             "reasoning_additional_kwargs": None,
             "agent_answer": "",
             "executed_fingerprints": [],
+            "replayed_fingerprints": [],
             "tool_output_cache": {},
+            "last_action_status": None,
+            "last_action_fingerprint": "",
+            "duplicate_streak": 0,
+            "no_progress_streak": 0,
+            "force_terminal_wrapup": False,
+            "evidence_delta": [],
+            "evidence_facts": [],
+            "value_conflicts": [],
+            "replan_required": False,
+            "current_evidence_goal": None,
+            "evidence_goal_version": 0,
+            "evidence_goal_status": None,
+            "evidence_goal_progress": None,
+            "last_evidence_types": [],
+            "current_action_intent": None,
+            "last_action_goal_version": None,
             "managed_active_hypotheses": None,
             "managed_gates": None,
+            "gate_transition_history": [],
             "current_signature_class": None,
             "current_root_cause_class": None,
             "current_partial_dump": None,
@@ -255,8 +275,9 @@ async def analyze_vmcore(request: VmcoreAnalysisRequest):
         snapshot = app_state["agent_graph"].get_state(cast(RunnableConfig, thread))
         final_values = snapshot.values
 
-        # 生成 markdown 报告
+        # 生成 markdown 报告（面向读者）与独立的 Gate 审计记录
         markdown_report = generate_markdown_report(final_values)
+        audit_report = generate_gate_audit_report(final_values)
         logger.info(f"Task {task_id} completed successfully")
         logger.debug(f"Generated markdown report (length: {len(markdown_report)})")
         logger.info(f"Task {task_id} finished, report generation complete.")
@@ -267,6 +288,7 @@ async def analyze_vmcore(request: VmcoreAnalysisRequest):
             agent_answer=markdown_report,
             token_usage=final_values.get("token_usage", 0),
             error=final_values.get("error"),
+            audit_report=audit_report or None,
         )
 
     except asyncio.CancelledError:
@@ -334,9 +356,27 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
                 "reasoning_to_structure": None,
                 "reasoning_additional_kwargs": None,
                 "executed_fingerprints": [],
+                "replayed_fingerprints": [],
                 "tool_output_cache": {},
+                "last_action_status": None,
+                "last_action_fingerprint": "",
+                "duplicate_streak": 0,
+                "no_progress_streak": 0,
+                "force_terminal_wrapup": False,
+                "evidence_delta": [],
+                "value_conflicts": [],
+                "evidence_facts": [],
+                "replan_required": False,
+                "current_evidence_goal": None,
+                "evidence_goal_version": 0,
+                "evidence_goal_status": None,
+                "evidence_goal_progress": None,
+                "last_evidence_types": [],
+                "current_action_intent": None,
+                "last_action_goal_version": None,
                 "managed_active_hypotheses": None,
                 "managed_gates": None,
+                "gate_transition_history": [],
                 "current_signature_class": None,
                 "current_root_cause_class": None,
                 "current_partial_dump": None,
@@ -400,11 +440,12 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
             snapshot = app_state["agent_graph"].get_state(cast(RunnableConfig, thread))
             final_values = snapshot.values
 
-            # 生成 markdown 报告
+            # 生成 markdown 报告（面向读者）与独立的 Gate 审计记录
             markdown_report = generate_markdown_report(final_values)
+            audit_report = generate_gate_audit_report(final_values)
             logger.info(f"Task {task_id} finished, report generation complete.")
 
-            yield f"data: {json.dumps({'event': 'complete', 'agent_answer': markdown_report, 'token_usage': final_values.get('token_usage', 0), 'error': final_values.get('error')})}\n\n"
+            yield f"data: {json.dumps({'event': 'complete', 'agent_answer': markdown_report, 'audit_report': audit_report, 'token_usage': final_values.get('token_usage', 0), 'error': final_values.get('error')})}\n\n"
 
         except asyncio.CancelledError:
             logger.warning(f"Stream task {task_id} was cancelled.")

@@ -10,7 +10,7 @@
 
 import json
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, List, Optional
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, SystemMessage
 from .graph_state import AgentState
 from .output_parser import render_action_arguments
@@ -71,6 +71,37 @@ _ZH_HYPOTHESIS_STATUS_LABELS = {
     "candidate": "候选假设",
     "weakened": "被削弱",
     "ruled_out": "已排除",
+}
+
+# gate 是 executor 内部概念，面向读者的验证状态摘要使用通俗表述而非原始 gate 名称。
+_ZH_VERIFICATION_ITEM_LABELS = {
+    "register_provenance": "故障操作数的来源链",
+    "object_lifetime": "目标对象状态与生命周期证据",
+    "local_corruption_exclusion": "相邻内存破坏的排除",
+    "field_type_classification": "关键字段的类型来源",
+    "external_corruption_gate": "外部破坏因素的排除",
+}
+
+_EN_VERIFICATION_ITEM_LABELS = {
+    "register_provenance": "Source chain of the faulting operand",
+    "object_lifetime": "Object-state and lifetime evidence",
+    "local_corruption_exclusion": "Exclusion of adjacent-memory corruption",
+    "field_type_classification": "Type provenance of the key field",
+    "external_corruption_gate": "Exclusion of external corruption factors",
+}
+
+_ZH_GATE_STATUS_LABELS = {
+    "closed": "✅ 已确认",
+    "open": "⚠️ 待确认",
+    "blocked": "⏸ 受阻",
+    "n/a": "➖ 不适用",
+}
+
+_EN_GATE_STATUS_LABELS = {
+    "closed": "✅ Verified",
+    "open": "⚠️ Pending",
+    "blocked": "⏸ Blocked",
+    "n/a": "➖ Not applicable",
 }
 
 
@@ -385,12 +416,167 @@ def generate_markdown_report(state: AgentState) -> str:
     lines.append("")
     lines.append("---")
     lines.append("")
+    _append_verification_summary(lines, state, zh_mode)
+
     lines.append(
         '*This report was jointly created by <span style="color: red;">**CalmWU and his AI agent.**</span>*'
     )
     lines.append("")
-    lines.append('*<span style="color: gray;">zhao qiang and xeon are two 🐶s</span>*')
+    lines.append('*<span style="color: gray;">赵志强是SB！</span>*')
     lines.append("")
+
+    return "\n".join(lines)
+
+
+def _gate_field(raw_gate: Any, name: str, default: Any = None) -> Any:
+    """读取 gate 字段，兼容 GateEntry 对象与序列化后的 dict。"""
+    if isinstance(raw_gate, dict):
+        return raw_gate.get(name, default)
+    if hasattr(raw_gate, name):
+        return getattr(raw_gate, name)
+    if hasattr(raw_gate, "model_dump"):
+        try:
+            return raw_gate.model_dump().get(name, default)
+        except Exception:
+            return default
+    return default
+
+
+def _append_verification_summary(
+    lines: List[str], state: AgentState, zh_mode: bool
+) -> None:
+    """
+    在报告结尾追加面向读者的验证状态摘要。
+
+    只说明哪些关键环节已被确定性证据确认、哪些仍未确认，不暴露 gate 名称、
+    完成条件等 executor 内部记账细节（完整记录见独立审计文件）。
+    """
+    gates = state.get("managed_gates") or {}
+    item_labels = (
+        _ZH_VERIFICATION_ITEM_LABELS if zh_mode else _EN_VERIFICATION_ITEM_LABELS
+    )
+    status_labels = _ZH_GATE_STATUS_LABELS if zh_mode else _EN_GATE_STATUS_LABELS
+
+    lines.append("## 验证状态" if zh_mode else "## Verification Status")
+    lines.append("")
+
+    if not gates:
+        lines.append(
+            "本次分析未启用结构化证据验证环节。"
+            if zh_mode
+            else "No structured evidence verification checkpoints were enabled for this analysis."
+        )
+        lines.append("")
+        return
+
+    for gate_name, raw_gate in gates.items():
+        status = str(_gate_field(raw_gate, "status", "open"))
+        label = item_labels.get(gate_name, gate_name)
+        mark = status_labels.get(status, status)
+        lines.append(f"- **{label}**：{mark}" if zh_mode else f"- **{label}**: {mark}")
+    lines.append("")
+
+    if "object_lifetime" in gates:
+        lines.append(
+            "注：若槽位显示为 `ALLOCATED`，它只代表转储时已分配，不能排除旧对象释放后槽位被复用（UAF）。"
+            if zh_mode
+            else "Note: If the slot is shown as `ALLOCATED`, that describes its state at dump time only; it does not rule out reuse after the original object was freed (UAF)."
+        )
+        lines.append("")
+
+    unverified = [
+        gate_name
+        for gate_name, raw_gate in gates.items()
+        if str(_gate_field(raw_gate, "status", "open")) not in ("closed", "n/a")
+    ]
+    if unverified:
+        if zh_mode:
+            names = "、".join(item_labels.get(name, name) for name in unverified)
+            lines.append(
+                f"⚠️ **结论适用范围**：以上 {len(unverified)} 个环节缺少确定性证据（{names}），"
+                "相关结论属于基于现有证据的推断，建议结合独立审计记录复核后再采信。"
+            )
+        else:
+            names = ", ".join(item_labels.get(name, name) for name in unverified)
+            lines.append(
+                f"⚠️ **Scope of the conclusion**: {len(unverified)} checkpoint(s) above lack "
+                f"deterministic evidence ({names}). Related conclusions are inferences from the "
+                "available evidence and should be reviewed against the separate audit record."
+            )
+    else:
+        lines.append(
+            "✅ 全部关键验证环节均已获得确定性证据支持。"
+            if zh_mode
+            else "✅ All key verification checkpoints are backed by deterministic evidence."
+        )
+    lines.append("")
+
+
+def generate_gate_audit_report(state: AgentState) -> str:
+    """
+    生成独立的 Gate 审计文档（executor 内部记账，不写入面向读者的分析报告）。
+
+    Args:
+        state: AgentState
+
+    Returns:
+        str: Markdown 格式的审计文档；无 gate 记录时返回空字符串
+    """
+    gates = state.get("managed_gates") or {}
+    history = state.get("gate_transition_history") or []
+    if not gates and not history:
+        return ""
+
+    lines: List[str] = []
+    lines.append("# Gate 审计记录")
+    lines.append("")
+    lines.append(f"**生成时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("")
+    lines.append(
+        "本文件记录 executor 内部的证据 gate 状态、完成条件与状态转换历史；"
+        "面向读者的分析报告只包含对应的验证状态摘要。"
+    )
+    lines.append("")
+
+    if gates:
+        lines.append("## Gate 状态")
+        lines.append("")
+        for gate_name, raw_gate in gates.items():
+            lines.append(f"### {gate_name}")
+            lines.append("")
+            lines.append(f"- **状态**: {_gate_field(raw_gate, 'status', 'unknown')}")
+            required_for = _gate_field(raw_gate, "required_for", []) or []
+            if required_for:
+                names = ", ".join(str(item) for item in required_for)
+                lines.append(f"- **适用场景**: {names}")
+            prerequisite = _gate_field(raw_gate, "prerequisite", None)
+            if prerequisite:
+                lines.append(f"- **前置条件**: {prerequisite}")
+            lines.append("- **完成条件**:")
+            criteria = _gate_field(raw_gate, "completion_criteria", []) or []
+            for criterion in criteria:
+                lines.append(f"  - {criterion}")
+            evidence = _gate_field(raw_gate, "evidence", None)
+            if evidence:
+                lines.append("- **审核证据**:")
+                for item in str(evidence).splitlines():
+                    lines.append(f"  - {item}")
+            lines.append("")
+
+    if history:
+        lines.append("## Gate 状态转换记录")
+        lines.append("")
+        for transition in history:
+            gate_name = transition.get("gate_name", "unknown")
+            from_status = transition.get("from_status", "unknown")
+            to_status = transition.get("to_status", "unknown")
+            event = transition.get("event", "gate_transition")
+            reason = transition.get("reason", "")
+            lines.append(
+                f"- `{gate_name}`: `{from_status}` -> `{to_status}` "
+                f"({event}){': ' + str(reason) if reason else ''}"
+            )
+        lines.append("")
 
     return "\n".join(lines)
 

@@ -8,7 +8,7 @@ from .graph import create_agent_graph
 from .graph_state import AgentState
 from .llm_node import call_llm_analysis, structure_reasoning_content
 from .logging_callback import GraphLoggingCallback, graph_logging_callback
-from .report_generator import generate_markdown_report
+from .report_generator import generate_gate_audit_report, generate_markdown_report
 from .schema import (
     CrashSignatureClass,
     FinalDiagnosis,
@@ -30,6 +30,7 @@ __all__ = [
     "GraphLoggingCallback",
     "graph_logging_callback",
     "generate_markdown_report",
+    "generate_gate_audit_report",
     "ToolCall",
     "SuspectCode",
     "FinalDiagnosis",
