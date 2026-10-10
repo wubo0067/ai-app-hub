@@ -19,7 +19,7 @@ README.md
 - **执行器级安全防护**：内置 `action_guard` 模块，防止 LLM 执行资源消耗过大或高风险的命令（如在大系统上盲目执行 `bt -a`），同时通过命令去重机制确保分析效率，防止推理陷入死循环。
 - **透明的思考链报告**：每一次分析都会生成结构化的 Markdown 报告，完整记录每一步命令的执行意图、假设的验证过程以及基于证据的最终根因定界。
 - **双层分类体系 (Two-tier Crash Classification)**：系统在 `src/react/schema.py` 中规范了清晰的内核诊断双层分类。**表层签名类** (`CrashSignatureClass`) 从 Panic 字符串直接可观测的早期路由标签（如 `null_deref`、`use_after_free`、`stack_corruption`、`soft_lockup`、`hard_lockup`、`rcu_stall` 等），用于匹配对应的诊断剧本 (Playbook)。**深层根因类** (`RootCauseClass`) 则是经过深度调查和证据验证后确定的最终根本原因（如 `out_of_bounds`、`double_free`、`race_condition`、`dma_corruption`、`mce` 等）。
-- **检查点控制门 (Verification Gates)**：为了彻底解决大模型"幻觉"和"浅尝辄止地盲猜"的弊端，系统引入了验证门控制机制。针对不同的崩溃签名，系统硬性规定了必须关闭的"证明门控"（例如 `pointer_corruption` 必须关闭 `register_provenance`（寄存器来源溯源）、`object_lifetime`（对象生命周期审核）、`local_corruption_exclusion` 等门控）。在所有必需的门控达到 `closed`（已通过具体工具输出验证）或 `n/a`（确认不适用）状态前，系统严禁将诊断状态标记为已闭环 (`is_conclusive=true`)。Gate 的关闭权归属于**执行器**：LLM 输出的 gate 状态仅为建议，证据评估器（`src/react/evidence.py`）仅在其执行器定义的 `completion_criteria` 被结构化证据事实满足时才允许关闭 gate；被拒绝的关闭请求及所有状态转换均记录在 `gate_transition_history` 中，并在报告的 Gate 审计章节呈现。
+- **检查点控制门 (Verification Gates)**：为了彻底解决大模型"幻觉"和"浅尝辄止地盲猜"的弊端，系统引入了验证门控制机制。针对不同的崩溃签名，系统硬性规定了必须关闭的"证明门控"（例如 `pointer_corruption` 必须关闭 `register_provenance`（寄存器来源溯源）、`object_lifetime`（对象生命周期审核）、`local_corruption_exclusion` 等门控）。在所有必需的门控达到 `closed`（已通过具体工具输出验证）或 `n/a`（确认不适用）状态前，系统严禁将诊断状态标记为已闭环 (`is_conclusive=true`)。Gate 的关闭权归属于**执行器**：LLM 输出的 gate 状态仅为建议，证据评估器（`src/react/evidence.py`）仅在其执行器定义的 `completion_criteria` 被结构化证据事实满足时才允许关闭 gate；被拒绝的关闭请求及所有状态转换均记录在 `gate_transition_history` 中，并输出到独立的 Gate 审计文档中呈现（详见 [4.7 客户端完整参数说明](#47-客户端完整参数说明)）。面向读者的报告只保留一段简明易懂的**验证状态**小结。
 - **精准的 e820 BIOS 内存映射验证与相邻页指纹提取**：`memorandum.txt` 证实了本系统的强悍表现——在遇到 `reserved` 物理页时，AI 会在不触发 seek error 的前提下，提取相邻物理页的指纹，进行精细的内存鉴证。系统将崩溃物理地址与 BIOS 内存映射表 (e820) 进行严格数学区间比对，从而判断内存是硬件保留还是启动后被特定设备 DMA 越界覆写，这种分析思路已达到资深内核专家的专业水准。
 - **长时间连接保持与流式传输**：内核 crash 工具在对数 GB 级的 vmcore 镜像进行大面积内存搜索 (search) 或加载庞大模块的调试符号时，耗时通常较长。FastAPI 服务端引入了独立的 Task 队列，以 15 秒为间隔向客户端发送心跳注释 (Keep-Alive Heartbeat)，即使单个底层操作耗时超过 2 分钟，客户端也能稳定连接并实时展示诊断进度节点。
 
@@ -59,7 +59,8 @@ graph TB
 
     K --> D
     D -->|Markdown 报告 | P[reports]
-```
+        D -->|Gate 审计记录 | P
+    ```
 
 **架构图说明**：
 - **实线箭头** 表示数据流或调用关系
@@ -317,7 +318,7 @@ Gate 的关闭决定权属于执行器，而非 LLM：
 - **证据评估器是唯一关闭者**：[`evaluate_gate_closures`](vmcore-analysis-agent/src/react/evidence.py) 从工具输出中提取结构化 `evidence_facts`（如 `rd_word:`、`struct_*`、`dis_*`、`sym:`），只有当所需证据类别组全部满足时才关闭 gate；`external_corruption_gate` 还要求其前置 `local_corruption_exclusion` 已先关闭。
 - **LLM 的 gate 状态仅为建议**：若 LLM 在证据不足时输出 `status: closed`，评估器会将该 gate 保持为 `open` 并记录 `llm_close_rejected` 转换；系统提示中明确声明此规则。
 - **结论始终受门控约束**：只要任意强制 gate 仍处于 `open`/`blocked`，[`project_managed_analysis_step`](vmcore-analysis-agent/src/react/state_manager.py) 会强制 `is_conclusive=false` 并剥离过早给出的 `final_diagnosis`。
-- **完整审计轨迹**：每次状态变更都追加到 `AgentState` 的 `gate_transition_history`，Markdown 报告渲染 **Gate 审计** 章节，列出每个 gate 的完成条件、审核证据与状态转换记录。
+- **完整审计轨迹**：每次状态变更都追加到 `AgentState` 的 `gate_transition_history`。该轨迹渲染为**独立的 Gate 审计文档**（与报告同级保存为 `<报告名>.audit.md`），列出每个 gate 的完成条件、审核证据与状态转换记录，从而让面向读者的报告专注于分析结论本身。
 
 **核心概念**：
 - **[`CrashSignatureClass`](vmcore-analysis-agent/src/react/schema.py#L117-L134) 与 [`RootCauseClass`](vmcore-analysis-agent/src/react/schema.py#L139-L162)**：前者是从 panic 日志中观察到的症状（例如 `soft_lockup`），后者是推断出的底层机制（例如 `deadlock`）。它们在分析流程中扮演不同的角色。
@@ -444,6 +445,7 @@ vmcore-analysis-agent/
 │   ├── test_output_parser.py          # 输出解析器测试
 │   ├── test_prompt_builder.py         # Prompt 构建器测试
 │   ├── test_prompts.py                # Prompt 测试
+│   ├── test_report_generator.py       # 报告生成与 Gate 审计测试
 │   ├── test_schema.py                 # 数据结构测试
 │   ├── test_stack_canary_analyzer.py  # 栈金丝雀分析器测试
 │   ├── test_stack_canary_client.py    # 栈金丝雀客户端测试
@@ -576,6 +578,9 @@ uv run main.py --stream --no-save
 - 分析完成后，默认会自动保存 markdown 报告到指定目录
 - 报告文件名格式：`127.0.0.1-2026-01-30-22-51-43.md`（从服务器 IP 和时间戳生成）
 - 报告包含完整的分析过程、推理步骤和最终诊断结论
+- 报告末尾会输出一段用自然语言表述的**验证状态**小结（每个验证门控一行），让读者一眼看出结论的证据支撑程度
+- 完整的 gate 审计内容——每个 gate 的状态、前置条件、完成条件、审核证据以及全部状态转换记录——会写入同级文件 `127.0.0.1-2026-01-30-22-51-43.audit.md`。这样既把执行器内部的记账信息从分析报告中剥离，又保留了完整的可追溯性。仅在存在 gate 数据时才生成该文件；`--no-save` 会同时跳过两个文件
+- 相同内容也可通过 API 获取：`POST /analyze` 返回 `audit_report` 字段，`/analyze/stream` 的 SSE `complete` 事件携带同一字段
 
 ## 应用场景
 
@@ -590,6 +595,92 @@ uv run main.py --stream --no-save
 2. **多模态分析**：结合日志、指标等多维度数据
 3. **实时分析**：支持在线系统的实时诊断
 4. **分布式部署**：支持大规模并发分析
+
+## 名词解释 (Glossary)
+
+### Gate（门控 / 验证门控）
+
+**Gate（门控）** 是 VMCore 崩溃分析状态机中的**强制验证检查点**。在 Agent 宣布得出确定性诊断结论（`is_conclusive=true`）之前，当前崩溃签名类所要求的所有门控必须达到终态（`closed` 或 `n/a`）。
+
+**目的**：通过强制要求收集并验证特定的诊断证据（如寄存器来源溯源、对象生命周期、损坏排除等），防止 LLM 过早或无依据地下结论。
+
+**状态**：
+
+| 状态 | 含义 |
+|------|------|
+| `open` | 尚未调查或调查未完成 |
+| `closed` | 已通过具体工具输出证据验证 |
+| `blocked` | 前置门控尚未关闭，当前门控无法开始 |
+| `n/a` | 确认不适用（需附理由说明） |
+
+**关键特性**：
+- **执行器拥有关闭权**：LLM 输出的 gate 状态仅为建议。证据评估器（`src/react/evidence.py`）是唯一有权关闭 gate 的组件，且仅当执行器定义的 `completion_criteria` 被从工具输出中提取的结构化证据事实满足时才允许关闭。
+- **按签名类区分**：每种 `CrashSignatureClass` 通过 `src/react/schema.py` 中的 `_REQUIRED_GATES` 映射到不同的必需门控集合。简单签名（如 `null_deref`）只需 1–2 个门控；复杂签名（如 `pointer_corruption`）需要 5 个。
+- **可审计**：每次状态转换都记录在 `gate_transition_history` 中，并渲染到独立的 **Gate 审计文档**（`<报告名>.audit.md`）。报告正文只携带一段简明的**验证状态**小结。
+
+> 完整实现细节请参阅 [`_REQUIRED_GATES`：验证门控系统](#_required_gates验证门控系统) 章节。
+
+### register_provenance（寄存器溯源）
+
+回答的问题：**故障寄存器里的坏值是从哪来的？**
+
+关闭此门控前，Agent 必须建立完整的**坏值传播链**：确认故障寄存器的值、追溯到产生该操作数的确切来源对象/字段/偏移、并独立验证字段/偏移或符号关系。
+
+**完成条件**（全部满足）：
+
+| # | 条件 | 典型证据 |
+|---|------|---------|
+| 1 | 故障寄存器值已获取 | `rd` 读取寄存器或异常帧 |
+| 2 | 来源对象/地址证据已获取 | `rd` / `struct` 读取来源内存位置 |
+| 3 | 字段/偏移或符号关系已被独立观测 | `struct -o`（字段偏移）+ `sym`（符号解析） |
+
+**所需证据类型**：`rd`（内存读取）**且**（`dis`（反汇编）**或** `sym`（符号表））
+
+**适用签名**：`pointer_corruption`、`null_deref`、`use_after_free`、`general_protection_fault`、`invalid_address_access`、`write_protection_violation`、`smap_smep_violation`
+
+### object_lifetime（对象与槽位状态）
+
+回答的问题：**转储能确认槽位当前是什么状态，还有哪些历史生命周期信息未知？**
+
+`kmem -S` 报告的是转储时的槽位状态。`[ALLOCATED]` 只表示此刻已分配，不能证明当前分配的仍是原来的对象。旧对象释放并复用后，悬空指针仍可能指向一个 `ALLOCATED` 槽位，因此它不能排除带复用的 UAF。类型不匹配可以支持这种可能性，但并非唯一解释；原地破坏、遍历/所有者错误仍是其他候选。
+
+**完成条件**：
+- 获取当前 slab 槽位状态及相关对象内容/布局，或获得 KASAN UAF 报告等直接时间生命周期证据。
+- 不得把当前分配状态或“前缀非零、尾部为零”的字节形态当作历史复用的支持或排除证据。
+
+**所需证据类型**：`kmem -S` 槽位状态加 `rd`/`struct` 对象证据，或 KASAN 等直接生命周期证据。
+
+**适用签名**：`pointer_corruption`、`use_after_free`、`page_not_present`
+
+### local_corruption_exclusion（本地损坏排除）
+
+回答的问题：**坏值是本地函数/CPU 写坏的，还是外部来源（DMA、其他 CPU、硬件）写坏的？**
+
+此门控采用**排除法**：Agent 反汇编相关函数，检查是否存在任何本地指令（`mov`、`st` 等）能将坏值写入故障地址。如果**不存在本地写入路径**，则排除本地损坏，嫌疑转向**外部来源**（DMA 越界、跨 CPU 竞态、硬件 MCE 等）。这是损坏分析中从"本地"到"外部"的关键转折点。
+
+**完成条件**（全部满足）：
+
+| # | 条件 | 典型证据 |
+|---|------|---------|
+| 1 | 相关反汇编观测已获取 | `dis` 反汇编包含故障指令的函数 |
+| 2 | 内存观测支持或排除本地写入者 | `rd` 读取目标内存区域，与反汇编交叉比对 |
+
+**所需证据类型**：`dis`（反汇编）**且** `rd`（内存读取）
+
+**适用签名**：`pointer_corruption`（同时作为 `external_corruption_gate` 的**前置门控**）
+
+**三个门控的递进关系**：
+
+```
+register_provenance          object_lifetime           local_corruption_exclusion
+"坏值从哪来？"              "来源对象还活着吗？"        "是自己写坏还是外部写坏？"
+    │                          │                       │
+    ▼                          ▼                       ▼
+ rd + dis/sym              rd + struct               dis + rd
+ (定位来源)               (判断生命周期)            (排除/确认写入者)
+```
+
+三者全部 `closed` 后，Agent 才能继续推进 `external_corruption_gate` 和 `field_type_classification`，完成 `pointer_corruption` 的完整证据链。
 
 ## 附录：第三方驱动调试符号编译指南 (以 mlx5_core 为例)
 

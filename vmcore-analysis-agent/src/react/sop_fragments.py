@@ -233,9 +233,9 @@ Analysis:
 ## 3.15b DMA Memory Corruption (Stray DMA Write)
 
 Preconditions before suspecting DMA:
-Treat these preconditions as the DMA-side realization of S1-S5 exclusion reasoning from the system layer. {DMA_PROMOTION_EVIDENCE_RULE}
-1. Exclude use-after-free with kmem -S and poison-pattern checks. This is part of S4.
-2. Exclude race or double-free style explanations. This is part of S4.
+Treat these preconditions as the DMA-side realization of S1-S5 gating reasoning from the system layer. {DMA_PROMOTION_EVIDENCE_RULE}
+1. Assess use-after-free as part of S4. Treat kmem -S as snapshot state only: ALLOCATED does not exclude a stale pointer to a reused slot, and absence of poison is not proof against UAF.
+2. Assess race or double-free style explanations as part of S4; rule them out only with mechanism-specific positive evidence.
 3. Confirm the corrupted memory is DMA-reachable. This is part of S5.
 4. Check whether corruption correlates with I/O pressure. This is part of S5.
 5. Prioritize dma_map or unmap violations if DMA API debug evidence exists. This is part of S5.
@@ -247,7 +247,7 @@ Non-indicators:
 - A bus-address-like value is not enough by itself. First prove whether the exact source field really contains that value.
 - Do not call a value a DMA physical address until you have checked whether it fits the actual system physical-memory range and stated the current IOMMU context.
 
-Before or alongside this DMA fragment, ensure the other S1-S4 gates are already closed: instruction-level provenance (S1), ordinary object-state validation (S2), and stack or snapshot artifact exclusion where applicable (S3), plus stronger software corruption-source exclusion (S4).
+Before or alongside this DMA fragment, ensure the other S1-S4 gates are already closed: instruction-level provenance (S1), ordinary object-state validation (S2), and stack or snapshot artifact exclusion where applicable (S3), plus stronger software corruption-source discrimination (S4).
 
 ### Step 0: Stale Data Exclusion (MANDATORY before any value-match evidence)
 The kmalloc/slab allocator does NOT zero memory on allocation. Any value found in an allocated

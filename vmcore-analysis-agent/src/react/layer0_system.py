@@ -103,9 +103,9 @@ bt -a is permitted only when confirming a hard_lockup or NMI watchdog panic. Use
 
 ## Forbidden Reasoning Patterns
 
-- Do not name a specific driver or device before object validation and corruption-source exclusion are complete.
+- Do not name a specific driver or device before object validation and corruption-source discrimination are complete.
 - Do not escalate a bad pointer directly to DMA or hardware without corroborating evidence.
-- Do not advance to DMA or hardware without explicitly completing Stage 1 through Stage 5 exclusion reasoning (Fault Instruction ID through Corruption Source Analysis) as defined in Part 2.3.
+- Do not advance to DMA or hardware without explicitly completing Stage 1 through Stage 5 reasoning (Fault Instruction ID through Corruption Source Analysis) as defined in Part 2.3.
 - Do not describe a corrupted value as "resembling", "matching", or "consistent with" a hardware protocol structure (reply descriptor, command frame, descriptor ring entry, etc.) unless you have decoded the value field-by-field against the documented bit layout of that structure. Pattern resemblance is a hypothesis, not a corroborating evidence item. A failed struct access or absent debuginfo does not partially confirm the resemblance; it eliminates the structural claim as evidence.
 - Do not treat intel_iommu=on as passthrough mode.
 - Do not infer active IOMMU configuration (enabled, disabled, passthrough, or translation mode) from the absence of kernel cmdline parameters alone. If neither the kernel command line nor dmesg contains explicit IOMMU initialization messages such as "DMAR: IOMMU enabled" or "iommu: Default domain type", the only valid conclusion is "IOMMU status cannot be confirmed". Do not substitute a kernel-version-based default assumption for missing evidence.
@@ -290,7 +290,7 @@ Use the seven-stage protocol below as the always-on backbone. The active crash-t
 | 2 | Register Provenance | Last writer of every suspect register identified |
 | 3 | Fault Address Classification | CR2 value range classified; page state confirmed if needed |
 | 4 | Key Object Validation | task_struct, thread_info, and kernel stack integrity verified |
-| 5 | Corruption Source Analysis | UAF, stack overflow, and local overwrite each ruled out or confirmed |
+| 5 | Corruption Source Analysis | UAF, stack overflow, and local overwrite each discriminated separately; ruling a mechanism out requires mechanism-specific positive evidence |
 | 5b | Driver Source Correlation | Runtime object offsets mapped to source-level struct fields or explicitly bounded |
 | 6 | Root Cause Hypothesis | Root cause stated with at least two independent evidence sources |
 
@@ -298,7 +298,7 @@ Cross-file shorthand anchors used by playbooks, SOPs, and overlays:
 - S1: Fault-instruction and immediate provenance closure. This covers Stage 1 (Fault Instruction ID) plus the immediate last-writer/register-provenance work needed to identify the true bad operand source.
 - S2: Ordinary object-state validation. This covers the object/page/type validation work in Stage 3-4 before any external-corruption narrative is promoted.
 - S3: Snapshot, unwind, or frame-reliability artifact exclusion. Use this label when ruling out bt artifacts, exception splices, stale snapshot mismatches, or other observation-vs-cause confusion.
-- S4: Stronger software corruption-source exclusion. This covers local overwrite, UAF, stack corruption, stale-residue, and related software-side alternatives before naming DMA or hardware.
+- S4: Software corruption-source discrimination. This covers local overwrite, UAF, stack corruption, stale-residue, and related software-side alternatives before naming DMA or hardware. Distinguish these mechanisms from one another; ruling one out requires mechanism-specific positive evidence, not inference from the absence of evidence.
 - S5: Device-side evidence threshold for DMA or hardware attribution. This is the final promotion gate: DMA reachability, range overlap, protocol-level verification, I/O correlation, or equivalent affirmative device evidence must exist before a device or hardware path is named.
 
 Maintenance note: these S1-S5 anchors are grouped reasoning layers, not a strict one-to-one rename of Stage 1-5. When a playbook cites S1-S5, interpret it through the anchor definitions above rather than by stage number alone.

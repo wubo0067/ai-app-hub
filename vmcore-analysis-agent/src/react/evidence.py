@@ -27,6 +27,11 @@ _KMEM_RANGE_RE = re.compile(
     rf"^\s*\S+\s+\S+\s+(?P<start>{_HEX})\s+-\s+(?P<end>{_HEX})\s+(?P<size>\d+)\s*$",
     re.IGNORECASE,
 )
+_KMEM_SLAB_SLOT_RE = re.compile(
+    r"^\s*(?:\[\s*(?P<allocated>(?:0x)?[0-9a-fA-F]{8,16})\s*\]|"
+    r"(?P<free>(?:0x)?[0-9a-fA-F]{8,16}))\s*$"
+)
+_KASAN_UAF_RE = re.compile(r"\bKASAN:\s*(?:slab-)?use-after-free\b", re.IGNORECASE)
 
 _GATE_COMPLETION_CRITERIA: dict[str, list[str]] = {
     "register_provenance": [
@@ -35,8 +40,9 @@ _GATE_COMPLETION_CRITERIA: dict[str, list[str]] = {
         "field/offset or symbol relation is independently observed",
     ],
     "object_lifetime": [
-        "object memory evidence is present",
-        "a second observation supports the object lifetime classification",
+        "the same slot's current kmem -S state and base-address memory are observed, or "
+        "direct temporal lifetime evidence is present",
+        "an ALLOCATED snapshot is not treated as excluding use-after-free with reuse",
     ],
     "local_corruption_exclusion": [
         "a relevant disassembly observation is present",
@@ -163,6 +169,21 @@ def _gate_criteria_satisfied(
     Returns:
         bool: 如果满足该门控的所有证据要求及前置条件则返回 True，否则返回 False。
     """
+    if gate_name == "object_lifetime":
+        if "lifetime_proof:kasan_use_after_free" in facts:
+            return True
+        slab_addresses = {
+            fact.split(":", 1)[1].split("=", 1)[0]
+            for fact in facts
+            if fact.startswith("kmem_slab_state:")
+        }
+        object_addresses = {
+            fact.split(":", 1)[1].split("=", 1)[0]
+            for fact in facts
+            if fact.startswith("rd_word:")
+        }
+        return bool(slab_addresses & object_addresses)
+
     # 统计当前事实集合中命中了哪些维度的证据类别：
     # - "rd": 内存读取证据（以 "rd_word:" 开头，记录指定地址的字值）
     # - "struct": 结构体布局证据（以 "struct_" 开头，记录结构体类型、字段偏移和大小）
@@ -178,13 +199,11 @@ def _gate_criteria_satisfied(
     # 定义各门控闭合所需的证据组（每个子列表为一个要求组，组内任一类别满足即满足该组，
     # 且所有要求组均须满足）：
     # - register_provenance（故障寄存器来源）: 需内存读取证据，且需反汇编或符号证据
-    # - object_lifetime（对象生命周期）: 需内存读取或结构体信息
     # - local_corruption_exclusion（局部内存破坏排除）: 需反汇编指令且需内存读取证据
     # - field_type_classification（字段类型分类）: 需结构体信息且需符号表证据
     # - external_corruption_gate（外部破坏门控）: 需至少具备一类结构化证据
     required_groups = {
         "register_provenance": [{"rd"}, {"dis", "sym"}],
-        "object_lifetime": [{"rd", "struct"}],
         "local_corruption_exclusion": [{"dis"}, {"rd"}],
         "field_type_classification": [{"struct"}, {"sym"}],
         "external_corruption_gate": [{"rd", "struct", "dis", "sym"}],
@@ -231,6 +250,8 @@ def extract_evidence_facts(
                         "struct_size:<name>=0x<size>"
         - dis 命令 → "dis_instruction:0x<address>=<mnemonic>"、"dis_symbol:<symbol>"
         - sym 命令 → "sym:<symbol>@0x<address>:<kind>"
+        - kmem -S 命令 → "kmem_slab_state:0x<address>=allocated|free"
+        - KASAN UAF 报告 → "lifetime_proof:kasan_use_after_free"
 
         如果命令类型不受支持或输出中无有效内容，则返回空集合。
     """
@@ -238,6 +259,9 @@ def extract_evidence_facts(
     # 例如 run_script 可能包含多行命令，每行会被拆分为独立命令。
     commands = _command_lines(tool_name, raw_args)
     facts: set[str] = set()
+    if _KASAN_UAF_RE.search(output):
+        facts.add("lifetime_proof:kasan_use_after_free")
+
     for command in commands:
         # 提取命令的第一个单词（命令名），转为小写以统一匹配
         # 例如 "rd 0x100 8" → "rd"，"struct task_struct" → "struct"
@@ -540,12 +564,9 @@ def _parse_vtop(output: str) -> set[str]:
 
 def _parse_kmem(output: str) -> set[str]:
     """
-    解析 ``kmem -v``（vmalloc 信息）命令的输出并提取事实（facts）。
+    解析 ``kmem`` 输出中的 vmalloc 范围或 ``kmem -S`` 当前 slab 槽位状态。
 
-    该函数逐行匹配输出中的 vmalloc 虚拟内存范围记录，生成格式为
-    ``kmem_vmap_range:0x<start>-0x<end>=0x<size>`` 的事实，
-    用于判断某个地址是否落在已知的 vmalloc 区间内（例如判断对象是否
-    来自 vmalloc 分配的内存区域）。
+    slab 状态事实只表示转储时的状态，不包含该槽位先前的分配历史。
 
     Args:
         output (str): ``kmem -v`` 命令的标准输出字符串。
@@ -556,14 +577,34 @@ def _parse_kmem(output: str) -> set[str]:
     facts: set[str] = set()
     for line in output.splitlines():
         match = _KMEM_RANGE_RE.match(line)
-        if not match:
-            continue
-        # 起止地址按十六进制解析
-        start = _to_int(match.group("start"))
-        end = _to_int(match.group("end"))
-        # 大小字段在输出中为十进制数字
-        size = int(match.group("size"), 10)
-        facts.add(f"kmem_vmap_range:0x{start:x}-0x{end:x}=0x{size:x}")
+        if match:
+            # 起止地址按十六进制解析
+            start = _to_int(match.group("start"))
+            end = _to_int(match.group("end"))
+            # 大小字段在输出中为十进制数字
+            size = int(match.group("size"), 10)
+            facts.add(f"kmem_vmap_range:0x{start:x}-0x{end:x}=0x{size:x}")
+
+    lines = output.splitlines()
+    slab_header = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if "FREE / [ALLOCATED]" in line.upper()
+        ),
+        None,
+    )
+    if slab_header is not None:
+        for line in lines[slab_header + 1 :]:
+            match = _KMEM_SLAB_SLOT_RE.match(line)
+            if not match:
+                continue
+            allocated = match.group("allocated")
+            address = allocated or match.group("free")
+            if address is None:
+                continue
+            status = "allocated" if allocated else "free"
+            facts.add(f"kmem_slab_state:0x{_to_int(address):x}={status}")
     return facts
 
 
@@ -575,7 +616,7 @@ def _fact_supports_gate(fact: str, gate_name: str) -> bool:
     - register_provenance: 内存读取、反汇编、符号表、虚拟地址映射状态
     - local_corruption_exclusion: 反汇编、内存读取、映射状态、vmalloc 范围
     - field_type_classification: 结构体布局、符号表
-    - object_lifetime: 内存读取、结构体布局、映射状态、vmalloc 范围
+    - object_lifetime: kmem -S 当前槽位状态、直接生命周期证据
     - 其他/未知门控: 接受所有已知类型的事实
 
     Args:
@@ -592,7 +633,7 @@ def _fact_supports_gate(fact: str, gate_name: str) -> bool:
     if gate_name == "field_type_classification":
         return fact.startswith(("struct_", "sym:"))
     if gate_name == "object_lifetime":
-        return fact.startswith(("rd_word:", "struct_", "vtop_", "kmem_"))
+        return fact.startswith(("lifetime_proof:", "kmem_slab_state:"))
     # 兜底：未知门控接受所有已知前缀的事实
     return fact.startswith(("rd_word:", "struct_", "dis_", "sym:", "vtop_", "kmem_"))
 

@@ -118,10 +118,69 @@ class EvidenceExtractionTests(unittest.TestCase):
             "ffffb2709a1ac000  (not mapped)",
         )
 
-        self.assertTrue(facts_support_goal(facts, {"gate_name": "object_lifetime"}))
+        self.assertFalse(facts_support_goal(facts, {"gate_name": "object_lifetime"}))
         self.assertTrue(
             facts_support_goal(facts, {"gate_name": "local_corruption_exclusion"})
         )
+
+    def test_kasan_uaf_report_is_temporal_lifetime_evidence(self) -> None:
+        facts = extract_evidence_facts(
+            "run_script",
+            {"script": "log -m | grep -i KASAN"},
+            "BUG: KASAN: use-after-free in example+0x10/0x20\n"
+            "Freed by task 12:\n"
+            "Allocated by task 13:\n",
+        )
+
+        self.assertIn("lifetime_proof:kasan_use_after_free", facts)
+        self.assertTrue(facts_support_goal(facts, {"gate_name": "object_lifetime"}))
+
+    def test_object_lifetime_gate_requires_snapshot_or_temporal_evidence(self) -> None:
+        gate = GateEntry(
+            required_for=["pointer_corruption"],
+            status="open",
+        )
+        observations = {
+            "rd_word:0xffff0000=0x10",
+            "struct_type:irqaction",
+        }
+
+        evaluated, _ = evaluate_gate_closures(
+            {"object_lifetime": gate}, observations
+        )
+        self.assertEqual(evaluated["object_lifetime"].status, "open")
+
+        evaluated, _ = evaluate_gate_closures(
+            {"object_lifetime": gate},
+            observations | {"kmem_slab_state:0xffff0000=allocated"},
+        )
+        self.assertEqual(evaluated["object_lifetime"].status, "closed")
+
+        evaluated, _ = evaluate_gate_closures(
+            {"object_lifetime": gate},
+            observations | {"kmem_slab_state:0xffff0080=allocated"},
+        )
+        self.assertEqual(evaluated["object_lifetime"].status, "open")
+
+        evaluated, _ = evaluate_gate_closures(
+            {"object_lifetime": gate},
+            observations | {"lifetime_proof:kasan_use_after_free"},
+        )
+        self.assertEqual(evaluated["object_lifetime"].status, "closed")
+
+    def test_extracts_current_kmem_slot_states(self) -> None:
+        facts = extract_evidence_facts(
+            "kmem",
+            {"command": "kmem -S ffff0000"},
+            "FREE / [ALLOCATED]\n"
+            "ffff0000\n"
+            "  [ffff0080]\n",
+        )
+
+        self.assertIn("kmem_slab_state:0xffff0000=free", facts)
+        self.assertIn("kmem_slab_state:0xffff0080=allocated", facts)
+        self.assertTrue(facts_support_goal(facts, {"gate_name": "object_lifetime"}))
+        self.assertNotIn("lifetime_proof:kasan_use_after_free", facts)
 
     def test_gate_progress_uses_fact_set_difference(self) -> None:
         prior = {"rd_word:0xffff0000=0x10"}

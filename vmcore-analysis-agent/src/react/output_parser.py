@@ -519,7 +519,7 @@ def apply_executor_consistency_audit(
     审计管线（按执行顺序）：
         [阶段 1] 故障上下文归一化 —— 修正签名/诊断术语与 Oops 类型一致
         [阶段 2] Action 形态归一化 —— 提升 MCP 工具、对齐提示词、预检命令
-        [阶段 3] 根因语义审计 —— slab OOB 方向、已分配槽 UAF、前缀覆盖、DMA 证据门槛
+        [阶段 3] 根因语义审计 —— slab OOB 方向、DMA 证据门槛
         [阶段 4] 页面错误访问类型矛盾检测 —— 对比错误码方向与指令类型
         [阶段 5] 取值级矛盾审计 —— 已读内存内容与结构体布局不相容
                  （因阶段 4 存在提前返回，阶段 5 由 apply_value_conflict_audit
@@ -574,31 +574,17 @@ def apply_executor_consistency_audit(
 
     # ------------------------------------------------------------
     # 阶段 3：根因语义审计
-    # 目标：基于 vmcore 中的客观证据（slab 分配状态、对象覆盖模式、
-    #       DMA 证据族等）对 LLM 的根因归因做交叉验证，发现并修正
+    # 目标：基于 vmcore 中的客观证据（slab OOB 方向、DMA 证据族等）
+    #       对 LLM 的根因归因做交叉验证，发现并修正
     #       LLM 可能产生的逻辑矛盾。
     #
     #   3a. reverse_slab_oob：拦截"高地址 OOB 写低地址"的反向归因
     #       （标准 kmalloc OOB 只能从低向高延伸）。
-    #   3b. allocated_slot_uaf：如果 kmem -S 显示 slot 当前已分配，
-    #       则反对"已释放/野指针 UAF"归因（除非有独立生命周期证据）。
-    #   3c. prefix_overwrite：当对象 dump 显示前缀密集非零 + 尾部
-    #       大面积为零时，优先归因于原位置写覆盖而非 UAF/OOB。
-    #   3d. dma_promotion_gate：判定 DMA 破坏需要至少 2 个独立的
+    #   3b. dma_promotion_gate：判定 DMA 破坏需要至少 2 个独立的
     #       设备侧证据族，否则降级为 unknown。
     # ------------------------------------------------------------
     analysis_step = _audit_reverse_slab_oob_claim(
         analysis_step,
-        log_prefix=log_prefix,
-    )
-    analysis_step = _audit_allocated_slot_uaf_claim(
-        analysis_step,
-        state,
-        log_prefix=log_prefix,
-    )
-    analysis_step = _audit_prefix_overwrite_pattern(
-        analysis_step,
-        state,
         log_prefix=log_prefix,
     )
     analysis_step = _audit_dma_promotion_gate(
@@ -789,138 +775,6 @@ def _audit_dma_promotion_gate(
     return analysis_step
 
 
-def _audit_allocated_slot_uaf_claim(
-    analysis_step: VMCoreLLMAnalysisStep,
-    state: dict[str, Any],
-    *,
-    log_prefix: str = "",
-) -> VMCoreLLMAnalysisStep:
-    """拦截与 kmem -S 已分配结论相冲突的 UAF/free-then-reuse 归因。"""
-    text = _collect_analysis_text_for_oob_audit(analysis_step)
-    if not text:
-        return analysis_step
-
-    lowered = _strip_allocated_uaf_audit_text(text).lower()
-    if not _looks_like_uaf_claim(lowered):
-        return analysis_step
-
-    if _looks_like_hedged_uaf_mention(lowered):
-        return analysis_step
-
-    state_text = _collect_state_text(state)
-    if not _looks_like_allocated_slab_observation(state_text.lower()):
-        return analysis_step
-
-    if _has_positive_lifetime_reuse_evidence(lowered):
-        return analysis_step
-
-    prefix = f"{log_prefix}: " if log_prefix else ""
-    audit_note = (
-        "Executor audit: kmem -S context shows the candidate slab slot is currently allocated, "
-        "but the analysis still asserted freed/stale-pointer UAF or free-then-reuse without separate "
-        "positive lifetime evidence. ALLOCATED rules out a simple freed-object explanation; absent "
-        "independent lifetime evidence, treat this as live-slot overwrite, type confusion, or another "
-        "non-UAF mechanism instead of concluding use-after-free."
-    )
-    logger.warning("%s%s", prefix, audit_note)
-
-    if audit_note not in analysis_step.reasoning:
-        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
-
-    if analysis_step.additional_notes:
-        if audit_note not in analysis_step.additional_notes:
-            analysis_step.additional_notes = (
-                f"{analysis_step.additional_notes} {audit_note}"
-            ).strip()
-    else:
-        analysis_step.additional_notes = audit_note
-
-    if analysis_step.root_cause_class == "use_after_free":
-        analysis_step.root_cause_class = "pointer_corruption"
-        if analysis_step.corruption_mechanism in {None, "unknown"}:
-            analysis_step.corruption_mechanism = "write_corruption"
-
-    if analysis_step.is_conclusive:
-        analysis_step.is_conclusive = False
-        analysis_step.final_diagnosis = None
-        analysis_step.fix_suggestion = None
-
-    if analysis_step.confidence not in {None, "low"}:
-        analysis_step.confidence = "low"
-
-    return analysis_step
-
-
-def _audit_prefix_overwrite_pattern(
-    analysis_step: VMCoreLLMAnalysisStep,
-    state: dict[str, Any],
-    *,
-    log_prefix: str = "",
-) -> VMCoreLLMAnalysisStep:
-    """识别前缀覆盖/零尾部模式，避免在 UAF 与 OOB 之间无谓摇摆。"""
-    state_text = _collect_state_text(state)
-    pattern = _find_dense_prefix_zero_tail_pattern(state_text)
-    if pattern is None:
-        return analysis_step
-
-    text = _collect_analysis_text_for_oob_audit(analysis_step).lower()
-    if not any(
-        marker in text
-        for marker in (
-            "use-after-free",
-            "use after free",
-            "uaf",
-            "out-of-bounds",
-            "out of bounds",
-            "overflow",
-            "stale pointer",
-            "type confusion",
-            "pointer corruption",
-        )
-    ):
-        return analysis_step
-
-    prefix = f"{log_prefix}: " if log_prefix else ""
-    audit_note = (
-        "Executor audit: the raw object dump shows a dense non-zero prefix with a mostly zero "
-        f"tail ({pattern}). In a live kmalloc slot, this is a prefix-overwrite signature: prefer "
-        "in-place write corruption, foreign-structure copy, or type confusion over classic UAF or "
-        "bulk adjacent-slot buffer overflow unless separate lifetime or neighboring-slot evidence proves otherwise. "
-        "Once that signature is established, the bytes inside the overwritten prefix ARE the "
-        "corruption payload and carry no meaning for the original field: never treat readable ASCII "
-        "or plausible-looking numbers there as the original value (e.g. an IRQ number or a name) and "
-        "never try to decode their protocol semantics - the vmcore cannot recover what was overwritten, "
-        "so such decoding is not a prerequisite for concluding. The only open question is writer "
-        "provenance (who wrote the payload); if it cannot be resolved from surviving evidence, state "
-        "that limit in the conclusion instead of probing the payload again."
-    )
-    logger.warning("%s%s", prefix, audit_note)
-
-    if audit_note not in analysis_step.reasoning:
-        analysis_step.reasoning = f"{audit_note} {analysis_step.reasoning}".strip()
-
-    if analysis_step.additional_notes:
-        if audit_note not in analysis_step.additional_notes:
-            analysis_step.additional_notes = (
-                f"{analysis_step.additional_notes} {audit_note}"
-            ).strip()
-    else:
-        analysis_step.additional_notes = audit_note
-
-    if analysis_step.root_cause_class in {
-        None,
-        "unknown",
-        "use_after_free",
-        "out_of_bounds",
-    }:
-        analysis_step.root_cause_class = "pointer_corruption"
-
-    if analysis_step.corruption_mechanism in {None, "unknown"}:
-        analysis_step.corruption_mechanism = "write_corruption"
-
-    return analysis_step
-
-
 def _collect_dma_evidence_families(lowered_text: str) -> set[str]:
     """提取 DMA 结论中已经满足的独立设备侧证据族。"""
     family_markers: dict[str, tuple[str, ...]] = {
@@ -1000,108 +854,6 @@ def _collect_dma_evidence_families(lowered_text: str) -> set[str]:
             break
 
     return matched
-
-
-def _looks_like_uaf_claim(lowered_text: str) -> bool:
-    """判断文本是否在主张 freed/stale-pointer 风格的 UAF。"""
-    strong_markers = (
-        "this is consistent with a use-after-free",
-        "this is consistent with use-after-free",
-        "confirms use-after-free",
-        "confirming use-after-free",
-        "retained stale reference confirms use-after-free",
-        "freed and its memory reused",
-        "pointer survived free",
-        "stale pointer is the root cause",
-        "use-after-free is the root cause",
-        "uaf is the root cause",
-    )
-    generic_markers = (
-        "use-after-free",
-        "use after free",
-        "uaf",
-        "stale pointer",
-        "freed and reallocated",
-        "freed and reused",
-        "original object was freed",
-    )
-    return any(marker in lowered_text for marker in strong_markers) or (
-        any(marker in lowered_text for marker in generic_markers)
-        and not _looks_like_hedged_uaf_mention(lowered_text)
-    )
-
-
-def _looks_like_hedged_uaf_mention(lowered_text: str) -> bool:
-    """区分把 UAF 当候选项列举，与把 UAF 当结论断言。"""
-    if not any(
-        marker in lowered_text for marker in ("use-after-free", "use after free", "uaf")
-    ):
-        return False
-
-    hedged_markers = (
-        "cannot be determined",
-        "cannot determine",
-        "could not determine",
-        "exact corruption mechanism",
-        "possible",
-        "candidate",
-        "one possibility",
-        "whether",
-        "or dma",
-        "or out-of-bounds",
-        "or out of bounds",
-    )
-    return any(marker in lowered_text for marker in hedged_markers)
-
-
-def _strip_allocated_uaf_audit_text(text: str) -> str:
-    """移除上一次 injected audit 文本，避免 audit 自己触发自己。"""
-    audit_prefix = "Executor audit: kmem -S context shows the candidate slab slot is currently allocated"
-    if audit_prefix not in text:
-        return text
-    return " ".join(segment for segment in text.split(audit_prefix) if segment.strip())
-
-
-def _looks_like_allocated_slab_observation(lowered_text: str) -> bool:
-    """判断状态文本是否明确给出了 kmem -S 的 ALLOCATED 观察。"""
-    return "kmem -s" in lowered_text and "free / [allocated]" in lowered_text
-
-
-def _has_positive_lifetime_reuse_evidence(lowered_text: str) -> bool:
-    """判断文本是否给出了超越类型不一致的正向生命周期复用证据。"""
-    evidence_markers = (
-        "free stack",
-        "alloc stack",
-        "allocation stack",
-        "free path",
-        "kfree",
-        "kmem_cache_free",
-        "refcount reached zero",
-        "lifetime transition",
-        "rcu callback",
-        "retained stale reference",
-        "survived free",
-        "after reuse",
-    )
-    return any(marker in lowered_text for marker in evidence_markers)
-
-
-def _find_dense_prefix_zero_tail_pattern(state_text: str) -> str | None:
-    """检测 128-byte 对象中前缀密集非零、尾部大面积为零的覆盖模式。"""
-    words = re.findall(r"\b[0-9a-fA-F]{16}\b", state_text)
-    if len(words) < 16:
-        return None
-
-    zero_word = "0000000000000000"
-    for start in range(0, len(words) - 15):
-        window = words[start : start + 16]
-        first_half = window[:8]
-        second_half = window[8:]
-        first_nonzero = sum(word != zero_word for word in first_half)
-        second_zero = sum(word == zero_word for word in second_half)
-        if first_nonzero >= 6 and second_zero >= 6:
-            return f"first_half_nonzero={first_nonzero}/8, second_half_zero={second_zero}/8"
-    return None
 
 
 def _collect_analysis_text_for_oob_audit(analysis_step: VMCoreLLMAnalysisStep) -> str:

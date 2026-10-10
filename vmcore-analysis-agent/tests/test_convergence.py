@@ -20,9 +20,9 @@ from src.react.nodes import (
     _only_read_only_value_probes,
 )
 from src.react.output_parser import (
-    _audit_prefix_overwrite_pattern,
     _mine_faulting_instruction,
     _mine_suspect_function,
+    apply_executor_consistency_audit,
     apply_fallback_conclusion_synthesis,
 )
 from src.react.schema import GateEntry, VMCoreAnalysisStep
@@ -228,8 +228,8 @@ class DisassemblyMiningTests(unittest.TestCase):
         self.assertEqual(_mine_faulting_instruction("no rip here"), "")
 
 
-class PrefixOverwriteAuditTests(unittest.TestCase):
-    """L4：前缀覆盖签名一旦确立，被覆盖字节就是载荷而非协议字段。"""
+class SlabLifetimeAuditTests(unittest.TestCase):
+    """当前 slab 状态和字节形态不能单独判定对象的历史生命周期。"""
 
     DENSE_DUMP = "\n".join(
         ["crash> rd -8 ff292187ae124a80 16"]
@@ -243,28 +243,45 @@ class PrefixOverwriteAuditTests(unittest.TestCase):
         return VMCoreLLMAnalysisStep.model_validate(
             {
                 "step_id": 5,
-                "reasoning": "The slot shows a prefix overwrite, likely pointer corruption.",
+                "reasoning": (
+                    "The slot has a dense non-zero prefix and zero tail; "
+                    "stale-pointer UAF with reuse remains possible."
+                ),
                 "action": {"command_name": "rd", "arguments": ["ff292187ae124a80", "16"]},
                 "is_conclusive": False,
                 "signature_class": "pointer_corruption",
+                "root_cause_class": "use_after_free",
                 "partial_dump": "partial",
                 "confidence": "low",
             }
         )
 
-    def test_audit_note_forbids_decoding_overwritten_payload(self) -> None:
-        state = {"messages": [ToolMessage(content=self.DENSE_DUMP, tool_call_id="t1", name="run_script")]}
-        out = _audit_prefix_overwrite_pattern(self._step(), state)
-        self.assertIn("ARE the corruption payload", out.additional_notes)
-        self.assertIn("never treat readable ASCII", out.additional_notes)
-        self.assertIn("writer provenance", out.additional_notes)
-        self.assertEqual(out.root_cause_class, "pointer_corruption")
-        self.assertEqual(out.corruption_mechanism, "write_corruption")
+    def test_allocated_slot_and_prefix_shape_do_not_demote_uaf(self) -> None:
+        state = {
+            "messages": [
+                ToolMessage(
+                    content=(
+                        "crash> kmem -S ff292187ae124a80\n"
+                        "FREE / [ALLOCATED]\n[ff292187ae124a80]"
+                    ),
+                    tool_call_id="t1",
+                    name="kmem",
+                ),
+                ToolMessage(
+                    content=self.DENSE_DUMP,
+                    tool_call_id="t2",
+                    name="rd",
+                ),
+            ]
+        }
 
-    def test_no_note_without_pattern(self) -> None:
-        state = {"messages": [ToolMessage(content="crash> rd 0x1 2\n0000000000000000", tool_call_id="t1", name="run_script")]}
-        step = self._step()
-        self.assertIs(_audit_prefix_overwrite_pattern(step, state), step)
+        out = apply_executor_consistency_audit(self._step(), state)
+
+        self.assertEqual(out.root_cause_class, "use_after_free")
+        self.assertNotIn("live-slot overwrite", out.reasoning)
+        self.assertNotIn("prefix-overwrite signature", out.reasoning)
+        self.assertNotIn("Executor audit:", out.reasoning)
+        self.assertIsNone(out.additional_notes)
 
 
 if __name__ == "__main__":

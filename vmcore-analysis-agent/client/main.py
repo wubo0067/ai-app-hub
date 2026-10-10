@@ -10,6 +10,7 @@ from client import (
     analyze_vmcore,
     analyze_vmcore_stream,
     health_check,
+    save_gate_audit_report,
     save_markdown_report,
 )
 
@@ -117,6 +118,15 @@ def main():
                             agent_answer, args.vmcore_path, args.output_dir
                         )
                         print(f"\n💾 报告已保存到：{filepath}")
+
+                        audit_path = save_gate_audit_report(
+                            result.get("audit_report", ""),
+                            args.vmcore_path,
+                            filepath,
+                            args.output_dir,
+                        )
+                        if audit_path:
+                            print(f"🧾 Gate 审计记录已保存到：{audit_path}")
                     except Exception as save_err:
                         print(f"\n⚠️ 保存报告失败：{save_err}")
             else:

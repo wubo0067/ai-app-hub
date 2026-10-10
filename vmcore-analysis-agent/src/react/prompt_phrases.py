@@ -35,7 +35,7 @@ LITERAL_ADDRESS_RULE = (
 
 S1_S5_DMA_GATE_RULE = (
     "Before considering or promoting DMA or hardware, explicitly close the system-layer S1-S5 "
-    "exclusion reasoning."
+    "gating reasoning."
 )
 
 DMA_PROMOTION_EVIDENCE_RULE = (

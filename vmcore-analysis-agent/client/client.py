@@ -121,6 +121,7 @@ def analyze_vmcore_stream(
                             final_result = {
                                 "success": True,
                                 "agent_answer": data.get("agent_answer", ""),
+                                "audit_report": data.get("audit_report", ""),
                                 "token_usage": data.get("token_usage", 0),
                                 "error": data.get("error"),
                             }
@@ -129,6 +130,7 @@ def analyze_vmcore_stream(
                             final_result = {
                                 "success": False,
                                 "agent_answer": "",
+                                "audit_report": "",
                                 "token_usage": 0,
                                 "error": data.get("error"),
                             }
@@ -147,6 +149,16 @@ def health_check(base_url: str) -> dict:
         return response.json()
 
 
+def _report_basename(vmcore_path: str) -> str:
+    """从 vmcore 路径推导报告文件名前缀（清理非法字符）。"""
+    # 例如：/var/crash/127.0.0.1-2026-01-30-22:51:43/vmcore -> 127.0.0.1-2026-01-30-22:51:43
+    vmcore_dir = Path(vmcore_path).parent.name
+    safe_filename = re.sub(r'[:<>"|?*]', "-", vmcore_dir)
+    if not safe_filename or safe_filename == ".":
+        safe_filename = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return safe_filename
+
+
 def save_markdown_report(
     agent_answer: str, vmcore_path: str, output_dir: str = "./reports"
 ) -> str:
@@ -161,20 +173,9 @@ def save_markdown_report(
     Returns:
         str: 保存的文件路径
     """
-    # 从 vmcore_path 中提取目录名作为文件名
-    # 例如：/var/crash/127.0.0.1-2026-01-30-22:51:43/vmcore -> 127.0.0.1-2026-01-30-22:51:43
-    vmcore_dir = Path(vmcore_path).parent.name
-
-    # 清理文件名中的非法字符（主要是冒号）
-    safe_filename = re.sub(r'[:<>"|?*]', "-", vmcore_dir)
-
-    # 如果提取失败，使用时间戳
-    if not safe_filename or safe_filename == ".":
-        safe_filename = datetime.now().strftime("%Y%m%d-%H%M%S")
-
     # 构造文件名，追加时间戳避免覆盖
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    filename = f"{safe_filename}-{timestamp}.md"
+    filename = f"{_report_basename(vmcore_path)}-{timestamp}.md"
     filepath = Path(output_dir) / filename
 
     # 确保输出目录存在
@@ -183,5 +184,38 @@ def save_markdown_report(
     # 写入文件
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(agent_answer)
+
+    return str(filepath)
+
+
+def save_gate_audit_report(
+    audit_report: str,
+    vmcore_path: str,
+    report_path: str,
+    output_dir: str = "./reports",
+) -> Optional[str]:
+    """
+    保存独立的 Gate 审计记录。
+
+    审计文件与主报告同名但追加 `.audit` 后缀，便于对照查找。
+
+    Args:
+        audit_report: markdown 格式的审计记录；为空表示无 gate 记录
+        vmcore_path: vmcore 文件路径，用于提取命名信息
+        report_path: 主报告文件路径，审计文件取其文件名（去掉时间戳后复用）
+        output_dir: 输出目录
+
+    Returns:
+        Optional[str]: 保存的文件路径；无审计内容时返回 None
+    """
+    if not audit_report:
+        return None
+
+    base = Path(report_path).stem if report_path else _report_basename(vmcore_path)
+    filepath = Path(output_dir) / f"{base}.audit.md"
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(audit_report)
 
     return str(filepath)

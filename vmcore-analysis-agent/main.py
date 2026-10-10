@@ -17,6 +17,7 @@ from src.llm.model import create_reasoning_llm, create_structured_llm
 from src.react import (
     AgentState,
     create_agent_graph,
+    generate_gate_audit_report,
     generate_markdown_report,
     graph_logging_callback,
 )
@@ -51,6 +52,7 @@ class VmcoreAnalysisResponse(BaseModel):
     agent_answer: str
     token_usage: int
     error: Optional[str] = None
+    audit_report: Optional[str] = None
 
 
 def validate_file_paths(request: VmcoreAnalysisRequest) -> Optional[str]:
@@ -272,8 +274,9 @@ async def analyze_vmcore(request: VmcoreAnalysisRequest):
         snapshot = app_state["agent_graph"].get_state(cast(RunnableConfig, thread))
         final_values = snapshot.values
 
-        # 生成 markdown 报告
+        # 生成 markdown 报告（面向读者）与独立的 Gate 审计记录
         markdown_report = generate_markdown_report(final_values)
+        audit_report = generate_gate_audit_report(final_values)
         logger.info(f"Task {task_id} completed successfully")
         logger.debug(f"Generated markdown report (length: {len(markdown_report)})")
         logger.info(f"Task {task_id} finished, report generation complete.")
@@ -284,6 +287,7 @@ async def analyze_vmcore(request: VmcoreAnalysisRequest):
             agent_answer=markdown_report,
             token_usage=final_values.get("token_usage", 0),
             error=final_values.get("error"),
+            audit_report=audit_report or None,
         )
 
     except asyncio.CancelledError:
@@ -434,11 +438,12 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
             snapshot = app_state["agent_graph"].get_state(cast(RunnableConfig, thread))
             final_values = snapshot.values
 
-            # 生成 markdown 报告
+            # 生成 markdown 报告（面向读者）与独立的 Gate 审计记录
             markdown_report = generate_markdown_report(final_values)
+            audit_report = generate_gate_audit_report(final_values)
             logger.info(f"Task {task_id} finished, report generation complete.")
 
-            yield f"data: {json.dumps({'event': 'complete', 'agent_answer': markdown_report, 'token_usage': final_values.get('token_usage', 0), 'error': final_values.get('error')})}\n\n"
+            yield f"data: {json.dumps({'event': 'complete', 'agent_answer': markdown_report, 'audit_report': audit_report, 'token_usage': final_values.get('token_usage', 0), 'error': final_values.get('error')})}\n\n"
 
         except asyncio.CancelledError:
             logger.warning(f"Stream task {task_id} was cancelled.")
