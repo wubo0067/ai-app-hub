@@ -279,7 +279,10 @@ def _build_replan_probe_menu(state: AgentState) -> list[str]:
             f"- Gate closure is not root-cause proof: every mandatory gate for "
             f"signature_class={signature_class} is closed, yet root_cause_class is still unset. "
             f"The gate set for this signature class is too weak to support a conclusion, so "
-            f"re-running commands that only re-confirm a closed gate cannot make progress."
+            f"re-running commands that only re-confirm a closed gate cannot make progress. "
+            f"Synthesize your closed gates now: if no new external object or driver is accessible, "
+            f"derive the best-fit root_cause_class (e.g. pointer_corruption or memory_corruption) "
+            f"with confidence=\"low\" or \"medium\" and record remaining unknowns in detailed_analysis."
         )
     else:
         lines.append(

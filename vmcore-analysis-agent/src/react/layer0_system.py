@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-from .prompt_phrases import LITERAL_ADDRESS_RULE
+from .prompt_phrases import (
+    BOUNDED_UNCERTAINTY_EXIT_RULE,
+    CORRUPTED_PAYLOAD_TERMINATION_RULE,
+    LITERAL_ADDRESS_RULE,
+)
 
 LAYER0_SYSTEM_PROMPT_TEMPLATE = f"""
 # Role
@@ -28,6 +32,8 @@ Each step: reason about current evidence, identify missing information, invoke o
 - Trace back to the underlying cause, not just the panic site.
 - Establish register and pointer provenance before escalating to root-cause hypotheses.
 - DMA or hardware explanations are last-tier hypotheses requiring corroborating evidence beyond the bad pointer itself.
+- Bounded uncertainty convergence: {BOUNDED_UNCERTAINTY_EXIT_RULE}
+- Corrupted payload handling: {CORRUPTED_PAYLOAD_TERMINATION_RULE}
 
 ================================================================================
 # Exception Frame Semantics
@@ -311,6 +317,8 @@ Three non-negotiable constraints:
 ## 2.4 Convergence Criteria
 
 Set is_conclusive to true only when root cause is identified with at least two independent evidence sources, the causal chain is complete, the strongest remaining alternative is explicit, and no mandatory verification gap remains.
+
+When direct writer evidence cannot be attained (due to missing module debuginfo, partial memory dump, or asynchronous memory corruption), closing the immediate causal chain (proving object corruption and excluding local execution path corruption) entitles you to conclude with a bounded conclusion: set root_cause_class to "pointer_corruption" or "memory_corruption" with confidence="low" or "medium", record the unverified writer in detailed_analysis/additional_notes, and terminate analysis. Bounded low-confidence convergence is always preferred over spinning in repeated probes until budget exhaustion.
 
 When the leading root-cause hypothesis depends on a hardware protocol structure claim (e.g., a driver-private reply descriptor, DMA buffer overwrite, or device queue corruption) but the relevant module debuginfo is unavailable and struct access for the critical driver type has failed, that verification gap is mandatory: is_conclusive must remain false. Record the specific struct access failure and state the bounded evidence set explicitly rather than promoting the hypothesis to a confirmed root cause.
 

@@ -86,6 +86,25 @@ FORCED_CHOICE_CONVERGENCE_RULE = (
     "is what the vmcore contains, so choosing (A) is correct whenever (B) has no concrete answer."
 )
 
+BOUNDED_UNCERTAINTY_EXIT_RULE = (
+    "When direct writer evidence is unattainable (due to missing module symbols, partial dump coverage, "
+    "or asynchronous DMA/interrupt overwrite), DO NOT spin on reading the corrupted object. "
+    "Proving that an object is corrupted and that the local execution frame did not corrupt it "
+    "is sufficient to conclude with root_cause_class=\"pointer_corruption\" or \"memory_corruption\" "
+    "(with confidence=\"low\" or \"medium\"). Explicitly recording verification gaps in detailed_analysis "
+    "is considered a successful bounded convergence, NOT a diagnostic failure."
+)
+
+CORRUPTED_PAYLOAD_TERMINATION_RULE = (
+    "When a kernel pointer or field has already been shown to contain corrupted data (e.g. invalid addresses, "
+    "unrelated magic numbers, or driver-private pattern values), treat the memory at that location as "
+    "CORRUPTED PAYLOAD, not a live protocol data structure. You are strictly forbidden from attempting to "
+    "reverse-engineer protocol or hardware struct field semantics out of corruption payload: bytes inside "
+    "memory already proven to be corruption payload are the payload, not live state, and their protocol "
+    "semantics can never be recovered from the vmcore. Once an object is proven corrupt, terminate further "
+    "read probes against it."
+)
+
 SLAB_OOB_DIRECTION_RULE = (
     "In kmalloc/slab adjacency reasoning, a standard contiguous out-of-bounds write "
     "from object A extends from lower to higher addresses. Therefore, if victim object V "

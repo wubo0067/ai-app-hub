@@ -76,7 +76,16 @@ class ReplanProbeMenuTests(unittest.TestCase):
         self.assertIn("all mandatory gates are closed but no root cause", rendered)
         self.assertIn("Gate closure is not root-cause proof", rendered)
         self.assertIn("signature_class=null_deref", rendered)
+        self.assertIn("Synthesize your closed gates now", rendered)
         self.assertIn("Pivot requirement", rendered)
+
+    def test_layer0_system_contains_bounded_uncertainty_and_payload_rules(self) -> None:
+        from src.react.layer0_system import LAYER0_SYSTEM_PROMPT_TEMPLATE
+
+        self.assertIn("Bounded uncertainty convergence", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        self.assertIn("Corrupted payload handling", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        self.assertIn("CORRUPTED PAYLOAD", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        self.assertIn("Bounded low-confidence convergence is always preferred", LAYER0_SYSTEM_PROMPT_TEMPLATE)
 
     def test_no_menu_without_replan(self) -> None:
         rendered = _render(
