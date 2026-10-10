@@ -523,6 +523,8 @@ async def call_crash_tool(state: AgentState) -> dict:
 
     prior_fingerprints = set(state.get("executed_fingerprints", []))
     prior_tool_outputs = dict(state.get("tool_output_cache", {}))
+    # 已经回放过一次的指纹：第二次命中同一命令时不再回放，改发硬拒。
+    prior_replayed = set(state.get("replayed_fingerprints", []))
     previous_action_fingerprint = state.get("last_action_fingerprint", "")
     crash_path_struct_offsets = state.get("crash_path_struct_offsets")
     struct_layout_cache = dict(state.get("struct_layout_cache", {}))
@@ -541,6 +543,8 @@ async def call_crash_tool(state: AgentState) -> dict:
     new_tool_output_cache: dict[str, str] = {}
     new_fingerprints: list[str] = []
     duplicate_fingerprints: list[str] = []
+    # 本步首次回放的指纹，写入 replayed_fingerprints 供后续步骤判定"第二次索取"
+    new_replayed_fingerprints: list[str] = []
     current_fingerprints: list[str] = []
     rejected_count = 0
 
@@ -634,8 +638,14 @@ async def call_crash_tool(state: AgentState) -> dict:
                     cached_has_evidence = bool(prior_output) and \
                         not prior_output.startswith(("[error]", "[TIMEOUT]")) and \
                         _has_non_echo_output(prior_output)
-                    if cached_has_evidence:
-                        # 有证据：回放历史输出，让 LLM 重新利用已有结果
+                    # 同一指纹已经回放过一次，说明 LLM 拿到过这份输出又原样索取。
+                    # 此时不再回放（否则"有证据"的重复命令可以无限次骗取同一份输出），
+                    # 而是与"无证据"分支一样硬拒，强制其更换命令或证据目标。
+                    # 依据：run D 在步骤 60/62/64 连续三次索取同一条
+                    # `rd -x ff292187ae124a80 16`，直到 no_progress_streak 触顶才被掐停。
+                    already_replayed = current_fingerprint in prior_replayed
+                    if cached_has_evidence and not already_replayed:
+                        # 有证据：首次重复时回放历史输出，让 LLM 重新利用已有结果
                         dedup_msg = (
                             f"[DEDUP] This command was already executed in a prior step. "
                             f"Reusing prior output to save budget.\n"
@@ -654,13 +664,25 @@ async def call_crash_tool(state: AgentState) -> dict:
                             current_fingerprint[:80],
                         )
                         duplicate_fingerprints.append(current_fingerprint)
+                        prior_replayed.add(current_fingerprint)
+                        new_replayed_fingerprints.append(current_fingerprint)
                     else:
-                        # 无证据：视为错误，要求 LLM 换方向
-                        dedup_msg = (
-                            f"[DEDUP-BLOCKED] This command was already executed and produced "
-                            f"no usable evidence. It is now unavailable. "
-                            f"You must select a different command or a different evidence target."
-                        )
+                        # 无证据、或有证据但已回放过：视为错误，要求 LLM 换方向
+                        if already_replayed:
+                            dedup_msg = (
+                                "[DEDUP-BLOCKED] This command was already executed, and its cached "
+                                "output was already replayed to you once. Requesting it a second time "
+                                "is refused: re-reading the same bytes cannot produce new evidence. "
+                                "Select a different command, a different address/length, or a "
+                                "different evidence target (see the replan menu), or terminate with "
+                                "bounded uncertainty."
+                            )
+                        else:
+                            dedup_msg = (
+                                "[DEDUP-BLOCKED] This command was already executed and produced "
+                                "no usable evidence. It is now unavailable. "
+                                "You must select a different command or a different evidence target."
+                            )
                         tool_messages.append(
                             ToolMessage(
                                 content=dedup_msg,
@@ -854,6 +876,7 @@ async def call_crash_tool(state: AgentState) -> dict:
         "step_count": 1,
         "messages": tool_messages,
         "executed_fingerprints": new_fingerprints,
+        "replayed_fingerprints": new_replayed_fingerprints,
         "tool_output_cache": {
             **state.get("tool_output_cache", {}),
             **new_tool_output_cache,

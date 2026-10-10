@@ -83,6 +83,10 @@ class AgentState(MessagesState):
     # 命令指纹到最近一次工具输出内容的映射缓存。
     # 用于 executor 在遇到相同命令时直接复用结果，减少重复调用外部工具。
     tool_output_cache: dict[str, str]
+    # 已经通过 [DEDUP] 回放过一次输出的命令指纹（append-only，按 set 语义读取）。
+    # 回放是给 LLM 一次"复用已有结果"的机会；同一指纹第二次命中时不再回放，
+    # 而是升级为 [DEDUP-BLOCKED] 硬拒，避免 LLM 靠反复索取同一份输出无限空转。
+    replayed_fingerprints: Annotated[list[str], add]
     last_action_status: Optional[str]
     last_action_fingerprint: str
     duplicate_streak: int

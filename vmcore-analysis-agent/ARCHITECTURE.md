@@ -70,7 +70,12 @@ validate_tool_call_request      # action_guard：命令合法性、参数校验�
 → update_gate_evidence          # 门控证据累积
 ```
 
-去重与防停滞状态在 `AgentState`：`executed_fingerprints`、`duplicate_streak`、`no_progress_streak`、`replan_required`。
+去重与防停滞状态在 `AgentState`：`executed_fingerprints`、`replayed_fingerprints`、`duplicate_streak`、`no_progress_streak`、`replan_required`。
+
+重复命令的处理只有**一次**宽容：缓存输出有实质证据时，第一次重复回放 `[DEDUP]`（省预算），
+并把指纹记入 `replayed_fingerprints`；同一指纹第二次被索取时不再回放，改发 `[DEDUP-BLOCKED]`
+硬拒（走 `rejected` 分支，`no_progress_streak` 累加并触发 replan advisory）。否则"有证据"的
+重复命令可以无限次骗取同一份输出，只能等 streak 触顶才被掐停。
 
 ## 一次分析的完整生命周期：从现象到根因
 
