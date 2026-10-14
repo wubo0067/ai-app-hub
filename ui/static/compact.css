@@ -39,6 +39,7 @@ td strong{font-size:13px}td small{font-size:11.5px}
 .report-host .case-card{margin-bottom:8px}
 .report-host .case-card:last-child{margin-bottom:0}
 .report-incident .row-actions{min-width:140px}
+.inventory-table td:first-child .duplicate-path{white-space:normal;overflow-wrap:anywhere;overflow:visible;text-overflow:clip;line-height:1.5}
 
 /* Overview cards share one visual language and retain readable data labels. */
 .overview-primary .metric,.overview-operational .metric{border-top:3px solid var(--orange);box-shadow:0 2px 8px #3a2b1c08;position:relative}
