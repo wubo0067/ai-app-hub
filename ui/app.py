@@ -456,7 +456,7 @@ def make_app(data_dir=None, password=None, secret=None):
         config = store.read("config")
         cached = discovery_snapshot(config)
         return inventory(config, store.read("cases"), store.read("tasks"),
-                         store.read("reviews"), cached["items"] if cached["initialized"] else None)
+                         store.read("reviews"), cached["items"])
 
     @app.get("/api/reviews")
     def reviews():

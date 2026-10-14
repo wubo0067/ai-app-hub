@@ -203,6 +203,7 @@ def test_folder_inventory_vmcore_identity_conflicts_and_re_review(tmp_path):
             old = time.time() - 60
             for file in (path, dmesg):
                 os.utime(file, (old, old))
+        assert client.get("/api/discover/stream").status_code == 200
         assert collection_for(str(one), [str(root)]) == str(batch.resolve())
         assert case_id(str(one), "") != case_id(str(two), "")
         def report(path, fault):
@@ -570,6 +571,7 @@ def test_cached_inventory_only_rechecks_new_or_changed_vmcores(tmp_path, monkeyp
         first.mkdir()
         files(first)
         assert client.get("/api/discover/cache").json() == {"initialized": False, "items": []}
+        assert client.get("/api/collections").json() == []
         assert client.post("/api/discover/incremental", headers=HEADERS).json()["needs_full_scan"]
         assert client.get("/api/discover/stream").text.count('"type": "vmcore"') == 1
         original = discovery.scan_metadata
