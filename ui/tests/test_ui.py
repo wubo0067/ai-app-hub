@@ -138,7 +138,86 @@ def test_report_count_does_not_count_script_archive_twice(tmp_path):
             {"id": "import", "case_id": "case", "status": "success", "created_at": "2026-01-02",
              "report": "reports/import.md", "source_report": None},
         ])
+        (store.root / "reports" / "import.md").write_text("# Imported report\n", encoding="utf-8")
         assert client.get("/api/summary").json()["report_count"] == 2
+
+
+def test_report_incident_groups_review_and_delete(tmp_path):
+    with client_for(tmp_path) as client:
+        login(client)
+        host = tmp_path / "host-a"
+        first = host / "dump-1" / "vmcore"
+        second = host / "dump-2" / "vmcore"
+        for path in (first, second):
+            path.parent.mkdir(parents=True)
+            path.write_text("core")
+
+        def imported(path, fault, stamp):
+            text = (f"# Report\n- **vmcore 路径**: `{path}`\nNODENAME: host-a\n"
+                    f"DATE: {stamp}\n## 总结\n**故障类型**: {fault}\n")
+            response = client.post("/api/import", json={"filename": "report.md", "markdown": text}, headers=HEADERS)
+            assert response.status_code == 200
+            return response.json()["task"]["id"]
+
+        first_task = imported(first, "内存损坏", "2026-10-01 10:00:00")
+        imported(first, "驱动异常", "2026-10-04 12:00:00")
+        imported(second, "死锁", "2026-10-02 11:00:00")
+        rows = client.get("/api/reports").json()
+        assert len(rows) == 3
+        assert {row["hostname"] for row in rows} == {"host-a"}
+        first_rows = [row for row in rows if row["vmcore_path"] == str(first)]
+        second_row = next(row for row in rows if row["vmcore_path"] == str(second))
+        assert len({row["incident_code"] for row in first_rows}) == 1
+        assert first_rows[0]["incident_code"] != second_row["incident_code"]
+        assert first_rows[0]["incident_code"].startswith("VM-20261001100000-")
+        record = next(case for case in client.get("/api/cases").json() if case["vmcore_path"] == str(first))
+        assert record["incident_code"] == first_rows[0]["incident_code"]
+        assert record["has_conflict"]
+        assert next(task for task in client.get("/api/tasks").json() if task["id"] == first_task)["incident_code"] == record["incident_code"]
+
+        review = client.put(f"/api/cases/{record['id']}/review", json={
+            "selected_task_id": first_task, "human": {"fault_type": "驱动异常"},
+            "verdicts": {"fault_type": "错误"}, "final_cause": "驱动访问已释放内存",
+        }, headers=HEADERS)
+        assert review.status_code == 200
+        assert review.json()["final_cause"] == "驱动访问已释放内存"
+        summary = client.get("/api/summary").json()
+        assert summary["accuracy"]["fault_type"]["reviewed"] == 1
+        assert ("驱动异常", 1) in [tuple(row) for row in summary["fault_types"]]
+
+        deleted = client.delete("/api/reports/" + first_rows[0]["id"], headers=HEADERS)
+        assert deleted.status_code == 200
+        assert len(client.get("/api/reports").json()) == 2
+        assert client.get("/api/reports/" + first_rows[0]["id"]).status_code == 404
+        assert any(task["id"] == first_rows[0]["task_id"] for task in client.get("/api/tasks").json())
+        assert client.get("/api/summary").json()["accuracy"]["fault_type"]["reviewed"] == 0
+
+
+def test_external_reports_without_tasks_can_be_compared_and_reviewed(tmp_path):
+    reports = tmp_path / "external"
+    reports.mkdir()
+    vmcore = tmp_path / "host-b" / "dump" / "vmcore"
+    for index, fault in enumerate(("死锁", "内存损坏"), 1):
+        (reports / f"report-{index}.md").write_text(
+            f"# Report\n- **vmcore 路径**: `{vmcore}`\nNODENAME: host-b\n"
+            f"DATE: 2026-10-03 12:00:00\n## 总结\n**故障类型**: {fault}\n", encoding="utf-8")
+    with client_for(tmp_path) as client:
+        login(client)
+        store = client.app.state.store
+        config = store.read("config")
+        config["report_roots"] = [str(reports)]
+        store.write("config", config)
+        rows = client.get("/api/reports").json()
+        assert len(rows) == 2 and len({row["incident_code"] for row in rows}) == 1
+        record = next(case for case in client.get("/api/cases").json() if case["vmcore_path"] == str(vmcore))
+        assert record["has_conflict"] and record["run_count"] == 2
+        selected = "report:" + rows[0]["id"]
+        response = client.put(f"/api/cases/{record['id']}/review", json={
+            "selected_task_id": selected, "human": {"fault_type": "死锁"},
+            "verdicts": {"fault_type": "正确"}, "final_cause": "锁顺序反转",
+        }, headers=HEADERS)
+        assert response.status_code == 200
+        assert client.get("/api/summary").json()["accuracy"]["fault_type"]["reviewed"] == 1
 
 
 def test_discovery_whitelist_and_stream_task(tmp_path, monkeypatch):

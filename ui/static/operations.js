@@ -34,17 +34,16 @@ function inventoryTable(items) {
     const value = (a,b) => a && a !== '未知' ? a : b || '未知';
     const tokens = runs.map(t => t.token_usage).filter(v => v != null).reduce((a,b) => a + Number(b), 0);
     const seconds = runs.reduce((a,t) => a + (t.duration_seconds || 0), 0);
-    return `<tr><td><strong class="mono">${esc(item.vmcore_path.split(/[\\/]/).slice(-2).join('/'))}</strong>${duplicates.has(item.vmcore_path)?` <span class="badge queued" title="文件大小与三处抽样内容一致，建议人工核对">疑似重复 · ${duplicates.get(item.vmcore_path)} 份</span>`:''}<small class="mono" title="${esc(item.vmcore_path)}">${esc(item.vmcore_path)}</small></td><td>${fmt(item.folder_created_at*1000)}</td><td>${esc(value(item.hostname_hint,c.hostname))}</td><td>${esc(value(item.dump_time_hint,c.dump_time))}</td><td>${esc(value(item.os_name_hint,c.os_name))}</td><td>${esc(value(item.kernel_hint,c.kernel))}</td><td class="path-cell" title="${esc(item.vmlinux_path||'未匹配')}">${esc(item.vmlinux_path||'未匹配')}</td><td>${latest ? badge(latest.status) : '<span class="badge unknown">未分析</span>'}<small>${runs.length} 次 · ${item.ready ? '文件就绪' : '文件待稳定'}</small></td><td>${tokens ? tokens.toLocaleString() : '未知'}<small>${seconds ? dur(seconds) : '未知'}</small></td><td class="row-actions">${inventoryActions(item,runs,active)}</td></tr>`;
+    return `<tr><td><strong class="mono">${esc(item.vmcore_path.split(/[\\/]/).slice(-2).join('/'))}</strong>${duplicates.has(item.vmcore_path)?` <span class="badge queued" title="文件大小与三处抽样内容一致，建议人工核对">疑似重复 · ${duplicates.get(item.vmcore_path)} 份</span>`:''}<small class="mono" title="${esc(item.vmcore_path)}">${esc(item.vmcore_path)}</small>${c.incident_code?`<small class="mono">${esc(c.incident_code)}</small>`:''}</td><td>${fmt(item.folder_created_at*1000)}</td><td>${esc(value(item.hostname_hint,c.hostname))}</td><td>${esc(value(item.dump_time_hint,c.dump_time))}</td><td>${esc(value(item.os_name_hint,c.os_name))}</td><td>${esc(value(item.kernel_hint,c.kernel))}</td><td class="path-cell" title="${esc(item.vmlinux_path||'未匹配')}">${esc(item.vmlinux_path||'未匹配')}</td><td>${latest ? badge(latest.status) : '<span class="badge unknown">未分析</span>'}<small>${runs.length} 次 · ${item.ready ? '文件就绪' : '文件待稳定'}</small></td><td>${tokens ? tokens.toLocaleString() : '未知'}<small>${seconds ? dur(seconds) : '未知'}</small></td><td class="row-actions">${inventoryActions(item,runs,active)}</td></tr>`;
   }).join('')}</tbody></table></div>${items.length ? '' : '<div class="empty">扫描中，尚未发现符合条件的 vmcore</div>'}</div>`;
 }
 
 function tasksPage() {
   setTimeout(checkNewInventory, 0);
   const existing = state.discovered||[];
-  const duplicates = duplicatePaths(existing);
   return head('VMCORE / INVENTORY','任务','复用已有扫描结果；自动检查新增文件，点击重新扫描才完整扫描。','<div class="toolbar"><button class="primary" id="create-task-open">创建任务 ＋</button><button class="secondary" id="scan-refresh">重新扫描 ↻</button></div>') +
     `<div id="scan-progress" class="scan-progress" role="status" aria-live="polite"><span class="scan-spinner"></span><div><strong>读取扫描记录…</strong><small>已有结果会保留在下方</small></div></div>`+
-    `<div class="toolbar"><input id="inventory-search" placeholder="搜索目录、主机、OS、内核"><select id="inventory-status"><option value="">全部状态</option><option value="unanalyzed">未分析</option>${Object.entries(statuses).map(([k,v]) => `<option value="${k}">${v}</option>`).join('')}</select><span class="hint" id="inventory-count">共 ${existing.length} 个 vmcore</span></div><div id="task-table">${inventoryTable(existing.filter(item=>!duplicates.has(item.vmcore_path)))}</div><div id="duplicate-card">${duplicates.size?`<div class="queue-label"><h2>疑似重复的 VMCORE</h2><small>${duplicates.size} 个文件；按文件大小及首、中、尾抽样内容识别</small></div>${inventoryTable(existing.filter(item=>duplicates.has(item.vmcore_path)))}`:''}</div>`+
+    `<div class="toolbar"><input id="inventory-search" placeholder="搜索目录、主机、OS、内核"><select id="inventory-status"><option value="">全部状态</option><option value="unanalyzed">未分析</option>${Object.entries(statuses).map(([k,v]) => `<option value="${k}">${v}</option>`).join('')}</select><span class="hint" id="inventory-count">共 ${existing.length} 个 vmcore</span></div><div id="task-table">${inventoryTable(existing)}</div>`+
     `<dialog id="create-task-dialog" class="task-dialog"><form id="manual-task-form"><h2>创建分析任务</h2><p class="hint">输入 vmcore 文件或其父目录的绝对路径。</p><div class="field"><label>vmcore 路径</label><input name="vmcore_path" placeholder="/data/vmcore/127.0.0.1/file" required></div>${state.settings.execution_mode==='agent'?'<div class="field"><label>dmesg 路径</label><input name="vmcore_dmesg_path" required></div><div class="field"><label>vmlinux 路径</label><input name="vmlinux_path" required></div>':''}<div class="form-actions"><button type="button" class="secondary" id="create-task-close">取消</button><button type="submit" class="primary">加入队列</button></div></form></dialog>`+
     `<dialog id="inventory-detail" class="task-dialog"><div class="dialog-body" id="inventory-detail-body"></div></dialog>`;
 }
@@ -60,12 +59,9 @@ function filteredInventory() {
 }
 
 function paintInventory() {
-  const duplicates = duplicatePaths(state.discovered||[]);
   const filtered = filteredInventory();
   const table = $('#task-table');
-  if (table) table.innerHTML = inventoryTable(filtered.filter(item => !duplicates.has(item.vmcore_path)));
-  const duplicateCard = $('#duplicate-card');
-  if (duplicateCard) duplicateCard.innerHTML = duplicates.size ? `<div class="queue-label"><h2>疑似重复的 VMCORE</h2><small>${duplicates.size} 个文件；按文件大小及首、中、尾抽样内容识别</small></div>${inventoryTable(filtered.filter(item => duplicates.has(item.vmcore_path)))}` : '';
+  if (table) table.innerHTML = inventoryTable(filtered);
   const count = $('#inventory-count');
   if (count) count.textContent = `共 ${(state.discovered||[]).length} 个 vmcore · 按父目录时间倒序`;
 }

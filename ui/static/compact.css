@@ -25,6 +25,20 @@ td strong{font-size:13px}td small{font-size:11.5px}
 #content table.resizable-table .column-resize:hover::after,#content table.resizable-table .column-resize:focus-visible::after{background:var(--orange-dark)}
 #content table.resizable-table td{overflow:hidden;text-overflow:ellipsis}
 #content table.resizable-table.diff-table td{overflow-wrap:anywhere}
+.report-host{margin:0 0 13px;border:1px solid var(--line);border-radius:9px;background:#fff;overflow:hidden}
+.report-host>summary,.report-incident>summary{display:flex;align-items:center;justify-content:space-between;gap:16px;cursor:pointer;padding:13px 16px;list-style:none}
+.report-host>summary::-webkit-details-marker,.report-incident>summary::-webkit-details-marker{display:none}
+.report-host>summary{background:#f7f8f5;border-bottom:1px solid var(--line)}
+.report-host>summary strong{font-size:15px;color:var(--ink)}
+.report-host>summary span,.report-incident>summary span{font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.report-incident{margin:10px 12px;border:1px solid #dbe2d9;border-radius:7px;overflow:hidden}
+.report-incident>summary{background:#fbfaf8;border-bottom:1px solid #e3e6df}
+.report-incident>summary strong{font-size:13px;color:#a94f19;white-space:nowrap}
+.report-incident .table-wrap{border:0}
+.report-host .case-list{padding:12px}
+.report-host .case-card{margin-bottom:8px}
+.report-host .case-card:last-child{margin-bottom:0}
+.report-incident .row-actions{min-width:140px}
 
 /* Overview cards share one visual language and retain readable data labels. */
 .overview-primary .metric,.overview-operational .metric{border-top:3px solid var(--orange);box-shadow:0 2px 8px #3a2b1c08;position:relative}

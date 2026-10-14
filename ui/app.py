@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Str
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .analysis import FIELDS, UNKNOWN, VERDICTS, case_comparison, case_id, collection_for, extract, result_fingerprint, stats
+from .analysis import FIELDS, UNKNOWN, VERDICTS, case_comparison, case_id, collection_for, extract, incident_code, result_fingerprint, stats
 from .discovery import checked_file, inventory, scan, scan_events, stable_file
 from .storage import Store
 from .script_reports import markdown_snapshot, produced_reports
@@ -52,6 +52,7 @@ class ReviewInput(BaseModel):
     verdicts: dict[str, str] = Field(default_factory=dict)
     human_seconds: int | None = Field(default=None, ge=0)
     notes: str = ""
+    final_cause: str = ""
 
 
 class ImportInput(BaseModel):
@@ -143,9 +144,12 @@ def make_app(data_dir=None, password=None, secret=None):
         task["ai"] = metadata["ai"]
         task["result_fingerprint"] = result_fingerprint(report)
         case = next(c for c in store.read("cases") if c["id"] == task["case_id"])
+        if not case.get("incident_code") and case.get("dump_time") not in (None, UNKNOWN):
+            case["incident_code"] = incident_code(case.get("vmcore_path") or case["id"], case["dump_time"], case.get("created_at"))
         for key in ("hostname", "dump_time", "kernel", "panic", "os_name"):
             if metadata[key] != UNKNOWN:
                 case[key] = metadata[key]
+        case.setdefault("incident_code", incident_code(case.get("vmcore_path") or case["id"], case.get("dump_time"), case.get("created_at")))
         case["ai"] = metadata["ai"]
         case["latest_task_id"] = task_id
         store.upsert("cases", case)
@@ -383,9 +387,10 @@ def make_app(data_dir=None, password=None, secret=None):
     @app.get("/api/summary")
     def summary():
         tasks = store.read("tasks")
-        result = stats(tasks, store.read("cases"), store.read("reviews"))
-        result["report_count"] = len(report_index()) + sum(
-            1 for task in tasks if task.get("report") and not task.get("source_report"))
+        reports = report_index()
+        cases, comparison_tasks = comparison_data(reports, tasks)
+        result = stats(tasks, cases, store.read("reviews"), comparison_tasks)
+        result["report_count"] = len(reports)
         result["manual_overrides"] = store.read("dashboard_overrides")
         return result
 
@@ -398,26 +403,44 @@ def make_app(data_dir=None, password=None, secret=None):
 
     @app.get("/api/tasks")
     def tasks():
-        return sorted(store.read("tasks"), key=lambda t: t["created_at"], reverse=True)
+        cases_by_id = {case["id"]: case for case in store.read("cases")}
+        return sorted(({**task, "incident_code": (cases_by_id.get(task.get("case_id")) or {}).get("incident_code") or incident_code(
+            (cases_by_id.get(task.get("case_id")) or {}).get("vmcore_path") or task.get("vmcore_path") or task.get("case_id") or task["id"],
+            (cases_by_id.get(task.get("case_id")) or {}).get("dump_time"),
+            (cases_by_id.get(task.get("case_id")) or {}).get("created_at") or task.get("created_at"))}
+            for task in store.read("tasks")), key=lambda t: t["created_at"], reverse=True)
 
     @app.get("/api/cases")
     def cases():
         tasks = store.read("tasks")
+        reports = report_index()
+        report_codes = {row["case_id"]: row["incident_code"] for row in reports}
+        all_cases, comparison_tasks = comparison_data(reports, tasks)
         tasks_by_case = {}
-        for task in tasks:
+        for task in comparison_tasks:
             tasks_by_case.setdefault(task["case_id"], []).append(task)
         reviews = {r["case_id"]: r for r in store.read("reviews")}
         roots = store.read("config")["scan_roots"]
-        return sorted(({**c, "collection": collection_for(c.get("vmcore_path"), roots),
+        return sorted(({**c, "incident_code": c.get("incident_code") or report_codes.get(c["id"]) or incident_code(c.get("vmcore_path") or c["id"], c.get("dump_time"), c.get("created_at")),
+                        "collection": collection_for(c.get("vmcore_path"), roots),
                         **case_comparison(c, tasks_by_case.get(c["id"], []), reviews.get(c["id"]))}
-                       for c in store.read("cases")), key=lambda c: c["created_at"], reverse=True)
+                       for c in all_cases), key=lambda c: c["created_at"], reverse=True)
 
     def report_index():
         config = store.read("config")
         paths = markdown_snapshot(config.get("report_roots", []))
         tasks = store.read("tasks")
         cases = {c["id"]: c for c in store.read("cases")}
+        cases_by_vmcore = {c["vmcore_path"]: c for c in cases.values() if c.get("vmcore_path")}
         by_source = {str(Path(t["source_report"]).resolve()): t for t in tasks if t.get("source_report")}
+        by_archive = {str((store.root / t["report"]).resolve()): t for t in tasks if t.get("report")}
+        for archive, task in by_archive.items():
+            if task.get("report_deleted") or (task.get("source_report") and str(Path(task["source_report"]).resolve()) in paths):
+                continue
+            file = Path(archive)
+            if file.is_file():
+                stat = file.stat()
+                paths[archive] = (stat.st_size, stat.st_mtime_ns)
         rows = []
         for name, (size, changed) in paths.items():
             if name.endswith(".audit.md"):
@@ -426,19 +449,56 @@ def make_app(data_dir=None, password=None, secret=None):
                 extracted, factual = report_facts(name, size, changed)
             except OSError:
                 continue
-            task = by_source.get(name)
-            case = cases.get(task["case_id"]) if task else next(
-                (c for c in cases.values() if c.get("vmcore_path") and c["vmcore_path"] == extracted["vmcore_path"]), None)
+            task = by_source.get(name) or by_archive.get(name)
+            if task and task.get("report_deleted"):
+                continue
+            case = cases.get(task["case_id"]) if task else cases_by_vmcore.get(extracted["vmcore_path"])
+            vmcore_path = extracted["vmcore_path"] or (case or {}).get("vmcore_path")
+            dump_time = factual["dump_time"] if factual["dump_time"] != UNKNOWN else (case or {}).get("dump_time", UNKNOWN)
+            crash_key = (case or {}).get("vmcore_path") or vmcore_path or (case or {}).get("id") or name
             rows.append({"id": hashlib.sha256(name.encode()).hexdigest()[:24], "path": name,
                          "filename": Path(name).name, "modified_at": changed,
                          "task_id": task["id"] if task else None,
-                         "vmcore_path": extracted["vmcore_path"] or (case or {}).get("vmcore_path"),
+                         "case_id": (case or {}).get("id") or case_id(vmcore_path, "report:" + name),
+                         "vmcore_path": vmcore_path, "ai": extracted["ai"],
+                         "incident_code": incident_code(crash_key, (case or {}).get("dump_time") or dump_time,
+                                                        (case or {}).get("created_at") or datetime.fromtimestamp(changed / 1e9, timezone.utc).isoformat()),
                          "hostname": factual["hostname"] if factual["hostname"] != UNKNOWN else (case or {}).get("hostname", UNKNOWN),
-                         "dump_time": factual["dump_time"] if factual["dump_time"] != UNKNOWN else (case or {}).get("dump_time", UNKNOWN),
+                         "dump_time": dump_time,
                          "os_name": factual["os_name"] if factual["os_name"] != UNKNOWN else (case or {}).get("os_name", UNKNOWN),
                          "kernel": factual["kernel"] if factual["kernel"] != UNKNOWN else (case or {}).get("kernel", UNKNOWN),
                          "token_usage": extracted["token_usage"]})
+        groups = {}
+        for row in rows:
+            groups.setdefault(row["case_id"], []).append(row)
+        for group in groups.values():
+            earliest = min(group, key=lambda row: row["modified_at"])
+            dated = next((row for row in group if row["dump_time"] != UNKNOWN), earliest)
+            stored = cases.get(earliest["case_id"])
+            code = (stored.get("incident_code") or incident_code(stored.get("vmcore_path") or stored["id"], stored.get("dump_time"), stored.get("created_at"))
+                    if stored else incident_code(earliest["vmcore_path"] or earliest["case_id"], dated["dump_time"],
+                                                 datetime.fromtimestamp(earliest["modified_at"] / 1e9, timezone.utc).isoformat()))
+            for row in group:
+                row["incident_code"] = code
         return sorted(rows, key=lambda row: row["modified_at"], reverse=True)
+
+    def comparison_data(reports, tasks):
+        all_cases = {case["id"]: case for case in store.read("cases")}
+        comparison_tasks = list(tasks)
+        for row in reports:
+            cid = row["case_id"]
+            if cid not in all_cases:
+                all_cases[cid] = {"id": cid, "created_at": datetime.fromtimestamp(row["modified_at"] / 1e9, timezone.utc).isoformat(),
+                                  "vmcore_path": row["vmcore_path"], "hostname": row["hostname"],
+                                  "dump_time": row["dump_time"], "os_name": row["os_name"],
+                                  "kernel": row["kernel"], "panic": UNKNOWN, "ai": row["ai"],
+                                  "latest_task_id": None, "imported": True}
+            if not row["task_id"]:
+                comparison_tasks.append({"id": "report:" + row["id"], "case_id": cid,
+                                         "status": "success", "created_at": datetime.fromtimestamp(row["modified_at"] / 1e9, timezone.utc).isoformat(),
+                                         "ai": row["ai"], "result_fingerprint": hashlib.sha256(json.dumps(row["ai"], sort_keys=True).encode()).hexdigest(),
+                                         "imported": True, "report_id": row["id"]})
+        return list(all_cases.values()), comparison_tasks
 
     @app.get("/api/reports")
     def reports():
@@ -450,6 +510,37 @@ def make_app(data_dir=None, password=None, secret=None):
         if not row:
             raise HTTPException(404, "报告不存在")
         return PlainTextResponse(Path(row["path"]).read_text(encoding="utf-8", errors="replace"), media_type="text/markdown")
+
+    @app.delete("/api/reports/{report_id}")
+    def delete_report(report_id: str):
+        row = next((r for r in report_index() if r["id"] == report_id), None)
+        if not row:
+            raise HTTPException(404, "报告不存在")
+        path = Path(row["path"])
+        task = next((t for t in store.read("tasks") if t["id"] == row["task_id"]), None) if row["task_id"] else None
+        # The index only contains configured report roots or this service's report archive.
+        try:
+            path.unlink(missing_ok=True)
+        except PermissionError as error:
+            raise HTTPException(403, "报告目录没有删除权限") from error
+        if task:
+            if task.get("report"):
+                (store.root / task["report"]).unlink(missing_ok=True)
+            task["report"] = None
+            task["source_report"] = None
+            task["report_deleted"] = True
+            store.upsert("tasks", task)
+            cases = store.read("cases")
+            case = next((c for c in cases if c["id"] == task["case_id"]), None)
+            if case:
+                remaining = [t for t in store.read("tasks") if t["case_id"] == case["id"] and
+                             t["status"] == "success" and not t.get("report_deleted")]
+                case["ai"] = (max(remaining, key=lambda t: t["created_at"]).get("ai", {}) if remaining
+                              else {field: UNKNOWN for field in FIELDS})
+                store.upsert("cases", case)
+        store.write("reviews", [r for r in store.read("reviews") if r.get("case_id") != row["case_id"]])
+        store.log("report_deleted", f"{report_id} {row['filename']}")
+        return {"deleted": report_id}
 
     @app.get("/api/collections")
     def collections():
@@ -776,9 +867,12 @@ def make_app(data_dir=None, password=None, secret=None):
         case = existing or {"id": cid, "created_at": now(), "imported": True, "latest_task_id": None,
                             "hostname": UNKNOWN, "dump_time": UNKNOWN, "kernel": UNKNOWN, "os_name": UNKNOWN,
                             "panic": UNKNOWN, "ai": {f: UNKNOWN for f in FIELDS}}
+        if not case.get("incident_code") and case.get("dump_time") not in (None, UNKNOWN):
+            case["incident_code"] = incident_code(case.get("vmcore_path") or cid, case["dump_time"], case.get("created_at"))
         for key in ("vmcore_path", "hostname", "dump_time", "kernel", "os_name", "panic"):
             if not existing or metadata[key] not in (UNKNOWN, None):
                 case[key] = metadata[key]
+        case.setdefault("incident_code", incident_code(case.get("vmcore_path") or cid, case.get("dump_time"), case.get("created_at")))
         for key, extracted_value in metadata["ai"].items():
             if extracted_value != UNKNOWN:
                 case["ai"][key] = extracted_value
@@ -799,18 +893,19 @@ def make_app(data_dir=None, password=None, secret=None):
 
     @app.put("/api/cases/{cid}/review")
     def save_review(cid: str, value: ReviewInput):
-        if not any(c["id"] == cid for c in store.read("cases")):
-            raise HTTPException(404, "案例不存在")
+        all_cases, comparison_tasks = comparison_data(report_index(), store.read("tasks"))
+        if not any(c["id"] == cid for c in all_cases):
+            raise HTTPException(404, "报告所属崩溃记录不存在")
         if any(key not in FIELDS or verdict not in VERDICTS for key, verdict in value.verdicts.items()):
             raise HTTPException(400, "复核结果无效")
-        runs = [t for t in store.read("tasks") if t["case_id"] == cid and t["status"] == "success"]
+        runs = [t for t in comparison_tasks if t["case_id"] == cid and t["status"] == "success" and not t.get("report_deleted")]
         selected = next((t for t in runs if t["id"] == value.selected_task_id), None) if value.selected_task_id else None
         if value.selected_task_id and not selected:
-            raise HTTPException(400, "所选运行不属于该案例")
+            raise HTTPException(400, "所选报告不属于本次崩溃")
         if selected is None and runs:
             selected = max(runs, key=lambda t: t["created_at"])
         if not selected:
-            raise HTTPException(400, "案例没有成功的分析运行")
+            raise HTTPException(400, "本次崩溃没有可复核报告")
         review = {"id": cid, "case_id": cid, "updated_at": now(),
                   "task_id": selected["id"], "ai_snapshot": selected.get("ai", {}).copy(),
                   "reviewed_task_ids": [t["id"] for t in runs],

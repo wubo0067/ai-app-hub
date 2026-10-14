@@ -2,11 +2,37 @@
 import hashlib
 import re
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 UNKNOWN = "未知"
 FIELDS = ("fault_type", "root_cause", "module", "evidence", "recommendation")
 VERDICTS = ("正确", "部分正确", "错误", "待确认")
+
+
+def incident_code(identity: str, dump_time: str | None, fallback_time: str | None = None) -> str:
+    """Stable, globally usable crash code: date plus a path-derived discriminator."""
+    stamp = None
+    for value in (dump_time, fallback_time):
+        if not value or value == UNKNOWN:
+            continue
+        text = str(value).strip()
+        try:
+            stamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            # crash sys commonly prints: Thu Mar 26 14:27:22 CST 2026.
+            cleaned = re.sub(r"\s+[A-Z]{2,5}\s+(\d{4})$", r" \1", text)
+            for pattern in ("%a %b %d %H:%M:%S %Y", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    stamp = datetime.strptime(cleaned, pattern)
+                    break
+                except ValueError:
+                    pass
+        if stamp:
+            break
+    date = stamp.strftime("%Y%m%d%H%M%S") if stamp else "00000000000000"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8].upper()
+    return f"VM-{date}-{digest}"
 
 
 def collection_for(vmcore_path: str | None, roots: list[str]) -> str:
@@ -37,7 +63,7 @@ def result_fingerprint(report: str) -> str:
 
 def case_comparison(case: dict, tasks: list[dict], review: dict | None = None) -> dict:
     all_runs = [t for t in tasks if t.get("case_id") == case["id"]]
-    runs = sorted((t for t in all_runs if t["status"] == "success"),
+    runs = sorted((t for t in all_runs if t["status"] == "success" and not t.get("report_deleted")),
                   key=lambda t: t["created_at"])
     fingerprints = {t.get("result_fingerprint") for t in runs if t.get("result_fingerprint")}
     changed = [field for field in FIELDS if len({t.get("ai", {}).get(field, UNKNOWN) for t in runs}) > 1]
@@ -100,15 +126,17 @@ def extract(report: str, dmesg: str = "") -> dict:
     }
 
 
-def stats(tasks, cases, reviews):
+def stats(tasks, cases, reviews, comparison_tasks=None):
     tasks_by_case = {}
-    for task in tasks:
+    for task in comparison_tasks if comparison_tasks is not None else tasks:
         tasks_by_case.setdefault(task["case_id"], []).append(task)
     executed = [t for t in tasks if not t.get("imported")]
     completed = [t for t in executed if t["status"] in ("success", "failed")]
     successful = [t for t in executed if t["status"] == "success"]
     success_by_case = {}
-    for task in successful:
+    for task in (comparison_tasks if comparison_tasks is not None else successful):
+        if task["status"] != "success" or task.get("report_deleted"):
+            continue
         success_by_case.setdefault(task["case_id"], []).append(task)
     durations = [t["duration_seconds"] for t in successful if t.get("duration_seconds") is not None]
     human = [r["human_seconds"] for r in reviews if r.get("human_seconds") is not None]
@@ -136,7 +164,12 @@ def stats(tasks, cases, reviews):
                            "partial": assessed.count("部分正确"),
                            "wrong": assessed.count("错误"),
                            "rate": round(100 * assessed.count("正确") / len(assessed), 1) if assessed else None}
-    types = Counter(c.get("ai", {}).get("fault_type", UNKNOWN) for c in cases)
+    review_by_case = {r["case_id"]: r for r in eligible_reviews}
+    types = Counter(
+        (review_by_case.get(c["id"], {}).get("human", {}).get("fault_type")
+         or c.get("ai", {}).get("fault_type", UNKNOWN))
+        for c in cases if success_by_case.get(c["id"])
+    )
     types.pop(UNKNOWN, None)
     review_by_case = {r["case_id"]: r for r in reviews}
     conflicts = sum(case_comparison(c, tasks_by_case.get(c["id"], []), review_by_case.get(c["id"]))["has_conflict"] for c in cases)

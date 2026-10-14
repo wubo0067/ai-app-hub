@@ -9,7 +9,7 @@
 | 仓库根目录 `vmcore-ui-deploy.tgz` | `/tmp/vmcore-ui-deploy.tgz` | 管理台代码、静态页面、requirements、配置模板与 systemd/Nginx 文件 |
 | 现有 `analytics_vmcore.sh` | `/data/analytics_vmcore.sh` | 分析入口，接收单个 vmcore 的父目录 |
 | 原 Agent 项目、依赖、模型凭据 | 保持脚本实际引用的路径 | 使脚本可独立运行；不包含在管理台包内 |
-| 原始 `vmcore` 与配套 `dmesg` 等 | `/data/vmcore/<案例目录>/` | 待分析文件；若目标主机已有则无需搬运 |
+| 原始 `vmcore` 与配套 `dmesg` 等 | `/data/vmcore/<崩溃目录>/` | 待分析文件；若目标主机已有则无需搬运 |
 | 内部 TLS 证书和私钥 | `/etc/pki/tls/certs/vmcore-ui.crt`、`/etc/pki/tls/private/vmcore-ui.key` | Nginx HTTPS；按实际域名签发 |
 | 旧管理台数据（仅迁移已有正式记录时） | `/var/lib/vmcore-ui/` | 须拷贝整个数据目录，包括 JSON、报告和审计 Markdown |
 
@@ -84,7 +84,7 @@ sudo systemctl enable --now vmcore-ui
 curl -I http://127.0.0.1:8080/
 ```
 
-可选的脚本验收（选择一个已完成写入的真实目录）：`sudo -u vmcoreui bash /data/analytics_vmcore.sh /data/vmcore/<案例目录>`。该命令会执行真实分析并生成报告。
+可选的脚本验收（选择一个已完成写入的真实目录）：`sudo -u vmcoreui bash /data/analytics_vmcore.sh /data/vmcore/<崩溃目录>`。该命令会执行真实分析并生成报告。
 
 ## 配置 Nginx、SELinux 和防火墙
 
@@ -110,6 +110,6 @@ sudo firewall-cmd --permanent --add-service=https
 sudo firewall-cmd --reload
 ```
 
-检查：`systemctl status vmcore-ui nginx --no-pager`、`journalctl -u vmcore-ui -n 100 --no-pager`、`curl -kI https://<内部域名>/`。优先用可信内部 CA 证书，并以浏览器正常访问验证证书；`-k` 只用于首轮连通性检查。首次用真实案例目录创建任务，确认报告位于任务详情，且原始 Markdown 路径来自配置的 reports 目录。
+检查：`systemctl status vmcore-ui nginx --no-pager`、`journalctl -u vmcore-ui -n 100 --no-pager`、`curl -kI https://<内部域名>/`。优先用可信内部 CA 证书，并以浏览器正常访问验证证书；`-k` 只用于首轮连通性检查。首次用真实崩溃目录创建任务，确认报告位于任务详情，且原始 Markdown 路径来自配置的 reports 目录。
 
-升级前停止管理台并备份整个 `/var/lib/vmcore-ui`，包括 `config.json`、任务与案例 JSON、分析和审计 Markdown。单实例运行；不启动多个 Uvicorn worker。
+升级前停止管理台并备份整个 `/var/lib/vmcore-ui`，包括 `config.json`、任务与崩溃记录 JSON、分析和审计 Markdown。单实例运行；不启动多个 Uvicorn worker。
