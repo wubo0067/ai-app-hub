@@ -1,5 +1,7 @@
 // Inventory and queue screens. Loaded after the base application.
 let inventoryStream = null;
+let inventoryEpoch = 0;
+let inventoryChecking = false;
 const inventoryColumns = ['VMCORE / 父目录','目录时间','主机名','生成时间','OS','内核','VMLINUX','状态 / 次数','Token / 耗时','操作'];
 const inventoryWidthKey = 'vmcore-inventory-widths-v1';
 function inventoryWidths() {
@@ -37,11 +39,11 @@ function inventoryTable(items) {
 }
 
 function tasksPage() {
-  setTimeout(startInventoryScan, 0);
+  setTimeout(checkNewInventory, 0);
   const existing = state.discovered||[];
   const duplicates = duplicatePaths(existing);
-  return head('VMCORE / INVENTORY','任务','自动扫描所有层级；每个 vmcore 一行，多次分析保留独立记录。','<div class="toolbar"><button class="primary" id="create-task-open">创建任务 ＋</button><button class="secondary" id="scan-refresh">重新扫描 ↻</button></div>') +
-    `<div id="scan-progress" class="scan-progress" role="status" aria-live="polite"><span class="scan-spinner"></span><div><strong>准备扫描…</strong><small>正在检查允许目录</small></div></div>`+
+  return head('VMCORE / INVENTORY','任务','复用已有扫描结果；自动检查新增文件，点击重新扫描才完整扫描。','<div class="toolbar"><button class="primary" id="create-task-open">创建任务 ＋</button><button class="secondary" id="scan-refresh">重新扫描 ↻</button></div>') +
+    `<div id="scan-progress" class="scan-progress" role="status" aria-live="polite"><span class="scan-spinner"></span><div><strong>读取扫描记录…</strong><small>已有结果会保留在下方</small></div></div>`+
     `<div class="toolbar"><input id="inventory-search" placeholder="搜索目录、主机、OS、内核"><select id="inventory-status"><option value="">全部状态</option><option value="unanalyzed">未分析</option>${Object.entries(statuses).map(([k,v]) => `<option value="${k}">${v}</option>`).join('')}</select><span class="hint" id="inventory-count">共 ${existing.length} 个 vmcore</span></div><div id="task-table">${inventoryTable(existing.filter(item=>!duplicates.has(item.vmcore_path)))}</div><div id="duplicate-card">${duplicates.size?`<div class="queue-label"><h2>疑似重复的 VMCORE</h2><small>${duplicates.size} 个文件；按文件大小及首、中、尾抽样内容识别</small></div>${inventoryTable(existing.filter(item=>duplicates.has(item.vmcore_path)))}`:''}</div>`+
     `<dialog id="create-task-dialog" class="task-dialog"><form id="manual-task-form"><h2>创建分析任务</h2><p class="hint">输入 vmcore 文件或其父目录的绝对路径。</p><div class="field"><label>vmcore 路径</label><input name="vmcore_path" placeholder="/data/vmcore/127.0.0.1/file" required></div>${state.settings.execution_mode==='agent'?'<div class="field"><label>dmesg 路径</label><input name="vmcore_dmesg_path" required></div><div class="field"><label>vmlinux 路径</label><input name="vmlinux_path" required></div>':''}<div class="form-actions"><button type="button" class="secondary" id="create-task-close">取消</button><button type="submit" class="primary">加入队列</button></div></form></dialog>`+
     `<dialog id="inventory-detail" class="task-dialog"><div class="dialog-body" id="inventory-detail-body"></div></dialog>`;
@@ -76,8 +78,47 @@ function scanProgress(folders, current, done, error, found=0) {
   el.innerHTML = `<span class="scan-spinner" aria-hidden="true"></span><div><strong>${error ? '扫描失败' : done ? '扫描完成' : '正在扫描目录…'} · ${folders.length} 个目录 · ${found} 个 vmcore</strong><small>${esc(error || current || '等待目录')}</small><div class="scan-trail">${folders.slice(-4).reverse().map(path => `<span title="${esc(path)}">${esc(path)}</span>`).join('')}</div></div>`;
 }
 
+function incrementalProgress(title, detail, active=false, error=false) {
+  const el = $('#scan-progress');
+  if (!el) return;
+  el.classList.toggle('complete', !active && !error);
+  el.classList.toggle('scan-error', error);
+  el.innerHTML = `<span class="scan-spinner" aria-hidden="true"></span><div><strong>${esc(title)}</strong><small>${esc(detail)}</small></div>`;
+}
+
+async function checkNewInventory() {
+  if (state.page !== 'tasks' || state.task || !$('#scan-progress') || inventoryStream || inventoryChecking) return;
+  inventoryChecking = true;
+  const epoch = ++inventoryEpoch;
+  try {
+    const cached = await api('/discover/cache');
+    if (epoch !== inventoryEpoch || state.page !== 'tasks' || state.task) return;
+    if (JSON.stringify(state.discovered||[]) !== JSON.stringify(cached.items)) {
+      state.discovered = cached.items;
+      paintInventory();
+    }
+    if (!cached.initialized) {
+      incrementalProgress('尚无扫描记录','点击“重新扫描”建立首次扫描结果');
+      return;
+    }
+    incrementalProgress('检查新增或变化的 VMCORE…','已有且未变化的文件直接复用扫描记录',true);
+    const update = await api('/discover/incremental',{method:'POST'});
+    if (epoch !== inventoryEpoch || state.page !== 'tasks' || state.task) return;
+    if (JSON.stringify(state.discovered||[]) !== JSON.stringify(update.items)) {
+      state.discovered = update.items;
+      paintInventory();
+    }
+    incrementalProgress('新增文件检查完成',`本次重新读取 ${update.changed} 个新增或变化的 VMCORE`);
+  } catch (error) {
+    if (epoch === inventoryEpoch) incrementalProgress('新增文件检查失败',error.message,false,true);
+  } finally {
+    inventoryChecking = false;
+  }
+}
+
 function startInventoryScan() {
   if (state.page !== 'tasks' || state.task || !$('#scan-progress')) return;
+  ++inventoryEpoch;
   if (inventoryStream) inventoryStream.close();
   state.scanning = true;
   const folders = [];
@@ -96,6 +137,7 @@ function startInventoryScan() {
       scanProgress(folders,data.item.vmcore_path,false,null,found.size);
     } else {
       stream.close();
+      inventoryStream = null;
       state.scanning = false;
       if (data.type === 'complete') {
         const previous = JSON.stringify(state.discovered||[]);
@@ -108,6 +150,7 @@ function startInventoryScan() {
   stream.onerror = () => {
     if (inventoryStream !== stream || !state.scanning) return;
     stream.close();
+    inventoryStream = null;
     state.scanning = false;
     scanProgress(folders,'',true,'扫描连接中断，请重新扫描',found.size);
   };

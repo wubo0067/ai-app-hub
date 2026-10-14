@@ -31,7 +31,9 @@ vmcore-ui.conf 到 /etc/nginx/conf.d/，检查并重载 Nginx。示例域名为 
 脚本路径：/data/analytics_vmcore.sh
 脚本参数：vmcore 父目录相对 /data/vmcore 的路径，例如 127.0.0.1/file
 脚本报告路径示例：/data/vmcore-analysis-agent/reports；部署时填写真实路径
-任务页：扫描时保留现有表格，扫描完成且结果变化才更新；疑似重复 vmcore 单列卡片；
+任务页：首次点击“重新扫描”建立扫描缓存；再次进入时只检查新增或已变化的文件，
+已有且未变化的 vmcore 跳过 crash 查询、符号匹配和内容抽样。点击“重新扫描”才完整扫描。
+扫描时保留现有表格，扫描完成且结果变化才更新；疑似重复 vmcore 单列卡片；
 列宽可拖动并保存在当前浏览器；每次脚本运行的完整输出保存在 data/logs 并显示于任务详情。
 任务扫描：递归查找同目录中的 vmcore 和 vmcore-dmesg，按父目录创建时间倒序。
 主机、故障时间、内核：匹配 vmlinux 且系统已有 crash 命令时优先读取 crash sys；

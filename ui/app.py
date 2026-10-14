@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import signal
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -94,6 +95,22 @@ def make_app(data_dir=None, password=None, secret=None):
     active_runs = {}
     active_processes = {}
     script_lock = asyncio.Lock()
+    discovery_lock = threading.Lock()
+
+    def discovery_key(config):
+        return json.dumps({key: config.get(key) for key in
+                           ("scan_roots", "symbol_roots", "execution_mode")}, sort_keys=True)
+
+    def discovery_snapshot(config):
+        cache = store.read("discovery_cache")
+        if cache.get("config_key") != discovery_key(config):
+            return {"initialized": False, "items": []}
+        return {"initialized": True, "items": cache.get("items", [])}
+
+    def save_discovery(config, items):
+        items = sorted(items, key=lambda item: (item["folder_created_at"], item["vmcore_path"]), reverse=True)
+        store.write("discovery_cache", {"config_key": discovery_key(config), "items": items})
+        return items
 
     def update_task(task):
         store.upsert("tasks", task)
@@ -436,8 +453,10 @@ def make_app(data_dir=None, password=None, secret=None):
 
     @app.get("/api/collections")
     def collections():
-        return inventory(store.read("config"), store.read("cases"),
-                         store.read("tasks"), store.read("reviews"))
+        config = store.read("config")
+        cached = discovery_snapshot(config)
+        return inventory(config, store.read("cases"), store.read("tasks"),
+                         store.read("reviews"), cached["items"] if cached["initialized"] else None)
 
     @app.get("/api/reviews")
     def reviews():
@@ -447,6 +466,26 @@ def make_app(data_dir=None, password=None, secret=None):
     def discover():
         return scan(store.read("config"))
 
+    @app.get("/api/discover/cache")
+    def discover_cache():
+        return discovery_snapshot(store.read("config"))
+
+    @app.post("/api/discover/incremental")
+    def discover_incremental():
+        with discovery_lock:
+            config = store.read("config")
+            snapshot = discovery_snapshot(config)
+            if not snapshot["initialized"]:
+                return {**snapshot, "changed": 0, "needs_full_scan": True}
+            known = {item["vmcore_path"]: item for item in snapshot["items"]}
+            found = []
+            changed = 0
+            for event in scan_events(config, known=known, emit_directories=False):
+                found.append(event["item"])
+                changed += int(not event.get("cached", False))
+            return {"initialized": True, "items": save_discovery(config, found),
+                    "changed": changed, "needs_full_scan": False}
+
     @app.get("/api/discover/stream")
     def discover_stream():
         config = store.read("config")
@@ -454,14 +493,18 @@ def make_app(data_dir=None, password=None, secret=None):
             count = 0
             folders = 0
             try:
-                for event in scan_events(config):
-                    if event["type"] == "directory":
-                        folders += 1
-                    else:
-                        count += 1
-                    yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
-                yield "data: " + json.dumps({"type": "complete", "folders": folders,
-                                              "vmcores": count}, ensure_ascii=False) + "\n\n"
+                with discovery_lock:
+                    found = []
+                    for event in scan_events(config):
+                        if event["type"] == "directory":
+                            folders += 1
+                        else:
+                            count += 1
+                            found.append(event["item"])
+                        yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+                    save_discovery(config, found)
+                    yield "data: " + json.dumps({"type": "complete", "folders": folders,
+                                                  "vmcores": count}, ensure_ascii=False) + "\n\n"
             except Exception as exc:
                 yield "data: " + json.dumps({"type": "error", "message": str(exc)}, ensure_ascii=False) + "\n\n"
         return StreamingResponse(events(), media_type="text/event-stream",

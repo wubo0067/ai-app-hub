@@ -62,10 +62,15 @@ def vmcore_fingerprint(path: str) -> str:
     return digest.hexdigest()
 
 
-def scan_events(config: dict):
-    roots = config.get("scan_roots", [])
-    symbols = config.get("symbol_roots", [])
-    symbol_files = []
+def scan_signature(vmcore: str, dmesg: str) -> str:
+    """Cheap change marker; an unchanged dump never needs crash or hashing again."""
+    core = Path(vmcore).stat()
+    log = Path(dmesg).stat()
+    return f"{core.st_size}:{core.st_mtime_ns}:{log.st_size}:{log.st_mtime_ns}"
+
+
+def _symbol_files(symbols: list[str]) -> list[str]:
+    found = []
     for root in symbols:
         if not Path(root).is_dir():
             continue
@@ -75,14 +80,22 @@ def scan_events(config: dict):
                 if name == "vmlinux" or name.endswith(".ko"):
                     path = str(Path(base) / name)
                     if inside(path, symbols):
-                        symbol_files.append(path)
+                        found.append(path)
+    return found
+
+
+def scan_events(config: dict, known: dict | None = None, emit_directories: bool = True):
+    roots = config.get("scan_roots", [])
+    symbols = config.get("symbol_roots", [])
+    symbol_files = None
     seen = set()
     for root in roots:
         if not Path(root).is_dir():
             continue
         for base, dirs, files in os.walk(root, followlinks=False):
             dirs[:] = [d for d in dirs if not (Path(base) / d).is_symlink()]
-            yield {"type": "directory", "path": base}
+            if emit_directories:
+                yield {"type": "directory", "path": base}
             if "vmcore" not in files or not any(n in files for n in ("vmcore-dmesg.txt", "vmcore-dmesg")):
                 continue
             vmcore = str(Path(base) / "vmcore")
@@ -96,6 +109,20 @@ def scan_events(config: dict):
                           if n in files and inside(str(Path(base) / n), roots)), None)
             if not dmesg:
                 continue
+            signature = scan_signature(vmcore, dmesg)
+            cached = (known or {}).get(vmcore)
+            if cached and cached.get("_scan_signature") == signature:
+                item = dict(cached)
+                ready_paths = [vmcore, dmesg]
+                if config.get("execution_mode") != "script":
+                    ready_paths += [item["vmlinux_path"], *item.get("debug_symbol_paths", [])] if item.get("vmlinux_path") else []
+                item["ready"] = bool(dmesg and (config.get("execution_mode") == "script" or item.get("vmlinux_path"))
+                                     and all(stable_file(path, roots + symbols, config["stable_seconds"])
+                                             for path in ready_paths))
+                yield {"type": "vmcore", "item": item, "cached": True}
+                continue
+            if symbol_files is None:
+                symbol_files = _symbol_files(symbols)
             release = None
             if dmesg:
                 with open(dmesg, "r", encoding="utf-8", errors="replace") as stream:
@@ -149,6 +176,7 @@ def scan_events(config: dict):
                           "osinfo_path": metadata["osinfo_path"],
                           "folder_created_at": folder_created_at(base),
                           "fingerprint": fingerprint,
+                          "_scan_signature": signature,
                           "ready": ready,
                           "size_bytes": Path(vmcore).stat().st_size}}
 
@@ -158,39 +186,44 @@ def scan(config: dict) -> list[dict]:
     return sorted(found, key=lambda item: (item["folder_created_at"], item["vmcore_path"]), reverse=True)
 
 
-def inventory(config: dict, cases: list[dict], tasks: list[dict], reviews: list[dict]) -> list[dict]:
+def inventory(config: dict, cases: list[dict], tasks: list[dict], reviews: list[dict],
+              discovered: list[dict] | None = None) -> list[dict]:
     """Folder-level inventory while keeping each vmcore as its own case."""
     roots = config.get("scan_roots", [])
     groups = {}
     seen = set()
-    for root in roots:
-        base = Path(root)
-        if base.is_dir():
-            for child in base.iterdir():
-                if child.is_dir() and not child.is_symlink():
-                    groups[str(child.resolve())] = {"path": str(child.resolve()), "discovered": 0,
-                        "ready": 0, "cases": 0, "runs": 0, "conflicts": 0, "pending_reviews": 0}
-    for root in roots:
-        if not Path(root).is_dir():
+    if discovered is None:
+        for root in roots:
+            base = Path(root)
+            if base.is_dir():
+                for child in base.iterdir():
+                    if child.is_dir() and not child.is_symlink():
+                        groups[str(child.resolve())] = {"path": str(child.resolve()), "discovered": 0,
+                            "ready": 0, "cases": 0, "runs": 0, "conflicts": 0, "pending_reviews": 0}
+        paths = []
+        for root in roots:
+            if not Path(root).is_dir():
+                continue
+            for base, dirs, files in os.walk(root, followlinks=False):
+                dirs[:] = [d for d in dirs if not (Path(base) / d).is_symlink()]
+                if "vmcore" in files:
+                    path = str(Path(base) / "vmcore")
+                    if inside(path, roots):
+                        dmesg = next((str(Path(base) / name) for name in ("vmcore-dmesg.txt", "vmcore-dmesg") if name in files), None)
+                        paths.append((path, bool(dmesg and stable_file(path, roots, config["stable_seconds"])
+                                                     and stable_file(dmesg, roots, config["stable_seconds"]))))
+    else:
+        paths = [(item["vmcore_path"], bool(item.get("ready"))) for item in discovered]
+    for path, ready in paths:
+        identity = str(Path(path).resolve())
+        if identity in seen:
             continue
-        for base, dirs, files in os.walk(root, followlinks=False):
-            dirs[:] = [d for d in dirs if not (Path(base) / d).is_symlink()]
-            if "vmcore" not in files:
-                continue
-            path = str(Path(base) / "vmcore")
-            if not inside(path, roots):
-                continue
-            identity = str(Path(path).resolve())
-            if identity in seen:
-                continue
-            seen.add(identity)
-            key = collection_for(path, roots)
-            group = groups.setdefault(key, {"path": key, "discovered": 0,
-                "ready": 0, "cases": 0, "runs": 0, "conflicts": 0, "pending_reviews": 0})
-            group["discovered"] += 1
-            dmesg = next((str(Path(base) / name) for name in ("vmcore-dmesg.txt", "vmcore-dmesg") if name in files), None)
-            group["ready"] += int(bool(dmesg and stable_file(path, roots, config["stable_seconds"])
-                                       and stable_file(dmesg, roots, config["stable_seconds"])))
+        seen.add(identity)
+        key = collection_for(path, roots)
+        group = groups.setdefault(key, {"path": key, "discovered": 0,
+            "ready": 0, "cases": 0, "runs": 0, "conflicts": 0, "pending_reviews": 0})
+        group["discovered"] += 1
+        group["ready"] += int(ready)
     from .analysis import case_comparison
     review_by_case = {r["case_id"]: r for r in reviews}
     tasks_by_case = {}

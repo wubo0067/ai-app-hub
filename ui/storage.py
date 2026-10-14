@@ -11,9 +11,9 @@ class Store:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
-        for name in ("tasks", "cases", "reviews", "config", "audit_log", "dashboard_overrides"):
+        for name in ("tasks", "cases", "reviews", "config", "audit_log", "dashboard_overrides", "discovery_cache"):
             if not (self.root / f"{name}.json").exists():
-                self.write(name, {} if name in ("config", "dashboard_overrides") else [])
+                self.write(name, {} if name in ("config", "dashboard_overrides", "discovery_cache") else [])
         (self.root / "reports").mkdir(exist_ok=True)
         (self.root / "audits").mkdir(exist_ok=True)
         (self.root / "logs").mkdir(exist_ok=True)

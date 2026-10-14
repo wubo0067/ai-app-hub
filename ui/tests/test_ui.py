@@ -559,3 +559,39 @@ def test_discovery_stream_lists_scanned_folders_and_vmcores(tmp_path):
         assert events[-2]["type"] == "vmcore"
         assert events[-1] == {"type": "complete", "folders": 3, "vmcores": 1}
         assert (nested / "osinfo.txt").is_file()
+
+
+def test_cached_inventory_only_rechecks_new_or_changed_vmcores(tmp_path, monkeypatch):
+    from ui import discovery
+    with client_for(tmp_path) as client:
+        login(client)
+        root = configure(client, tmp_path)
+        first = root / "first"
+        first.mkdir()
+        files(first)
+        assert client.get("/api/discover/cache").json() == {"initialized": False, "items": []}
+        assert client.post("/api/discover/incremental", headers=HEADERS).json()["needs_full_scan"]
+        assert client.get("/api/discover/stream").text.count('"type": "vmcore"') == 1
+        original = discovery.scan_metadata
+        checked = []
+        def counted(vmcore, dmesg, vmlinux):
+            checked.append(vmcore)
+            return original(vmcore, dmesg, vmlinux)
+        monkeypatch.setattr(discovery, "scan_metadata", counted)
+        unchanged = client.post("/api/discover/incremental", headers=HEADERS).json()
+        assert unchanged["changed"] == 0 and len(unchanged["items"]) == 1
+        assert checked == []
+        second = root / "second"
+        second.mkdir()
+        files(second)
+        updated = client.post("/api/discover/incremental", headers=HEADERS).json()
+        assert updated["changed"] == 1 and len(updated["items"]) == 2
+        assert checked == [str(second / "vmcore")]
+        checked.clear()
+        (first / "vmcore-dmesg.txt").write_text("Linux version 6.1.1 test\n", encoding="utf-8")
+        changed = client.post("/api/discover/incremental", headers=HEADERS).json()
+        assert changed["changed"] == 1 and checked == [str(first / "vmcore")]
+    with client_for(tmp_path) as client:
+        login(client)
+        restored = client.get("/api/discover/cache").json()
+        assert restored["initialized"] and len(restored["items"]) == 2
