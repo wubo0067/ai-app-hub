@@ -1,0 +1,10 @@
+{
+  "agent_url": "http://127.0.0.1:8000",
+  "scan_roots": ["/data/vmcore"],
+  "symbol_roots": ["/usr/lib/debug/lib/modules"],
+  "stable_seconds": 30,
+  "max_parallel": 1,
+  "execution_mode": "script",
+  "script_path": "/data/analytics_vmcore.sh",
+  "report_roots": ["/data/vmcore-analysis-agent/reports"]
+}

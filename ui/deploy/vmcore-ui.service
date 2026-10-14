@@ -1,0 +1,21 @@
+[Unit]
+Description=VMCore analysis management UI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vmcoreui
+Group=vmcoreui
+WorkingDirectory=/opt/vmcore-ui
+EnvironmentFile=/etc/vmcore-ui.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/vmcore-ui/.venv/bin/python /opt/vmcore-ui/run.py
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

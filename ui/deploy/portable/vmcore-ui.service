@@ -1,0 +1,21 @@
+[Unit]
+Description=VMCore management UI (bundled Python)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vmcoreui
+Group=vmcoreui
+WorkingDirectory=/data/vmcore-ui
+EnvironmentFile=/data/vmcore-ui/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/sh /data/vmcore-ui/start.sh
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
