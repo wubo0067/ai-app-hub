@@ -62,7 +62,6 @@ rollback() {
 trap rollback EXIT
 
 tar --no-same-owner -xzf "$ARCHIVE" -C "$BASE"
-install -o root -g root -m 644 "$BASE/vmcore-ui.conf" /etc/nginx/conf.d/vmcore-ui.conf
 sh "$BASE/install.sh"
 systemctl is-active --quiet vmcore-ui
 trap - EXIT

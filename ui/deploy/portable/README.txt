@@ -13,7 +13,7 @@ RHEL 8.10 x86_64 离线整包
   sudo sh /tmp/vmcore-ui-upgrade.sh "$(realpath vmcore-ui-rhel8.10-x86_64.tar.gz)"
 升级脚本停服务后备份整个 /data/vmcore-ui，再覆盖解压、运行安装脚本并检查服务。
 备份保存在 /data/vmcore-ui-backups；升级失败时会恢复旧目录并重启旧服务。
-已有 data/config.json、历史报告、.env 登录密码均保留。Nginx 配置会备份后更新为本包中的域名及端口。
+已有 data/config.json、历史报告、.env 登录密码和现有 Nginx 配置均保留。
 升级会按现有 data/config.json 检查脚本报告目录，必要时用 setfacl 赋予 vmcoreui 读写权限；
 若目标机缺少 setfacl 或目录仍不可访问，升级失败并恢复旧 UI。安装前可用
 sudo -u vmcoreui test -w /data/vmcore-analysis-agent/reports 检查。

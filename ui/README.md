@@ -42,7 +42,7 @@ Windows PowerShell 中把 `source`/`export` 换成 `.venv\Scripts\Activate.ps1` 
 
 ## 新 Linux 主机部署（脚本模式）
 
-RHEL 8.10 x86_64 的整包交付优先使用 [`deploy/portable/README.txt`](deploy/portable/README.txt)：包内已有 Linux Python 3.11 和 Python 依赖，解压到 `/data/vmcore-ui` 后运行一次 `install.sh`。便携部署的 Nginx 示例域名为 `vmcore.example.com`，对外监听 8080；部署前应替换为自己的域名。管理台只监听 `127.0.0.1:18080`。已安装旧包时使用包内 `upgrade.sh`，先备份并停服务，再覆盖程序及 Nginx 配置。以下为分步安装方式。
+RHEL 8.10 x86_64 的整包交付优先使用 [`deploy/portable/README.txt`](deploy/portable/README.txt)：包内已有 Linux Python 3.11 和 Python 依赖，解压到 `/data/vmcore-ui` 后运行一次 `install.sh`。便携部署的 Nginx 示例域名为 `vmcore.example.com`，对外监听 8080；首次部署前应替换为自己的域名。管理台只监听 `127.0.0.1:18080`。已安装旧包时使用包内 `upgrade.sh`，先备份并停服务，再覆盖程序，同时保留服务器现有 Nginx 配置。以下为分步安装方式。
 
 RHEL 8.10、内部 YUM 源与 Nginx 的逐步命令见 [`deploy/RHEL8.10.md`](deploy/RHEL8.10.md)。
 
