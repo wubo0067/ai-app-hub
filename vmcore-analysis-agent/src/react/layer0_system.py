@@ -144,7 +144,8 @@ Respond only with valid JSON matching the minimal structured-output schema.
 Minimal-output contract:
 - Return only the fields defined in the provided schema.
 - active_hypotheses and gates are executor-managed internal state and should normally not appear in your JSON.
-- Exception: in a concluding response you MAY emit gate updates for the specific required gates you are closing, but do not reconstruct unrelated gate state.
+- Exception: you MAY propose gate status/evidence updates, but they are claims only; do not set status='n/a' or present a gate as executor-verified.
+- The executor alone determines gate closure and applicability from registered evidence rules.
 - Do not invent bookkeeping fields beyond the schema.
 
 Reasoning field discipline:

@@ -22,7 +22,10 @@ OPEN_GATE = {
 }
 CLOSED_GATE = {
     "register_provenance": GateEntry(
-        status="closed", evidence="rd+dis", required_for=["null_deref"]
+        status="closed",
+        evidence="rd+dis",
+        required_for=["null_deref"],
+        closure_basis="executor_evidence",
     )
 }
 ALL_DIMENSION_FACTS = [
@@ -192,6 +195,68 @@ class ReplanProbeMenuTests(unittest.TestCase):
             rendered,
         )
 
+    def test_open_optional_gate_is_not_a_probe_objective(self) -> None:
+        gates = {
+            name: GateEntry(
+                status="closed",
+                evidence="executor-verified",
+                required_for=["pointer_corruption"],
+                closure_basis="executor_evidence",
+            )
+            for name in (
+                "register_provenance",
+                "object_lifetime",
+                "local_corruption_exclusion",
+            )
+        }
+        gates["external_corruption_gate"] = GateEntry(
+            status="open",
+            required_for=["pointer_corruption"],
+        )
+        rendered = _render(
+            current_signature_class="pointer_corruption",
+            current_root_cause_class=None,
+            managed_gates=gates,
+            current_evidence_goal=None,
+            last_action_status="executed",
+            duplicate_streak=0,
+            no_progress_streak=0,
+            replan_required=False,
+            evidence_facts=ALL_DIMENSION_FACTS,
+        )
+        self.assertIn("Current gate objective: no outstanding gate", rendered)
+        self.assertIn("Unresolved mandatory gates: none", rendered)
+        self.assertIn("external_corruption_gate=open (optional; advisory only)", rendered)
+        self.assertNotIn("advance external_corruption_gate", rendered)
+        self.assertIn("Stage 6: convergence and bounded conclusion", rendered)
+        self.assertNotIn("external_corruption_gate still pending", rendered)
+
+    def test_telemetry_only_required_gate_does_not_invite_repeated_probing(self) -> None:
+        gates = {
+            "stack_integrity": GateEntry(
+                status="open",
+                required_for=["soft_lockup"],
+            ),
+            "lock_holder": GateEntry(
+                status="open",
+                required_for=["soft_lockup"],
+            ),
+        }
+        rendered = _render(
+            current_signature_class="soft_lockup",
+            current_root_cause_class=None,
+            managed_gates=gates,
+            current_evidence_goal=None,
+            last_action_status="executed",
+            duplicate_streak=0,
+            no_progress_streak=0,
+            replan_required=False,
+            evidence_facts=[],
+        )
+        self.assertIn("stack_integrity is telemetry-only", rendered)
+        self.assertIn("Do not keep probing solely to close this gate", rendered)
+        self.assertIn("result remains non-conclusive", rendered)
+
     def test_unregistered_gates_never_claim_gates_closed(self) -> None:
         """门控集合尚未注册时，`_format_unresolved_gates` 同样返回 "none"。
 
@@ -215,6 +280,22 @@ class ReplanProbeMenuTests(unittest.TestCase):
                 self.assertNotIn("Gate closure is not root-cause proof", rendered)
                 self.assertNotIn("every mandatory gate", rendered)
                 self.assertIn("Mandatory gates are still unresolved", rendered)
+
+    def test_unclassified_signature_is_not_presented_as_gate_exhaustion(self) -> None:
+        rendered = _render(
+            current_signature_class="unknown",
+            current_root_cause_class="pointer_corruption",
+            managed_gates=None,
+            current_evidence_goal=None,
+            last_action_status="rejected",
+            duplicate_streak=0,
+            no_progress_streak=2,
+            replan_required=True,
+            evidence_facts=[],
+        )
+        self.assertIn("no registered policy, conclusion prohibited", rendered)
+        self.assertIn("no gate policy is registered", rendered)
+        self.assertNotIn("all mandatory gates are closed", rendered)
 
     def test_untapped_dimensions_exclude_observed_ones(self) -> None:
         rendered = _render(

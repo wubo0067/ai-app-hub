@@ -10,6 +10,7 @@ from langchain_core.messages import AIMessage, BaseMessage
 
 from .action_guard import canonicalize_command_line, extract_command_lines
 from .consistency import format_conflict_fact
+from .evidence import has_executor_closure_rule
 from .graph_state import (
     AgentState,
     CONVERGENCE_GUARD_STREAK_THRESHOLD,
@@ -19,7 +20,14 @@ from .prompt_overlays import DRIVER_OBJECT_OVERLAY, STACK_CORRUPTION_OVERLAY
 from .prompt_phrases import FORCED_CHOICE_CONVERGENCE_RULE
 from .prompt_layers import LAYER0_SYSTEM_PROMPT_TEMPLATE, PLAYBOOKS, SOP_FRAGMENTS
 from .prompts import build_minimal_schema_enum_contract
-from .schema import CrashSignatureClass, GateEntry, Hypothesis, VMCoreLLMAnalysisStep
+from .schema import (
+    CrashSignatureClass,
+    GateEntry,
+    Hypothesis,
+    VMCoreLLMAnalysisStep,
+    gate_resolution_state,
+    required_gates_for,
+)
 
 # 中文报告输出规则：仅当 state["report_language"] == "zh" 时注入到系统提示词。
 # 要求所有自由文本字段用简体中文书写，同时保留技术标识符与枚举值的英文形式，
@@ -193,14 +201,12 @@ def _observed_evidence_categories(evidence_facts: object) -> set[str]:
 
 
 def _gates_exhausted(state: AgentState) -> bool:
-    """强制门控是否已注册且全部关闭。
-
-    注意 `_format_unresolved_gates` 对 None/{} 也返回 "none"，那表示"门控集合尚未注册"
-    （早期步或 _build_managed_gates 返回 None 时），与"全部已关闭"语义相反，
-    故必须先确认门控确实存在。
-    """
-    return bool(state.get("managed_gates")) and (
-        _format_unresolved_gates(state.get("managed_gates")) == "none"
+    """Return whether a registered policy has only executor-verified terminal gates."""
+    return (
+        gate_resolution_state(
+            state.get("current_signature_class"), state.get("managed_gates")
+        )
+        == "satisfied"
     )
 
 
@@ -351,15 +357,23 @@ def build_executor_state_section(state: AgentState) -> str:
     step_count = state.get("step_count", 0)
 
     hypotheses = _format_hypotheses(state.get("managed_active_hypotheses"))
-    gates = _format_gates(state.get("managed_gates"))
-    unresolved_gates = _format_unresolved_gates(state.get("managed_gates"))
-    next_gate_objective = _format_next_gate_objective(state.get("managed_gates"))
+    gates = _format_gates(
+        state.get("managed_gates"), signature_class
+    )
+    unresolved_gates = _format_unresolved_gates(
+        state.get("managed_gates"), signature_class
+    )
+    next_gate_objective = _format_next_gate_objective(
+        state.get("managed_gates"), signature_class
+    )
     reasoning_gate_contract = _format_reasoning_gate_contract(
-        state.get("managed_gates")
+        state.get("managed_gates"), signature_class
     )
     evidence_goal = state.get("current_evidence_goal") or "none"
     recent_commands = _recent_command_summaries(state.get("messages", []))
-    stage_name = _infer_stage_name(step_count, state.get("managed_gates"))
+    stage_name = _infer_stage_name(
+        step_count, state.get("managed_gates"), signature_class
+    )
 
     # C5：门控全部关闭后 evidence goal 为 None，此时若又处于 replan 状态，
     # "no outstanding gate" 与 "Replanning required" 并存却不给方向，
@@ -393,7 +407,7 @@ def build_executor_state_section(state: AgentState) -> str:
         f"- Current gate objective: {next_gate_objective}",
         f"- Current evidence goal: {evidence_goal} (version={state.get('evidence_goal_version', 0)}, status={state.get('evidence_goal_status', 'unknown')})",
         "- Action evidence contract: declare evidence_goal_id, intended_evidence_type, target_object, and expected_observation for every tool action.",
-        "- Gate closure rule: gate status emitted by the LLM is advisory only; the executor Evidence Evaluator alone may close a gate when its completion criteria are satisfied.",
+        "- Gate closure rule: LLM gate statuses and evidence are claims only. Do not set status='n/a'; only executor-owned evidence rules may close gates or determine applicability.",
         "- Action selection rule: if any mandatory gate remains open or blocked, the next action must directly advance the current gate objective or unblock its prerequisite.",
         f"- Reasoning gate contract: {reasoning_gate_contract}",
     ]
@@ -699,7 +713,9 @@ def _format_hypotheses(raw_hypotheses: object) -> str:
     return "; ".join(formatted)
 
 
-def _format_gates(raw_gates: object) -> str:
+def _format_gates(
+    raw_gates: object, signature_class: Optional[str] = None
+) -> str:
     """
     将门控状态字典格式化为简洁的键值对字符串。
 
@@ -713,58 +729,168 @@ def _format_gates(raw_gates: object) -> str:
         str: 格式化后的门控状态摘要；无数据时返回 "none"。
     """
     gates = cast(Optional[dict[str, GateEntry]], raw_gates)
+    if (
+        signature_class is not None
+        and gate_resolution_state(signature_class, gates) == "unclassified"
+    ):
+        return f"unclassified signature_class={signature_class}; no gate policy"
     if not gates:
+        if signature_class is not None:
+            registry_state = gate_resolution_state(signature_class, gates)
+            if registry_state == "unregistered":
+                return "required gate policy registered but gate state is not initialized"
         return "none"
 
     formatted = []
     # 仅展示前 5 个 gate，平衡可读性与信息密度。
+    required_gate_names = (
+        set(required_gates_for(signature_class) or [])
+        if signature_class is not None
+        else set(gates)
+    )
     for gate_name, gate_entry in list(gates.items())[:5]:
         gate = GateEntry.model_validate(gate_entry)
-        formatted.append(f"{gate_name}={gate.status}")
+        terminal_unverified = gate.status in {"closed", "n/a"} and not (
+            (gate.status == "closed" and gate.closure_basis == "executor_evidence")
+            or (gate.status == "n/a" and gate.closure_basis == "executor_na")
+        )
+        suffix = " (unverified)" if terminal_unverified else ""
+        if gate_name not in required_gate_names:
+            suffix += " (optional; advisory only)"
+        formatted.append(f"{gate_name}={gate.status}{suffix}")
     return ", ".join(formatted)
 
 
-def _format_unresolved_gates(raw_gates: object) -> str:
+def _format_unresolved_gates(
+    raw_gates: object, signature_class: Optional[str] = None
+) -> str:
     gates = cast(Optional[dict[str, GateEntry]], raw_gates)
+    if signature_class is not None:
+        registry_state = gate_resolution_state(signature_class, gates)
+        if registry_state == "unclassified":
+            return (
+                f"unclassified signature_class={signature_class}; "
+                "no registered policy, conclusion prohibited"
+            )
+        if registry_state == "unregistered":
+            required = required_gates_for(signature_class) or []
+            return "gate state not initialized: " + ", ".join(required)
+        if registry_state == "satisfied":
+            return "none"
+
     if not gates:
-        return "none"
+        return "required gate state is not initialized"
 
     unresolved = []
-    for gate_name, gate_entry in gates.items():
+    gate_names = (
+        required_gates_for(signature_class)
+        if signature_class is not None
+        else list(gates)
+    ) or []
+    for gate_name in gate_names:
+        gate_entry = gates.get(gate_name)
+        if gate_entry is None:
+            unresolved.append(f"{gate_name}=missing")
+            continue
         gate = GateEntry.model_validate(gate_entry)
-        if gate.status in {"open", "blocked"}:
-            unresolved.append(f"{gate_name}={gate.status}")
+        if (
+            gate.status not in {"closed", "n/a"}
+            or gate.closure_basis
+            not in {"executor_evidence", "executor_na"}
+        ):
+            unresolved.append(f"{gate_name}={gate.status} (not executor-verified)")
 
     return ", ".join(unresolved) if unresolved else "none"
 
 
-def _format_next_gate_objective(raw_gates: object) -> str:
+def _format_next_gate_objective(
+    raw_gates: object, signature_class: Optional[str] = None
+) -> str:
     gates = cast(Optional[dict[str, GateEntry]], raw_gates)
+    if signature_class is not None:
+        registry_state = gate_resolution_state(signature_class, gates)
+        if registry_state == "unclassified":
+            return (
+                f"classify signature_class={signature_class}; "
+                "no gate policy is registered, so a conclusion is not allowed"
+            )
+        if registry_state == "unregistered":
+            required = required_gates_for(signature_class) or []
+            return "initialize required gate state: " + ", ".join(required)
+        if registry_state == "satisfied":
+            return "no outstanding gate"
     if not gates:
-        return "no outstanding gate"
+        return "required gate policy is not initialized"
 
-    for gate_name, gate_entry in gates.items():
+    gate_names = (
+        required_gates_for(signature_class)
+        if signature_class is not None
+        else list(gates)
+    ) or []
+    for gate_name in gate_names:
+        gate_entry = gates.get(gate_name)
+        if gate_entry is None:
+            continue
         gate = GateEntry.model_validate(gate_entry)
         if gate.status == "blocked":
             prerequisite = gate.prerequisite or "missing prerequisite"
             return f"unblock {gate_name} by advancing prerequisite {prerequisite}"
         if gate.status == "open":
+            if not has_executor_closure_rule(gate_name, gate.required_for):
+                return (
+                    f"{gate_name} is telemetry-only: no executor closure rule is available. "
+                    "Do not keep probing solely to close this gate; preserve a non-conclusive "
+                    "result if no other required evidence path is available"
+                )
             if gate_name == "register_provenance":
                 return (
                     "close register_provenance by tracing the bad register back to the exact source object "
                     "and field/offset that produced the operand"
                 )
-            return f"advance {gate_name} toward closed or n/a with concrete evidence"
+            return (
+                f"advance {gate_name} with concrete evidence; "
+                "the executor determines closure"
+            )
+        if gate.status in {"closed", "n/a"}:
+            return (
+                f"gate {gate_name} has an unverified terminal status; "
+                "obtain executor-verifiable evidence and do not claim closure"
+            )
 
-    return "no outstanding gate"
+    return "mandatory gate state is unresolved"
 
 
-def _format_reasoning_gate_contract(raw_gates: object) -> str:
+def _format_reasoning_gate_contract(
+    raw_gates: object, signature_class: Optional[str] = None
+) -> str:
     gates = cast(Optional[dict[str, GateEntry]], raw_gates)
+    if signature_class is not None:
+        registry_state = gate_resolution_state(signature_class, gates)
+        if registry_state == "unclassified":
+            return (
+                "state that the signature class is unclassified and do not claim a conclusive result"
+            )
+        if registry_state == "unregistered":
+            return (
+                "state that required gate state is not initialized and do not claim a conclusive result"
+            )
+        if registry_state == "satisfied":
+            return (
+                "executor-verified gates are complete; assess root-cause evidence and alternatives "
+                "without changing gate status"
+            )
     if not gates:
-        return "no gate-specific closure narrative required; reasoning may focus on the next diagnostic action"
+        return "gate policy is not initialized; do not claim a conclusive result"
 
-    for gate_name, gate_entry in gates.items():
+    gate_names = (
+        required_gates_for(signature_class)
+        if signature_class is not None
+        else list(gates)
+    ) or []
+    for gate_name in gate_names:
+        gate_entry = gates.get(gate_name)
+        if gate_entry is None:
+            continue
         gate = GateEntry.model_validate(gate_entry)
         if gate.status == "blocked":
             prerequisite = gate.prerequisite or "missing prerequisite"
@@ -773,6 +899,12 @@ def _format_reasoning_gate_contract(raw_gates: object) -> str:
                 "and state the expected evidence needed to unblock or advance the gate"
             )
         if gate.status == "open":
+            if not has_executor_closure_rule(gate_name, gate.required_for):
+                return (
+                    f"state that {gate_name} is telemetry-only because no executor closure rule "
+                    "is available; do not claim it is satisfied or keep probing solely to close it, "
+                    "and explain that the result remains non-conclusive"
+                )
             if gate_name == "register_provenance":
                 return (
                     "name target gate register_provenance, explain which concrete source object and field/offset "
@@ -786,8 +918,13 @@ def _format_reasoning_gate_contract(raw_gates: object) -> str:
                 f"name target gate {gate_name}, explain why the next action advances it, "
                 "and state the expected gate transition or evidence needed next"
             )
+        if gate.status in {"closed", "n/a"}:
+            return (
+                f"gate {gate_name} has a model-reported terminal status without executor verification; "
+                "state that it remains unresolved"
+            )
 
-    return "all mandatory gates are already closed or n/a; reasoning may focus on conclusion quality and remaining alternatives"
+    return "all mandatory gates are executor-verified; reasoning may focus on conclusion quality and remaining alternatives"
 
 
 def _recent_command_summaries(messages: Sequence[BaseMessage]) -> str:
@@ -1030,6 +1167,7 @@ def _recent_text_blob(messages: Sequence[BaseMessage]) -> str:
 def _infer_stage_name(
     step_count: int,
     gates: Optional[dict[str, GateEntry]],
+    signature_class: Optional[str] = None,
 ) -> str:
     """根据当前推理步数和待处理的门控（gate）状态，推断所处的分析阶段的中文描述。
 
@@ -1048,10 +1186,17 @@ def _infer_stage_name(
     # 找出第一个状态为 open 或 blocked 的门控，作为当前待处理门控
     pending_gate = None
     if gates:
+        required_gate_names = required_gates_for(signature_class)
+        gate_names = (
+            required_gate_names
+            if required_gate_names is not None
+            else list(gates)
+        )
         open_gates = [
             name
-            for name, gate in gates.items()
-            if GateEntry.model_validate(gate).status in {"open", "blocked"}
+            for name in gate_names
+            if name in gates
+            and GateEntry.model_validate(gates[name]).status in {"open", "blocked"}
         ]
         if open_gates:
             pending_gate = open_gates[0]

@@ -11,8 +11,10 @@ from .schema import (
     RootCauseClass,
     VMCoreAnalysisStep,
     VMCoreLLMAnalysisStep,
+    gate_resolution_state,
+    required_gates_for,
 )
-from .evidence import evaluate_gate_closures
+from .evidence import evaluate_gate_closures, has_executor_closure_rule
 
 
 def project_managed_analysis_step(
@@ -73,14 +75,35 @@ def project_managed_analysis_step(
         state.get("evidence_facts", []),
         state.get("managed_gates"),
     )
+    if gates is None:
+        gate_transitions.extend(
+            {
+                "gate_name": gate_name,
+                "from_status": "unclassified",
+                "to_status": "unclassified",
+                "event": "llm_gate_request_ignored",
+                "reason": "no registered mandatory gate policy exists for this signature",
+                "requested_status": gate.status,
+                "requested_evidence": gate.evidence or "",
+            }
+            for gate_name, gate in (llm_step.gates or {}).items()
+            if gate.status in {"closed", "n/a"}
+        )
 
     step_data = llm_step.model_dump()
-    if llm_step.is_conclusive and _has_unresolved_gates(gates):
+    gate_state = gate_resolution_state(signature_class, gates)
+    if llm_step.is_conclusive and _has_unresolved_gates(gates, signature_class):
         step_data["is_conclusive"] = False
         step_data["final_diagnosis"] = None
         step_data["additional_notes"] = (
             (step_data.get("additional_notes") or "")
-            + " Evidence evaluator kept the result non-conclusive because mandatory gates remain open."
+            + (
+                " Executor kept the result non-conclusive because the signature class "
+                "has no registered mandatory gate policy."
+                if gate_state == "unclassified"
+                else " Executor kept the result non-conclusive because mandatory gates "
+                "are missing, unresolved, or lack executor verification."
+            )
         ).strip()
 
     # 构造最终的 VMCoreAnalysisStep 对象，将 LLM 的原始数据与补全后的上下文进行合并
@@ -115,7 +138,7 @@ def project_managed_analysis_step(
             *gate_transitions,
         ],
     }
-    evidence_goal = _build_evidence_goal(gates)
+    evidence_goal = _build_evidence_goal(gates, signature_class)
     previous_goal = state.get("current_evidence_goal")
     goal_version = state.get("evidence_goal_version", 0)
     if evidence_goal != previous_goal:
@@ -146,20 +169,29 @@ def project_managed_analysis_step(
     return step, managed_updates
 
 
-def _has_unresolved_gates(gates: Optional[Dict[str, GateEntry]]) -> bool:
-    if not gates:
-        return False
-    return any(gate.status in {"open", "blocked"} for gate in gates.values())
+def _has_unresolved_gates(
+    gates: Optional[Dict[str, GateEntry]],
+    signature_class: Optional[CrashSignatureClass] = None,
+) -> bool:
+    return gate_resolution_state(signature_class, gates) != "satisfied"
 
 
 def _build_evidence_goal(
     gates: Optional[Dict[str, GateEntry]],
+    signature_class: Optional[CrashSignatureClass] = None,
 ) -> Optional[dict[str, object]]:
     """Map the next managed gate to an evidence target without prescribing one command."""
     if not gates:
         return None
 
-    for gate_name, gate in gates.items():
+    required_gates = required_gates_for(signature_class)
+    gate_names = required_gates if required_gates is not None else list(gates)
+    for gate_name in gate_names:
+        gate = gates.get(gate_name)
+        if gate is None:
+            continue
+        if not has_executor_closure_rule(gate_name, gate.required_for):
+            continue
         if gate.status not in {"open", "blocked"}:
             continue
         if gate.status == "blocked":
@@ -314,25 +346,21 @@ def _build_managed_gates(
 
     Args:
         signature_class: 崩溃签名的类别，用于确定需要哪些门控。
-                        若为 None 或 "unknown"，则直接返回历史门控。
+                        若没有注册的门控策略，则不继承历史门控。
         prior_gates: 已有的历史门控字典，包含之前分析阶段的状态。
 
     Returns:
-        若签名类别有效且存在对应的门控配置，返回受管理门控字典；
-        否则返回 None 或直接返回历史门控。
+        仅当签名类别具有非空门控策略时返回受管理门控字典；
+        未分类或未注册策略返回 None。
 
     Note:
         - 历史门控状态会被深拷贝，避免修改原始数据。
         - 新创建的门控会设置默认状态和证据信息。
         - external_corruption_gate 的状态依赖于 local_corruption_exclusion 的状态。
     """
-    # 若签名类别无效，直接返回历史门控
-    if signature_class is None or signature_class == "unknown":
-        return prior_gates
-
-    # 从全局配置中获取该类签名所需的所有门控名称列表
-    required = VMCoreAnalysisStep._REQUIRED_GATES.get(signature_class, [])
-    if not required:
+    # 未注册签名没有可授权的门控状态，避免旧签名门控为当前结论背书
+    required = required_gates_for(signature_class)
+    if required is None:
         return None
 
     gate_names = list(required)
@@ -348,15 +376,26 @@ def _build_managed_gates(
             managed[gate_name] = GateEntry(
                 required_for=[signature_class],
                 status=llm_gate.status,
-                prerequisite=llm_gate.prerequisite,
+                prerequisite=None,
                 evidence=llm_gate.evidence,
+                closure_basis=None,
             )
             continue
 
         # 若历史门控中存在该门控，深拷贝其状态作为初始值
         previous = (prior_gates or {}).get(gate_name)
         if previous is not None:
-            managed[gate_name] = GateEntry.model_validate(previous.model_dump())
+            previous_data = previous.model_dump()
+            previous_data["required_for"] = [signature_class]
+            if signature_class not in previous.required_for:
+                previous_data.update(
+                    {
+                        "status": "open",
+                        "evidence": None,
+                        "closure_basis": None,
+                    }
+                )
+            managed[gate_name] = GateEntry.model_validate(previous_data)
             continue
 
         # 根据门控类型创建默认实例
@@ -400,9 +439,17 @@ def _build_managed_gates(
     # 处理 external_corruption_gate 与 local_corruption_exclusion 的依赖关系
     external_gate = managed.get("external_corruption_gate")
     local_gate = managed.get("local_corruption_exclusion")
-    if external_gate is not None and external_gate.status not in ("closed", "n/a"):
+    external_verified = external_gate is not None and (
+        external_gate.status == "closed"
+        and external_gate.closure_basis == "executor_evidence"
+    )
+    if external_gate is not None and not external_verified:
         # 若 local_corruption_exclusion 尚未关闭，则 external_corruption_gate 保持阻塞
-        if local_gate is None or local_gate.status not in ("closed", "n/a"):
+        local_verified = local_gate is not None and (
+            (local_gate.status == "closed" and local_gate.closure_basis == "executor_evidence")
+            or (local_gate.status == "n/a" and local_gate.closure_basis == "executor_na")
+        )
+        if not local_verified:
             managed["external_corruption_gate"] = GateEntry(
                 required_for=external_gate.required_for,
                 status="blocked",

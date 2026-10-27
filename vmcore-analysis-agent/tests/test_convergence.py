@@ -36,6 +36,7 @@ CLOSED_GATES = {
         status="closed",
         evidence="rd+dis+struct",
         required_for=["pointer_corruption"],
+        closure_basis="executor_evidence",
     )
     for name in (
         "register_provenance",
@@ -66,6 +67,7 @@ Kernel panic - not syncing: Fatal exception
 def _converged_state(**overrides: object) -> dict:
     state = {
         "report_language": "eng",
+        "current_signature_class": "pointer_corruption",
         "current_root_cause_class": "pointer_corruption",
         "managed_gates": CLOSED_GATES,
         "no_progress_streak": CONVERGENCE_GUARD_STREAK_THRESHOLD,
@@ -190,13 +192,62 @@ class GateClosureHelperTests(unittest.TestCase):
     def test_open_gate_blocks(self) -> None:
         self.assertFalse(_gates_all_closed(OPEN_GATES))
 
+    def test_open_optional_gate_does_not_block_required_policy(self) -> None:
+        gates = {
+            **CLOSED_GATES,
+            "external_corruption_gate": GateEntry(
+                status="open",
+                evidence="optional evidence path",
+                required_for=["pointer_corruption"],
+            ),
+        }
+        self.assertTrue(_gates_all_closed(gates, "pointer_corruption"))
+
+    def test_conclusive_schema_ignores_unverified_optional_gate(self) -> None:
+        gates = {
+            **CLOSED_GATES,
+            "external_corruption_gate": GateEntry(
+                status="open",
+                required_for=["pointer_corruption"],
+            ),
+        }
+        step = VMCoreAnalysisStep.model_validate(
+            {
+                "step_id": 13,
+                "reasoning": "All mandatory gates have executor evidence.",
+                "action": None,
+                "is_conclusive": True,
+                "signature_class": "pointer_corruption",
+                "root_cause_class": "pointer_corruption",
+                "gates": gates,
+                "final_diagnosis": {
+                    "crash_type": "pointer corruption",
+                    "panic_string": "Kernel panic",
+                    "faulting_instruction": "RIP: unknown",
+                    "root_cause": "Pointer corruption",
+                    "detailed_analysis": "Required evidence gates are satisfied.",
+                    "suspect_code": {
+                        "file": "unknown",
+                        "function": "unknown",
+                        "line": "unknown",
+                    },
+                    "evidence": ["Executor-verified mandatory gates."],
+                },
+            }
+        )
+        self.assertTrue(step.is_conclusive)
+
     def test_dict_shaped_gates_are_validated(self) -> None:
         """state 里的门控可能是序列化后的 dict，而非 GateEntry 实例。"""
         as_dict = {
-            name: {"status": "closed", "required_for": ["pointer_corruption"]}
+            name: {
+                "status": "closed",
+                "required_for": ["pointer_corruption"],
+                "closure_basis": "executor_evidence",
+            }
             for name in CLOSED_GATES
         }
-        self.assertTrue(_gates_all_closed(as_dict))
+        self.assertTrue(_gates_all_closed(as_dict, "pointer_corruption"))
 
 
 class FallbackSynthesisTests(unittest.TestCase):
@@ -229,6 +280,19 @@ class FallbackSynthesisTests(unittest.TestCase):
         self.assertTrue(any("gate register_provenance" in item for item in diagnosis.evidence))
         self.assertIn("Executor fallback", out.additional_notes)
 
+    def test_fallback_ignores_unverified_optional_gate(self) -> None:
+        gates = {
+            **CLOSED_GATES,
+            "external_corruption_gate": GateEntry(
+                status="open",
+                required_for=["pointer_corruption"],
+            ),
+        }
+        out = apply_fallback_conclusion_synthesis(
+            self._step(gates=gates), _converged_state(managed_gates=gates)
+        )
+        self.assertTrue(out.is_conclusive)
+
     def test_synthesized_result_survives_message_revalidation(self) -> None:
         """报告侧重新校验序列化 JSON，合成结果必须自洽否则又被降级。"""
         out = apply_fallback_conclusion_synthesis(self._step(), _converged_state())
@@ -249,6 +313,29 @@ class FallbackSynthesisTests(unittest.TestCase):
         )
         self.assertFalse(out.is_conclusive)
         self.assertIsNone(out.final_diagnosis)
+
+    def test_unclassified_signature_cannot_be_rescued_by_fallback(self) -> None:
+        for signature_class in ("unknown", "stack_corruption"):
+            with self.subTest(signature_class=signature_class):
+                step = self._step(
+                    signature_class=signature_class,
+                    gates=None,
+                    root_cause_class="pointer_corruption",
+                )
+                out = apply_fallback_conclusion_synthesis(step, _converged_state())
+                self.assertFalse(out.is_conclusive)
+                self.assertIsNone(out.final_diagnosis)
+
+    def test_gate_without_executor_basis_does_not_converge(self) -> None:
+        unverified = {
+            name: {
+                "status": "closed",
+                "required_for": ["pointer_corruption"],
+                "evidence": "LLM claim",
+            }
+            for name in CLOSED_GATES
+        }
+        self.assertFalse(_gates_all_closed(unverified, "pointer_corruption"))
 
     def test_idempotent_when_already_conclusive(self) -> None:
         once = apply_fallback_conclusion_synthesis(self._step(), _converged_state())

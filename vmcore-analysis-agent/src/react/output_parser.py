@@ -35,6 +35,8 @@ from .schema import (
     get_root_cause_from_mechanism_mapping,
     get_root_cause_like_mechanisms,
     get_signature_class_aliases,
+    gate_resolution_state,
+    required_gates_for,
 )
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
@@ -2141,16 +2143,26 @@ def _clip_fallback_text(text: str, limit: int = _MAX_FALLBACK_EVIDENCE_CHARS) ->
 
 
 def _unresolved_required_gates(analysis_result: VMCoreAnalysisStep) -> List[str]:
-    """返回该签名类尚未 closed/n/a 的强制 gate 名（与 validate_and_patch 同判据）。"""
-    required = VMCoreAnalysisStep._REQUIRED_GATES.get(
-        analysis_result.signature_class or "", []
+    """Return policy, registration, and gate-status blockers to conclusion synthesis."""
+    resolution = gate_resolution_state(
+        analysis_result.signature_class, analysis_result.gates
     )
+    if resolution == "unclassified":
+        return [
+            f"unclassified signature_class={analysis_result.signature_class or 'null'}"
+        ]
+    required = required_gates_for(analysis_result.signature_class) or []
     gates = analysis_result.gates or {}
-    return [
+    unresolved = [
         name
         for name in required
-        if name not in gates or gates[name].status not in {"closed", "n/a"}
+        if name not in gates
+        or gates[name].status not in {"closed", "n/a"}
+        or gates[name].closure_basis not in {"executor_evidence", "executor_na"}
     ]
+    if resolution == "unregistered":
+        return unresolved or ["required gate state is not registered"]
+    return unresolved
 
 
 def _mine_panic_string(state_text: str) -> str:
@@ -2205,7 +2217,10 @@ def _build_fallback_evidence(
     evidence: List[str] = []
 
     for gate_name, gate in (analysis_result.gates or {}).items():
-        if gate.status not in {"closed", "n/a"}:
+        if not (
+            (gate.status == "closed" and gate.closure_basis == "executor_evidence")
+            or (gate.status == "n/a" and gate.closure_basis == "executor_na")
+        ):
             continue
         detail = gate.evidence or "(no evidence text recorded)"
         evidence.append(f"gate {gate_name} [{gate.status}]: {_clip_fallback_text(detail)}")
@@ -2234,8 +2249,16 @@ def _render_fallback_analysis(
 ) -> str:
     chinese = _fallback_report_is_chinese(state)
     gates = analysis_result.gates or {}
-    closed = [name for name, gate in gates.items() if gate.status == "closed"]
-    not_applicable = [name for name, gate in gates.items() if gate.status == "n/a"]
+    closed = [
+        name
+        for name, gate in gates.items()
+        if gate.status == "closed" and gate.closure_basis == "executor_evidence"
+    ]
+    not_applicable = [
+        name
+        for name, gate in gates.items()
+        if gate.status == "n/a" and gate.closure_basis == "executor_na"
+    ]
 
     if chinese:
         paragraphs = [
