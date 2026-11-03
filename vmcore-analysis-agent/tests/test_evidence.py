@@ -16,6 +16,7 @@ from src.react.evidence import (
     extract_evidence_facts,
     facts_support_goal,
     gate_completion_criteria,
+    has_executor_closure_rule,
 )
 from src.react.schema import GateEntry
 from src.react.evidence import update_gate_evidence
@@ -361,6 +362,11 @@ class EvidenceExtractionTests(unittest.TestCase):
         )
 
         self.assertEqual(evaluated["external_corruption_gate"].status, "open")
+
+    def test_external_gate_has_no_executor_closure_rule_yet(self) -> None:
+        # 规则已定义，但 external_source 事实抽取尚未实现，因此当前不应声称可闭合。
+        self.assertFalse(has_executor_closure_rule("external_corruption_gate"))
+        self.assertTrue(has_executor_closure_rule("local_corruption_exclusion"))
 
     def test_llm_cannot_supply_executor_closure_basis(self) -> None:
         step = VMCoreLLMAnalysisStep.model_validate(

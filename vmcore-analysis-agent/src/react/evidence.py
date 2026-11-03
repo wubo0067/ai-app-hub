@@ -299,12 +299,13 @@ def has_executor_closure_rule(
 ) -> bool:
     if gate_name == "object_lifetime" and "page_not_present" in set(required_for):
         return False
+    # external_corruption_gate 的规则已定义，但 external_source 事实抽取尚未实现，
+    # 因此当前没有可执行能力；接入抽取器后把该门控加回此集合。
     return gate_name in {
         "register_provenance",
         "object_lifetime",
         "local_corruption_exclusion",
         "field_type_classification",
-        "external_corruption_gate",
     }
 
 
