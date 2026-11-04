@@ -4,9 +4,12 @@
 # Author: CalmWU
 # Created: 2026-03-23
 
+import logging
 from typing import Any, ClassVar, Dict, List, Literal, Optional, cast, get_args
 
 from pydantic import BaseModel, Field, model_validator
+
+logger = logging.getLogger(__name__)
 
 _CORRUPTION_MECHANISM_ALIASES = {
     "type_misuse": "field_type_misuse",
@@ -41,6 +44,7 @@ _ROOT_CAUSE_CLASS_ALIASES = {
     "stack_protector": "stack_corruption",
     "stack_smash": "stack_corruption",
     "kernel_stack_corruption": "stack_corruption",
+    "memory_corruption": "pointer_corruption",
 }
 
 _DRIVER_INFERENCE_METHOD_ALIASES = {
@@ -278,6 +282,11 @@ def _coerce_root_cause_class(data: Any) -> Any:
         return data
 
     normalized = _ROOT_CAUSE_CLASS_ALIASES.get(raw, raw)
+    if raw == "memory_corruption":
+        logger.warning(
+            "Coerced legacy root_cause_class='memory_corruption' to '%s'.",
+            normalized,
+        )
 
     if normalized in _ROOT_CAUSE_FROM_MECHANISM:
         if data.get("corruption_mechanism") in {None, "unknown"}:

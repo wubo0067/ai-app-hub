@@ -321,6 +321,16 @@ def validate_tool_call_request(
         )
         if struct_error is not None:
             return struct_error
+    else:
+        # 独立 struct 调用同样受已知崩溃路径偏移覆盖校验约束
+        # （注意：observed_struct_offsets 为崩溃指令级偏移集合，跨不相关结构体查询时需保证偏移兼容或先通过 struct -o 验证）
+        struct_error = _validate_struct_requests(
+            lines,
+            observed_struct_offsets=observed_struct_offsets,
+            struct_layout_cache=struct_layout_cache,
+        )
+        if struct_error is not None:
+            return struct_error
 
     return None
 
@@ -392,11 +402,11 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
     if command == "bt" and "-f" in parts[1:]:
         flag_index = parts.index("-f")
         if flag_index == len(parts) - 1:
-            return "bt -f requires a concrete pid or task argument."
+            return "bt -f requires a concrete hex task_struct address argument."
 
         target = parts[flag_index + 1]
         if target.isdigit() and len(parts) == flag_index + 2:
-            return "bt -f must target a concrete pid or task context, not a frame number from bt output."
+            return "bt -f must target a hex task_struct address (e.g., bt -f <task_addr>), not a numeric PID or frame number from bt output."
 
     # log 命令检查：必须配合 grep 使用，禁止单独使用
     if command == "log":
@@ -461,24 +471,24 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
             return "bare struct -o is forbidden; use struct -o <type>."
 
         if len(parts) < 2:
-            return "struct command is incomplete; use struct -o <type> or struct <type> <addr>."
+            return "struct command is incomplete; use struct -o <type>, struct <type> <addr>, or struct <type>.<field>[,<field>] <addr>."
 
         if parts[1] == "-o":
-            if len(parts) != 3:
+            if len(parts) != 3 or "." in parts[2]:
                 return (
                     "struct layout queries only allow the form 'struct -o <type>'; "
-                    "do not append field names or extra operands."
+                    "do not append field names, dot members, or extra operands."
                 )
         else:
             if parts[1].startswith("-"):
                 return (
-                    "struct only allows 'struct -o <type>' or 'struct <type> <addr>'; "
+                    "struct only allows 'struct -o <type>', 'struct <type> <addr>', or 'struct <type>.<field>[,<field>] <addr>'; "
                     "other flag forms are forbidden."
                 )
             if len(parts) > 3:
                 return (
-                    "struct instance queries only allow 'struct <type>' or 'struct <type> <addr>'; "
-                    "do not append field names such as 'driver' or 'init_name'."
+                    "struct instance queries only allow 'struct <type>', 'struct <type> <addr>', or 'struct <type>.<field>[,<field>] <addr>'; "
+                    "do not append space-separated field names such as 'driver' or 'init_name'."
                 )
 
     # rd 命令检查：必须提供地址目标
@@ -770,13 +780,13 @@ def _validate_struct_requests(
         parts = canonicalize_command_line(line).split()
         if len(parts) < 2 or parts[0] != "struct":
             continue
-        # struct -o <type> 形式：查询布局
+        # struct -o <type> 形式：查询布局（不允许点号字段）
         if len(parts) >= 3 and parts[1] == "-o":
             offset_query_types.add(parts[2])
             continue
-        # struct <type> <addr> 形式：查询实例
+        # struct <type> <addr> 或 struct <type>.<field> <addr> 形式：查询实例
         if parts[1] != "-o" and len(parts) >= 3:
-            instance_query_types.append(parts[1])
+            instance_query_types.append(parts[1].split(".", 1)[0])
 
     # 验证每个实例查询
     for type_name in instance_query_types:

@@ -84,11 +84,83 @@ class ReplanProbeMenuTests(unittest.TestCase):
 
     def test_layer0_system_contains_bounded_uncertainty_and_payload_rules(self) -> None:
         from src.react.layer0_system import LAYER0_SYSTEM_PROMPT_TEMPLATE
+        from src.react.playbooks import PLAYBOOKS
+        from src.react.prompt_builder import build_analysis_system_prompt
+        from src.react.prompts import simplified_structure_reasoning_prompt
+        from src.react.sop_fragments import SOP_FRAGMENTS
 
         self.assertIn("Bounded uncertainty convergence", LAYER0_SYSTEM_PROMPT_TEMPLATE)
         self.assertIn("Corrupted payload handling", LAYER0_SYSTEM_PROMPT_TEMPLATE)
         self.assertIn("CORRUPTED PAYLOAD", LAYER0_SYSTEM_PROMPT_TEMPLATE)
         self.assertIn("Bounded low-confidence convergence is always preferred", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        # N3: Neither LAYER0 nor the assembled prompt may recommend "memory_corruption" alongside pointer_corruption
+        self.assertNotIn('"pointer_corruption" or "memory_corruption"', LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        assembled = build_analysis_system_prompt(BASE_STATE, is_last_step=False)
+        self.assertNotIn('"pointer_corruption" or "memory_corruption"', assembled)
+        self.assertNotIn('`"pointer_corruption"` or `"memory_corruption"`', assembled)
+        # B1: struct dot syntax must be explicitly permitted in both LAYER0 and simplified_structure_reasoning_prompt
+        self.assertIn("struct <type>.<field>[,<field>] <addr>", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        self.assertIn("struct <type>.<field>[,<field>] <addr>", simplified_structure_reasoning_prompt())
+        # B3: CR2 classification in step 5 and #PF vs #GP rules must be conditionalized
+        self.assertIn("For a General Protection Fault (#GP), the CPU does NOT update CR2", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        self.assertIn("fault-address classification (#PF CR2 / #GP non-canonical operand)", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        self.assertNotIn("RIP instruction, CR2 classification, and immediate bad operand", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        self.assertIn("BUG: unable to handle page fault for address", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        # B4: bt -f consistency across layer0 and SOP 3.8b (only hex task_addr allowed; numeric PID/frame number rejected)
+        self.assertNotIn("bt -f <pid>", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        self.assertIn("bt -f <task_addr>", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        self.assertIn("bt -f <task_addr>", SOP_FRAGMENTS["stack_overflow"])
+        self.assertIn("never pass a frame number or numeric PID to bt -f", SOP_FRAGMENTS["stack_overflow"])
+        # B2 & N7: Generic stack_corruption playbook must not unconditionally require a canary slot;
+        # Canary Overwrite Value Analysis belongs in stack_protector_canary
+        self.assertNotIn("Divide-by-Zero", PLAYBOOKS["general_protection_fault"])
+        self.assertNotIn("MANDATORY PRE-CONCLUSION GATE (stack_protector_canary)", PLAYBOOKS["stack_corruption"])
+        self.assertNotIn("Canary Overwrite Value Analysis", PLAYBOOKS["stack_corruption"])
+        self.assertIn("Canary Overwrite Value Analysis", PLAYBOOKS["stack_protector_canary"])
+        self.assertNotIn("Given canary_frame_addr", PLAYBOOKS["stack_corruption"])
+        self.assertNotIn("relative to the corrupted canary slot", PLAYBOOKS["stack_corruption"])
+        self.assertNotIn("Locate the stack canary check point (__stack_chk_fail call site)", PLAYBOOKS["stack_corruption"])
+        # R3: canary-only rules must not remain in the generic (non-canary) stack playbook
+        self.assertNotIn("Do NOT attribute canary corruption", PLAYBOOKS["stack_corruption"])
+        self.assertNotIn("This restriction applies ONLY to the canary slot", PLAYBOOKS["stack_corruption"])
+        self.assertNotIn("{CANARY_", PLAYBOOKS["stack_corruption"])
+        # R1: bt -f guidance must never suggest a pid/task target
+        self.assertNotIn("concrete pid", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        # R2: every bt -f mention must carry the address form
+        self.assertNotIn("Use bt -f,", SOP_FRAGMENTS["advanced_techniques"])
+
+    def test_driver_overlay_requires_signal_or_dma_not_step_count_alone(self) -> None:
+        from langchain_core.messages import HumanMessage
+        from src.react.prompt_builder import _select_context_overlays, _select_sop_fragments
+        from src.react.prompt_overlays import DRIVER_OBJECT_OVERLAY
+
+        # Plain 'sym ' at step_count >= 6 must NOT trigger DRIVER_OBJECT_OVERLAY or duplicate SOP
+        state_no_signal = {
+            "current_signature_class": "pointer_corruption",
+            "current_root_cause_class": None,
+            "step_count": 8,
+            "messages": [HumanMessage(content="sym ffffffff81000000")],
+        }
+        recent_no_signal = "sym ffffffff81000000"
+        self.assertNotIn(
+            DRIVER_OBJECT_OVERLAY,
+            _select_context_overlays(state_no_signal, recent_no_signal),
+        )
+        self.assertEqual(
+            _select_sop_fragments(state_no_signal, recent_no_signal),
+            [],
+        )
+
+        # Concrete driver signal ('mod -s' / '_base_') triggers DRIVER_OBJECT_OVERLAY without duplicate SOP
+        recent_with_signal = "mod -s mpt3sas /usr/lib/debug/mpt3sas.ko.debug"
+        self.assertIn(
+            DRIVER_OBJECT_OVERLAY,
+            _select_context_overlays(state_no_signal, recent_with_signal),
+        )
+        self.assertEqual(
+            _select_sop_fragments(state_no_signal, recent_with_signal),
+            [],
+        )
 
     def test_no_menu_without_replan(self) -> None:
         rendered = _render(

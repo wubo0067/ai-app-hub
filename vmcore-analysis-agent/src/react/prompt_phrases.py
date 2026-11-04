@@ -90,7 +90,7 @@ BOUNDED_UNCERTAINTY_EXIT_RULE = (
     "When direct writer evidence is unattainable (due to missing module symbols, partial dump coverage, "
     "or asynchronous DMA/interrupt overwrite), DO NOT spin on reading the corrupted object. "
     "Proving that an object is corrupted and that the local execution frame did not corrupt it "
-    "is sufficient to conclude with root_cause_class=\"pointer_corruption\" or \"memory_corruption\" "
+    "is sufficient to conclude with root_cause_class=\"pointer_corruption\" "
     "(with confidence=\"low\" or \"medium\"). Explicitly recording verification gaps in detailed_analysis "
     "is considered a successful bounded convergence, NOT a diagnostic failure."
 )

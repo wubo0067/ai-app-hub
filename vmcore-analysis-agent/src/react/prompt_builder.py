@@ -287,7 +287,7 @@ def _build_replan_probe_menu(state: AgentState) -> list[str]:
             f"The gate set for this signature class is too weak to support a conclusion, so "
             f"re-running commands that only re-confirm a closed gate cannot make progress. "
             f"Synthesize your closed gates now: if no new external object or driver is accessible, "
-            f"derive the best-fit root_cause_class (e.g. pointer_corruption or memory_corruption) "
+            f"derive the best-fit root_cause_class (e.g. pointer_corruption) "
             f"with confidence=\"low\" or \"medium\" and record remaining unknowns in detailed_analysis."
         )
     else:
@@ -531,21 +531,7 @@ def _select_sop_fragments(state: AgentState, recent_text: str) -> list[str]:
     if any(token in lowered_recent_text for token in ("search", "ptov", "kmem -p")):
         fragments.append(SOP_FRAGMENTS["address_search"])
 
-    driver_source_signal = _has_driver_source_correlation_signal(lowered_recent_text)
-
-    # 指针/链表损坏线索出现后，增强驱动源码关联排查指导。
-    if (
-        signature_class
-        in {
-            "pointer_corruption",
-            "use_after_free",
-            "null_deref",
-            "general_protection_fault",
-        }
-        and step_count >= 6
-        and driver_source_signal
-    ):
-        fragments.append(SOP_FRAGMENTS["driver_source_correlation"])
+    # 指针/链表损坏线索出现后，由 DRIVER_OBJECT_OVERLAY 提供驱动源码关联排查指导（不再重复注入同文 SOP）。
 
     if (
         "stack overflow" in lowered_recent_text
@@ -594,8 +580,6 @@ def _select_context_overlays(state: AgentState, recent_text: str) -> list[str]:
     signature_class = state.get("current_signature_class")
     # 获取当前根本原因类别
     root_cause_class = state.get("current_root_cause_class")
-    # 获取当前步骤计数，默认为 0
-    step_count = state.get("step_count", 0)
     # 将最近文本转换为小写，便于关键词匹配
     lowered_recent_text = recent_text.lower()
     # 检查是否为栈保护案例
@@ -622,9 +606,7 @@ def _select_context_overlays(state: AgentState, recent_text: str) -> list[str]:
         and (
             # 根本原因是 DMA 损坏
             root_cause_class == "dma_corruption"
-            # 或者步骤计数已足够深
-            or step_count >= 6
-            # 或者最近文本中包含特定关键词
+            # 或者最近文本中包含驱动源码关联强信号
             or driver_source_signal
         )
         # 并且不是栈保护案例
@@ -668,8 +650,8 @@ def _has_driver_source_correlation_signal(lowered_recent_text: str) -> bool:
             "function pointer",
             "_base_",
             "mod -s",
-            "sym ",
-            "apic",
+            "local apic",
+            "0xfee0",
             "fee0",
             "list_head",
             "self-referential",
@@ -910,9 +892,12 @@ def _format_reasoning_gate_contract(
                     "name target gate register_provenance, explain which concrete source object and field/offset "
                     "must be identified next, and state how the next action will close the bad-register chain. "
                     "Do not demand proof of the ultimate overflow writer to close this gate. "
-                    "Before claiming the chain is closed, verify that the memory address computed from the "
-                    "faulting instruction's operand registers (using the exception frame values) matches the "
-                    "fault address in the dmesg BUG line; if they do not match, re-examine the operand derivation"
+                    "Before claiming the chain is closed, verify the memory address computed from the "
+                    "faulting instruction's operand registers (using the exception frame values): for #PF, "
+                    "confirm it matches CR2 / the fault address in the dmesg BUG line; for #GP, confirm the "
+                    "operand produces a non-canonical address (or matches 'probably for non-canonical address' "
+                    "if present in dmesg) and do not compare against stale CR2; if they do not match, "
+                    "re-examine the operand derivation"
                 )
             return (
                 f"name target gate {gate_name}, explain why the next action advances it, "

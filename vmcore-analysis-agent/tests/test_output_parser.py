@@ -121,6 +121,54 @@ class KernelFrameRegisterParsingTests(unittest.TestCase):
         )
         self.assertEqual(_parse_kernel_frame_registers(text), {})
 
+    def test_rhel9_null_deref_address_format_escalates_corrupted_base(self) -> None:
+        """RHEL9 / Linux 5.7+ 使用 'BUG: kernel NULL pointer dereference, address: <addr>'。"""
+        text = (
+            "BUG: kernel NULL pointer dereference, address: 0000000000000062\n"
+            "Oops: 0000 [#1] PREEMPT SMP NOPTI\n"
+            "RIP: 0010:show_interrupts+0x240/0x5a0\n"
+            "RSP: 0018:ffffae024a1c3d98 EFLAGS: 00010286\n"
+            "RAX: 0000000000000000 RBX: ffff912345678000 RCX: 0000000000000000\n"
+            "RBP: 0000000000000012 R08: 0000000000002000 R09: 0000000000000000\n"
+        )
+        det = _detect_corrupted_base_null_deref(text)
+        self.assertIsNotNone(det)
+        assert det is not None
+        self.assertEqual(det["register"], "RBP")
+        self.assertEqual(det["register_value"], 0x12)
+        self.assertEqual(det["fault_addr"], 0x62)
+        self.assertEqual(det["offset"], 0x50)
+
+    def test_rhel9_page_fault_for_address_context_corrects_gpf_signature(self) -> None:
+        """RHEL9 / Linux 5.7+ 使用 'BUG: unable to handle page fault for address: <addr>'。"""
+        from langchain_core.messages import HumanMessage
+        from src.react.output_parser import (
+            _is_kernel_paging_request_page_fault_context,
+            _normalize_signature_class_from_fault_context,
+        )
+
+        text = (
+            "BUG: unable to handle page fault for address: ffffae024a1c3d98\n"
+            "Oops: 0000 [#1] PREEMPT SMP NOPTI\n"
+            "RIP: 0010:foo+0x10/0x40\n"
+        )
+        self.assertTrue(_is_kernel_paging_request_page_fault_context(text))
+        step = _make_conclusive_step(signature_class="general_protection_fault")
+        reconciled = _normalize_signature_class_from_fault_context(
+            step, {"messages": [HumanMessage(content=text)]}
+        )
+        self.assertEqual(reconciled.signature_class, "pointer_corruption")
+
+    def test_memory_corruption_alias_coerces_to_pointer_corruption_with_warning(self) -> None:
+        from src.react.schema import VMCoreLLMAnalysisStep
+
+        with self.assertLogs("src.react.schema", level="WARNING") as cm:
+            step = _make_conclusive_step(root_cause_class="memory_corruption")
+        self.assertEqual(step.root_cause_class, "pointer_corruption")
+        self.assertTrue(
+            any("memory_corruption" in msg and "pointer_corruption" in msg for msg in cm.output)
+        )
+
 
 class ValueConflictAuditTests(unittest.TestCase):
     """[阶段 5] 取值级矛盾审计：已读内存与结构体布局不相容时的降级与提示注入。"""

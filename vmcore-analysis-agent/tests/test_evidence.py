@@ -53,6 +53,15 @@ class EvidenceExtractionTests(unittest.TestCase):
         self.assertIn("dis_instruction:0xffff0000=mov", dis_facts)
         self.assertIn("sym:irq_handler@0xffffffff81000000:T", sym_facts)
 
+    def test_struct_dot_syntax_does_not_produce_layout_facts(self) -> None:
+        """点号语法只打印字段值，无 struct 头/偏移行，不构成 field_type_classification 的 struct 证据。"""
+        dot_facts = extract_evidence_facts(
+            "struct",
+            {"command": "struct device.driver ffff888100000000"},
+            "  driver = 0xffffffffc0123400\n",
+        )
+        self.assertEqual(dot_facts, set())
+
     def test_run_script_collects_each_supported_command(self) -> None:
         facts = extract_evidence_facts(
             "run_script",

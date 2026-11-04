@@ -59,9 +59,10 @@ _REGISTER_DUMP_RE = re.compile(
     r"(?P<val>[0-9a-fA-F]{8,16})\b"
 )
 
-# 从 "NULL pointer dereference at 0000000000000062" 提取故障地址
+# 从 "NULL pointer dereference at 0000000000000062" 或
+# "BUG: kernel NULL pointer dereference, address: 0000000000000062" 提取故障地址
 _NULL_DEREF_ADDR_RE = re.compile(
-    r"NULL pointer dereference at\s+(?P<addr>[0-9a-fA-F]{8,16})",
+    r"NULL pointer dereference(?: at|,\s*address:)\s+(?P<addr>[0-9a-fA-F]{8,16})",
     flags=re.IGNORECASE,
 )
 
@@ -1679,14 +1680,17 @@ def _is_kernel_paging_request_page_fault_context(text: str) -> bool:
         bool: 如果是页面错误上下文则返回 True
 
     判断条件：
-        1. 包含"BUG: unable to handle kernel paging request"
+        1. 包含"BUG: unable to handle kernel paging request"或"BUG: unable to handle page fault for address"
         2. Oops 错误代码为 0x0000（表示页面错误）
     """
     if not text:
         return False
 
     lowered = text.lower()
-    if "bug: unable to handle kernel paging request" not in lowered:
+    if (
+        "bug: unable to handle kernel paging request" not in lowered
+        and "bug: unable to handle page fault for address" not in lowered
+    ):
         return False
 
     oops_match = _OOPS_RE.search(text)
