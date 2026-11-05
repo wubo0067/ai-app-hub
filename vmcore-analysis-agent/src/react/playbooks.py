@@ -2,8 +2,6 @@
 # -*- coding: utf-8 -*-
 
 from .prompt_phrases import (
-    CANARY_RESIDUAL_DATA_RULE,
-    CANARY_SLOT_ONLY_SCOPE_NOTE,
     DMA_MINIMUM_EVIDENCE_GATE_RULE,
     DMA_PROMOTION_EVIDENCE_RULE,
     S1_S5_DMA_GATE_RULE,
@@ -17,7 +15,8 @@ Analysis:
 1. Use dis -l <stuck_function> 100 to identify loops or pause-based spin paths.
 2. Check for missing cond_resched() or long IRQ-disabled sections.
 3. For hard lockup, use bt -a to inspect all CPUs for lock contention or non-progress.
-4. Use runq to inspect per-CPU queue backlog and scheduler imbalance.
+4. For soft lockup or spinlock/rwlock contention (e.g., native_queued_spin_lock_slowpath), decode the lock address from registers/stack, inspect `qspinlock` `val` (locked/pending/tail CPU & idx), and use `bt -c <cpu>` on the active/running peer CPUs plus `runq` to locate the lock holder.
+5. Use runq to inspect per-CPU queue backlog and scheduler imbalance.
 """.strip()
 
 
@@ -34,7 +33,7 @@ Use this guide as part of {S1_S5_DMA_GATE_RULE} In this file, S1 mainly covers i
 - Validate task_struct, thread_info, kernel stack, and driver-private objects before escalating to external corruption.
 - For pointer-corruption branches, explicitly rule in or rule out stack overflow, UAF, struct overwrite, and hardware error before naming DMA.
 - Repeated abnormal 8-byte value patterns across nearby fields are corruption fingerprints. Compare neighboring fields and explain the pattern before escalating to DMA or generic wild-pointer language.
-- If vmcore-dmesg shows recurring driver reset or discovery messages immediately before the crash, analyze that timing as a possible reinitialization or race window affecting the corrupted object.
+- If vmcore-dmesg shows recurring driver reset or discovery messages immediately before the crash, treat that driver as a temporal writer CANDIDATE, not as a proven cause. If the crash task is a periodic poller and the storm falls within one polling period, explicitly run the protocol, device-ownership, or DMA-range checks needed to promote or reject the candidate; do not dismiss it as unrelated temporal context before those checks.
 """.strip()
 
 
@@ -124,14 +123,14 @@ Analysis:
 
 - Treat pointer corruption as a provenance-first workflow, not a device-attribution workflow.
 - {S1_S5_DMA_GATE_RULE} At minimum in this playbook: close register provenance first (S1), object lifetime and ordinary object-state validation next (S2), stack or snapshot artifact exclusion when relevant (S3), local corruption discrimination after that (S4), and only then assess whether any affirmative device-side evidence exists (S5).
-- S2 (object-state validation) for slab objects: if the corrupted object's slab cache (e.g., kmalloc-128) is routinely used by the suspected hardware driver, check whether the suspicious values could be residue from a prior allocation of that cache by the same driver. kmalloc caches are NOT zeroed on free or re-allocation; a prior valid allocation can leave its entire content as stale data in the returned slab slot.
+- S2 (object-state validation) for slab objects: if the corrupted object's slab cache (e.g., kmalloc-128) is routinely used by the suspected hardware driver, check whether the suspicious values could be residue from a prior allocation of that cache by the same driver. Unless zeroed by `__GFP_ZERO` / `kzalloc` or `init_on_alloc` / `init_on_free`, kmalloc caches are NOT zeroed on free or re-allocation; a prior valid allocation can leave its entire content as stale data in the returned slab slot.
 - S5 (device-side evidence): {DMA_PROMOTION_EVIDENCE_RULE} {DMA_MINIMUM_EVIDENCE_GATE_RULE} Before naming a specific device as the DMA source, you MUST either: (a) confirm a DMA-range overlap between the corrupted page's physical address and the device's DMA buffers, OR (b) explicitly document why range overlap cannot be verified AND provide a protocol-level bit-layout verification of the payload. Additionally, you must consider ALL DMA-capable devices present in the system (check lspci-equivalent output or device tree). Name the suspected device only after other DMA-capable devices (e.g., mlx5 NICs, other HBAs, NVMe controllers) have been explicitly evaluated and found less likely, even if the evaluation is brief.
 - If the only apparent support is a driver-specific value inside a neighboring slab slot or elsewhere on the slab page, DMA remains unproven. That observation may support prior allocation, stale residue, or adjacent-object software corruption and cannot by itself close S5.
 - A snapshot mismatch between crash-time registers and current vmcore memory is diagnostic context only; it does not prove overwrite mechanism.
 - If a driver or third-party module is on the crash path, validate the full driver object shape before escalating to external corruption.
 - If the bad value came from a concrete load like mov 0x10(%r13), %rcx, the next validation target is the r13-based object, not a different argument register.
 - If nearby fields repeat a suspicious high-bit prefix or bus-address-like pattern, preserve that as a corruption fingerprint and test it explicitly instead of hand-waving it as "looks physical".
-- If a guessed struct name fails on a module-private object, stop guessing protocol-layer types and switch to module-symbol loading plus raw-object validation.
+- If a guessed private struct name fails on a module-private object, stop guessing private C type names and switch to module-symbol loading plus raw-object validation. This does not forbid a manual, documented protocol-header decode of aligned repeated records; it forbids inventing a private C layout from resemblance alone.
 
 ### Corruption Mechanism Gate (mandatory before setting final_root_cause)
 
@@ -181,9 +180,9 @@ Analysis:
 Pattern: task blocked for more than 120 seconds.
 
 Analysis:
-1. Distinguish true deadlock, lock starvation, and I/O hang first.
+1. Distinguish true deadlock, lock starvation, and I/O hang first (when custom crash extensions are available, use `hanginfo`, `rqlist`, or `scsishow` as appropriate).
 2. Use foreach UN bt to inspect all D-state tasks.
-3. Inspect lock ownership with struct mutex and wait-chain backtraces.
+3. Inspect lock ownership with struct mutex / rw_semaphore and wait-chain backtraces: for `struct mutex`, mask the lower flag bits of `owner` (`owner & ~0x7`) to extract the holder `task_struct *`, then run `bt <holder_task_addr>` or `bt -c <cpu>` if the holder is running on a CPU.
 4. If lockdep output exists in dmesg, prioritize it.
 """.strip(),
     "atomic_sleep": """
@@ -222,27 +221,19 @@ Analysis:
 ## General Protection Fault Playbook
 
 - Use this playbook only when the evidence actually points to x86 #13 or an equivalent protection-domain fault.
-- Do not enter this playbook for BUG: unable to handle kernel paging request with Oops: 0000; that remains a page-fault investigation and should normally route to pointer_corruption or null_deref depending on the address shape.
+- Do not enter this playbook for BUG: unable to handle kernel paging request (or BUG: unable to handle page fault for address) with Oops: 0000; that remains a page-fault investigation and should normally route to pointer_corruption or null_deref depending on the address shape.
 - Start with canonical-address validation and provenance of the bad register or operand.
 - Treat a non-canonical or partially plausible pointer as evidence of corruption, not evidence of a specific writer.
 - Prefer software wild pointer, UAF, OOB, or race explanations before DMA or hardware unless device-side evidence is already present.
 - A large non-zero kernel fault address is not a NULL dereference equivalent. Keep crash_type wording aligned with the actual address class.
 - If a bad register came from a module-private object, load module symbols first and inspect the exact producer object before speculating about DMA or stale register state.
 - If recurring device events in dmesg occur immediately before the fault, fold that timing into the live hypotheses instead of treating those logs as unrelated background noise.
-
-## 3.9 Divide-by-Zero / Invalid Opcode
-Pattern: divide error or invalid opcode.
-
-Analysis:
-1. Use dis -rl <RIP> to find div, idiv, or ud2.
-2. For divide error, inspect the divisor register and confirm whether it is zero.
-3. For ud2, correlate with BUG or WARN style source-side traps.
 """.strip(),
     "bug_on": _BUG_WARN_PLAYBOOK,
     "warn_on": _BUG_WARN_PLAYBOOK,
     "invalid_address_access": """
 ## 3.11 Invalid Address Access (Canonical but Garbage-Valued Fault Address)
-Pattern: unable to handle kernel paging request at <address> where the fault address is
+Pattern: unable to handle kernel paging request at <address> (or BUG: unable to handle page fault for address: <address>) where the fault address is
 non-zero, non-trivial, and does not match any expected kernel object layout; the address
 appears random, offset-shifted, or clearly outside any kernel-mapped region, yet is
 architecturally canonical.
@@ -285,7 +276,7 @@ Analysis:
 """.strip(),
     "write_protection_violation": """
 ## 3.12 Write Protection Violation (Read-Only Page Fault)
-Pattern: BUG: unable to handle kernel paging request at <address>; Oops error code with
+Pattern: BUG: unable to handle kernel paging request at <address> (or BUG: unable to handle page fault for address: <address>); Oops error code with
 bit 0 (protection fault, page IS present) and bit 1 (write access) both set -- e.g.,
 Oops: 0003; or "kernel BUG at ... write to read-only memory"; or dmesg explicitly states
 "Write protect fault" or "kernel attempted to write to read-only page".
@@ -327,7 +318,7 @@ Analysis:
 """.strip(),
     "page_not_present": """
 ## 3.13 Page Not Present (Missing Mapping -- VMalloc / VMap / Module Space)
-Pattern: unable to handle kernel paging request at <address>; Oops error code 0x0000
+Pattern: unable to handle kernel paging request at <address> (or BUG: unable to handle page fault for address: <address>); Oops error code 0x0000
 (neither protection fault nor write fault -- the page is simply absent); fault address is
 in the vmalloc region, the module address range, a driver vmap area, or another
 dynamically-mapped kernel virtual range -- not the slab/kmalloc heap and not near NULL.
@@ -370,7 +361,7 @@ Analysis:
 """.strip(),
     "smap_smep_violation": """
 ## 3.14 SMAP / SMEP Violation (Privilege Boundary Fault)
-Pattern: unable to handle kernel paging request at <user-space address>; fault address is
+Pattern: unable to handle kernel paging request at <user-space address> (or BUG: unable to handle page fault for address: <user-space address>); fault address is
 in user-space range (typically < 0x00007fffffffffff); Oops error code with bit 4
 (instruction-fetch fault) set for SMEP, or bit 2 clear and bit 0 set for SMAP.
 
@@ -468,6 +459,49 @@ You MUST keep the candidate set restricted to:
 2. Active callee upward overwrite from a lower-address active callee.
 3. Active exception-path overwrite by code executing during the same canary-bearing window.
 
+### Canary Overwrite Value Analysis
+
+When the corrupted canary slot contains a recognizable value (not random garbage), that value
+is a critical forensic clue. Pursue it aggressively:
+
+1. If the canary was overwritten with a task_struct pointer (e.g., current task's address from
+   bt output), this means the overflow code was likely accessing `current` or `current->field`
+   and writing beyond bounds. Next steps:
+   a. Run `task <task_addr>` to expand the task_struct and look for fields whose addresses or
+      values match the stack corruption pattern.
+   b. Identify which kernel functions store `current` (the task pointer) on the stack as a local
+      variable. Search for code paths where `current->xxx` access could produce an OOB write
+      into adjacent stack slots.
+   c. Cross-reference with the call chain: which functions in the active backtrace access
+      task_struct fields that could spill onto the stack at the corrupted offset?
+   d. Treat a `current`-valued canary as a spill-location clue, not as proof by itself. Inspect
+      the disassembly for explicit stack-store instructions that save `current` or a
+      current-derived pointer into a local slot to free registers, including both rbp-relative
+      and rsp-relative forms (for example, `mov %rax, -0x40(%rbp)` or `mov %rax, 0x20(%rsp)`).
+   e. Only escalate this theory after proving slot adjacency: identify the exact saved slot for
+      `current`, identify a neighboring overflow-capable local object or write primitive in the
+      same frame, and show that the overwrite distance could reach that slot. Merely accessing
+      `current` or spilling it somewhere in the frame is insufficient.
+
+2. If the canary was overwritten with a kernel text address, use `sym <value>` and `dis -rl <value>`
+   to identify the function. This may reveal a function pointer copy, callback table, or residual
+   stack payload, but it is NOT proof that the named function was the overflow source.
+   a. First classify the address as a written value: saved return site, copied function pointer,
+      callback table entry, or stale residual stack content.
+   b. Only after establishing how that code pointer could have been materialized on the stack may
+      you use it in writer-provenance reasoning.
+   c. Reject any jump from "handle_mm_fault+0xbfd is on the stack" to "handle_mm_fault caused
+      the overflow" unless a concrete write path, local object, and slot-overlap proof are shown.
+
+3. If the canary was overwritten with a non-symbol kernel address that appears multiple times
+   on the stack, treat it as a corruption fingerprint. Do NOT give up after `sym` fails:
+   a. Run `vtop <address>` to verify whether the page exists, is mapped, and its ownership.
+   b. Run `kmem -p <translated_PA>` to check the physical page state (slab, anonymous, reserved).
+   c. If the page belongs to a specific subsystem or memory pool, that narrows the corruption
+      source significantly.
+   d. Check whether the value could be a per-CPU pointer, module data address, or vmalloc region
+      address by comparing against known address ranges.
+
 ### Conditional Provenance Fallback
 
 Only after the canary slot has been closed by `resolve_stack_canary_slot` (or a proven manual
@@ -502,7 +536,7 @@ window is AFTER the prologue store and BEFORE the epilogue check.
 
 **Blame guardrails**: Do not blame link_path_walk, zone_statistics, handle_mm_fault, or any interrupted-path frame merely because its address appears on the stack. Do not identify the canary slot by scanning for a recognizable value and reverse-justifying the address. Do not use stack direction across an exception boundary unless frame provenance and active overlap have been explicitly proven.
 """.strip(),
-    "stack_corruption": f"""
+    "stack_corruption": """
 ## Stack Corruption (Generic -- Non-Canary)
 Pattern: Kernel stack overflow, stack smashing detected, or frame-pointer corruption where the
 panic did NOT contain stack-protector or __stack_chk_fail.
@@ -529,9 +563,9 @@ Before naming a local overflow source, complete this checklist in order:
 4. Apply stack-growth direction only within a proven ordinary call segment; do not carry ordinary overflow causality across an exception boundary.
 5. If the suspected source and corrupted slot are separated by an exception-entry boundary, keep local-overflow attribution provisional until frame provenance and active-overlap arithmetic are proven.
 6. Evaluate at least these alternative mechanisms before final blame: self-frame local overflow
-   (canary-bearing function's own code or unprotected leaf callees), active overwrite inside the
-   exception path, stack-slot reuse from pre-fault returned frames (valid for saved RBP/RIP/locals
-   but NOT for the canary slot -- see CANARY INVARIANT above), and frame reconstruction error.
+   (the corrupted frame's own code or unprotected leaf callees), active overwrite inside the
+   exception path, stack-slot reuse from pre-fault returned frames (valid for saved RBP, saved RIP,
+   and non-canary local slots), and frame reconstruction error.
 
 ### CRITICAL: Stack Growth Direction and Causality Constraint (x86-64)
 
@@ -539,63 +573,34 @@ On x86-64, the kernel stack grows from HIGH addresses toward LOW addresses.
 - A frame at a LOWER address was pushed LATER (called more recently).
 - A frame at a HIGHER address was pushed EARLIER (called first).
 - A local buffer overflow writes UPWARD (toward HIGHER addresses), so it can only corrupt
-  its own canary, saved RBP, return address, and frames of EARLIER callers (higher addresses).
+  its own local slots, saved RBP, return address, and frames of EARLIER callers (higher addresses).
 - A local buffer overflow CANNOT corrupt frames at LOWER addresses, because those frames
   belong to functions called LATER and did not exist when the overflow occurred.
 
 **Mandatory causality check before attributing corruption source**:
-Given canary_frame_addr (address of the frame whose canary is corrupted) and
+Given target_frame_addr (address of the corrupted frame/slot) and
 suspect_frame_addr (address of the suspected overflow source):
-- If suspect_frame_addr > canary_frame_addr (suspect frame is at a higher address, i.e.,
+- If suspect_frame_addr > target_frame_addr (suspect frame is at a higher address, i.e.,
   an earlier/outer caller): the suspect's local overflow writes upward and CANNOT reach the
-  canary at a lower address. This attribution is PHYSICALLY IMPOSSIBLE. Reject it immediately.
+  target slot at a lower address. This attribution is PHYSICALLY IMPOSSIBLE. Reject it immediately.
   Exception: if a non-standard write primitive (negative index, wrong-pointer memcpy/memmove,
   arbitrary-write, or UAF) is evidenced, revisit with explicit proof of the write direction.
-- If suspect_frame_addr < canary_frame_addr (suspect frame is at a lower address, i.e.,
-  a later/inner callee): the suspect's local overflow writes upward and CAN reach the canary
-  at a higher address. This attribution is physically plausible.
-- If suspect_frame_addr == canary_frame_addr: the function corrupted its own canary.
+- If suspect_frame_addr < target_frame_addr (suspect frame is at a lower address, i.e.,
+  a later/inner callee): the suspect's local overflow writes upward and CAN reach the target
+  slot at a higher address. This attribution is physically plausible.
+- If suspect_frame_addr == target_frame_addr: the function corrupted its own frame.
 
 **Self-frame priority rule**:
-- If suspect_frame_addr == canary_frame_addr, prioritize self-frame overflow, inline expansion,
+- If suspect_frame_addr == target_frame_addr, prioritize self-frame overflow, inline expansion,
    or unprotected leaf-callee overwrite before investigating any other frame.
 - Do not pivot to interrupted-path or unrelated caller frames until you can explain why the
-   canary-bearing frame itself is not the primary suspect.
+   corrupted frame itself is not the primary suspect.
 
 Example of INVALID reasoning:
-  "link_path_walk (frame at 0x17c08) overflowed and corrupted the canary of
+  "link_path_walk (frame at 0x17c08) overflowed and corrupted the frame of
    search_module_extables (frame at 0x17a10)"
   -> WRONG: 0x17c08 > 0x17a10, so link_path_walk's frame is at a higher address (earlier caller).
   Its overflow writes toward even higher addresses and cannot reach 0x17a20.
-
-### [STOP] MANDATORY PRE-CONCLUSION GATE (stack_protector_canary)
-
-You MUST execute this gate explicitly and in writing BEFORE stating any final diagnosis or
-naming any overflow source. Failure to complete this gate makes the conclusion invalid.
-
-**Gate Checklist** -- fill in ALL items:
-
-```
-Canary-bearing function    : <name>
-Canary frame address       : 0x<addr>          <- from bt output
-Canary slot address        : 0x<addr>          <- RBP - <offset> from disassembly
-
-For each candidate function you intend to blame:
-  Candidate                : <name>
-  Candidate frame address  : 0x<addr>          <- from bt output
-  Comparison               : candidate (0x<X>) vs canary_slot (0x<Y>)
-  candidate > canary_slot? : YES -> [NO] EXCLUDED (PHYSICALLY IMPOSSIBLE, reject immediately)
-                             NO  -> [OK] Plausible, continue investigation
-```
-
-**Gate Rule**: If candidate frame address > canary frame address -> the candidate is an earlier
-(outer) caller. Its local overflow writes toward higher addresses. It CANNOT reach the canary at
-a lower address. You MUST mark this candidate as EXCLUDED and MUST NOT name it as the overflow
-source in the final diagnosis.
-
-**If all candidates are excluded**: the conclusion MUST state the corruption source as
-indeterminate. Name only the remaining allowed mechanism families (self-frame or callee) as
-the investigation direction. Do NOT default to the most recently disassembled function.
 
 ### CRITICAL: Exception-Path Stack Is Not an Ordinary Call Nest
 
@@ -615,14 +620,14 @@ Mandatory rule:
    locally overflow into a post-exception handler frame, or vice versa.
 - Before using stack-direction arithmetic for causality, first classify each frame as one of:
    interrupted normal-path frame, exception-entry state/pt_regs region, or exception-handler frame.
-- If the candidate source and the corrupted canary are on opposite sides of an exception-entry
+- If the candidate source and the corrupted target slot are on opposite sides of an exception-entry
    boundary, you MUST mark ordinary local-overflow causality as unproven and avoid direct blame
    based only on "lower address means later call".
 
 Example of INVALID reasoning:
    "zone_statistics faulted, then handle_mm_fault and search_module_extables ran later at lower
     addresses, therefore handle_mm_fault is the likely local overflow source because only later
-    frames can overwrite the canary"
+    frames can overwrite the target frame"
    -> INSUFFICIENT: this treats the page-fault path as an ordinary contiguous call nest and ignores
    the interrupted-frame / exception-entry / handler segmentation. The frame provenance must be
    established first.
@@ -641,13 +646,13 @@ Key indicators of nested exception frames:
   execution, not that link_path_walk called it directly.
 
 When analyzing nested exception frames:
-- Treat the canary-bearing function's own frame as the primary investigation target first.
+- Treat the corrupted function's own frame as the primary investigation target first.
 - The exception-handler call chain is additional provenance context, not a default cross-frame
    overflow source.
 - Do not pivot to unrelated interrupted-path callers unless you can prove a concrete write
-   primitive or proven overlap into the canary-bearing function's slot.
+   primitive or proven overlap into the corrupted function's slot.
 - Do NOT upgrade an exception-handler frame to "likely overflow source" merely because it sits
-   at a lower address than the canary frame or than the interrupted frame. First prove that the
+   at a lower address than the corrupted frame or than the interrupted frame. First prove that the
    overwrite mechanism is an active local overwrite rather than reused stack residue, saved-state
    confusion, or a misidentified frame link.
 - Treat deep offsets inside exception-path functions only as control-flow location evidence.
@@ -660,18 +665,19 @@ When analyzing nested exception frames:
 
 Analysis:
 1. Identify the faulting function from the panic string and disassemble it with dis -rl <function>.
-2. Locate the stack canary check point (__stack_chk_fail call site) and determine the canary slot
-   from the disassembly (e.g., rbp-0x18 or similar). Compute the canary's absolute stack address.
+2. Locate the corrupted saved RIP, saved RBP, or local stack slot from the frame-pointer chain and
+   disassembly (or if a `__stack_chk_fail` call site is present, locate its stack slot offset).
+   Compute the corrupted slot's absolute stack address.
 3. Read the task's kernel stack with rd <stack_base> <size> to examine the raw stack content;
-   look for overwritten canary or return address.
+   look for overwritten saved RBP, return address, or local frame state.
 4. Before using any rbp-relative address arithmetic, prove which stack word is the actual saved
    caller RBP and which stack word is the saved RIP. Do NOT assume the bt frame address itself
    is RBP.
 5. **Perform the mandatory causality check**: list all frames with their addresses, identify
    which frames are at lower addresses (later calls) vs higher addresses (earlier calls) relative
-   to the corrupted canary slot. Only frames at LOWER addresses (later calls whose overflow
-   writes upward toward the canary) are physically capable of causing the corruption WITHIN the
-   same proven stack segment. Do not apply this rule across an unproven exception-entry boundary.
+   to the corrupted target slot. Only frames at LOWER addresses (later calls whose overflow
+   writes upward toward the target slot) are physically capable of causing the corruption WITHIN
+   the same proven stack segment. Do not apply this rule across an unproven exception-entry boundary.
 6. Frames prefixed with ? in the backtrace are stack-scan candidates, not reliable frame-pointer
    links; do not treat them as proven callers. However, ? frames from exception handlers
    (e.g., handle_mm_fault, __do_page_fault) are significant because they indicate nested
@@ -696,65 +702,21 @@ Analysis:
 
 ### Active-Frame Overlap Proof
 
-If you claim that a caller's active local object overlaps an active callee canary or local slot,
+If you claim that a caller's active local object overlaps an active callee local slot,
 you must prove the overlap with canonical stack-layout arithmetic:
 
 12. Derive the caller's post-prologue RSP from its prologue exactly: pushes plus local-allocation.
 13. Derive the callee's entry stack position from the call site: call pushes the return address at
     caller_rsp-8, and the callee prologue then moves further downward from there.
-14. Compute the callee canary/local slot from the callee's own prologue and verify that it lies
+14. Compute the callee target local slot from the callee's own prologue and verify that it lies
     below the caller's call-site RSP as required by x86-64 stack discipline.
-15. If an alleged callee canary address lies inside a caller-local range but above the caller's
+15. If an alleged callee slot address lies inside a caller-local range but above the caller's
     call-site RSP, your frame arithmetic is inconsistent. Reject the active-overlap theory and
     re-evaluate whether the address actually belongs to the caller frame, stale residual data, or
     a misidentified saved-frame link.
 
-### Canary Overwrite Value Analysis
-
-When the corrupted canary slot contains a recognizable value (not random garbage), that value
-is a critical forensic clue. Pursue it aggressively:
-
-16. If the canary was overwritten with a task_struct pointer (e.g., current task's address from
-    bt output), this means the overflow code was likely accessing `current` or `current->field`
-    and writing beyond bounds. Next steps:
-    a. Run `task <task_addr>` to expand the task_struct and look for fields whose addresses or
-       values match the stack corruption pattern.
-    b. Identify which kernel functions store `current` (the task pointer) on the stack as a local
-       variable. Search for code paths where `current->xxx` access could produce an OOB write
-       into adjacent stack slots.
-    c. Cross-reference with the call chain: which functions in the active backtrace access
-       task_struct fields that could spill onto the stack at the corrupted offset?
-    d. Treat a `current`-valued canary as a spill-location clue, not as proof by itself. Inspect
-       the disassembly for explicit stack-store instructions that save `current` or a
-       current-derived pointer into a local slot to free registers, including both rbp-relative
-       and rsp-relative forms (for example, `mov %rax, -0x40(%rbp)` or `mov %rax, 0x20(%rsp)`).
-    e. Only escalate this theory after proving slot adjacency: identify the exact saved slot for
-       `current`, identify a neighboring overflow-capable local object or write primitive in the
-       same frame, and show that the overwrite distance could reach that slot. Merely accessing
-       `current` or spilling it somewhere in the frame is insufficient.
-
-17. If the canary was overwritten with a kernel text address, use `sym <value>` and `dis -rl <value>`
-    to identify the function. This may reveal a function pointer copy, callback table, or residual
-    stack payload, but it is NOT proof that the named function was the overflow source.
-    a. First classify the address as a written value: saved return site, copied function pointer,
-       callback table entry, or stale residual stack content.
-    b. Only after establishing how that code pointer could have been materialized on the stack may
-       you use it in writer-provenance reasoning.
-    c. Reject any jump from "handle_mm_fault+0xbfd is on the stack" to "handle_mm_fault caused
-       the overflow" unless a concrete write path, local object, and slot-overlap proof are shown.
-
-18. If the canary was overwritten with a non-symbol kernel address that appears multiple times
-    on the stack, treat it as a corruption fingerprint. Do NOT give up after `sym` fails:
-    a. Run `vtop <address>` to verify whether the page exists, is mapped, and its ownership.
-    b. Run `kmem -p <translated_PA>` to check the physical page state (slab, anonymous, reserved).
-    c. If the page belongs to a specific subsystem or memory pool, that narrows the corruption
-       source significantly.
-    d. Check whether the value could be a per-CPU pointer, module data address, or vmalloc region
-       address by comparing against known address ranges.
-
 ### Stack Reuse and Prior-Frame Pollution Mechanism
 
-[STOP] **CANARY INVARIANT REMINDER**: {CANARY_RESIDUAL_DATA_RULE} {CANARY_SLOT_ONLY_SCOPE_NOTE}
 The following discussion of residual stack data applies to corruption of saved-RBP, saved-RIP,
 and non-canary local variables.
 
@@ -796,8 +758,6 @@ non-canary frame data:
     c. If a prior-occupant function had an off-by-one or boundary error that wrote past its
        frame into adjacent stack space, the residue would persist and be discoverable when
        the slot is reused.
-    d. [STOP] {CANARY_RESIDUAL_DATA_RULE} {CANARY_SLOT_ONLY_SCOPE_NOTE} For __stack_chk_fail
-       cases, focus on self-frame overflow (mechanism 25a) instead.
 
 20a. **Analyze the active call chain before exception-path blame**:
     a. If the panic task is still on a coherent syscall path such as sys_open -> do_filp_open ->
@@ -810,16 +770,12 @@ non-canary frame data:
        incomplete and must remain non-conclusive.
 
 21. **Residual data pattern matching**: Compare corrupted stack data and surrounding bytes
-    against known kernel data patterns. For NON-CANARY slots (saved RBP, saved RIP, locals),
-    residual data from prior functions is a valid corruption source. For the CANARY SLOT,
-    residual data is irrelevant -- the prologue overwrites it; only in-execution writes matter.
-    a. task_struct pointer at canary slot -> the canary-bearing function (or its active callee)
-       accessed `current` and an OOB write during execution spilled it into the canary slot;
-       NOT residual data from a prior function
-    b. task_struct pointer at non-canary slot -> prior function may have stored `current` as
-       residual, or active function spilled it
-    c. Repeated non-symbol addresses -> structure copy or memcpy overflow from a known object
-    d. Contiguous validated string object -> only then consider string-copy style overflow; an
+    against known kernel data patterns. For non-canary slots (saved RBP, saved RIP, locals),
+    residual data from prior functions is a valid corruption source.
+    a. task_struct pointer at the corrupted non-canary slot -> prior function may have stored
+       `current` as residual, or the active function spilled it
+    b. Repeated non-symbol addresses -> structure copy or memcpy overflow from a known object
+    c. Contiguous validated string object -> only then consider string-copy style overflow; an
        isolated ASCII-decodable 8-byte word is only a weak clue and cannot establish pathname,
        filename, or userspace-string provenance by itself
 
@@ -844,36 +800,39 @@ following:
     c. If the evidence is only "these 8 bytes decode as ASCII", explicitly reject pathname
        attribution as unproven.
 
-### Mandatory Mechanism Closure For Meaningful Canary Values
+### Mandatory Mechanism Closure For Corrupted Non-Canary Stack Slots
 
-If the canary slot contains a meaningful kernel pointer such as current task_struct, a stable
-object pointer, or a repeated non-random value, you are NOT allowed to stop at naming that value.
-Before final diagnosis, you must explicitly work through this closure checklist:
+If a corrupted non-canary stack slot (saved RIP, saved RBP, or local slot) contains a meaningful
+kernel pointer such as current task_struct, a stable object pointer, or a repeated non-random
+value, you are NOT allowed to stop at naming that value. Before final diagnosis, work through
+this closure checklist:
 
-24. **Pre-fault interrupted-path reconstruction**:
+24. **Pre-fault interrupted-path and value-source reconstruction (NON-CANARY SLOTS ONLY)**:
     a. Reconstruct the normal call chain that was executing before the page fault or exception
        handler began.
-    b. Identify which deeper functions in that interrupted path had already returned before the
-       exception path reused the low-address stack region.
+    b. For non-canary slots only (saved RBP, saved RIP, or local variables -- NEVER for a
+       `__stack_chk_fail` canary slot), identify whether deeper functions in that interrupted
+       path had already returned before the exception path reused the low-address stack region.
     c. Prefer candidate functions that could plausibly materialize `current`, `current->field`,
        validated string objects, or copied structure fields on the stack.
 
 25. **Mechanism triage**: evaluate the following mechanism families, not just one:
-    a. self-frame local overflow: the canary-bearing function itself (or an inlined/unprotected
-       leaf callee) performed an out-of-bounds write that reached the canary slot. THIS IS THE
+    a. self-frame local overflow: the corrupted frame itself (or an inlined/unprotected leaf
+       callee) performed an out-of-bounds write that reached the target slot. THIS IS THE
        DEFAULT AND MOST COMMON MECHANISM and must be evaluated FIRST;
     b. exception-path local overwrite: a function in the exception/page-fault path wrote past its
-       own local bounds into the canary slot;
+       own local bounds into the target slot;
     c. current-pointer spill/copy overflow: some function stored `current` or `current->xxx` in a
-       local stack slot and then copied or wrote beyond that slot;
-   d. [STOP] {CANARY_RESIDUAL_DATA_RULE} {CANARY_SLOT_ONLY_SCOPE_NOTE}
+       local stack slot and then copied or wrote beyond that slot.
 
 26. **Conclusive-output gate**:
-    a. Do not set is_conclusive=true unless at least one mechanism family above has positive
-       supporting evidence from stack bytes, frame layout, disassembly, or call-chain timing.
+    a. Note that `stack_corruption` currently has no registered executor gate policy in `_REQUIRED_GATES`;
+       therefore, when no gate policy is registered for the active signature class, do NOT claim
+       `is_conclusive=true` -- summarize bounded non-conclusive findings once at least one mechanism
+       family above is supported by stack bytes, frame layout, disassembly, or call-chain timing.
     b. For the remaining mechanism families, explicitly state whether they are weakened by
        address-direction causality, weakened by stack-layout evidence, or still open because the
        partial dump prevents closure.
-    c. A statement such as "canary overwritten with task_struct pointer, therefore likely kernel
-       bug in handle_mm_fault" is insufficient and must be treated as non-conclusive.""".strip(),
+    c. A statement such as "stack slot overwritten with task_struct pointer, therefore likely
+       kernel bug in handle_mm_fault" is insufficient and must be treated as non-conclusive.""".strip(),
 }

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import uuid
-import yaml
 import json
 import asyncio
 from pathlib import Path
@@ -12,8 +11,8 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 from langchain_core.runnables import RunnableConfig
 from src.utils.logging import logger
-from src.utils.config import config_manager
-from src.llm.model import create_reasoning_llm, create_structured_llm
+from src.utils.settings import get_settings
+from src.llm.model import create_reasoning_llm
 from src.react import (
     AgentState,
     create_agent_graph,
@@ -97,7 +96,6 @@ def validate_file_paths(request: VmcoreAnalysisRequest) -> Optional[str]:
 # 全局变量存储初始化的组件
 app_state: dict[str, Any] = {
     "reasoning_llm": None,
-    "structured_llm": None,
     "mcp_tools": None,
     "agent_graph": None,
 }
@@ -107,17 +105,11 @@ app_state: dict[str, Any] = {
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     logger.info("Starting vmcore-analysis-agent server...")
-    logger.info(
-        f"config: \n{yaml.dump(config_manager.get_all(), allow_unicode=True, sort_keys=False)}"
-    )
+    logger.info(f"settings: {get_settings().masked_summary()}")
 
-    # 初始化 推理 LLM
+    # 初始化推理 LLM
     app_state["reasoning_llm"] = create_reasoning_llm()
     logger.info(f"LLM Model: {app_state['reasoning_llm'].model_name}")
-
-    # 初始化结构化 LLM（用于结构化 Reasoner 的纯文本推理内容）
-    app_state["structured_llm"] = create_structured_llm()
-    logger.info(f"Chat LLM Model: {app_state['structured_llm'].model_name}")
 
     # 初始化工具
     logger.info("Initializing MCP tools via auto discovery...")
@@ -128,11 +120,10 @@ async def lifespan(app: FastAPI):
     else:
         logger.info(f"Loaded {len(app_state['mcp_tools'])} MCP tools successfully.")
 
-    # 创建 agent 图
+    # 创建 agent 图（推理与结构化兜底共用同一个 LLM 实例）
     app_state["agent_graph"] = create_agent_graph(
         app_state["reasoning_llm"],
         app_state["mcp_tools"] or [],
-        structured_llm=app_state["structured_llm"],
     )
     logger.info("Agent graph created successfully.")
 
@@ -144,7 +135,7 @@ async def lifespan(app: FastAPI):
 
     # 放到这段代码里，语义基本就是：
     # 启动时：
-    #   初始化 reasonining_llm、structured_llm、mcp_tools、agent_graph
+    #   初始化 reasoning_llm、mcp_tools、agent_graph
     # 服务运行中：
     #   应用开始接收 /health、/analyze、/analyze/stream 请求
     # 关闭时：
@@ -238,6 +229,7 @@ async def analyze_vmcore(request: VmcoreAnalysisRequest):
             "evidence_delta": [],
             "evidence_facts": [],
             "value_conflicts": [],
+            "value_conflict_audit_counts": {},
             "replan_required": False,
             "current_evidence_goal": None,
             "evidence_goal_version": 0,
@@ -365,6 +357,7 @@ async def analyze_vmcore_stream(request: VmcoreAnalysisRequest):
                 "force_terminal_wrapup": False,
                 "evidence_delta": [],
                 "value_conflicts": [],
+                "value_conflict_audit_counts": {},
                 "evidence_facts": [],
                 "replan_required": False,
                 "current_evidence_goal": None,

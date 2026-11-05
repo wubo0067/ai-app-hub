@@ -19,6 +19,10 @@ _VTOP_UNMAPPED_RE = re.compile(
     rf"^\s*(?P<address>{_HEX})\s+\(not mapped\)\s*$",
     re.IGNORECASE,
 )
+_VTOP_MAPPED_RE = re.compile(
+    rf"^\s*(?P<virtual>{_HEX})\s+(?P<physical>{_HEX})\s*$",
+    re.IGNORECASE,
+)
 _VTOP_PTE_RE = re.compile(
     rf"^\s*PTE:\s*(?:{_HEX}\s*=>\s*)?(?P<value>{_HEX})\s*$",
     re.IGNORECASE,
@@ -52,20 +56,31 @@ _GATE_COMPLETION_CRITERIA: dict[str, list[str]] = {
         "struct field layout evidence is present",
         "a type or symbol observation corroborates the field classification",
     ],
-    "external_corruption_gate": [
-        "the local corruption exclusion prerequisite is closed",
-        "at least one concrete external-source observation is present",
-    ],
 }
 
 
-def gate_completion_criteria(gate_name: str) -> list[str]:
+def gate_completion_criteria(
+    gate_name: str, required_for: Iterable[str] = ()
+) -> list[str]:
     """Return executor-owned, human-readable completion criteria for a gate."""
-    return list(
-        _GATE_COMPLETION_CRITERIA.get(
-            gate_name, ["at least one concrete structured evidence fact is present"]
-        )
-    )
+    signature_classes = set(required_for)
+    if gate_name == "object_lifetime" and "page_not_present" in signature_classes:
+        return [
+            "the executor currently has no closure rule for this signature-specific gate; "
+            "address-linked mapping teardown or lifetime evidence extraction is not implemented"
+        ]
+    if gate_name == "external_corruption_gate":
+        return [
+            "the executor rule requires local_corruption_exclusion to be verified and an "
+            "external_source fact, but extraction of external_source facts is not implemented; "
+            "a protocol-template decode alone therefore cannot close this optional gate"
+        ]
+    criteria = _GATE_COMPLETION_CRITERIA.get(gate_name)
+    if criteria is not None:
+        return list(criteria)
+    return [
+        "no executor closure rule is defined; structured facts are telemetry only"
+    ]
 
 
 def evaluate_gate_closures(
@@ -105,32 +120,92 @@ def evaluate_gate_closures(
             else raw_gate
         )
         prior = prior_gates.get(gate_name)  # 获取该门控先前的状态
-        prior_status = getattr(prior, "status", None)  # 先前的状态
+        gate_scope = set(getattr(gate, "required_for", []))
+        prior_scope = set(getattr(prior, "required_for", []))
+        prior_applies = bool(gate_scope & prior_scope)
+        prior_status = (
+            getattr(prior, "status", None) if prior_applies else None
+        )
+        prior_basis = (
+            getattr(prior, "closure_basis", None) if prior_applies else None
+        )
+        requested_evidence = getattr(gate, "evidence", None) or ""
+        gate.evidence = (
+            getattr(prior, "evidence", None) if prior_applies else None
+        )
         requested_status = getattr(gate, "status", "open")  # LLM 请求的状态
+        required_for = getattr(gate, "required_for", [])
         gate.completion_criteria = gate_completion_criteria(
-            gate_name
+            gate_name, required_for
         )  # 设置该门控的完成准则
 
-        if prior_status in {"closed", "n/a"}:
-            # 如果门控之前已经是关闭或不可用状态，保持现状
+        if prior_status == "closed" and prior_basis == "executor_evidence":
             gate.status = prior_status
-        elif _gate_criteria_satisfied(gate_name, fact_set, evaluated):
-            # 如果当前证据已满足门控的完成准则，则将其设为关闭
+            gate.closure_basis = prior_basis
+        elif prior_status == "n/a" and prior_basis == "executor_na":
+            gate.status = prior_status
+            gate.closure_basis = prior_basis
+        elif _gate_criteria_satisfied(
+            gate_name, fact_set, evaluated, required_for
+        ):
             gate.status = "closed"
-        elif requested_status == "closed":
-            # 如果 LLM 请求关闭门控，但证据并不足以满足准则
-            if not _gate_criteria_satisfied(gate_name, fact_set, evaluated):
-                gate.status = prior_status or "open"  # 拒绝关闭，回退到先前状态或 open
+            gate.closure_basis = "executor_evidence"
+            executor_facts = sorted(
+                fact for fact in fact_set if _fact_supports_gate(fact, gate_name)
+            )
+            if executor_facts:
+                gate.evidence = "\n".join(
+                    f"[executor-evidence] {fact}" for fact in executor_facts
+                )
+        else:
+            gate.status = (
+                prior_status if prior_status in {"open", "blocked"} else "open"
+            )
+            gate.closure_basis = None
+
+            if requested_status == "closed":
                 transitions.append(
                     {
                         "gate_name": gate_name,
                         "from_status": prior_status or "open",
-                        "to_status": "open",
-                        "event": "llm_close_rejected",  # 记录为 LLM 关闭请求被拒绝
+                        "to_status": gate.status,
+                        "event": "llm_close_rejected",
                         "reason": "completion criteria not satisfied by structured evidence",
+                        "requested_status": requested_status,
+                        "requested_evidence": requested_evidence,
                         "evidence_facts": sorted(fact_set),
                     }
                 )
+            elif not has_executor_closure_rule(
+                gate_name, required_for
+            ) and any(
+                _fact_supports_gate(fact, gate_name) for fact in fact_set
+            ):
+                transitions.append(
+                    {
+                        "gate_name": gate_name,
+                        "from_status": gate.status,
+                        "to_status": gate.status,
+                        "event": "weak_gate_closure",
+                        "reason": "structured facts are telemetry only; no executor closure rule is defined",
+                        "evidence_facts": sorted(fact_set),
+                    }
+                )
+        if requested_status == "n/a" and not (
+            gate.status == "n/a" and gate.closure_basis == "executor_na"
+        ):
+            transitions.append(
+                {
+                    "gate_name": gate_name,
+                    "from_status": prior_status or "open",
+                    "to_status": gate.status,
+                    "event": "llm_na_rejected",
+                    "reason": "not-applicable status requires an executor-owned rule",
+                    "requested_status": requested_status,
+                    "requested_evidence": requested_evidence,
+                    "evidence_facts": sorted(fact_set),
+                }
+            )
         evaluated[gate_name] = gate  # 将评估后的门控存入结果字典
 
         current_status = getattr(gate, "status", "open")
@@ -142,7 +217,7 @@ def evaluate_gate_closures(
                     "from_status": prior_status,
                     "to_status": current_status,
                     "event": "gate_transition",
-                    "reason": "evidence evaluator",
+                    "reason": "executor evidence rule satisfied",
                     "evidence_facts": sorted(fact_set),
                 }
             )
@@ -154,6 +229,7 @@ def _gate_criteria_satisfied(
     gate_name: str,
     facts: set[str],
     evaluated_gates: Mapping[str, Any],
+    required_for: Iterable[str] = (),
 ) -> bool:
     """
     判断当前提取到的结构化事实是否满足指定门控（gate）的闭合准则。
@@ -170,8 +246,8 @@ def _gate_criteria_satisfied(
         bool: 如果满足该门控的所有证据要求及前置条件则返回 True，否则返回 False。
     """
     if gate_name == "object_lifetime":
-        if "lifetime_proof:kasan_use_after_free" in facts:
-            return True
+        if "page_not_present" in set(required_for):
+            return False
         slab_addresses = {
             fact.split(":", 1)[1].split("=", 1)[0]
             for fact in facts
@@ -183,6 +259,12 @@ def _gate_criteria_satisfied(
             if fact.startswith("rd_word:")
         }
         return bool(slab_addresses & object_addresses)
+
+    if gate_name == "external_corruption_gate":
+        prerequisite = evaluated_gates.get("local_corruption_exclusion")
+        if prerequisite is None or getattr(prerequisite, "status", None) != "closed":
+            return False
+        return any(fact.startswith("external_source:") for fact in facts)
 
     # 统计当前事实集合中命中了哪些维度的证据类别：
     # - "rd": 内存读取证据（以 "rd_word:" 开头，记录指定地址的字值）
@@ -206,24 +288,30 @@ def _gate_criteria_satisfied(
         "register_provenance": [{"rd"}, {"dis", "sym"}],
         "local_corruption_exclusion": [{"dis"}, {"rd"}],
         "field_type_classification": [{"struct"}, {"sym"}],
-        "external_corruption_gate": [{"rd", "struct", "dis", "sym"}],
-    }.get(gate_name, [{"rd", "struct", "dis", "sym"}])
-
-    # 外部破坏门控（external_corruption_gate）具有前置依赖：
-    # 必须先确认局部破坏排除门控（local_corruption_exclusion）已关闭（closed）或不适用（n/a）
-    if gate_name == "external_corruption_gate":
-        prerequisite = evaluated_gates.get("local_corruption_exclusion")
-        if prerequisite is None or getattr(prerequisite, "status", None) not in {
-            "closed",
-            "n/a",
-        }:
-            return False
+    }.get(gate_name)
+    if required_groups is None:
+        return False
 
     # 检查是否所有必需的证据组都得到了满足：
     # 每个 group 只要包含的类别中有至少一项为 True，则该 group 计数加 1
     return sum(
         any(categories[name] for name in group) for group in required_groups
     ) >= len(required_groups)
+
+
+def has_executor_closure_rule(
+    gate_name: str, required_for: Iterable[str] = ()
+) -> bool:
+    if gate_name == "object_lifetime" and "page_not_present" in set(required_for):
+        return False
+    # external_corruption_gate 的规则已定义，但 external_source 事实抽取尚未实现，
+    # 因此当前没有可执行能力；接入抽取器后把该门控加回此集合。
+    return gate_name in {
+        "register_provenance",
+        "object_lifetime",
+        "local_corruption_exclusion",
+        "field_type_classification",
+    }
 
 
 def extract_evidence_facts(
@@ -251,7 +339,7 @@ def extract_evidence_facts(
         - dis 命令 → "dis_instruction:0x<address>=<mnemonic>"、"dis_symbol:<symbol>"
         - sym 命令 → "sym:<symbol>@0x<address>:<kind>"
         - kmem -S 命令 → "kmem_slab_state:0x<address>=allocated|free"
-        - KASAN UAF 报告 → "lifetime_proof:kasan_use_after_free"
+        - KASAN UAF 报告 → unbound lifetime signal (telemetry only)
 
         如果命令类型不受支持或输出中无有效内容，则返回空集合。
     """
@@ -260,7 +348,7 @@ def extract_evidence_facts(
     commands = _command_lines(tool_name, raw_args)
     facts: set[str] = set()
     if _KASAN_UAF_RE.search(output):
-        facts.add("lifetime_proof:kasan_use_after_free")
+        facts.add("lifetime_signal:kasan_use_after_free_unbound")
 
     for command in commands:
         # 提取命令的第一个单词（命令名），转为小写以统一匹配
@@ -401,6 +489,44 @@ def _command_lines(tool_name: str, raw_args: Any) -> list[str]:
     return [line.strip() for line in str(script).splitlines() if line.strip()]
 
 
+def _extract_ascii_facts(byte_map: Mapping[int, int]) -> set[str]:
+    """Extract bounded printable-string facts from reconstructed ``rd`` bytes."""
+    facts: set[str] = set()
+    ordered = sorted(byte_map)
+    if not ordered:
+        return facts
+
+    max_strings = 8
+    index = 0
+    while index < len(ordered) and len(facts) < max_strings:
+        run_start = ordered[index]
+        run = bytearray()
+        previous = run_start
+        while index < len(ordered):
+            address = ordered[index]
+            if address != previous + 1:
+                if run:
+                    break
+                run_start = address
+            byte = byte_map[address]
+            if 0x20 <= byte <= 0x7E:
+                run.append(byte)
+            else:
+                if len(run) >= 8:
+                    facts.add(
+                        f"rd_ascii:0x{run_start:x}={run.decode('ascii')}"
+                    )
+                    if len(facts) >= max_strings:
+                        return facts
+                run = bytearray()
+                run_start = address + 1
+            previous = address
+            index += 1
+        if len(run) >= 8:
+            facts.add(f"rd_ascii:0x{run_start:x}={run.decode('ascii')}")
+    return facts
+
+
 def _parse_rd(output: str) -> set[str]:
     """
     解析 ``rd``（内存读取）命令的输出并提取事实（facts）。
@@ -412,7 +538,9 @@ def _parse_rd(output: str) -> set[str]:
 
     该函数将每个字与其所在地址关联，生成格式为
     ``rd_word:0x<address>=0x<value>`` 的事实。由于 64 位内核中每个字占 8 字节，
-    第 index 个字的地址为 ``起始地址 + index * 8``。
+    第 index 个字的地址为 ``起始地址 + index * 8``。连续原始内存中长度不少于
+    8 的可打印字符串还会生成 ``rd_ascii:0x<address>=<text>`` 事实，作为字符串
+    线索，不代表协议语义已被验证。
 
     Args:
         output (str): ``rd`` 命令的标准输出字符串。
@@ -421,6 +549,7 @@ def _parse_rd(output: str) -> set[str]:
         set[str]: 包含提取出的内存字事实的集合。
     """
     facts: set[str] = set()
+    byte_map: dict[int, int] = {}
     for line in output.splitlines():
         # 匹配 "地址: 数据..." 格式的行，例如 "ffff0000: 0000000000000010 ..."
         match = _RD_LINE_RE.match(line)
@@ -438,7 +567,13 @@ def _parse_rd(output: str) -> set[str]:
         # 每个字按其实际内存地址（起始地址 + 序号*8字节）记录一条事实，
         # 数值统一规范化为十六进制输出
         for index, word in enumerate(words):
-            facts.add(f"rd_word:0x{address + index * 8:x}=0x{_to_int(word):x}")
+            value = _to_int(word)
+            facts.add(f"rd_word:0x{address + index * 8:x}=0x{value:x}")
+            if value < (1 << 64):
+                for offset, byte in enumerate(value.to_bytes(8, "little")):
+                    byte_map[address + index * 8 + offset] = byte
+    # ASCII 只作为可读字符串线索；协议语义仍需按文档 bit layout 解码。
+    facts.update(_extract_ascii_facts(byte_map))
     return facts
 
 
@@ -538,6 +673,8 @@ def _parse_vtop(output: str) -> set[str]:
        说明该虚拟地址在当前页表中没有对应的物理页。
     2. 页表项（PTE）值 → 生成 ``vtop_pte:0x<value>`` 事实，
        记录该地址对应的页表项内容（可用于判断页面权限、有效性等）。
+    3. 已映射地址 → 生成 ``vtop_phys:0x<virtual>=0x<physical>`` 事实，
+       供 Slab 页边界和 4KB 对齐分析使用。
 
     Args:
         output (str): ``vtop`` 命令的标准输出字符串。
@@ -553,6 +690,13 @@ def _parse_vtop(output: str) -> set[str]:
             # 将地址转换为整数后以十六进制规范化输出
             address = _to_int(unmapped.group("address"))
             facts.add(f"vtop_unmapped:0x{address:x}")
+            continue
+
+        mapped = _VTOP_MAPPED_RE.match(line)
+        if mapped:
+            virtual = _to_int(mapped.group("virtual"))
+            physical = _to_int(mapped.group("physical"))
+            facts.add(f"vtop_phys:0x{virtual:x}=0x{physical:x}")
             continue
 
         # 尝试匹配 PTE 行，例如 "PTE: 0x123456789" 或 "PTE: 0x123 => 0x456"
@@ -629,13 +773,19 @@ def _fact_supports_gate(fact: str, gate_name: str) -> bool:
     if gate_name == "register_provenance":
         return fact.startswith(("rd_word:", "dis_", "sym:", "vtop_"))
     if gate_name == "local_corruption_exclusion":
-        return fact.startswith(("dis_", "rd_word:", "vtop_", "kmem_"))
+        return fact.startswith(
+            ("dis_", "rd_word:", "rd_ascii:", "vtop_", "kmem_")
+        )
     if gate_name == "field_type_classification":
         return fact.startswith(("struct_", "sym:"))
     if gate_name == "object_lifetime":
-        return fact.startswith(("lifetime_proof:", "kmem_slab_state:"))
+        return fact.startswith(("kmem_slab_state:", "rd_word:"))
+    if gate_name == "external_corruption_gate":
+        return fact.startswith("external_source:")
     # 兜底：未知门控接受所有已知前缀的事实
-    return fact.startswith(("rd_word:", "struct_", "dis_", "sym:", "vtop_", "kmem_"))
+    return fact.startswith(
+        ("rd_word:", "rd_ascii:", "struct_", "dis_", "sym:", "vtop_", "kmem_")
+    )
 
 
 def _to_int(value: str) -> int:

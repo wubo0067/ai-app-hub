@@ -13,9 +13,14 @@ from datetime import datetime
 from typing import Any, List, Optional
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, SystemMessage
 from .graph_state import AgentState
+from .evidence import has_executor_closure_rule
 from .output_parser import render_action_arguments
-from .schema import VMCoreAnalysisStep
-from src.utils.config import config_manager
+from .schema import (
+    VMCoreAnalysisStep,
+    gate_resolution_state,
+    required_gates_for,
+)
+from src.utils.settings import get_reasoning_model_name
 from src.utils.logging import logger
 
 
@@ -94,14 +99,14 @@ _ZH_GATE_STATUS_LABELS = {
     "closed": "✅ 已确认",
     "open": "⚠️ 待确认",
     "blocked": "⏸ 受阻",
-    "n/a": "➖ 不适用",
+    "n/a": "➖ 预留（当前未启用）",
 }
 
 _EN_GATE_STATUS_LABELS = {
     "closed": "✅ Verified",
     "open": "⚠️ Pending",
     "blocked": "⏸ Blocked",
-    "n/a": "➖ Not applicable",
+    "n/a": "➖ Reserved (not currently enabled)",
 }
 
 
@@ -132,8 +137,8 @@ def generate_markdown_report(state: AgentState) -> str:
 
     lines = []
 
-    # 直接从配置中获取模型名称
-    model_name = str(config_manager.get("llm_model", "unknown")).lower()
+    # 从运行配置中获取模型名称
+    model_name = get_reasoning_model_name().lower()
 
     # 标题和基本信息
     lines.append("# VMCore 分析报告")
@@ -449,7 +454,7 @@ def _append_verification_summary(
     在报告结尾追加面向读者的验证状态摘要。
 
     只说明哪些关键环节已被确定性证据确认、哪些仍未确认，不暴露 gate 名称、
-    完成条件等 executor 内部记账细节（完整记录见独立审计文件）。
+    完成条件等执行器记账细节（完整记录见单独返回的审计报告）。
     """
     gates = state.get("managed_gates") or {}
     item_labels = (
@@ -461,16 +466,32 @@ def _append_verification_summary(
     lines.append("")
 
     if not gates:
-        lines.append(
-            "本次分析未启用结构化证据验证环节。"
-            if zh_mode
-            else "No structured evidence verification checkpoints were enabled for this analysis."
+        resolution = gate_resolution_state(
+            state.get("current_signature_class"), state.get("managed_gates")
         )
+        if resolution == "unclassified":
+            message = (
+                "当前签名类别尚未分类或没有已注册的门控策略；不能据此视为验证通过，结论不得标记为定论。"
+                if zh_mode
+                else "The signature class is unclassified or has no registered gate policy; this does not mean verification passed, and the result must not be treated as conclusive."
+            )
+        else:
+            message = (
+                "当前签名需要结构化证据验证，但必需门控状态尚未初始化；不能据此视为验证通过，结论不得标记为定论。"
+                if zh_mode
+                else "Structured evidence verification is required for this signature, but its mandatory gate state is not initialized; this does not mean verification passed, and the result must not be treated as conclusive."
+            )
+        lines.append(message)
         lines.append("")
         return
 
-    for gate_name, raw_gate in gates.items():
-        status = str(_gate_field(raw_gate, "status", "open"))
+    required_gate_names = required_gates_for(state.get("current_signature_class"))
+    verification_gate_names = (
+        required_gate_names if required_gate_names is not None else list(gates)
+    )
+    for gate_name in verification_gate_names:
+        raw_gate = gates.get(gate_name)
+        status = str(_gate_field(raw_gate, "status", "unregistered"))
         label = item_labels.get(gate_name, gate_name)
         mark = status_labels.get(status, status)
         lines.append(f"- **{label}**：{mark}" if zh_mode else f"- **{label}**: {mark}")
@@ -484,11 +505,21 @@ def _append_verification_summary(
         )
         lines.append("")
 
-    unverified = [
-        gate_name
-        for gate_name, raw_gate in gates.items()
-        if str(_gate_field(raw_gate, "status", "open")) not in ("closed", "n/a")
-    ]
+    unverified: List[str] = []
+    for gate_name in verification_gate_names:
+        raw_gate = gates.get(gate_name)
+        if raw_gate is None or not (
+            (
+                str(_gate_field(raw_gate, "status", "open")) == "closed"
+                and _gate_field(raw_gate, "closure_basis", None)
+                == "executor_evidence"
+            )
+            or (
+                str(_gate_field(raw_gate, "status", "open")) == "n/a"
+                and _gate_field(raw_gate, "closure_basis", None) == "executor_na"
+            )
+        ):
+            unverified.append(gate_name)
     if unverified:
         if zh_mode:
             names = "、".join(item_labels.get(name, name) for name in unverified)
@@ -503,18 +534,43 @@ def _append_verification_summary(
                 f"deterministic evidence ({names}). Related conclusions are inferences from the "
                 "available evidence and should be reviewed against the separate audit record."
             )
-    else:
-        lines.append(
-            "✅ 全部关键验证环节均已获得确定性证据支持。"
-            if zh_mode
-            else "✅ All key verification checkpoints are backed by deterministic evidence."
+    signature_class = state.get("current_signature_class")
+    unsupported_required = [
+        gate_name
+        for gate_name in verification_gate_names
+        if not has_executor_closure_rule(
+            gate_name,
+            _gate_field(gates.get(gate_name), "required_for", None)
+            or ([signature_class] if signature_class is not None else []),
         )
+    ]
+    if unsupported_required:
+        names = "、".join(
+            item_labels.get(name, name) for name in unsupported_required
+        )
+        lines.append(
+            (
+                f"⚠️ **规则能力限制**：{names} 的执行器闭合规则尚未实现；"
+                "继续收集当前未被规则支持的证据也不能关闭这些门控，本次分析无法形成定论。"
+                if zh_mode
+                else f"⚠️ **Rule coverage limitation**: executor closure rules for {', '.join(item_labels.get(name, name) for name in unsupported_required)} are not implemented. Collecting evidence unsupported by the current rules cannot close these gates, so this analysis cannot be conclusive."
+            )
+        )
+    else:
+        if not unverified and gate_resolution_state(
+            state.get("current_signature_class"), state.get("managed_gates")
+        ) == "satisfied":
+            lines.append(
+                "✅ 全部关键验证环节均已获得确定性证据支持。"
+                if zh_mode
+                else "✅ All key verification checkpoints are backed by deterministic evidence."
+            )
     lines.append("")
 
 
 def generate_gate_audit_report(state: AgentState) -> str:
     """
-    生成独立的 Gate 审计文档（executor 内部记账，不写入面向读者的分析报告）。
+    生成独立的 Gate 审计文档（与面向读者的分析报告分开，由 API 返回）。
 
     Args:
         state: AgentState
@@ -524,6 +580,9 @@ def generate_gate_audit_report(state: AgentState) -> str:
     """
     gates = state.get("managed_gates") or {}
     history = state.get("gate_transition_history") or []
+    required_gate_names = set(
+        required_gates_for(state.get("current_signature_class")) or []
+    )
     if not gates and not history:
         return ""
 
@@ -533,8 +592,8 @@ def generate_gate_audit_report(state: AgentState) -> str:
     lines.append(f"**生成时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append("")
     lines.append(
-        "本文件记录 executor 内部的证据 gate 状态、完成条件与状态转换历史；"
-        "面向读者的分析报告只包含对应的验证状态摘要。"
+        "本文件记录执行器判定的证据 gate 状态、完成条件与状态转换历史，"
+        "并作为独立审计报告交付给 API 调用方；面向读者的分析报告只包含对应的验证状态摘要。"
     )
     lines.append("")
 
@@ -545,6 +604,13 @@ def generate_gate_audit_report(state: AgentState) -> str:
             lines.append(f"### {gate_name}")
             lines.append("")
             lines.append(f"- **状态**: {_gate_field(raw_gate, 'status', 'unknown')}")
+            if gate_name in required_gate_names:
+                lines.append("- **策略角色**: 必需门控")
+            else:
+                lines.append("- **策略角色**: 可选门控（不阻止定论）")
+            closure_basis = _gate_field(raw_gate, "closure_basis", None)
+            if closure_basis:
+                lines.append(f"- **判定来源**: {closure_basis}")
             required_for = _gate_field(raw_gate, "required_for", []) or []
             if required_for:
                 names = ", ".join(str(item) for item in required_for)
@@ -572,10 +638,16 @@ def generate_gate_audit_report(state: AgentState) -> str:
             to_status = transition.get("to_status", "unknown")
             event = transition.get("event", "gate_transition")
             reason = transition.get("reason", "")
+            requested_status = transition.get("requested_status")
+            requested_evidence = transition.get("requested_evidence")
             lines.append(
                 f"- `{gate_name}`: `{from_status}` -> `{to_status}` "
                 f"({event}){': ' + str(reason) if reason else ''}"
             )
+            if requested_status:
+                lines.append(f"  - LLM requested status: {requested_status}")
+            if requested_evidence:
+                lines.append(f"  - LLM requested evidence: {requested_evidence}")
         lines.append("")
 
     return "\n".join(lines)

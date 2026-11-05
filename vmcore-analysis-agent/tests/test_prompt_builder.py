@@ -22,7 +22,10 @@ OPEN_GATE = {
 }
 CLOSED_GATE = {
     "register_provenance": GateEntry(
-        status="closed", evidence="rd+dis", required_for=["null_deref"]
+        status="closed",
+        evidence="rd+dis",
+        required_for=["null_deref"],
+        closure_basis="executor_evidence",
     )
 }
 ALL_DIMENSION_FACTS = [
@@ -76,7 +79,154 @@ class ReplanProbeMenuTests(unittest.TestCase):
         self.assertIn("all mandatory gates are closed but no root cause", rendered)
         self.assertIn("Gate closure is not root-cause proof", rendered)
         self.assertIn("signature_class=null_deref", rendered)
+        self.assertIn("Synthesize your closed gates now", rendered)
         self.assertIn("Pivot requirement", rendered)
+
+    def test_layer0_system_contains_bounded_uncertainty_and_payload_rules(self) -> None:
+        from src.react.layer0_system import LAYER0_SYSTEM_PROMPT_TEMPLATE
+        from src.react.playbooks import PLAYBOOKS
+        from src.react.prompt_builder import build_analysis_system_prompt
+        from src.react.prompts import simplified_structure_reasoning_prompt
+        from src.react.sop_fragments import SOP_FRAGMENTS
+
+        self.assertIn("Bounded uncertainty convergence", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        self.assertIn("Corrupted payload handling", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        self.assertIn("CORRUPTED PAYLOAD", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        self.assertIn("coherent, documented protocol template", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        self.assertIn("candidate writers", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        self.assertIn("Bounded low-confidence convergence is always preferred", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        # N3: Neither LAYER0 nor the assembled prompt may recommend "memory_corruption" alongside pointer_corruption
+        self.assertNotIn('"pointer_corruption" or "memory_corruption"', LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        assembled = build_analysis_system_prompt(BASE_STATE, is_last_step=False)
+        self.assertNotIn('"pointer_corruption" or "memory_corruption"', assembled)
+        self.assertNotIn('`"pointer_corruption"` or `"memory_corruption"`', assembled)
+        # B1: struct dot syntax must be explicitly permitted in both LAYER0 and simplified_structure_reasoning_prompt
+        self.assertIn("struct <type>.<field>[,<field>] <addr>", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        self.assertIn("struct <type>.<field>[,<field>] <addr>", simplified_structure_reasoning_prompt())
+        # B3: CR2 classification in step 5 and #PF vs #GP rules must be conditionalized
+        self.assertIn("For a General Protection Fault (#GP), the CPU does NOT update CR2", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        self.assertIn("fault-address classification (#PF CR2 / #GP non-canonical operand)", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        self.assertNotIn("RIP instruction, CR2 classification, and immediate bad operand", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        self.assertIn("BUG: unable to handle page fault for address", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        # B4: bt -f consistency across layer0 and SOP 3.8b (only hex task_addr allowed; numeric PID/frame number rejected)
+        self.assertNotIn("bt -f <pid>", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        self.assertIn("bt -f <task_addr>", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        self.assertIn("bt -f <task_addr>", SOP_FRAGMENTS["stack_overflow"])
+        self.assertIn("never pass a frame number or numeric PID to bt -f", SOP_FRAGMENTS["stack_overflow"])
+        # B2 & N7: Generic stack_corruption playbook must not unconditionally require a canary slot;
+        # Canary Overwrite Value Analysis belongs in stack_protector_canary
+        self.assertNotIn("Divide-by-Zero", PLAYBOOKS["general_protection_fault"])
+        self.assertNotIn("MANDATORY PRE-CONCLUSION GATE (stack_protector_canary)", PLAYBOOKS["stack_corruption"])
+        self.assertNotIn("Canary Overwrite Value Analysis", PLAYBOOKS["stack_corruption"])
+        self.assertIn("Canary Overwrite Value Analysis", PLAYBOOKS["stack_protector_canary"])
+        self.assertNotIn("Given canary_frame_addr", PLAYBOOKS["stack_corruption"])
+        self.assertNotIn("relative to the corrupted canary slot", PLAYBOOKS["stack_corruption"])
+        self.assertNotIn("Locate the stack canary check point (__stack_chk_fail call site)", PLAYBOOKS["stack_corruption"])
+        # R3: canary-only rules must not remain in the generic (non-canary) stack playbook
+        self.assertNotIn("Do NOT attribute canary corruption", PLAYBOOKS["stack_corruption"])
+        self.assertNotIn("This restriction applies ONLY to the canary slot", PLAYBOOKS["stack_corruption"])
+        self.assertNotIn("{CANARY_", PLAYBOOKS["stack_corruption"])
+        # R1: bt -f guidance must never suggest a pid/task target
+        self.assertNotIn("concrete pid", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        # R2: every bt -f mention must carry the address form
+        self.assertNotIn("Use bt -f,", SOP_FRAGMENTS["advanced_techniques"])
+
+    def test_driver_overlay_requires_signal_or_dma_not_step_count_alone(self) -> None:
+        from langchain_core.messages import HumanMessage
+        from src.react.prompt_builder import _select_context_overlays, _select_sop_fragments
+        from src.react.prompt_overlays import DRIVER_OBJECT_OVERLAY
+
+        # Plain 'sym ' at step_count >= 6 must NOT trigger DRIVER_OBJECT_OVERLAY or duplicate SOP
+        state_no_signal = {
+            "current_signature_class": "pointer_corruption",
+            "current_root_cause_class": None,
+            "step_count": 8,
+            "messages": [HumanMessage(content="sym ffffffff81000000")],
+        }
+        recent_no_signal = "sym ffffffff81000000"
+        self.assertNotIn(
+            DRIVER_OBJECT_OVERLAY,
+            _select_context_overlays(state_no_signal, recent_no_signal),
+        )
+        self.assertEqual(
+            _select_sop_fragments(state_no_signal, recent_no_signal),
+            [],
+        )
+
+        # Concrete driver signal ('mod -s' / '_base_') triggers DRIVER_OBJECT_OVERLAY without duplicate SOP
+        recent_with_signal = "mod -s mpt3sas /usr/lib/debug/mpt3sas.ko.debug"
+        self.assertIn(
+            DRIVER_OBJECT_OVERLAY,
+            _select_context_overlays(state_no_signal, recent_with_signal),
+        )
+        self.assertEqual(
+            _select_sop_fragments(state_no_signal, recent_with_signal),
+            [],
+        )
+
+    def test_repeated_value_conflict_renders_compact_residual(self) -> None:
+        from src.react.consistency import MAX_VALUE_CONFLICT_AUDIT_INJECTIONS
+        from src.react.prompt_builder import _format_value_conflicts
+
+        fact = (
+            "conflict:object_does_not_match_type:irqaction@0xff292187ae124a80:"
+            "next@0x18=0x12,thread_fn@0x20=0x5c"
+        )
+        full = _format_value_conflicts([fact], {fact: 1})
+        self.assertIn("next@0x18=0x12", full[0])
+
+        compact = _format_value_conflicts(
+            [fact], {fact: MAX_VALUE_CONFLICT_AUDIT_INJECTIONS + 1}
+        )
+        self.assertIn("already audited", compact[0])
+        self.assertNotIn("next@0x18=0x12", compact[0])
+
+    def test_dmesg_rule_distinguishes_payload_provenance_from_dma_writer(self) -> None:
+        from src.react.prompt_overlays import DRIVER_OBJECT_OVERLAY
+        from src.react.sop_fragments import SOP_FRAGMENTS
+
+        self.assertIn("confirmed payload provenance", DRIVER_OBJECT_OVERLAY)
+        self.assertIn("mpt3sas_base_get_reply_virt_addr", DRIVER_OBJECT_OVERLAY)
+        self.assertIn("ioc->reply_dma_min_address", DRIVER_OBJECT_OVERLAY)
+        self.assertIn("Sub-step C2", SOP_FRAGMENTS["dma_corruption"])
+        self.assertIn("reply_dma_min_address", SOP_FRAGMENTS["dma_corruption"])
+
+    def test_protocol_candidate_routes_to_dma_sop(self) -> None:
+        from src.react.prompt_builder import _select_sop_fragments
+        from src.react.sop_fragments import SOP_FRAGMENTS
+
+        state_with_candidate = {
+            "current_signature_class": "pointer_corruption",
+            "current_root_cause_class": None,
+            "step_count": 26,
+            "messages": [],
+            "evidence_facts": [
+                "rd_ascii:0xff292187ae125ab0=sense pool",
+                "vtop_phys:0xff292187ae124a80=0x12e124a80",
+            ],
+        }
+
+        fragments = _select_sop_fragments(
+            state_with_candidate, "rd -x ff292187ae125ab0 2"
+        )
+
+        self.assertIn(SOP_FRAGMENTS["dma_corruption"], fragments)
+
+    def test_reply_helper_routes_to_dma_sop(self) -> None:
+        from src.react.prompt_builder import _select_sop_fragments
+        from src.react.sop_fragments import SOP_FRAGMENTS
+
+        state = {
+            "current_signature_class": "pointer_corruption",
+            "current_root_cause_class": None,
+            "step_count": 26,
+            "messages": [],
+        }
+        fragments = _select_sop_fragments(
+            state,
+            "call 0xffffffffc21598f0 <mpt3sas_base_get_reply_virt_addr>",
+        )
+        self.assertIn(SOP_FRAGMENTS["dma_corruption"], fragments)
 
     def test_no_menu_without_replan(self) -> None:
         rendered = _render(
@@ -183,6 +333,68 @@ class ReplanProbeMenuTests(unittest.TestCase):
             rendered,
         )
 
+    def test_open_optional_gate_is_not_a_probe_objective(self) -> None:
+        gates = {
+            name: GateEntry(
+                status="closed",
+                evidence="executor-verified",
+                required_for=["pointer_corruption"],
+                closure_basis="executor_evidence",
+            )
+            for name in (
+                "register_provenance",
+                "object_lifetime",
+                "local_corruption_exclusion",
+            )
+        }
+        gates["external_corruption_gate"] = GateEntry(
+            status="open",
+            required_for=["pointer_corruption"],
+        )
+        rendered = _render(
+            current_signature_class="pointer_corruption",
+            current_root_cause_class=None,
+            managed_gates=gates,
+            current_evidence_goal=None,
+            last_action_status="executed",
+            duplicate_streak=0,
+            no_progress_streak=0,
+            replan_required=False,
+            evidence_facts=ALL_DIMENSION_FACTS,
+        )
+        self.assertIn("Current gate objective: no outstanding gate", rendered)
+        self.assertIn("Unresolved mandatory gates: none", rendered)
+        self.assertIn("external_corruption_gate=open (optional; advisory only)", rendered)
+        self.assertNotIn("advance external_corruption_gate", rendered)
+        self.assertIn("Stage 6: convergence and bounded conclusion", rendered)
+        self.assertNotIn("external_corruption_gate still pending", rendered)
+
+    def test_telemetry_only_required_gate_does_not_invite_repeated_probing(self) -> None:
+        gates = {
+            "stack_integrity": GateEntry(
+                status="open",
+                required_for=["soft_lockup"],
+            ),
+            "lock_holder": GateEntry(
+                status="open",
+                required_for=["soft_lockup"],
+            ),
+        }
+        rendered = _render(
+            current_signature_class="soft_lockup",
+            current_root_cause_class=None,
+            managed_gates=gates,
+            current_evidence_goal=None,
+            last_action_status="executed",
+            duplicate_streak=0,
+            no_progress_streak=0,
+            replan_required=False,
+            evidence_facts=[],
+        )
+        self.assertIn("stack_integrity is telemetry-only", rendered)
+        self.assertIn("Do not keep probing solely to close this gate", rendered)
+        self.assertIn("result remains non-conclusive", rendered)
+
     def test_unregistered_gates_never_claim_gates_closed(self) -> None:
         """门控集合尚未注册时，`_format_unresolved_gates` 同样返回 "none"。
 
@@ -206,6 +418,22 @@ class ReplanProbeMenuTests(unittest.TestCase):
                 self.assertNotIn("Gate closure is not root-cause proof", rendered)
                 self.assertNotIn("every mandatory gate", rendered)
                 self.assertIn("Mandatory gates are still unresolved", rendered)
+
+    def test_unclassified_signature_is_not_presented_as_gate_exhaustion(self) -> None:
+        rendered = _render(
+            current_signature_class="unknown",
+            current_root_cause_class="pointer_corruption",
+            managed_gates=None,
+            current_evidence_goal=None,
+            last_action_status="rejected",
+            duplicate_streak=0,
+            no_progress_streak=2,
+            replan_required=True,
+            evidence_facts=[],
+        )
+        self.assertIn("no registered policy, conclusion prohibited", rendered)
+        self.assertIn("no gate policy is registered", rendered)
+        self.assertNotIn("all mandatory gates are closed", rendered)
 
     def test_untapped_dimensions_exclude_observed_ones(self) -> None:
         rendered = _render(

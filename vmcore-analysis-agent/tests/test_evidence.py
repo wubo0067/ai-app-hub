@@ -16,11 +16,12 @@ from src.react.evidence import (
     extract_evidence_facts,
     facts_support_goal,
     gate_completion_criteria,
+    has_executor_closure_rule,
 )
 from src.react.schema import GateEntry
 from src.react.evidence import update_gate_evidence
 from src.react.schema import VMCoreLLMAnalysisStep
-from src.react.state_manager import project_managed_analysis_step
+from src.react.state_manager import _build_evidence_goal, project_managed_analysis_step
 
 
 class EvidenceExtractionTests(unittest.TestCase):
@@ -51,6 +52,15 @@ class EvidenceExtractionTests(unittest.TestCase):
         self.assertIn("struct_size:irqaction=0x20", struct_facts)
         self.assertIn("dis_instruction:0xffff0000=mov", dis_facts)
         self.assertIn("sym:irq_handler@0xffffffff81000000:T", sym_facts)
+
+    def test_struct_dot_syntax_does_not_produce_layout_facts(self) -> None:
+        """点号语法只打印字段值，无 struct 头/偏移行，不构成 field_type_classification 的 struct 证据。"""
+        dot_facts = extract_evidence_facts(
+            "struct",
+            {"command": "struct device.driver ffff888100000000"},
+            "  driver = 0xffffffffc0123400\n",
+        )
+        self.assertEqual(dot_facts, set())
 
     def test_run_script_collects_each_supported_command(self) -> None:
         facts = extract_evidence_facts(
@@ -111,6 +121,27 @@ class EvidenceExtractionTests(unittest.TestCase):
             kmem_facts,
         )
 
+    def test_extracts_mapped_physical_address_and_ascii_string(self) -> None:
+        vtop_facts = extract_evidence_facts(
+            "vtop",
+            {"command": "ff292187ae124a80"},
+            "VIRTUAL           PHYSICAL\n"
+            "ff292187ae124a80  12e124a80\n"
+            "PTE: 1f4405920 => 800000012e124163\n",
+        )
+        rd_facts = extract_evidence_facts(
+            "rd",
+            {"command": "rd -x ff292187ae125ab0 2"},
+            "ff292187ae125ab0: 6f702065736e6573 fe52cb0bb9006c6f  sense po\n",
+        )
+
+        self.assertIn(
+            "vtop_phys:0xff292187ae124a80=0x12e124a80", vtop_facts
+        )
+        self.assertIn(
+            "rd_ascii:0xff292187ae125ab0=sense pool", rd_facts
+        )
+
     def test_mapping_facts_support_lifetime_and_local_exclusion(self) -> None:
         facts = extract_evidence_facts(
             "vtop",
@@ -123,7 +154,7 @@ class EvidenceExtractionTests(unittest.TestCase):
             facts_support_goal(facts, {"gate_name": "local_corruption_exclusion"})
         )
 
-    def test_kasan_uaf_report_is_temporal_lifetime_evidence(self) -> None:
+    def test_kasan_uaf_report_without_address_is_telemetry_only(self) -> None:
         facts = extract_evidence_facts(
             "run_script",
             {"script": "log -m | grep -i KASAN"},
@@ -132,8 +163,12 @@ class EvidenceExtractionTests(unittest.TestCase):
             "Allocated by task 13:\n",
         )
 
-        self.assertIn("lifetime_proof:kasan_use_after_free", facts)
-        self.assertTrue(facts_support_goal(facts, {"gate_name": "object_lifetime"}))
+        self.assertIn("lifetime_signal:kasan_use_after_free_unbound", facts)
+        self.assertFalse(facts_support_goal(facts, {"gate_name": "object_lifetime"}))
+
+        gate = GateEntry(required_for=["use_after_free"], status="open")
+        evaluated, _ = evaluate_gate_closures({"object_lifetime": gate}, facts)
+        self.assertEqual(evaluated["object_lifetime"].status, "open")
 
     def test_object_lifetime_gate_requires_snapshot_or_temporal_evidence(self) -> None:
         gate = GateEntry(
@@ -166,7 +201,32 @@ class EvidenceExtractionTests(unittest.TestCase):
             {"object_lifetime": gate},
             observations | {"lifetime_proof:kasan_use_after_free"},
         )
-        self.assertEqual(evaluated["object_lifetime"].status, "closed")
+        self.assertEqual(evaluated["object_lifetime"].status, "open")
+
+    def test_page_not_present_lifetime_gate_requires_mapping_lifetime_evidence(self) -> None:
+        gate = GateEntry(
+            required_for=["page_not_present"],
+            status="open",
+        )
+        facts = {
+            "vtop_unmapped:0xffffb2709a1ac000",
+            "rd_word:0xffffb2709a1ac000=0x1",
+            "kmem_slab_state:0xffffb2709a1ac000=allocated",
+        }
+
+        evaluated, transitions = evaluate_gate_closures(
+            {"object_lifetime": gate}, facts
+        )
+
+        self.assertEqual(evaluated["object_lifetime"].status, "open")
+        self.assertIn(
+            "the executor currently has no closure rule for this signature-specific gate; "
+            "address-linked mapping teardown or lifetime evidence extraction is not implemented",
+            evaluated["object_lifetime"].completion_criteria,
+        )
+        self.assertTrue(
+            any(item["event"] == "weak_gate_closure" for item in transitions)
+        )
 
     def test_extracts_current_kmem_slot_states(self) -> None:
         facts = extract_evidence_facts(
@@ -219,6 +279,145 @@ class EvidenceExtractionTests(unittest.TestCase):
         )
         self.assertEqual(len(evaluated["register_provenance"].completion_criteria), 3)
 
+    def test_llm_na_is_rejected_and_claim_is_audited(self) -> None:
+        gate = GateEntry(
+            required_for=["use_after_free"],
+            status="n/a",
+            evidence="The model says the gate does not apply.",
+        )
+
+        evaluated, transitions = evaluate_gate_closures(
+            {"object_lifetime": gate}, []
+        )
+
+        self.assertEqual(evaluated["object_lifetime"].status, "open")
+        self.assertIsNone(evaluated["object_lifetime"].closure_basis)
+        rejected = [item for item in transitions if item["event"] == "llm_na_rejected"]
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(
+            rejected[0]["requested_evidence"],
+            "The model says the gate does not apply.",
+        )
+
+        legacy_prior = GateEntry(
+            required_for=["use_after_free"],
+            status="n/a",
+            evidence="Unverified legacy claim.",
+        )
+        evaluated, _ = evaluate_gate_closures(
+            {"object_lifetime": gate},
+            [],
+            {"object_lifetime": legacy_prior},
+        )
+        self.assertEqual(evaluated["object_lifetime"].status, "open")
+
+        executor_prior = GateEntry(
+            required_for=["use_after_free"],
+            status="n/a",
+            evidence="Executor applicability rule verified.",
+            closure_basis="executor_na",
+        )
+        evaluated, transitions = evaluate_gate_closures(
+            {"object_lifetime": gate},
+            [],
+            {"object_lifetime": executor_prior},
+        )
+        self.assertEqual(evaluated["object_lifetime"].status, "n/a")
+        self.assertFalse(
+            any(item["event"] == "llm_na_rejected" for item in transitions)
+        )
+
+    def test_unsupported_gate_facts_are_telemetry_not_closure(self) -> None:
+        gate = GateEntry(required_for=["soft_lockup"], status="open")
+
+        evaluated, transitions = evaluate_gate_closures(
+            {"lock_holder": gate}, {"rd_word:0xffff0000=0x1"}
+        )
+
+        self.assertEqual(evaluated["lock_holder"].status, "open")
+        self.assertTrue(
+            any(item["event"] == "weak_gate_closure" for item in transitions)
+        )
+
+    def test_evidence_goal_skips_telemetry_only_and_optional_gates(self) -> None:
+        telemetry_only = {
+            "stack_integrity": GateEntry(
+                required_for=["soft_lockup"], status="open"
+            ),
+            "lock_holder": GateEntry(required_for=["soft_lockup"], status="open"),
+        }
+        self.assertIsNone(_build_evidence_goal(telemetry_only, "soft_lockup"))
+
+        optional_only = {
+            "register_provenance": GateEntry(
+                required_for=["pointer_corruption"],
+                status="closed",
+                closure_basis="executor_evidence",
+            ),
+            "object_lifetime": GateEntry(
+                required_for=["pointer_corruption"],
+                status="closed",
+                closure_basis="executor_evidence",
+            ),
+            "local_corruption_exclusion": GateEntry(
+                required_for=["pointer_corruption"],
+                status="closed",
+                closure_basis="executor_evidence",
+            ),
+            "external_corruption_gate": GateEntry(
+                required_for=["pointer_corruption"], status="open"
+            ),
+        }
+        self.assertIsNone(_build_evidence_goal(optional_only, "pointer_corruption"))
+
+    def test_external_gate_requires_an_external_source_fact(self) -> None:
+        gates = {
+            "local_corruption_exclusion": GateEntry(
+                required_for=["pointer_corruption"],
+                status="closed",
+                closure_basis="executor_evidence",
+            ),
+            "external_corruption_gate": GateEntry(
+                required_for=["pointer_corruption"], status="open"
+            ),
+        }
+
+        evaluated, _ = evaluate_gate_closures(
+            gates,
+            {
+                "rd_word:0xffff0000=0x1",
+                "struct_type:device_private",
+            },
+            gates,
+        )
+
+        self.assertEqual(evaluated["external_corruption_gate"].status, "open")
+
+    def test_external_gate_has_no_executor_closure_rule_yet(self) -> None:
+        # 规则已定义，但 external_source 事实抽取尚未实现，因此当前不应声称可闭合。
+        self.assertFalse(has_executor_closure_rule("external_corruption_gate"))
+        self.assertTrue(has_executor_closure_rule("local_corruption_exclusion"))
+
+    def test_llm_cannot_supply_executor_closure_basis(self) -> None:
+        step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 7,
+                "reasoning": "The model claims the gate was verified.",
+                "action": None,
+                "is_conclusive": False,
+                "signature_class": "null_deref",
+                "gates": {
+                    "register_provenance": {
+                        "required_for": ["null_deref"],
+                        "status": "closed",
+                        "closure_basis": "executor_evidence",
+                    }
+                },
+            }
+        )
+
+        self.assertIsNone(step.gates["register_provenance"].closure_basis)
+
     def test_evaluator_closes_gate_and_records_transition(self) -> None:
         gates = {
             "register_provenance": GateEntry(
@@ -270,6 +469,115 @@ class EvidenceExtractionTests(unittest.TestCase):
                 item["event"] == "llm_close_rejected"
                 for item in updates["gate_transition_history"]
             )
+        )
+
+    def test_state_manager_does_not_accept_llm_na(self) -> None:
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 5,
+                "reasoning": "The model claims the lifetime gate is not applicable.",
+                "action": None,
+                "is_conclusive": False,
+                "signature_class": "use_after_free",
+                "partial_dump": "partial",
+                "gates": {
+                    "object_lifetime": {
+                        "required_for": ["use_after_free"],
+                        "status": "n/a",
+                        "evidence": "Model-only applicability claim.",
+                    }
+                },
+            }
+        )
+
+        _, updates = project_managed_analysis_step(
+            llm_step,
+            {"evidence_facts": [], "gate_transition_history": []},
+            original_reasoning="The model claims the lifetime gate is not applicable.",
+        )
+
+        self.assertEqual(updates["managed_gates"]["object_lifetime"].status, "open")
+        self.assertIsNone(updates["managed_gates"]["object_lifetime"].evidence)
+        self.assertIsNone(
+            updates["managed_gates"]["object_lifetime"].closure_basis
+        )
+        self.assertTrue(
+            any(
+                item["event"] == "llm_na_rejected"
+                for item in updates["gate_transition_history"]
+            )
+        )
+
+    def test_unknown_signature_does_not_inherit_prior_gates(self) -> None:
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 6,
+                "reasoning": "The crash signature cannot be classified.",
+                "action": None,
+                "is_conclusive": False,
+                "signature_class": "unknown",
+                "partial_dump": "partial",
+            }
+        )
+        prior_gates = {
+            "register_provenance": GateEntry(
+                required_for=["pointer_corruption"],
+                status="closed",
+                closure_basis="executor_evidence",
+            )
+        }
+
+        _, updates = project_managed_analysis_step(
+            llm_step,
+            {
+                "current_signature_class": "pointer_corruption",
+                "managed_gates": prior_gates,
+                "evidence_facts": [],
+                "gate_transition_history": [],
+            },
+            original_reasoning="The crash signature cannot be classified.",
+        )
+
+        self.assertIsNone(updates["managed_gates"])
+
+    def test_signature_change_does_not_reuse_prior_gate_closure(self) -> None:
+        llm_step = VMCoreLLMAnalysisStep.model_validate(
+            {
+                "step_id": 8,
+                "reasoning": "The missing mapping is being classified separately.",
+                "action": None,
+                "is_conclusive": False,
+                "signature_class": "page_not_present",
+                "partial_dump": "partial",
+            }
+        )
+        prior_gates = {
+            "object_lifetime": GateEntry(
+                required_for=["pointer_corruption"],
+                status="closed",
+                evidence="Evidence for a different signature.",
+                closure_basis="executor_evidence",
+            )
+        }
+
+        _, updates = project_managed_analysis_step(
+            llm_step,
+            {
+                "current_signature_class": "pointer_corruption",
+                "managed_gates": prior_gates,
+                "evidence_facts": [
+                    "rd_word:0xffffb2709a1ac000=0x1",
+                    "kmem_slab_state:0xffffb2709a1ac000=allocated",
+                ],
+                "gate_transition_history": [],
+            },
+            original_reasoning="The missing mapping is being classified separately.",
+        )
+
+        self.assertEqual(updates["managed_gates"]["object_lifetime"].status, "open")
+        self.assertEqual(
+            updates["managed_gates"]["object_lifetime"].required_for,
+            ["page_not_present"],
         )
 
 

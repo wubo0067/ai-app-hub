@@ -86,6 +86,29 @@ FORCED_CHOICE_CONVERGENCE_RULE = (
     "is what the vmcore contains, so choosing (A) is correct whenever (B) has no concrete answer."
 )
 
+BOUNDED_UNCERTAINTY_EXIT_RULE = (
+    "When direct writer evidence is unattainable (due to missing module symbols, partial dump coverage, "
+    "or asynchronous DMA/interrupt overwrite), DO NOT spin on reading the corrupted object. "
+    "Proving that an object is corrupted and that the local execution frame did not corrupt it "
+    "is sufficient to conclude with root_cause_class=\"pointer_corruption\" "
+    "(with confidence=\"low\" or \"medium\"). Explicitly recording verification gaps in detailed_analysis "
+    "is considered a successful bounded convergence, NOT a diagnostic failure."
+)
+
+CORRUPTED_PAYLOAD_TERMINATION_RULE = (
+    "When a kernel pointer or field has already been shown to contain corrupted data (e.g. invalid addresses, "
+    "unrelated magic numbers, or driver-private pattern values), treat isolated bytes at that location as "
+    "CORRUPTED PAYLOAD, not live state. Do not invent protocol or hardware semantics from one corrupted scalar "
+    "or from random-looking bytes. "
+    "Exception: when at least two fixed-size, aligned records in the same dump share a coherent, documented "
+    "protocol template (version/action, message length consistent with the record size, function/event, and "
+    "a zero or reserved tail), you MAY decode their fields against the documented bit layout. That decode is "
+    "one device-side evidence family; it is not proof of DMA by itself and must be combined with device "
+    "ownership, DMA-range overlap, or IOMMU evidence. Mark confidence accordingly. Do not use this exception "
+    "to guess private struct names or to decode isolated corrupted scalars. Once both the corruption question "
+    "and any coherent-template question have been answered, stop re-reading the same bytes."
+)
+
 SLAB_OOB_DIRECTION_RULE = (
     "In kmalloc/slab adjacency reasoning, a standard contiguous out-of-bounds write "
     "from object A extends from lower to higher addresses. Therefore, if victim object V "

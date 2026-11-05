@@ -21,6 +21,7 @@ from .action_guard import (
     validate_tool_call_request,
 )
 from .consistency import (
+    MAX_VALUE_CONFLICT_AUDIT_INJECTIONS,
     format_conflict_fact,
     parse_conflict_fact,
     prune_resolved_value_conflicts,
@@ -35,6 +36,8 @@ from .schema import (
     get_root_cause_from_mechanism_mapping,
     get_root_cause_like_mechanisms,
     get_signature_class_aliases,
+    gate_resolution_state,
+    required_gates_for,
 )
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
@@ -57,9 +60,10 @@ _REGISTER_DUMP_RE = re.compile(
     r"(?P<val>[0-9a-fA-F]{8,16})\b"
 )
 
-# 从 "NULL pointer dereference at 0000000000000062" 提取故障地址
+# 从 "NULL pointer dereference at 0000000000000062" 或
+# "BUG: kernel NULL pointer dereference, address: 0000000000000062" 提取故障地址
 _NULL_DEREF_ADDR_RE = re.compile(
-    r"NULL pointer dereference at\s+(?P<addr>[0-9a-fA-F]{8,16})",
+    r"NULL pointer dereference(?: at|,\s*address:)\s+(?P<addr>[0-9a-fA-F]{8,16})",
     flags=re.IGNORECASE,
 )
 
@@ -1458,6 +1462,7 @@ def apply_value_conflict_audit(
     *,
     log_prefix: str = "",
     force_wrapup: bool = False,
+    audit_counts: Optional[dict[str, int]] = None,
 ) -> VMCoreLLMAnalysisStep:
     """[阶段 5] 取值级矛盾审计：已读内存内容与结构体布局不相容。
 
@@ -1475,6 +1480,9 @@ def apply_value_conflict_audit(
         force_wrapup: 是否处于强制收口/最后一步。此时仍注入审计说明（让最终结论
             带上矛盾告警），但不再撤销结论、不再降级根因、不再压制置信度 ——
             否则步数耗尽时任何残留矛盾都会让 agent 只能输出 unknown。
+        audit_counts: 可选的“事实 -> 已累计处理次数”计数器。调用方传入同一个 dict
+            即可跨步骤累计；同一冲突超过 MAX_VALUE_CONFLICT_AUDIT_INJECTIONS 次后
+            只保留一次简短 residual 提示，避免重复刷屏和反复降级。
 
     Returns:
         VMCoreLLMAnalysisStep: 审计修正后的分析步骤
@@ -1484,6 +1492,10 @@ def apply_value_conflict_audit(
     if not conflicts:
         return analysis_step
 
+    counts = audit_counts if audit_counts is not None else {}
+    for fact in conflicts:
+        counts[fact] = counts.get(fact, 0) + 1
+
     if _mentions_value_level_conflict(analysis_step, conflicts):
         logger.debug(
             "%sExecutor audit found a value-level contradiction, but the model already referenced it.",
@@ -1491,12 +1503,39 @@ def apply_value_conflict_audit(
         )
         return analysis_step
 
+    limit = MAX_VALUE_CONFLICT_AUDIT_INJECTIONS
+    full_conflicts = [fact for fact in conflicts if counts[fact] <= limit]
+    exhausted_conflicts = [fact for fact in conflicts if counts[fact] > limit]
+
+    if not full_conflicts:
+        # 只在首次进入“已审计超限”状态时留一条简短 residual；强制收口时
+        # 即使计数已超过该阈值也要再留一次，保证最终报告带有 residual caveat。
+        if force_wrapup or any(
+            counts[fact] == limit + 1 for fact in exhausted_conflicts
+        ):
+            bases = []
+            for fact in exhausted_conflicts:
+                parsed = parse_conflict_fact(fact)
+                if parsed is not None:
+                    type_name, base = parsed
+                    bases.append(f"{type_name}@0x{base:x}")
+            residual_summary = ", ".join(bases) if bases else "; ".join(exhausted_conflicts)
+            residual_note = (
+                "Executor audit: value-level contradiction remains unresolved for "
+                f"{residual_summary}; it is retained as a residual caveat. "
+                "Do not re-audit the same object again; treat it as an unverified/foreign "
+                "object rather than a valid instance."
+            )
+            logger.warning("%s%s", prefix, residual_note)
+            _append_audit_note(analysis_step, residual_note)
+        return analysis_step
+
     rendered = [
         text
-        for text in (format_conflict_fact(fact) for fact in conflicts)
+        for text in (format_conflict_fact(fact) for fact in full_conflicts)
         if text is not None
     ]
-    summary = "; ".join(rendered) if rendered else "; ".join(conflicts)
+    summary = "; ".join(rendered) if rendered else "; ".join(full_conflicts)
     audit_note = (
         "Executor audit: unresolved value-level contradiction between the memory you read "
         f"and the declared struct layout. {summary}"
@@ -1677,14 +1716,17 @@ def _is_kernel_paging_request_page_fault_context(text: str) -> bool:
         bool: 如果是页面错误上下文则返回 True
 
     判断条件：
-        1. 包含"BUG: unable to handle kernel paging request"
+        1. 包含"BUG: unable to handle kernel paging request"或"BUG: unable to handle page fault for address"
         2. Oops 错误代码为 0x0000（表示页面错误）
     """
     if not text:
         return False
 
     lowered = text.lower()
-    if "bug: unable to handle kernel paging request" not in lowered:
+    if (
+        "bug: unable to handle kernel paging request" not in lowered
+        and "bug: unable to handle page fault for address" not in lowered
+    ):
         return False
 
     oops_match = _OOPS_RE.search(text)
@@ -2141,16 +2183,26 @@ def _clip_fallback_text(text: str, limit: int = _MAX_FALLBACK_EVIDENCE_CHARS) ->
 
 
 def _unresolved_required_gates(analysis_result: VMCoreAnalysisStep) -> List[str]:
-    """返回该签名类尚未 closed/n/a 的强制 gate 名（与 validate_and_patch 同判据）。"""
-    required = VMCoreAnalysisStep._REQUIRED_GATES.get(
-        analysis_result.signature_class or "", []
+    """Return policy, registration, and gate-status blockers to conclusion synthesis."""
+    resolution = gate_resolution_state(
+        analysis_result.signature_class, analysis_result.gates
     )
+    if resolution == "unclassified":
+        return [
+            f"unclassified signature_class={analysis_result.signature_class or 'null'}"
+        ]
+    required = required_gates_for(analysis_result.signature_class) or []
     gates = analysis_result.gates or {}
-    return [
+    unresolved = [
         name
         for name in required
-        if name not in gates or gates[name].status not in {"closed", "n/a"}
+        if name not in gates
+        or gates[name].status not in {"closed", "n/a"}
+        or gates[name].closure_basis not in {"executor_evidence", "executor_na"}
     ]
+    if resolution == "unregistered":
+        return unresolved or ["required gate state is not registered"]
+    return unresolved
 
 
 def _mine_panic_string(state_text: str) -> str:
@@ -2205,7 +2257,10 @@ def _build_fallback_evidence(
     evidence: List[str] = []
 
     for gate_name, gate in (analysis_result.gates or {}).items():
-        if gate.status not in {"closed", "n/a"}:
+        if not (
+            (gate.status == "closed" and gate.closure_basis == "executor_evidence")
+            or (gate.status == "n/a" and gate.closure_basis == "executor_na")
+        ):
             continue
         detail = gate.evidence or "(no evidence text recorded)"
         evidence.append(f"gate {gate_name} [{gate.status}]: {_clip_fallback_text(detail)}")
@@ -2234,8 +2289,16 @@ def _render_fallback_analysis(
 ) -> str:
     chinese = _fallback_report_is_chinese(state)
     gates = analysis_result.gates or {}
-    closed = [name for name, gate in gates.items() if gate.status == "closed"]
-    not_applicable = [name for name, gate in gates.items() if gate.status == "n/a"]
+    closed = [
+        name
+        for name, gate in gates.items()
+        if gate.status == "closed" and gate.closure_basis == "executor_evidence"
+    ]
+    not_applicable = [
+        name
+        for name, gate in gates.items()
+        if gate.status == "n/a" and gate.closure_basis == "executor_na"
+    ]
 
     if chinese:
         paragraphs = [

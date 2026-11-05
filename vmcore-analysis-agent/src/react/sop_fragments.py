@@ -75,7 +75,7 @@ Pattern: kernel stack overflow, corrupted stack end detected, or crash in random
 Analysis:
 1. Distinguish process, IRQ, and exception stack overflows.
 2. Treat bt as provisional when frames are context-inconsistent; first validate return addresses, stack progression, and control-flow plausibility before trusting the call chain.
-3. Use bt -f only with a concrete pid or task when you need per-frame details for that task; never use bt -f with a frame number.
+3. Use bt -f <task_addr> (hex task_struct address) only when you need per-frame details for that task; never pass a frame number or numeric PID to bt -f.
 4. On x86_64 with a frame-pointer prologue, saved caller RBP is at [RBP] and the return address is at [RBP+8]; compute the canary slot from the disassembly-derived offset such as rbp-0x18 instead of guessing from older frames.
 5. On x86-64, the stack grows downward (high -> low). In a typical contiguous local-stack-buffer overflow within function F, writes often progress toward higher addresses and may hit F's canary and caller-side data. This is not universal: wrong-pointer memcpy or memmove, struct-pointer writes, negative indices such as buf[-8], and use-after-free or other arbitrary-write primitives may write in either direction or without local stack-direction constraints. Always validate the concrete write primitive and address progression before attributing causality.
 6. For any claim that caller locals overlap an active callee frame, compute caller post-prologue RSP first. Since the callee frame is allocated below the caller's call-site RSP, an alleged callee canary above that boundary is a proof error.
@@ -108,12 +108,17 @@ __stack_chk_fail.
    b. **Recommended RBP derivation -- frame-pointer chain (preferred over bt address formulas)**:
       - If `__stack_chk_fail` has a standard prologue (push %rbp; mov %rsp, %rbp), then
         [__stack_chk_fail_RBP + 8] holds the return address back to the canary-bearing function.
-      - Locate that exact return-address value in the raw stack dump (e.g., via `bt -f` or
-        `rd -x` around the suspected frame region). The stack address that contains this value
-        equals __stack_chk_fail_RBP + 8.
+      - Locate that exact return-address value in the raw stack dump (e.g., via `bt -f <task_addr>`
+        or `rd -x` around the suspected frame region; never pass a bare `bt -f` or numeric PID to `bt -f`).
+        The stack address that contains this value equals __stack_chk_fail_RBP + 8.
       - Therefore __stack_chk_fail_RBP = (that address) - 8.
       - [__stack_chk_fail_RBP] = saved old RBP = the canary-bearing function's RBP_absolute.
       - This derivation is more reliable than computing RBP from the `bt` frame address alone.
+      - **ORC unwinder fallback (no frame-pointer prologue)**: On kernels built with `CONFIG_UNWINDER_ORC=y`
+        where disassembly shows no `push %rbp; mov %rsp, %rbp`, derive the canary slot relative to RSP:
+        locate the return-address slot in `bt -f <task_addr>` or `rd -x <rsp> <count>`, reconstruct the
+        canary-bearing function's entry RSP from the `sub $N, %rsp` allocation and register pushes, and
+        compute the RSP-relative canary slot offset from the `mov %rax, <disp>(%rsp)` store in prologue.
    c. Accept RBP_absolute only if ALL of the following are independently verified:
       - Consistent with the function prologue, push instructions, and `sub $N, %rsp` layout.
       - [RBP_absolute] is a plausible saved RBP (a stack-range address for this task).
@@ -250,8 +255,10 @@ Non-indicators:
 Before or alongside this DMA fragment, ensure the other S1-S4 gates are already closed: instruction-level provenance (S1), ordinary object-state validation (S2), and stack or snapshot artifact exclusion where applicable (S3), plus stronger software corruption-source discrimination (S4).
 
 ### Step 0: Stale Data Exclusion (MANDATORY before any value-match evidence)
-The kmalloc/slab allocator does NOT zero memory on allocation. Any value found in an allocated
-or recently-freed slab object may be residue from a previous allocation.
+The kmalloc/slab allocator does NOT zero memory on allocation unless explicitly requested via
+`__GFP_ZERO` / `kzalloc` or kernel hardening (`init_on_alloc=1` / `init_on_free=1`). When zeroing
+is not active, any value found in an allocated or recently-freed slab object may be residue from a
+previous allocation.
 
 Before treating a suspicious value found in slab memory as proof of DMA origin:
 1. **Stale residue test**: determine whether the slab object (or any adjacent object in the
@@ -312,10 +319,16 @@ Sub-step B: extract suspect-device DMA ranges only after fingerprint work or whe
 - Use pci_dev.dev.driver_data to locate the runtime driver object when possible.
 - Verify object and field paths against the current kernel layout before dereferencing module-private objects.
 - Check whether the faulting PA lies within a validated DMA buffer range.
-- Do not guess protocol-layer or firmware-message struct names for a driver-private queue object. Load module symbols with mod -s first and then inspect the actual driver-private type or field path.
+- Do not guess private protocol-layer or firmware-message C type names for a driver-private queue object. Load module symbols with mod -s first and then inspect the actual driver-private type or field path. A manual decode against a documented public protocol header is allowed when repeated aligned records make the template coherent; a guessed private struct layout is not.
 - If struct -o <guessed_type> fails on a module crash path, do not keep guessing private types. Instead: (1) load module symbols with `mod -s <module>` first; (2) if symbol enumeration is then necessary, use `sym -m <module>` or `sym -m <module> | grep -i <keyword>`. `sym -l` is ALWAYS forbidden in any form (with or without a grep filter) — it dumps all kernel symbols, floods the context, and causes a hard failure or tool timeout.
 
 Sub-step C: when driver structs are unavailable, inspect generic dma_ops and coherent_dma_mask to understand protection level.
+
+Sub-step C2: for a coherent driver reply-frame / receive-ring template, close ownership against the actual DMA pool before naming DMA:
+- Resolve the driver object (for mpt3sas, `struct MPT3SAS_ADAPTER`) and read its DMA pool fields: `reply`, `reply_dma`, `reply_dma_min_address`, `reply_dma_max_address`, `reply_sz`, `reply_free`, `reply_free_dma`, `reply_post`, and the reply-post free DMA addresses.
+- Compute the legal range from the pool base and depth/size, then compare the corrupted page's physical address (`vtop`) against it. A protocol-looking frame outside every pool range is payload provenance only, not DMA-range proof.
+- When disassembly shows an address-conversion helper call (for example `mpt3sas_base_get_reply_virt_addr`), follow that helper to identify the pool base; do not infer the frame size from the helper, because the size comes from the driver facts (`reply_sz = ReplyFrameSize * 4`).
+- Repeat the check for every candidate controller, not just the first HBA. A reply-frame pool owned by another adapter can land on the same physical page.
 
 Sub-step D: field-type disambiguation before naming the root cause.
 - After identifying the corrupted object and field offset, determine the declared C type of that field from driver source, debug info, or a defensible offset-to-source correlation.
@@ -348,11 +361,21 @@ validate the following:
    valid (correct list_head self-links, plausible flags, non-garbage padding), the corruption
    is localized and inconsistent with a coarse-grained DMA write that would replace the
    entire cache line or page.
+2b. **Order-1 slab / 4KB page boundary**: when the object lives in an order-1 slab page,
+   compare objects in the first and second 4KB halves. A page-granular split (one half
+   overwritten with a repeated template, the other half still holding valid objects) is a
+   strong DMA/page-granularity candidate, but it is not proof by itself: software OOB can also
+   stop near a page boundary. Combine it with a validated protocol template, device ownership,
+   or DMA-range overlap before promoting DMA.
 3. **Value range and structure**: DMA reply payloads from SCSI/SAS/NVMe controllers contain
    structured fields (descriptor type, SMID, VP ID, flags, physical address). If the
    "suspicious" values are a mix of small integers, partial bit patterns, and one matching
    log_info code, verify that the entire object can be decoded as a valid reply frame before
-   treating the field match as a payload fingerprint.
+   treating the field match as a payload fingerprint. At least two aligned records with a
+   coherent documented header (version/action, message length consistent with the record size,
+   function/event, zero or reserved tail) are stronger than a single matching word. Two or
+   more distinct high-entropy codes in such frames establish payload provenance, but still do
+   NOT establish a DMA write until the reply/receive-pool range check succeeds.
 4. **Minimum assertion threshold**: do NOT assert "DMA burst overwrote the slab page" unless
    you have: (a) at least 4 contiguous 8-byte words showing coherent device-specific data,
    OR (b) validated DMA-range overlap PLUS a decoded protocol structure. A single matching
@@ -369,6 +392,8 @@ validate the following:
 - If IOMMU is confirmed operational for the suspect device (translated domain), DMA
   confidence must remain low until IOMMU bypass or misconfiguration is proven.
 """.strip(),
+    # NOTE: driver_source_correlation is retained as a reference SOP entry; runtime
+    # injection is handled exclusively via DRIVER_OBJECT_OVERLAY to avoid duplicate text.
     "driver_source_correlation": """
 ## 3.15c Driver Source Correlation
 
@@ -686,7 +711,7 @@ is a critical analysis error that misleads the customer.
 ## PART 5: ADVANCED TECHNIQUES
 
 ### 5.1 Reconstructing Local Variables
-- Use bt -f, dis -rl, and ABI knowledge to reconstruct only what is defensible.
+- Use bt -f <task_addr> (hex task_struct address), dis -rl, and ABI knowledge to reconstruct only what is defensible.
 
 ### 5.2 Compiler Optimizations
 - Treat inlining, tail calls, and aggressive register allocation as sources of backtrace incompleteness.

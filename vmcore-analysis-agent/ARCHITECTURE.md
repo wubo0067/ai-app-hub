@@ -1,4 +1,4 @@
-﻿# VMCore Analysis Agent — 架构与核心逻辑
+# VMCore Analysis Agent — 架构与核心逻辑
 
 本文是给维护者的"读码地图"：先给一句话核心，再按数据流展开三个子系统，最后回答"想改 X 应该动哪个文件"。
 
@@ -42,7 +42,7 @@ flowchart LR
 
 **执行器状态回灌是 LLM 与执行器之间唯一的反馈通道**：门控没关、矛盾未解，都会以文本形式出现在下一轮 prompt 里。
 
-`llm_runtime.py` 负责发送前的消息压缩（`compress_messages_for_llm`）与 `max_tokens` 自适应。
+`llm_runtime.py` 负责发送前的消息压缩（`compress_messages_for_llm`）与基于真实 token 的预算规划（`prepare_messages_for_llm`）：历史 AI 消息中的 `gates[*].evidence` 只保留在状态/报告中，请求副本会清空；thinking 模式下输出预算覆盖 reasoning + 正文，预算不足时关闭 thinking 或快速失败，不再静默回落到 4,096。
 
 ### ② LLM 输出强制管线 —— 每轮固定顺序（`llm_node.py`）
 
@@ -50,9 +50,9 @@ flowchart LR
 repair_structured_output            # JSON/枚举修复（output_parser）
 → apply_executor_consistency_audit  # 确定性审计：可改写结论字段、注入 audit note
 → apply_value_conflict_audit        # 未解决数值矛盾 → 压制收敛/改写根因
-→ project_managed_analysis_step     # state_manager：合并 LLM gate 更新，
-                                    #   evidence.evaluate_gate_closures 判定关闭，
-                                    #   拒绝不满足准则的 LLM 关闭（llm_close_rejected）
+→ project_managed_analysis_step     # state_manager：投影门控请求；
+                                    #   evidence.evaluate_gate_closures 独占终态判定，
+                                    #   拒绝未经验证的 LLM closed/n/a 请求
 → build_tool_calls                  # action → tool_calls（含 action_guard 预检）
 → （收口轮：违规请求工具 → 强制重试一次）
 → apply_fallback_conclusion_synthesis # 收口轮兜底：确定性合成有界结论
@@ -245,21 +245,21 @@ layer0 2.4a 则给出各里程碑必须达成的目标：
 
 ## 门控（gates）—— 收敛的硬门槛
 
-定义：`schema.GateEntry`（status: `open|closed|blocked|n/a`，`required_for` 按 `signature_class` 决定哪些门控必须关闭才允许 `is_conclusive=true`）。
+定义：`schema.GateEntry`（status: `open|closed|blocked|n/a`，`required_for` 按 `signature_class` 决定适用门控；定论要求所有适用门控有 executor-owned `closure_basis`。LLM 不能自行设置 `n/a` 或将门控标记为已验证）。
 
-执行器管理的门控集合（`evidence._GATE_COMPLETION_CRITERIA`）：
+执行器管理的门控评估与完成条件（`evidence._gate_criteria_satisfied`、`gate_completion_criteria`）：
 
 | gate | 关闭准则（executor-owned，LLM 不能口头关闭） |
 |---|---|
-| `register_provenance` | 寄存器写入来源被独立观察（dis/rd/sym 等） |
-| `object_lifetime` | 同槽位 `kmem -S` 状态 + 基址内存均被观察，或有直接生命周期证据（KASAN）；ALLOCATED 快照不排除 UAF-with-reuse |
-| `local_corruption_exclusion` | 有相关反汇编 + 内存观察支持或排除本地写入者 |
-| `field_type_classification` | struct 布局证据 + 类型/符号佐证 |
-| `external_corruption_gate` | 前置 `local_corruption_exclusion` 已关闭 + 至少一条具体外部来源观察 |
+| `register_provenance` | 当前执行器校验要求内存事实及 dis/sym 事实类别同时出现；地址/来源关系仍需分析和验证 |
+| `object_lifetime` | 当前支持同地址 `kmem -S` 状态与内存读取事实；未绑定目标地址的 KASAN 信号仅作 telemetry。`page_not_present` 的地址关联映射拆除/生命周期事实抽取与闭合规则尚未实现，因此该签名下此门控保持未决 |
+| `local_corruption_exclusion` | 当前执行器校验要求 dis 与内存事实类别同时出现 |
+| `field_type_classification` | 当前执行器校验要求 struct 与 sym 事实类别同时出现 |
+| `external_corruption_gate` | 要求前置门控 executor-verified，且有 `external_source:` 执行器事实；该事实抽取尚未接入，因此不会被通用 rd/struct/dis/sym 事实关闭 |
 
-依赖关系：`external_corruption_gate` 被 `local_corruption_exclusion` 阻塞（`state_manager` 维护）。LLM 只能"申请"关闭，`evaluate_gate_closures` 按事实判定，不满足则记录 `llm_close_rejected` 事件并写进报告。
+只有 `_REQUIRED_GATES` 中列出的必需门控阻止定论；额外出现的可选门控只作展示/审计，不影响收敛。没有专属执行器闭合规则的必需门控只记录 `weak_gate_closure` telemetry，保持未决；提示词会说明不要仅为关闭这类门控而重复探测，相关分析仍为非定论，直到补上事实抽取和门控规则。未知或未登记门控策略的签名（当前包括 `unknown` 与 `stack_corruption`）也不能定论。`n/a` 目前没有执行器判定规则，因此 LLM 的请求会被拒绝并写入审计记录。
 
-证据事实前缀（`evidence.extract_evidence_facts`）：`rd_word:`、`struct_`、`dis_`、`sym:`、`vtop_`、`kmem_`、`kmem_slab_state:0x<addr>=allocated|free`、`kmem_vmap_range:`、`lifetime_proof:`（KASAN UAF 专用）。
+证据事实前缀（`evidence.extract_evidence_facts`）：`rd_word:`、`struct_`、`dis_`、`sym:`、`vtop_`、`kmem_`、`kmem_slab_state:0x<addr>=allocated|free`、`kmem_vmap_range:`、`lifetime_signal:kasan_use_after_free_unbound`（telemetry，不构成生命周期证明）。
 
 ## 工具层（`src/mcp_tools/`）
 
@@ -295,5 +295,7 @@ layer0 2.4a 则给出各里程碑必须达成的目标：
 
 ## 已知语义风险（备忘）
 
-- `object_lifetime` 的 KASAN 事实（`lifetime_proof:`）未与目标槽位地址绑定，任意 KASAN UAF 事实即可关闭该门控（`evidence._gate_criteria_satisfied`）。
+- KASAN 地址绑定尚未实现：KASAN UAF 输出目前只生成未绑定地址的 telemetry，不参与 `object_lifetime` 闭合；因此仅有 KASAN 证据的 UAF 分析可能保持非定论。
+- 多个签名的必需门控尚无执行器闭合规则；这类门控会保持未决，相应分析无法由当前规则集得出定论，直到补齐事实抽取与规则。
+- `n/a` 是预留状态，目前没有执行器适用性规则会产生该状态；LLM 请求会被拒绝。
 - `local_corruption_exclusion` 是代码级门控名，措辞上仍是 exclusion；prompt 侧已统一为 discrimination 语义，重命名标识符需同步 `state_manager`/`schema`/`report_generator` 与测试。

@@ -374,6 +374,10 @@ def format_conflict_fact(fact: str) -> str | None:
 # 分析文本里出现"短语 + 对象标识"即视为该冲突已被回应，不再计入未解决冲突。
 RESOLVED_CONFLICT_MARKER = "已核对冲突"
 
+# 同一冲突最多完整注入几次。超过后改为一次性简短 residual 提示，并停止把
+# root_cause/confidence 压回 unknown/low，避免 executor audit 在剩余步数里刷屏。
+MAX_VALUE_CONFLICT_AUDIT_INJECTIONS = 2
+
 
 def conflict_resolution_phrase(fact: str) -> str | None:
     """返回模型回应这条冲突时应写出的短语；事实不可解析时返回 None。"""

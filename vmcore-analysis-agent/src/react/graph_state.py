@@ -96,6 +96,8 @@ class AgentState(MessagesState):
     # 取值级矛盾事实（内存内容与结构体布局不符），格式见 consistency.py。
     # 与 evidence_facts 分开保存：它属于派生关系，不参与门控证据统计。
     value_conflicts: list[str]
+    # 每条 value_conflict 已累计处理的次数，用于超限后降噪并保留 residual caveat。
+    value_conflict_audit_counts: dict[str, int]
     replan_required: bool
     current_evidence_goal: Optional[dict[str, object]]
     evidence_goal_version: int

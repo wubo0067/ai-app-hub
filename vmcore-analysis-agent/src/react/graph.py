@@ -21,7 +21,6 @@ from typing import List
 from langgraph.graph import START, StateGraph
 from langgraph.checkpoint.memory import InMemorySaver
 
-from src.utils.config import config_manager
 from src.utils.logging import logger
 from .graph_state import AgentState
 from .nodes import (
@@ -36,47 +35,14 @@ from .llm_node import call_llm_analysis, structure_reasoning_content
 from .edges import should_continue, after_crash_tool
 
 
-def _debug_log_bound_tools_payload(bound_llm) -> None:
-    """Log bound tool schema payload when debug switch is enabled.
-
-    This helper intentionally uses best-effort introspection because different
-    LangChain model wrappers expose bound tool payloads via different fields.
-    """
-
-    if not config_manager.get("debug_tools_schema", False):
-        return
-
-    payload = None
-
-    # Common path for RunnableBinding-like objects created by bind_tools.
-    kwargs = getattr(bound_llm, "kwargs", None)
-    if isinstance(kwargs, dict):
-        payload = kwargs.get("tools") or kwargs.get("functions")
-
-    # Fallback for wrappers that store kwargs on an internal bound object.
-    if payload is None:
-        bound = getattr(bound_llm, "bound", None)
-        bound_kwargs = getattr(bound, "kwargs", None)
-        if isinstance(bound_kwargs, dict):
-            payload = bound_kwargs.get("tools") or bound_kwargs.get("functions")
-
-    if payload is None:
-        logger.warning(
-            "debug_tools_schema is enabled, but no bound tools/functions payload was found on llm_with_tools."
-        )
-        return
-
-    logger.info("[DEBUG] Bound tool schema payload (tools/functions): %s", payload)
-
-
-def create_agent_graph(llm, tools_list: List, structured_llm=None):
+def create_agent_graph(llm, tools_list: List):
     """创建并编译 VMCore 分析 Agent 的 LangGraph 状态图。
 
     该函数负责完成以下工作：
-    1. 将可用工具绑定到主 LLM，使其具备工具调用能力。
+    1. 使用原始推理 LLM 构造主分析节点；结构化 JSON 的 action 由 build_tool_calls 转换。
     2. 初始化图状态检查点，用于在多轮推理过程中保存状态。
     3. 按照既定流程注册各个节点及其转换边。
-    4. 在存在 structured_llm 时，启用结构化推理兜底节点。
+    4. 结构化推理兜底节点与主分析节点共用同一个 LLM 实例。
     5. 编译并返回可执行的 LangGraph 对象。
 
     整体执行流程如下：
@@ -89,25 +55,25 @@ def create_agent_graph(llm, tools_list: List, structured_llm=None):
     当满足结束条件时，图会跳转到 __end__ 并结束执行。
 
     Args:
-        llm: 主推理模型实例，用于执行常规分析与决策。
-        tools_list: 提供给 LLM 使用的工具列表；为空时仅执行纯 LLM 推理。
-        structured_llm: 可选的结构化输出模型实例，用于在特定场景下生成结构化推理结果。
+        llm: 推理模型实例；主分析节点与结构化兜底节点共用该实例。
+        tools_list: 当前可用的 MCP 工具列表；仅用于记录可用性，工具调用由
+            build_tool_calls 从结构化 action 字段合成。
 
     Returns:
         编译完成的 LangGraph 可执行图对象。
     """
 
-    # 当未提供工具时，直接使用原始 LLM 执行分析。
+    # 结构化 JSON 的 action 由 build_tool_calls 转成 LangChain tool_calls；
+    # 这里不再 bind_tools，避免 RunnableBinding 代理导致 max_tokens 等绑定丢失。
     if not tools_list:
         logger.warning(
             "No tools provided to the agent. LLM will run without tool-calling capability."
         )
-        llm_with_tools = llm
     else:
-        # 将工具绑定到 LLM，使其能够在分析过程中主动发起工具调用。
-        llm_with_tools = llm.bind_tools(tools_list)
-        logger.info(f"Bound {len(tools_list)} tools to LLM for agent execution.")
-        _debug_log_bound_tools_payload(llm_with_tools)
+        logger.info(
+            f"{len(tools_list)} tools available; tool calls are synthesized from "
+            "structured action fields."
+        )
 
     # 初始化内存检查点，用于保存图执行过程中的状态。
     checkpointer = InMemorySaver()
@@ -120,7 +86,7 @@ def create_agent_graph(llm, tools_list: List, structured_llm=None):
     # 注册 LLM 分析节点：负责读取当前状态并决定下一步动作。
     builder.add_node(
         llm_analysis_node,
-        partial(call_llm_analysis, llm_with_tools=llm_with_tools),
+        partial(call_llm_analysis, llm=llm),
     )
     logger.debug(f"Added node: {llm_analysis_node}")
 
@@ -128,19 +94,12 @@ def create_agent_graph(llm, tools_list: List, structured_llm=None):
     builder.add_node(crash_tool_node, call_crash_tool)
     logger.debug(f"Added node: {crash_tool_node}")
 
-    # 如果提供了结构化模型，则启用结构化推理节点作为补充或兜底路径。
-    if structured_llm:
-        builder.add_node(
-            structure_reasoning_node,
-            partial(structure_reasoning_content, structured_llm=structured_llm),
-        )
-        logger.debug(f"Added node: {structure_reasoning_node}")
-    else:
-        # 未提供结构化模型时，仅记录告警，不注册该节点。
-        logger.warning(
-            "No structured_llm provided. structure_reasoning_node will not be available. "
-            "DeepSeek-Reasoner empty content fallback will be disabled."
-        )
+    # 注册结构化推理兜底节点：与主分析节点共用同一个 LLM 实例。
+    builder.add_node(
+        structure_reasoning_node,
+        partial(structure_reasoning_content, llm=llm),
+    )
+    logger.debug(f"Added node: {structure_reasoning_node}")
 
     # 注册初始化节点：用于收集 vmcore 分析所需的基础上下文数据。
     builder.add_node(collect_crash_init_data_node, collect_crash_init_data)
@@ -161,11 +120,12 @@ def create_agent_graph(llm, tools_list: List, structured_llm=None):
     )
 
     # 定义 LLM 分析节点的所有可能后继节点。
-    llm_analysis_targets = [crash_tool_node, "__end__", llm_analysis_node]
-
-    # 仅在结构化推理节点可用时，将其加入 LLM 分析的跳转目标中。
-    if structured_llm:
-        llm_analysis_targets.append(structure_reasoning_node)
+    llm_analysis_targets = [
+        crash_tool_node,
+        "__end__",
+        llm_analysis_node,
+        structure_reasoning_node,
+    ]
 
     # 根据 LLM 当前输出结果，决定继续工具调用、重复分析、结构化推理或结束。
     builder.add_conditional_edges(
@@ -178,15 +138,14 @@ def create_agent_graph(llm, tools_list: List, structured_llm=None):
     )
 
     # 结构化推理节点完成后，可继续调用工具、返回分析节点，或直接结束。
-    if structured_llm:
-        builder.add_conditional_edges(
-            structure_reasoning_node,
-            should_continue,
-            [crash_tool_node, llm_analysis_node, "__end__"],
-        )
-        logger.debug(
-            f"Added conditional edge: {structure_reasoning_node} -> [crash_tool_node, llm_analysis_node, __end__]"
-        )
+    builder.add_conditional_edges(
+        structure_reasoning_node,
+        should_continue,
+        [crash_tool_node, llm_analysis_node, "__end__"],
+    )
+    logger.debug(
+        f"Added conditional edge: {structure_reasoning_node} -> [crash_tool_node, llm_analysis_node, __end__]"
+    )
 
     # 工具执行完成后，根据执行结果决定回到 LLM 继续推理，或结束流程。
     builder.add_conditional_edges(

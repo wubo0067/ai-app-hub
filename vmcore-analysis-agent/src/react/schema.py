@@ -4,9 +4,12 @@
 # Author: CalmWU
 # Created: 2026-03-23
 
+import logging
 from typing import Any, ClassVar, Dict, List, Literal, Optional, cast, get_args
 
 from pydantic import BaseModel, Field, model_validator
+
+logger = logging.getLogger(__name__)
 
 _CORRUPTION_MECHANISM_ALIASES = {
     "type_misuse": "field_type_misuse",
@@ -41,6 +44,7 @@ _ROOT_CAUSE_CLASS_ALIASES = {
     "stack_protector": "stack_corruption",
     "stack_smash": "stack_corruption",
     "kernel_stack_corruption": "stack_corruption",
+    "memory_corruption": "pointer_corruption",
 }
 
 _DRIVER_INFERENCE_METHOD_ALIASES = {
@@ -278,6 +282,11 @@ def _coerce_root_cause_class(data: Any) -> Any:
         return data
 
     normalized = _ROOT_CAUSE_CLASS_ALIASES.get(raw, raw)
+    if raw == "memory_corruption":
+        logger.warning(
+            "Coerced legacy root_cause_class='memory_corruption' to '%s'.",
+            normalized,
+        )
 
     if normalized in _ROOT_CAUSE_FROM_MECHANISM:
         if data.get("corruption_mechanism") in {None, "unknown"}:
@@ -553,6 +562,10 @@ class VMCoreLLMAnalysisStep(BaseModel):
             legacy_value = data.get("crash_class")
             if legacy_value is not None:
                 data["signature_class"] = legacy_value
+        if isinstance(data, dict) and isinstance(data.get("gates"), dict):
+            for gate in data["gates"].values():
+                if isinstance(gate, dict):
+                    gate.pop("closure_basis", None)
         data = _coerce_signature_class(data)
         data = _coerce_root_cause_class(data)
         data = _coerce_corruption_mechanism(data, root_cause_field="root_cause_class")
@@ -692,13 +705,13 @@ class GateEntry(BaseModel):
 
     每个 gate 代表一个必须完成的验证步骤，用于确认崩溃根因的特定假设。
     在将分析结论标记为“最终结论”（is_conclusive=True）之前，所有相关的 gate
-    必须处于 closed 或 n/a 状态，且 evidence 字段必须填写具体的工具输出。
+    必须由执行器验证为 closed 或 n/a，且结论必须保留对应的 closure_basis。
 
     status 含义：
       open    — 尚未调查，或调查尚未完成
-      closed  — 已验证通过（evidence 字段必须填写具体工具输出，不得使用泛泛总结）
+      closed  — 仅执行器可设置为已验证通过（须有 executor-owned closure_basis）
       blocked — 前置 gate 尚未关闭，当前 gate 无法开始验证（通常仅 external_corruption_gate 使用）
-      n/a     — 确实不适用（evidence 字段必须解释为何不适用，如特定硬件环境未触发）
+      n/a     — 预留状态（当前未启用）；未来仅执行器可按专属适用性规则设置，LLM 请求不生效
     """
 
     @model_validator(mode="before")
@@ -737,7 +750,10 @@ class GateEntry(BaseModel):
     )
     status: GateStatus = Field(
         "open",
-        description="open=pending, closed=verified, blocked=prereq not met, n/a=not applicable",
+        description=(
+            "open=pending, closed=executor-verified, blocked=prerequisite not met, "
+            "n/a=reserved and currently unused; only a future executor applicability rule may set it"
+        ),
     )
     prerequisite: Optional[str] = Field(
         None,
@@ -745,7 +761,11 @@ class GateEntry(BaseModel):
     )
     evidence: Optional[str] = Field(
         None,
-        description="Specific tool output or observation that closed/blocked/n/a this gate",
+        description="Executor-observed evidence; LLM claims are retained only in request audit events",
+    )
+    closure_basis: Optional[Literal["executor_evidence", "executor_na"]] = Field(
+        None,
+        description="Executor-owned basis for a terminal gate status; never supplied by the LLM",
     )
     completion_criteria: List[str] = Field(
         default_factory=list,
@@ -917,7 +937,9 @@ class VMCoreAnalysisStep(BaseModel):
         description=(
             "Evidence gates for mandatory checkpoints. "
             "Include ONLY gates whose required_for list contains the current signature_class. "
-            "All required gates must reach status='closed' or 'n/a' before is_conclusive=true. "
+            "Gate status updates are advisory; do not set status='n/a'. "
+            "The executor alone may close or mark a gate not applicable. "
+            "All required gates must be executor-verified, with closure_basis, before is_conclusive=true. "
             "See §1.1a Gate Catalog for closure standards."
         ),
     )
@@ -955,21 +977,33 @@ class VMCoreAnalysisStep(BaseModel):
             )
 
         if self.is_conclusive:
-            required_gate_names = self._REQUIRED_GATES.get(
-                self.signature_class or "", []
-            )
-            unresolved_gates = [
-                gate_name
-                for gate_name in required_gate_names
-                if self.gates is None
-                or gate_name not in self.gates
-                or self.gates[gate_name].status not in {"closed", "n/a"}
-            ]
-            if unresolved_gates:
+            resolution = gate_resolution_state(self.signature_class, self.gates)
+            if resolution != "satisfied":
+                required_gate_names = self._REQUIRED_GATES.get(
+                    self.signature_class or "", []
+                )
+                unresolved_gates = [
+                    gate_name
+                    for gate_name in required_gate_names
+                    if self.gates is None
+                    or gate_name not in self.gates
+                    or self.gates[gate_name].status not in {"closed", "n/a"}
+                    or self.gates[gate_name].closure_basis
+                    not in {"executor_evidence", "executor_na"}
+                ]
+                if resolution == "unclassified":
+                    gate_note = (
+                        "signature_class is unclassified or has no registered gate policy"
+                    )
+                elif resolution == "unregistered":
+                    gate_note = "required gates are not registered"
+                else:
+                    gate_note = (
+                        "required gates are not executor-verified: "
+                        + ", ".join(unresolved_gates)
+                    )
                 conclusive_audit_notes.append(
-                    "Conclusive output downgraded: required gates are not closed/n/a: "
-                    + ", ".join(unresolved_gates)
-                    + "."
+                    f"Conclusive output downgraded: {gate_note}."
                 )
 
         if conclusive_audit_notes:
@@ -997,3 +1031,43 @@ class VMCoreAnalysisStep(BaseModel):
                 default_root_cause or "unknown",
             )
         return self
+
+
+def required_gates_for(
+    signature_class: Optional[str],
+) -> Optional[List[str]]:
+    """Return registered mandatory gates, or None when the signature has no policy."""
+    if signature_class is None:
+        return None
+    gates = VMCoreAnalysisStep._REQUIRED_GATES.get(signature_class)
+    return list(gates) if gates else None
+
+
+def gate_resolution_state(
+    signature_class: Optional[str],
+    gates: Optional[Dict[str, GateEntry]],
+) -> Literal["unclassified", "unregistered", "unresolved", "satisfied"]:
+    """Distinguish missing policy/state from unresolved and executor-verified gates."""
+    required = required_gates_for(signature_class)
+    if required is None:
+        return "unclassified"
+    if gates is None:
+        return "unregistered"
+
+    for gate_name in required:
+        gate = gates.get(gate_name)
+        if gate is None:
+            return "unregistered"
+    for gate_name in required:
+        raw_gate = gates[gate_name]
+        gate = (
+            raw_gate
+            if isinstance(raw_gate, GateEntry)
+            else GateEntry.model_validate(raw_gate)
+        )
+        if gate.status == "closed" and gate.closure_basis == "executor_evidence":
+            continue
+        if gate.status == "n/a" and gate.closure_basis == "executor_na":
+            continue
+        return "unresolved"
+    return "satisfied"

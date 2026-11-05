@@ -19,14 +19,12 @@ _BROAD_ASCII_GREP_RE = re.compile(
 _FORBIDDEN_EXPR_RE = re.compile(
     r"\$\(|\$\(\(|\$[A-Za-z_][A-Za-z0-9_]*|%[A-Za-z0-9]+:|\(%[A-Za-z0-9]+\)|%rip\+|\$r[A-Za-z0-9]+"
 )
-# 地址算术运算模式检测，要求在执行前解析地址计算
-_ADDRESS_ARITHMETIC_RE = re.compile(
-    r"^(?:rd|ptov|vtop|struct|sym|kmem|search|dis|p(?:\s+/x|/x)?)\b.*"
-    r"(?:0x[0-9A-Fa-f]+|\b[0-9A-Fa-f]{8,}\b|[A-Za-z_][A-Za-z0-9_]*)"
-    r"(?:\s*[+-]\s*)"
-    r"(?:0x[0-9A-Fa-f]+|\d+|[A-Za-z_][A-Za-z0-9_]*)"
+# 地址算术运算检测：只检查单个操作数 token 内部的 "地址 +/- 偏移"。
+# 不能在整行上匹配 "十六进制 - 选项/标识符"，否则 search -s <start> -e <end> <value>
+# 会把 -e 误判成减法，直接拒绝合法的 bounded search。
+_ADDRESS_ARITHMETIC_TOKEN_RE = re.compile(
+    r"^(?:0x)?[0-9A-Fa-f]{8,}(?:[+-](?:0x)?[0-9A-Fa-f]+)$"
 )
-_KMEM_S_CACHE_NAME_RE = re.compile(r"^kmem\s+-S\s+[A-Za-z_][A-Za-z0-9_-]*$")
 # 反汇编行匹配：提取指令部分
 _DISASM_LINE_RE = re.compile(r"^\s*0x[0-9a-fA-F]+\s+<[^>]+>:\s+(?P<inst>.+)$")
 # 寄存器间 mov 指令匹配：追踪寄存器别名关系
@@ -53,6 +51,20 @@ def _collapse_whitespace(text: str) -> str:
         规范化后的字符串
     """
     return " ".join(text.strip().split())
+
+
+def _has_unresolved_address_arithmetic(command_line: str) -> bool:
+    """Return True only for a concrete address arithmetic operand.
+
+    ``search -s <start> -e <end> <value>`` is a valid bounded scan: the ``-e``
+    token is an option, not subtraction.  Checking each whitespace-delimited
+    token avoids that false positive while still rejecting ``addr+0x10`` and
+    ``addr-0x10`` operands that crash cannot evaluate.
+    """
+    for token in command_line.split():
+        if _ADDRESS_ARITHMETIC_TOKEN_RE.fullmatch(token):
+            return True
+    return False
 
 
 def canonicalize_command_line(command_line: str) -> str:
@@ -321,6 +333,16 @@ def validate_tool_call_request(
         )
         if struct_error is not None:
             return struct_error
+    else:
+        # 独立 struct 调用同样只做布局时序校验；observed_struct_offsets 是
+        # 跨类型的全局集合，不能用来判定某个具体实例查询的类型是否合法。
+        struct_error = _validate_struct_requests(
+            lines,
+            observed_struct_offsets=observed_struct_offsets,
+            struct_layout_cache=struct_layout_cache,
+        )
+        if struct_error is not None:
+            return struct_error
 
     return None
 
@@ -364,9 +386,7 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
     # 地址算术只检查首个 pipe 之前的 crash 命令主体，避免把 grep tail
     # 中的选项或模式误判成 "identifier - identifier" 一类算术表达式。
     arithmetic_target = normalized.split("|", 1)[0].strip()
-    if not _KMEM_S_CACHE_NAME_RE.fullmatch(
-        arithmetic_target
-    ) and _ADDRESS_ARITHMETIC_RE.search(arithmetic_target):
+    if _has_unresolved_address_arithmetic(arithmetic_target):
         return f"address arithmetic must be resolved before execution: {normalized}"
 
     rd_ss_error = _validate_rd_ss_command(normalized)
@@ -392,11 +412,11 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
     if command == "bt" and "-f" in parts[1:]:
         flag_index = parts.index("-f")
         if flag_index == len(parts) - 1:
-            return "bt -f requires a concrete pid or task argument."
+            return "bt -f requires a concrete hex task_struct address argument."
 
         target = parts[flag_index + 1]
         if target.isdigit() and len(parts) == flag_index + 2:
-            return "bt -f must target a concrete pid or task context, not a frame number from bt output."
+            return "bt -f must target a hex task_struct address (e.g., bt -f <task_addr>), not a numeric PID or frame number from bt output."
 
     # log 命令检查：必须配合 grep 使用，禁止单独使用
     if command == "log":
@@ -461,24 +481,24 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
             return "bare struct -o is forbidden; use struct -o <type>."
 
         if len(parts) < 2:
-            return "struct command is incomplete; use struct -o <type> or struct <type> <addr>."
+            return "struct command is incomplete; use struct -o <type>, struct <type> <addr>, or struct <type>.<field>[,<field>] <addr>."
 
         if parts[1] == "-o":
-            if len(parts) != 3:
+            if len(parts) != 3 or "." in parts[2]:
                 return (
                     "struct layout queries only allow the form 'struct -o <type>'; "
-                    "do not append field names or extra operands."
+                    "do not append field names, dot members, or extra operands."
                 )
         else:
             if parts[1].startswith("-"):
                 return (
-                    "struct only allows 'struct -o <type>' or 'struct <type> <addr>'; "
+                    "struct only allows 'struct -o <type>', 'struct <type> <addr>', or 'struct <type>.<field>[,<field>] <addr>'; "
                     "other flag forms are forbidden."
                 )
             if len(parts) > 3:
                 return (
-                    "struct instance queries only allow 'struct <type>' or 'struct <type> <addr>'; "
-                    "do not append field names such as 'driver' or 'init_name'."
+                    "struct instance queries only allow 'struct <type>', 'struct <type> <addr>', or 'struct <type>.<field>[,<field>] <addr>'; "
+                    "do not append space-separated field names such as 'driver' or 'init_name'."
                 )
 
     # rd 命令检查：必须提供地址目标
@@ -744,9 +764,11 @@ def _validate_struct_requests(
     验证 struct 查询请求与已知偏移量的兼容性。
 
     验证逻辑：
-    1. 如果已知某些偏移量（来自反汇编分析），检查 struct 查询是否能覆盖这些偏移
-    2. 禁止同时使用 struct -o <type> 和 struct <type> <addr>（应先检查布局再查实例）
-    3. 检查结构体大小是否足够大以包含所有已知偏移
+    1. 禁止同时使用 struct -o <type> 和 struct <type> <addr>（应先检查布局再查实例）
+    2. 不再用 crash-path 全局偏移拒绝显式 struct 实例查询：observed_struct_offsets
+       是跨类型、跨基址寄存器聚合的全局集合，无法归属到具体类型；把某个类型的
+       最大偏移套到另一个类型上会产生误杀（如 irq_desc 的 0x1b0 误杀 irqaction）。
+       实例查询是否真的类型不匹配，由读取后的 value-conflict audit 负责。
 
     Args:
         lines: 待验证的命令列表
@@ -770,13 +792,13 @@ def _validate_struct_requests(
         parts = canonicalize_command_line(line).split()
         if len(parts) < 2 or parts[0] != "struct":
             continue
-        # struct -o <type> 形式：查询布局
+        # struct -o <type> 形式：查询布局（不允许点号字段）
         if len(parts) >= 3 and parts[1] == "-o":
             offset_query_types.add(parts[2])
             continue
-        # struct <type> <addr> 形式：查询实例
+        # struct <type> <addr> 或 struct <type>.<field> <addr> 形式：查询实例
         if parts[1] != "-o" and len(parts) >= 3:
-            instance_query_types.append(parts[1])
+            instance_query_types.append(parts[1].split(".", 1)[0])
 
     # 验证每个实例查询
     for type_name in instance_query_types:
@@ -790,31 +812,8 @@ def _validate_struct_requests(
                 "struct <type> <addr> only after validating offset coverage."
             )
 
-        # 如果缓存中没有布局，跳过后续检查
-        if cached_layout is None:
-            continue
-
-        # 检查结构体大小是否足够
-        size = int(cached_layout.get("size", 0))
-        field_offsets = {
-            int(offset) for offset in cached_layout.get("field_offsets", [])
-        }
-        max_observed = max(observed_offsets)
-        if max_observed >= size:
-            return (
-                f"struct type {type_name} is too small for the observed crash-path offsets "
-                f"(max observed offset 0x{max_observed:x}, size 0x{size:x})."
-            )
-
-        # 检查是否有未覆盖的偏移量
-        uncovered_offsets = [
-            offset for offset in observed_offsets if offset not in field_offsets
-        ]
-        if uncovered_offsets:
-            uncovered_str = ", ".join(f"0x{offset:x}" for offset in uncovered_offsets)
-            return (
-                f"struct type {type_name} does not cover the observed crash-path field offsets {uncovered_str}; "
-                "do not interpret this type until a compatible layout is validated."
-            )
+        # 已缓存布局也不能证明 observed_offsets 属于该类型；这里只保留
+        # "先 struct -o 再 struct <type> <addr>" 的时序约束，不按全局最大偏移硬拒。
+        # 显式实例查询若类型真的不匹配，会在读取后由 detect_value_conflicts 捕获。
 
     return None

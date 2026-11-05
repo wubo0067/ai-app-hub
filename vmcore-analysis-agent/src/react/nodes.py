@@ -29,7 +29,7 @@ from .graph_state import (
     CONVERGENCE_GUARD_STREAK_THRESHOLD,
     has_committed_root_cause,
 )
-from .schema import GateEntry
+from .schema import GateEntry, gate_resolution_state
 from .consistency import MemoryRead, detect_value_conflicts, parse_memory_reads
 from .prompts import crash_init_data_prompt
 from .prompt_phrases import FORCED_CHOICE_CONVERGENCE_RULE
@@ -119,14 +119,17 @@ _READONLY_VALUE_PROBE_COMMANDS = frozenset(
 )
 
 
-def _gates_all_closed(gates: Optional[Mapping[str, object]]) -> bool:
-    """门控已注册且没有任何 open/blocked 门控时返回 True。"""
-    if not gates:
-        return False
-    return not any(
-        GateEntry.model_validate(gate).status in {"open", "blocked"}
-        for gate in gates.values()
+def _gates_all_closed(
+    gates: Optional[Mapping[str, object]],
+    signature_class: Optional[str] = None,
+) -> bool:
+    """Return whether a registered gate policy has only executor-verified terminal gates."""
+    normalized_gates = (
+        {name: GateEntry.model_validate(gate) for name, gate in gates.items()}
+        if gates is not None
+        else None
     )
+    return gate_resolution_state(signature_class, normalized_gates) == "satisfied"
 
 
 def _only_read_only_value_probes(lines: List[str]) -> bool:
@@ -154,7 +157,9 @@ def _convergence_guard_error(state: AgentState, lines: List[str]) -> str | None:
         return None
     if not has_committed_root_cause(state):
         return None
-    if not _gates_all_closed(state.get("managed_gates")):
+    if not _gates_all_closed(
+        state.get("managed_gates"), state.get("current_signature_class")
+    ):
         return None
     if not _only_read_only_value_probes(lines):
         return None
@@ -163,9 +168,10 @@ def _convergence_guard_error(state: AgentState, lines: List[str]) -> str | None:
         f"root_cause_class={state.get('current_root_cause_class')} is established and every "
         f"mandatory gate is closed, and the last "
         f"{state.get('no_progress_streak', 0)} actions produced no new evidence. This read-only "
-        f"value probe cannot strengthen the conclusion: bytes inside memory already proven to be "
-        f"corruption payload are the payload, not live state, so their protocol semantics can "
-        f"never be recovered from the vmcore. Emit the final JSON conclusion now "
+        f"value probe cannot strengthen the conclusion: an isolated overwritten scalar is payload, "
+        f"not live state. If the evidence already in hand contains at least two aligned records "
+        f"with a coherent documented protocol template, evaluate that template under the "
+        f"corrupted-payload exception. Emit the final JSON conclusion now "
         f"(is_conclusive=true, confidence=\"low\" is acceptable, action=null) and record the "
         f"residual unknown in final_diagnosis.detailed_analysis."
     )
