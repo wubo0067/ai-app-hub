@@ -9,5 +9,7 @@ rag-preprocessing/data/md/ssl/*.md
 rag-preprocessing/data/md/*.md
 *.xml
 *.log
+.env
 knowledge_extract/extract_pdf/output/
 vmcore-analysis-agent/logs
+vmcore-analysis-agent/.venv

@@ -5,6 +5,8 @@
 # Created: 2026-01-19
 
 import json
+import openai
+from dataclasses import replace
 from typing import Any, cast
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage, HumanMessage
 from .graph_state import AgentState
@@ -19,8 +21,14 @@ from .output_parser import (
     select_analysis_content,
     unresolved_value_conflicts,
 )
-from .llm_runtime import ainvoke_with_retry, compress_messages_for_llm
-from .llm_runtime import compute_adaptive_max_tokens
+from .llm_runtime import (
+    ContextBudgetError,
+    LLMBudgetConfig,
+    OutputBudget,
+    ainvoke_with_retry,
+    calibrate_chars_per_token,
+    prepare_messages_for_llm,
+)
 from .prompt_builder import build_analysis_system_prompt, build_executor_state_section
 from .prompts import (
     build_structure_reasoning_force_conclusion,
@@ -30,6 +38,28 @@ from .prompts import (
 from .schema import VMCoreAnalysisStep, VMCoreLLMAnalysisStep
 from .state_manager import project_managed_analysis_step
 from src.utils.logging import logger
+from src.utils.settings import get_settings
+
+
+def _build_structured_chain(llm, budget: OutputBudget):
+    """按真实预算构造结构化输出链。
+
+    max_tokens/thinking/effort 必须作为 with_structured_output 的参数传入，
+    由其内部与 response_format 一起 bind 到底层模型；如果再套一层
+    `.bind(...)`，RunnableSequence 不会把这些 kwargs 传给底层 chat model。
+    """
+    if budget.max_tokens is None:
+        raise ContextBudgetError("Cannot build LLM chain without an output budget")
+    return llm.with_structured_output(
+        VMCoreLLMAnalysisStep,
+        method="json_mode",
+        include_raw=True,
+        max_tokens=budget.max_tokens,
+        reasoning_effort=budget.reasoning_effort,
+        extra_body={
+            "thinking": {"type": "enabled" if budget.thinking else "disabled"}
+        },
+    )
 
 
 def _reasoning_signals_convergence(reasoning: str) -> bool:
@@ -47,7 +77,7 @@ def _reasoning_signals_convergence(reasoning: str) -> bool:
     )
 
 
-async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
+async def call_llm_analysis(state: AgentState, llm) -> dict:
     """
     调用 LLM 分析节点，根据收集到的 vmcore 信息进行智能分析。
 
@@ -57,7 +87,7 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
 
     Args:
         state: AgentState，包含历史消息和上下文
-        llm_with_tools: 绑定了工具的 LLM 实例
+        llm: 原始推理 LLM 实例；结构化输出链在本节点内按预算构造
 
     Returns:
         dict: 包含 messages、error 和 step_count 的状态更新
@@ -96,13 +126,44 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         is_last_step=effective_last_step,
     )
 
-    # 压缩消息历史后再发送给 LLM，避免 reasoning_content 累积和大工具输出导致 token 暴增
-    compressed_messages = compress_messages_for_llm(state["messages"])
-    messages_to_send = [SystemMessage(content=system_message), *compressed_messages]
-    adaptive_max_tokens = compute_adaptive_max_tokens(messages_to_send)
+    # 压缩消息历史后按真实预算规划输出；thinking 预算不足时 plan 会关闭 thinking，
+    # 而不是静默回落到 4,096。
+    settings = get_settings()
+    budget_config = LLMBudgetConfig(
+        context_window=settings.reasoning_context_window,
+        max_output_tokens=settings.reasoning_max_output_tokens,
+        min_thinking_output_tokens=settings.reasoning_min_thinking_output_tokens,
+        thinking_enabled=settings.reasoning_thinking == "enabled",
+        reasoning_effort=settings.reasoning_effort,
+        reasoning_history_keep=settings.reasoning_history_keep,
+    )
+    system_message_obj = SystemMessage(content=system_message)
+    try:
+        compressed_messages, budget = prepare_messages_for_llm(
+            system_message_obj,
+            state["messages"],
+            budget_config,
+        )
+    except ContextBudgetError as exc:
+        logger.error(f"Context budget error before LLM call: {exc}")
+        return {
+            "step_count": 1,
+            "token_usage": 0,
+            "error": {
+                "message": str(exc),
+                "node": llm_analysis_node,
+                "is_error": True,
+            },
+        }
+    messages_to_send = [system_message_obj, *compressed_messages]
 
     logger.info(
-        f"Prepared messages for LLM analysis (step {current_step}): {[type(m).__name__ for m in messages_to_send]} with system prompt length {len(system_message)} and adaptive max_tokens {adaptive_max_tokens}"
+        f"Prepared messages for LLM analysis (step {current_step}): "
+        f"{[type(m).__name__ for m in messages_to_send]} "
+        f"system_prompt_chars={len(system_message)} "
+        f"prompt_est_tokens={budget.prompt_tokens} "
+        f"max_tokens={budget.max_tokens} thinking={budget.thinking} "
+        f"effort={budget.reasoning_effort}"
     )
 
     # 这段代码既不是单纯让 LLM 终止推理，也不是单纯让它继续推理。它的真实作用是防止 agent 空转，并根据 is_last_step 决定：
@@ -176,24 +237,65 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
         )
         return step, remaining, projected, updates
 
-    # 结构化输出，设置 include_raw=True 以获取 token 消耗等元数据
-    llm_analysis = llm_with_tools.bind(
-        max_tokens=adaptive_max_tokens
-    ).with_structured_output(
-        VMCoreLLMAnalysisStep, method="json_mode", include_raw=True
-    )
+    # 结构化输出，设置 include_raw=True 以获取 token 消耗等元数据。
+    # 链在预算确定后构造，确保 max_tokens/thinking/effort 真正进入请求。
     try:
-        # 使用 include_raw=True 后，ainvoke 返回包含 'parsed' 和 'raw' 的字典
-        output_data = await ainvoke_with_retry(llm_analysis, messages_to_send)
+        llm_analysis = _build_structured_chain(llm, budget)
+        try:
+            # 使用 include_raw=True 后，ainvoke 返回包含 'parsed' 和 'raw' 的字典
+            output_data = await ainvoke_with_retry(llm_analysis, messages_to_send)
+        except openai.LengthFinishReasonError as exc:
+            logger.warning(
+                f"LLM output hit max_tokens (completion budget exhausted): {exc}"
+            )
+            if not budget.thinking:
+                raise ContextBudgetError(
+                    f"LLM output hit max_tokens with thinking disabled; "
+                    f"prompt_est={budget.prompt_tokens}, "
+                    f"max_tokens={budget.max_tokens}"
+                ) from exc
+
+            # thinking 吃掉了输出预算：关闭 thinking，压缩后只再给一次机会。
+            fallback_config = replace(budget_config, thinking_enabled=False)
+            fallback_messages, budget = prepare_messages_for_llm(
+                system_message_obj,
+                messages_to_send[1:],
+                fallback_config,
+            )
+            compressed_messages = fallback_messages
+            messages_to_send = [system_message_obj, *compressed_messages]
+            llm_analysis = _build_structured_chain(llm, budget)
+            logger.info(
+                f"Retrying once with thinking disabled: "
+                f"prompt_est={budget.prompt_tokens} "
+                f"max_tokens={budget.max_tokens} "
+                f"effort={budget.reasoning_effort}"
+            )
+            output_data = await ainvoke_with_retry(llm_analysis, messages_to_send)
+
         if output_data is None:
             logger.error("LLM output_data is None")
             raise ValueError("LLM returned None output")
         llm_step = cast(VMCoreLLMAnalysisStep, output_data["parsed"])
         raw_message = cast(AIMessage, output_data["raw"])
 
-        # 获取并记录 token 消耗数量
+        # 获取并记录 token 消耗数量；用真实 prompt_tokens 校准字符/token 估算。
         usage_metadata = getattr(raw_message, "usage_metadata", {}) or {}
         curr_token_usage = usage_metadata.get("total_tokens", 0)
+        prompt_tokens_actual = usage_metadata.get("input_tokens") or usage_metadata.get(
+            "prompt_tokens"
+        )
+        if prompt_tokens_actual:
+            calibrate_chars_per_token(
+                budget.prompt_chars, int(prompt_tokens_actual)
+            )
+        logger.info(
+            f"[llm] usage prompt={prompt_tokens_actual} "
+            f"completion={usage_metadata.get('output_tokens')} "
+            f"total={curr_token_usage} "
+            f"budget_max_tokens={budget.max_tokens} "
+            f"thinking={budget.thinking}"
+        )
 
         # 检查解析结果是否为空
         if llm_step is None:
@@ -374,16 +476,16 @@ async def call_llm_analysis(state: AgentState, llm_with_tools) -> dict:
     }
 
 
-async def structure_reasoning_content(state: AgentState, structured_llm) -> dict:
+async def structure_reasoning_content(state: AgentState, llm) -> dict:
     """
-    使用 deepseek-chat 模型将 DeepSeek-Reasoner 的纯文本 reasoning_content 结构化为 VMCoreAnalysisStep。
+    使用推理 LLM 将纯文本 reasoning_content 结构化为 VMCoreAnalysisStep。
 
-    当 Reasoner 模型返回空 content 但有纯文本 reasoning_content 时，
-    此节点接收该文本并通过 Chat 模型将其转换为结构化的分析步骤。
+    当模型返回空 content 但有纯文本 reasoning_content 时，
+    此节点接收该文本并通过同一个推理 LLM 将其转换为结构化的分析步骤。
 
     Args:
         state: AgentState，包含 reasoning_to_structure 和 reasoning_additional_kwargs
-        structured_llm: deepseek-chat LLM 实例
+        llm: 推理 LLM 实例（与主分析节点共用）
 
     Returns:
         dict: 包含 messages、reasoning_to_structure(清空) 等状态更新
@@ -425,30 +527,45 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
 
         system_prompt += "\n\n" + CHINESE_REPORT_RULE
 
-    # 只发送最小上下文：系统提示 + 待结构化的 reasoning 文本
-    messages_to_send = [
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=reasoning),
-    ]
-    adaptive_max_tokens = compute_adaptive_max_tokens(
-        messages_to_send,
-        # default_max_tokens: 上下文充裕时允许的最大输出 token 数（上限）。
-        # 此节点只做"文本 reasoning → 结构化 JSON"的简单转换，且用的是
-        # deepseek-chat（非 Reasoner），输出远小于完整分析节点，8192 足够。
-        default_max_tokens=8192,
-        # min_max_tokens: 当输入消息逼近上下文上限时，输出预算可压缩到的下限（地板值）。
-        # 2048 保证即便上下文紧张，也至少能产出一份有意义的结论，而非空输出。
-        min_max_tokens=2048,
-        # safety_margin_tokens: 预留的安全余量（token）。
-        # 上下文占用是按 approx_chars_per_token≈2.0 粗估的，存在误差；
-        # 预留 2048 兜底，避免估算偏差导致请求超过 context_limit 报 HTTP 400。
+    # 只发送最小上下文：系统提示 + 待结构化的 reasoning 文本。
+    # 该节点只做"文本 reasoning → JSON"的转换，强制关闭 thinking，避免再耗输出预算。
+    settings = get_settings()
+    budget_config = LLMBudgetConfig(
+        context_window=settings.reasoning_context_window,
+        max_output_tokens=8192,
+        min_thinking_output_tokens=2048,
+        thinking_enabled=False,
+        reasoning_effort="low",
         safety_margin_tokens=2048,
+        min_output_tokens=2048,
+        max_text_output_tokens=8192,
+        reasoning_history_keep=0,
     )
-
-    chat_with_structured = structured_llm.bind(
-        max_tokens=adaptive_max_tokens
-    ).with_structured_output(
-        VMCoreLLMAnalysisStep, method="json_mode", include_raw=True
+    system_message_obj = SystemMessage(content=system_prompt)
+    try:
+        compressed, budget = prepare_messages_for_llm(
+            system_message_obj,
+            [HumanMessage(content=reasoning)],
+            budget_config,
+        )
+        messages_to_send = [system_message_obj, *compressed]
+        chat_with_structured = _build_structured_chain(llm, budget)
+    except ContextBudgetError as exc:
+        logger.error(f"Context budget error in structure node: {exc}")
+        return {
+            "step_count": 0,
+            "token_usage": 0,
+            "reasoning_to_structure": None,
+            "reasoning_additional_kwargs": None,
+            "error": {
+                "message": str(exc),
+                "node": structure_reasoning_node,
+                "is_error": True,
+            },
+        }
+    logger.info(
+        f"Prepared structured reasoning request: prompt_est={budget.prompt_tokens} "
+        f"max_tokens={budget.max_tokens} thinking={budget.thinking}"
     )
 
     try:
@@ -463,6 +580,18 @@ async def structure_reasoning_content(state: AgentState, structured_llm) -> dict
 
         usage_metadata = getattr(raw_chat_message, "usage_metadata", {}) or {}
         curr_token_usage = usage_metadata.get("total_tokens", 0)
+        prompt_tokens_actual = usage_metadata.get("input_tokens") or usage_metadata.get(
+            "prompt_tokens"
+        )
+        if prompt_tokens_actual:
+            calibrate_chars_per_token(
+                budget.prompt_chars, int(prompt_tokens_actual)
+            )
+        logger.info(
+            f"[llm] structure usage prompt={prompt_tokens_actual} "
+            f"completion={usage_metadata.get('output_tokens')} "
+            f"total={curr_token_usage} max_tokens={budget.max_tokens}"
+        )
 
         if llm_step is None:
             content = raw_chat_message.content

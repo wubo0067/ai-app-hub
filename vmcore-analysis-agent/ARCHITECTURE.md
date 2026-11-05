@@ -1,4 +1,4 @@
-﻿# VMCore Analysis Agent — 架构与核心逻辑
+# VMCore Analysis Agent — 架构与核心逻辑
 
 本文是给维护者的"读码地图"：先给一句话核心，再按数据流展开三个子系统，最后回答"想改 X 应该动哪个文件"。
 
@@ -42,7 +42,7 @@ flowchart LR
 
 **执行器状态回灌是 LLM 与执行器之间唯一的反馈通道**：门控没关、矛盾未解，都会以文本形式出现在下一轮 prompt 里。
 
-`llm_runtime.py` 负责发送前的消息压缩（`compress_messages_for_llm`）与 `max_tokens` 自适应。
+`llm_runtime.py` 负责发送前的消息压缩（`compress_messages_for_llm`）与基于真实 token 的预算规划（`prepare_messages_for_llm`）：历史 AI 消息中的 `gates[*].evidence` 只保留在状态/报告中，请求副本会清空；thinking 模式下输出预算覆盖 reasoning + 正文，预算不足时关闭 thinking 或快速失败，不再静默回落到 4,096。
 
 ### ② LLM 输出强制管线 —— 每轮固定顺序（`llm_node.py`）
 

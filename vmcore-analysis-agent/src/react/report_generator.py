@@ -20,7 +20,7 @@ from .schema import (
     gate_resolution_state,
     required_gates_for,
 )
-from src.utils.config import config_manager
+from src.utils.settings import get_reasoning_model_name
 from src.utils.logging import logger
 
 
@@ -137,8 +137,8 @@ def generate_markdown_report(state: AgentState) -> str:
 
     lines = []
 
-    # 直接从配置中获取模型名称
-    model_name = str(config_manager.get("llm_model", "unknown")).lower()
+    # 从运行配置中获取模型名称
+    model_name = get_reasoning_model_name().lower()
 
     # 标题和基本信息
     lines.append("# VMCore 分析报告")
@@ -505,7 +505,7 @@ def _append_verification_summary(
         )
         lines.append("")
 
-    unverified = []
+    unverified: List[str] = []
     for gate_name in verification_gate_names:
         raw_gate = gates.get(gate_name)
         if raw_gate is None or not (
@@ -534,13 +534,14 @@ def _append_verification_summary(
                 f"deterministic evidence ({names}). Related conclusions are inferences from the "
                 "available evidence and should be reviewed against the separate audit record."
             )
+    signature_class = state.get("current_signature_class")
     unsupported_required = [
         gate_name
         for gate_name in verification_gate_names
         if not has_executor_closure_rule(
             gate_name,
             _gate_field(gates.get(gate_name), "required_for", None)
-            or [state.get("current_signature_class")],
+            or ([signature_class] if signature_class is not None else []),
         )
     ]
     if unsupported_required:

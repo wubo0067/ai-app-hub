@@ -313,6 +313,7 @@ python-dotenv==1.2.1
     #   fastmcp
     #   langgraph-cli
     #   pydantic-settings
+    #   vmcore-analysis-agent
 python-multipart==0.0.21
     # via mcp
 pywin32==311 ; sys_platform == 'win32'
@@ -321,7 +322,6 @@ pyyaml==6.0.3
     # via
     #   jsonschema-path
     #   langchain-core
-    #   vmcore-analysis-agent
 referencing==0.36.2
     # via
     #   jsonschema
@@ -432,8 +432,6 @@ uvicorn==0.40.0
     #   mcp
     #   sse-starlette
     #   vmcore-analysis-agent
-watchdog==6.0.0
-    # via vmcore-analysis-agent
 watchfiles==1.1.1
     # via langgraph-api
 wcwidth==0.2.14

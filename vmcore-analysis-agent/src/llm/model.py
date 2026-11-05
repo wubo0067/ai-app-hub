@@ -10,8 +10,8 @@ from pydantic import SecretStr
 
 # from langchain_openai import ChatOpenAI
 from langchain_core.messages import AIMessage
-from src.utils.config import config_manager
 from src.utils.logging import logger
+from src.utils.settings import get_settings
 from langchain_deepseek.chat_models import ChatDeepSeek
 
 
@@ -57,23 +57,16 @@ class ChatDeepSeekReasoner(ChatDeepSeek):
 
 def create_reasoning_llm():
     """Create and return the reasoning LLM instance."""
-    api_key = os.environ.get("DEEPSEEK_API_KEY")
-    base_url = str(
-        config_manager.get("base_url")
-    ).lower()  # DeepSeek API 的 base_url 配置项
-    # 是否是 think 模式
-    thinking = str(config_manager.get("thinking", "disabled")).lower()
-    # 模型名称
-    model_name = str(config_manager.get("llm_model")).lower()
-    temperature = float(config_manager.get("temperature"))
-    reasoning_effort = str(config_manager.get("reasoning_effort", "max")).lower()
-
-    if not all([api_key, base_url, model_name]):
-        logger.error("Missing required LLM configuration parameters")
-        raise ValueError("Missing required LLM configuration parameters")
+    settings = get_settings()
+    api_key = settings.reasoning_api_key
+    base_url = settings.reasoning_base_url
+    thinking = settings.reasoning_thinking
+    model_name = settings.reasoning_model
+    temperature = settings.reasoning_temperature
+    reasoning_effort = settings.reasoning_effort
 
     # 配置 LangSmith 追踪
-    if config_manager.get("langsmith_tracing"):
+    if settings.langsmith_tracing:
         os.environ["LANGSMITH_TRACING"] = "true"
 
     # top_p 值      采样集合大小    随机性        确定性        适合场景
@@ -104,11 +97,12 @@ def create_reasoning_llm():
 
         llm = llm_class(
             api_key=SecretStr(str(api_key)),
-            base_url=base_url,
-            model=model_name,
-            max_tokens=max_tokens,
-            timeout=300,  # 5 分钟超时，后期步骤对话历史很长，LLM 推理耗时较久
-            max_retries=3,  # 遇到连接超时等瞬态错误时自动重试
+                    # ChatDeepSeek 用 api_base 字段构建真实客户端，传 base_url(openai_api_base) 不会生效
+                    api_base=base_url,
+                    model=model_name,
+                    max_tokens=max_tokens,
+                    timeout=300,  # 5 分钟超时，后期步骤对话历史很长，LLM 推理耗时较久
+                    max_retries=3,  # 遇到连接超时等瞬态错误时自动重试
             **llm_kwargs,
         )
         logger.info(f"Successfully created LLM instance, model: {llm}")
@@ -118,39 +112,4 @@ def create_reasoning_llm():
         raise
 
 
-def create_structured_llm():
-    """Create the structured-output LLM instance.
 
-    用于将 DeepSeek-Reasoner 的纯文本 reasoning_content 结构化为 JSON。
-    当 Reasoner 模型返回空 content 但有 reasoning_content 时，
-    使用此 Chat 模型将推理内容转换为 VMCoreAnalysisStep 结构化输出。
-    """
-    api_key = os.environ.get("DEEPSEEK_API_KEY")
-    base_url = str(
-        config_manager.get("base_url")
-    ).lower()  # DeepSeek API 的 base_url 配置项
-
-    # 模型名称
-    model_name = str(config_manager.get("llm_model")).lower()
-
-    if not api_key or not base_url:
-        logger.error("Missing DEEPSEEK_API_KEY env var or BASE_URL for chat LLM")
-        raise ValueError("Missing DEEPSEEK_API_KEY env var or BASE_URL for chat LLM")
-
-    try:
-        llm = ChatDeepSeek(
-            api_key=SecretStr(str(api_key)),
-            base_url=base_url,
-            model=model_name,
-            max_tokens=8192,
-            top_p=0.1,
-            temperature=0.0,
-            timeout=120,
-            max_retries=3,
-            extra_body={"thinking": {"type": "disabled"}},
-        )
-        logger.info(f"Successfully created chat LLM instance: {llm}")
-        return llm
-    except Exception as e:
-        logger.error(f"Failed to create chat LLM instance: {e}")
-        raise

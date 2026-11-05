@@ -5,20 +5,25 @@
 # Created: 2026-03-23
 
 import asyncio
+import json
 import math
+from dataclasses import dataclass
+from typing import Optional
 
 import openai
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 
 from src.utils.logging import logger
 
-REASONER_CONTEXT_LIMIT_TOKENS = 131_072
-DEFAULT_REASONER_MAX_TOKENS = 48_000
-MIN_REASONER_MAX_TOKENS = 4_096
+# 输出预算：thinking 模式必须覆盖 reasoning + 正文，不能再按 4,096 保底。
+MIN_TEXT_OUTPUT_TOKENS = 4_096
+MAX_TEXT_OUTPUT_TOKENS = 16_384
 REASONER_TOKEN_SAFETY_MARGIN = 8_192
-# 上下文以中文/推理文本为主时，字符与 token 的比值更低（约 1.5~2.0）。
-# 采用更保守的 2.0 估算，避免低估上下文占用导致 context 超限（HTTP 400）。
-APPROX_CHARS_PER_TOKEN = 2.0
+INITIAL_CHARS_PER_TOKEN = 1.5
+REASONING_DIGEST_CHARS = 1_000
+
+# 运行时校准值：初始用 1.5，后续根据 API usage 的 prompt_tokens 更新。
+_CHARS_PER_TOKEN = INITIAL_CHARS_PER_TOKEN
 
 # 证据型 crash 工具：其中间输出（日志行、slab 槽位表、反汇编指令、结构体字段）
 # 是诊断的核心证据，享受比普通工具输出更宽松的截断上限，降低"中间截断丢失关键证据"
@@ -74,27 +79,50 @@ EVIDENCE_BUDGET_CHARS = 80_000
 FALLBACK_EVIDENCE_LIMIT_CHARS = 8_000
 
 
+class ContextBudgetError(RuntimeError):
+    """请求在压缩后仍无法放入上下文/输出预算。"""
+
+
+@dataclass(frozen=True)
+class LLMBudgetConfig:
+    """一次 LLM 调用的上下文与输出预算配置。"""
+
+    context_window: int = 524_288
+    max_output_tokens: int = 48_000
+    min_thinking_output_tokens: int = 40_960
+    thinking_enabled: bool = True
+    reasoning_effort: str = "max"
+    safety_margin_tokens: int = REASONER_TOKEN_SAFETY_MARGIN
+    min_output_tokens: int = MIN_TEXT_OUTPUT_TOKENS
+    max_text_output_tokens: int = MAX_TEXT_OUTPUT_TOKENS
+    reasoning_history_keep: int = 2
+    chars_per_token: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class OutputBudget:
+    """预算规划结果；max_tokens=None 表示必须先压缩。"""
+
+    max_tokens: Optional[int]
+    thinking: bool
+    reasoning_effort: str
+    prompt_tokens: int
+    prompt_chars: int
+    must_compress: bool = False
+    reason: str = ""
+
+
 async def ainvoke_with_retry(
     chain, messages: list, max_retries: int = 3, base_delay: float = 2.0
 ):
     """对 LLM ainvoke 调用进行指数退避重试，仅针对瞬态网络连接错误。
 
-    同时捕获 LengthFinishReasonError（reasoning_tokens 耗尽 max_tokens 导致
-    content 为空），此类错误带有随机性（同样的 prompt 下次可能不会触发），
-    因此也纳入重试范围。
+    LengthFinishReasonError 表示输出预算已经耗尽，原样重试同一请求通常仍会失败，
+    因此交给上层做一次有界降级重试（或快速失败），不在本函数内重试。
     """
     for attempt in range(max_retries):
         try:
             return await chain.ainvoke(messages)
-        except openai.LengthFinishReasonError as exc:
-            if attempt == max_retries - 1:
-                raise
-            delay = base_delay * (2**attempt)
-            logger.warning(
-                f"[retry] LLM output hit max_tokens (reasoning exhausted budget) "
-                f"on attempt {attempt + 1}/{max_retries}, retrying in {delay:.0f}s: {exc}"
-            )
-            await asyncio.sleep(delay)
         except (openai.APIConnectionError, openai.APITimeoutError) as exc:
             if attempt == max_retries - 1:
                 raise
@@ -104,6 +132,251 @@ async def ainvoke_with_retry(
                 f"retrying in {delay:.0f}s: {exc}"
             )
             await asyncio.sleep(delay)
+
+
+def _truncate_middle(text: str, head_chars: int, tail_chars: int) -> str:
+    """保留头尾、截断中间，并插入可操作的重新获取提示。"""
+    keep_chars = head_chars + tail_chars
+    if keep_chars <= 0 or len(text) <= keep_chars:
+        return text
+
+    omitted = len(text) - keep_chars
+    tail = text[-tail_chars:] if tail_chars > 0 else ""
+    return (
+        text[:head_chars]
+        + f"\n\n[SYSTEM LOG: {omitted} characters of this tool output have been pruned "
+        f"(middle section) to save context window. If the pruned portion may contain "
+        f"critical evidence, re-invoke the same command to obtain its full output.]\n\n"
+        + tail
+    )
+
+
+def _compact_ai_gate_evidence(messages: list) -> list:
+    """从请求副本的历史 AIMessage 中移除 gates[*].evidence。
+
+    只移除 evidence，保留 gate 的 status/closure_basis。VMCoreAnalysisStep
+    在解析历史消息时会用 gate 状态复核 is_conclusive，不能把 gates 整体删掉。
+    """
+    compacted: list = []
+    stripped_gates = 0
+    saved_chars = 0
+
+    for msg in messages:
+        if not isinstance(msg, AIMessage) or not isinstance(msg.content, str):
+            compacted.append(msg)
+            continue
+
+        try:
+            payload = json.loads(msg.content)
+        except (TypeError, ValueError):
+            compacted.append(msg)
+            continue
+        if not isinstance(payload, dict):
+            compacted.append(msg)
+            continue
+
+        gates = payload.get("gates")
+        if not isinstance(gates, dict):
+            compacted.append(msg)
+            continue
+
+        changed = False
+        for gate in gates.values():
+            if not isinstance(gate, dict):
+                continue
+            evidence = gate.get("evidence")
+            if not evidence:
+                continue
+            saved_chars += len(evidence) if isinstance(evidence, str) else len(str(evidence))
+            gate["evidence"] = None
+            stripped_gates += 1
+            changed = True
+
+        if changed:
+            msg = msg.model_copy(
+                update={
+                    "content": json.dumps(
+                        payload, ensure_ascii=False, separators=(",", ":")
+                    )
+                }
+            )
+        compacted.append(msg)
+
+    if stripped_gates:
+        logger.info(
+            f"[compress] stripped gate evidence from historical AI messages: "
+            f"{stripped_gates} gates, saved ~{saved_chars} chars"
+        )
+    return compacted
+
+
+def _trim_old_reasoning(messages: list, keep_count: int) -> list:
+    """只保留最近 keep_count 条 AI 的完整 reasoning_content，旧消息摘要化。
+
+    字段本身必须保留：DeepSeek-Reasoner 多轮请求要求 assistant 消息携带
+    reasoning_content。这里用短摘要替代旧内容，而不是删除字段。
+    """
+    ai_indices = [i for i, msg in enumerate(messages) if isinstance(msg, AIMessage)]
+    if keep_count > 0:
+        old_indices = set(ai_indices[:-keep_count])
+    else:
+        old_indices = set(ai_indices)
+
+    trimmed: list = []
+    saved_chars = 0
+    for index, msg in enumerate(messages):
+        if index not in old_indices or not isinstance(msg, AIMessage):
+            trimmed.append(msg)
+            continue
+
+        reasoning = msg.additional_kwargs.get("reasoning_content")
+        marker = "\n[SYSTEM LOG: earlier reasoning_content was summarized to save context.]"
+        if not isinstance(reasoning, str) or len(reasoning) <= (
+            REASONING_DIGEST_CHARS + len(marker)
+        ):
+            trimmed.append(msg)
+            continue
+
+        digest = reasoning[:REASONING_DIGEST_CHARS] + marker
+        additional_kwargs = dict(msg.additional_kwargs)
+        additional_kwargs["reasoning_content"] = digest
+        saved_chars += len(reasoning) - len(digest)
+        trimmed.append(msg.model_copy(update={"additional_kwargs": additional_kwargs}))
+
+    if saved_chars:
+        logger.info(
+            f"[compress] summarized old reasoning_content: saved ~{saved_chars} chars"
+        )
+    return trimmed
+
+
+def _emergency_downgrade(
+    messages: list,
+    recent_tool_messages_to_keep: int,
+    max_tool_output_chars: int,
+) -> tuple[list, int, int]:
+    """紧急降级：只压旧证据/DEDUP，保护最近工具和最近 DEDUP。"""
+    tool_indices = [
+        i for i, msg in enumerate(messages) if isinstance(msg, ToolMessage)
+    ]
+    recent_indices = _recent_index_set(tool_indices, recent_tool_messages_to_keep)
+    dedup_positions = [
+        i
+        for i in tool_indices
+        if isinstance(messages[i].content, str)
+        and messages[i].content.startswith(DEDUP_PREFIX)
+    ]
+    recent_dedup_positions = (
+        set(dedup_positions[-DEDUP_FULL_PRESERVE_COUNT:])
+        if dedup_positions
+        else set()
+    )
+
+    downgraded: list = []
+    count = 0
+    saved_chars = 0
+    for index, msg in enumerate(messages):
+        if (
+            isinstance(msg, ToolMessage)
+            and isinstance(msg.content, str)
+            and index not in recent_indices
+            and index not in recent_dedup_positions
+        ):
+            content = msg.content
+            is_evidence = (
+                msg.name in EVIDENCE_TOOL_COMMANDS
+                or content.startswith(DEDUP_PREFIX)
+            )
+            if is_evidence and len(content) > max_tool_output_chars:
+                head_chars = max_tool_output_chars * 3 // 5
+                tail_chars = max_tool_output_chars - head_chars
+                truncated = _truncate_middle(content, head_chars, tail_chars)
+                saved_chars += len(content) - len(truncated)
+                msg = msg.model_copy(update={"content": truncated})
+                count += 1
+        downgraded.append(msg)
+    return downgraded, count, saved_chars
+
+
+def estimate_prompt_chars(messages: list, system_message: Optional[SystemMessage] = None) -> int:
+    """统计将进入请求的字符数（含 system 与历史 reasoning_content）。"""
+    total_chars = 0
+    if system_message is not None and isinstance(system_message.content, str):
+        total_chars += len(system_message.content)
+
+    for message in messages:
+        content = getattr(message, "content", "")
+        total_chars += len(content) if isinstance(content, str) else len(str(content))
+        if isinstance(message, AIMessage):
+            reasoning = message.additional_kwargs.get("reasoning_content")
+            if isinstance(reasoning, str):
+                total_chars += len(reasoning)
+    return total_chars
+
+
+def estimate_prompt_tokens(
+    messages: list,
+    system_message: Optional[SystemMessage] = None,
+    chars_per_token: Optional[float] = None,
+) -> int:
+    """按字符数估算 prompt tokens，并计入消息固定开销。"""
+    ratio = chars_per_token or _CHARS_PER_TOKEN
+    chars = estimate_prompt_chars(messages, system_message)
+    message_count = len(messages) + (1 if system_message is not None else 0)
+    return math.ceil(chars / ratio) + 4 * message_count + 16
+
+
+def calibrate_chars_per_token(prompt_chars: int, prompt_tokens: int) -> None:
+    """用真实 usage.prompt_tokens 校准字符/token 比值。"""
+    global _CHARS_PER_TOKEN
+    if prompt_chars <= 0 or prompt_tokens <= 0:
+        return
+    observed = prompt_chars / prompt_tokens
+    if not 1.0 <= observed <= 3.0:
+        return
+    _CHARS_PER_TOKEN = 0.7 * _CHARS_PER_TOKEN + 0.3 * observed
+
+
+def plan_output_budget(
+    prompt_tokens: int,
+    prompt_chars: int,
+    config: LLMBudgetConfig,
+) -> OutputBudget:
+    """在 thinking 预算和正文预算之间做选择，绝不静默回落到 4,096。"""
+    available = (
+        config.context_window - prompt_tokens - config.safety_margin_tokens
+    )
+
+    if config.thinking_enabled and available >= config.min_thinking_output_tokens:
+        return OutputBudget(
+            max_tokens=min(config.max_output_tokens, available),
+            thinking=True,
+            reasoning_effort=config.reasoning_effort,
+            prompt_tokens=prompt_tokens,
+            prompt_chars=prompt_chars,
+        )
+
+    if available >= config.min_output_tokens:
+        return OutputBudget(
+            max_tokens=min(config.max_text_output_tokens, available),
+            thinking=False,
+            reasoning_effort="low",
+            prompt_tokens=prompt_tokens,
+            prompt_chars=prompt_chars,
+        )
+
+    return OutputBudget(
+        max_tokens=None,
+        thinking=False,
+        reasoning_effort="low",
+        prompt_tokens=prompt_tokens,
+        prompt_chars=prompt_chars,
+        must_compress=True,
+        reason=(
+            f"prompt_tokens={prompt_tokens} leaves only {available} tokens "
+            f"for output (minimum {config.min_output_tokens})"
+        ),
+    )
 
 
 def _assign_evidence_tiers(
@@ -164,33 +437,38 @@ def compress_messages_for_llm(
     recent_tool_messages_to_keep: int = 2,  # 需要应用较宽松限制的最近 ToolMessage 的数量
     max_recent_tool_output_chars: int = 12000,  # 最近 ToolMessage 内容的最大字符数限制
     evidence_tool_limit_chars: int = EVIDENCE_TOOL_LIMIT_CHARS,  # 证据型命令 ToolMessage 的字符数限制
+    *,
+    system_message: Optional[SystemMessage] = None,
+    prompt_budget_tokens: Optional[int] = None,
+    reasoning_history_keep: int = 2,
+    chars_per_token: Optional[float] = None,
 ) -> list:
     """
     在发送给 LLM 前对消息历史进行保守压缩，降低 token 消耗。
 
     策略：
-    1. 所有 AIMessage 一律原样保留，尤其禁止改写 reasoning_content。
+    1. 历史 AIMessage 的 gates[*].evidence 一律清空，但保留 gate 状态，
+       因为 VMCoreAnalysisStep 解析时会用 status/closure_basis 校验结论。
     2. 最近几条 ToolMessage 默认保留更多内容，但若单条过大仍会压缩到上限。
     3. 证据型命令（bt/log/kmem/struct/dis 等）的 ToolMessage 享受比普通消息更宽松的
        evidence_tool_limit_chars 上限，但这个"宽松待遇"来自一个全局预算
        EVIDENCE_BUDGET_CHARS，且预算按"离当前最近"优先分配（逆序预分配，见下方
        _assign_evidence_tiers）：越靠近当前轮次的证据消息越优先拿到宽松档，
        预算耗尽后，越久远的证据消息越先降级到 FALLBACK_EVIDENCE_LIMIT_CHARS。
-       同一消息在同一次调用内使用同一上限，保证 LLM 本轮看到的截断结果一致。
     4. DEDUP 消息（LLM 主动重请求同一命令得到的完整缓存输出）中，最近
        DEDUP_FULL_PRESERVE_COUNT 条享受远高于普通证据消息的上限
-       （DEDUP_HARD_CAP_CHARS），但并非无限——单条硬上限存在，避免 1~2 条超大
-       DEDUP 输出独自撑爆总预算；更早的 DEDUP 消息退化为按证据型消息的预算分配处理。
-    5. 对超过限制的 ToolMessage，截断其中间部分，并在截断标记中提示可重新执行
-       原命令获取完整输出。
-    6. 兜底：以上步骤压缩后，若消息总字符数估算仍超出上下文预算，对所有证据型/
-       DEDUP 消息做一次不分新旧的紧急降级（压到 max_tool_output_chars），
-       确保绝不把明显超限的请求发给 LLM。这是最后一道防线，会牺牲掉第 3/4 点
-       原本想保留的"越新越详细"的精细化处理——出现这种情况本身就说明前面的
-       预算参数需要调低，值得在日志里关注。
+       （DEDUP_HARD_CAP_CHARS），但并非无限。
+    5. 如果给了 system_message + prompt_budget_tokens，压缩后按真实 token 估算复检；
+       仍超限时先摘要旧 reasoning_content，再只对旧证据/DEDUP 做紧急降级，
+       保护最近工具消息和最近 DEDUP。
+    6. 此函数不修改 AgentState，仅返回压缩后的副本用于当次 LLM 调用。
 
-    此函数不修改 AgentState，仅返回压缩后的副本用于当次 LLM 调用。
+    如果最终仍超预算，本函数只记录 warning；由 prepare_messages_for_llm 决定是否
+    关闭 thinking 或抛出 ContextBudgetError，避免把超限请求发给 LLM。
     """
+    # 先移除历史 AI 消息中重复的全量 gate evidence（通常是上下文膨胀的主因）。
+    messages = _compact_ai_gate_evidence(messages)
+
     # 获取所有 ToolMessage 在原始消息列表中的索引
     tool_msg_indices = [
         i for i, msg in enumerate(messages) if isinstance(msg, ToolMessage)
@@ -223,24 +501,6 @@ def compress_messages_for_llm(
         FALLBACK_EVIDENCE_LIMIT_CHARS,
     )
 
-    def truncate_middle(text: str, head_chars: int, tail_chars: int) -> str:
-        # 计算需要保留的总字符数
-        keep_chars = head_chars + tail_chars
-        # 如果保留字符数小于等于 0 或文本长度小于等于保留字符数，则直接返回原文本
-        if keep_chars <= 0 or len(text) <= keep_chars:
-            return text
-
-        # 计算被省略的字符数
-        omitted = len(text) - keep_chars
-        # 返回截取后的文本：头部 + 系统日志标记 + 尾部
-        return (
-            text[:head_chars]
-            + f"\n\n[SYSTEM LOG: {omitted} characters of this tool output have been pruned "
-            f"(middle section) to save context window. If the pruned portion may contain "
-            f"critical evidence, re-invoke the same command to obtain its full output.]\n\n"
-            + text[-tail_chars:]
-        )
-
     # 存储压缩后的消息列表
     compressed = []
     # 统计被截断的 ToolMessage 数量
@@ -270,11 +530,10 @@ def compress_messages_for_llm(
         is_dedup = msg.content.startswith(DEDUP_PREFIX)
         if is_dedup and index in recent_dedup_positions:
             # 最近 DEDUP 消息：享受远高于普通证据消息的上限，但仍设硬上限
-            # （DEDUP_HARD_CAP_CHARS），避免单条超大 DEDUP 输出独自撑爆总预算。
             if len(msg.content) > DEDUP_HARD_CAP_CHARS:
                 dedup_head_chars = DEDUP_HARD_CAP_CHARS * 3 // 5
                 dedup_tail_chars = DEDUP_HARD_CAP_CHARS - dedup_head_chars
-                truncated_content = truncate_middle(
+                truncated_content = _truncate_middle(
                     msg.content, dedup_head_chars, dedup_tail_chars
                 )
                 msg = msg.model_copy(update={"content": truncated_content})
@@ -290,7 +549,6 @@ def compress_messages_for_llm(
         # 字符限制取二者中的较大值：
         # - 最近 ToolMessage 使用较宽松限制（近期证据权重更高）
         # - 证据型命令（含旧 DEDUP 消息）使用 _assign_evidence_tiers 预先分配好的档位
-        #   （该档位已按"离当前最近优先"的原则分配，无需在此处再判断预算是否耗尽）
         tool_limit = max_tool_output_chars
         if index in recent_tool_indices:
             tool_limit = max(tool_limit, max_recent_tool_output_chars)
@@ -300,32 +558,22 @@ def compress_messages_for_llm(
             )
         # 如果当前消息内容长度超过了对应限制，则进行截断处理
         if len(msg.content) > tool_limit:
-            # 计算头部保留字符数（占限制的 3/5）
             tool_head_chars = tool_limit * 3 // 5
-            # 计算尾部保留字符数（占限制的 2/5）
             tool_tail_chars = tool_limit - tool_head_chars
-            # 使用中间截断函数处理消息内容
-            truncated_content = truncate_middle(
+            truncated_content = _truncate_middle(
                 msg.content,
                 tool_head_chars,
                 tool_tail_chars,
             )
-            # 创建新的 ToolMessage 对象，更新其内容为截断后的内容
             msg = msg.model_copy(update={"content": truncated_content})
-            # 增加被截断的消息计数
             truncated_tool_count += 1
-            # 如果是近期消息，增加近期截断计数
             if index in recent_tool_indices:
                 truncated_recent_tool_count += 1
-            # 如果是证据型消息（含降级的旧 DEDUP），增加证据型截断计数
             if is_evidence:
                 truncated_evidence_tool_count += 1
-            # 累加压缩后的字符数
             tool_chars_after += len(msg.content)
-            # 将处理后的消息添加到压缩列表
             compressed.append(msg)
         else:
-            # 如果未超过限制，直接累加字符数并添加消息到压缩列表
             tool_chars_after += len(msg.content)
             compressed.append(msg)
 
@@ -351,117 +599,111 @@ def compress_messages_for_llm(
             f"truncated_recent_dedup={truncated_recent_dedup_count}, dedup_hard_cap={DEDUP_HARD_CAP_CHARS})"
         )
 
-    # --- 总量安全检查：压缩后若仍超上下文预算，对证据型消息执行紧急降级 ---
-    total_compressed_chars = sum(
-        len(m.content) if isinstance(m.content, str) else len(str(m.content))
-        for m in compressed
-    )
-    context_char_limit = (
-        REASONER_CONTEXT_LIMIT_TOKENS - REASONER_TOKEN_SAFETY_MARGIN
-    ) * APPROX_CHARS_PER_TOKEN
+    # --- 总量安全检查：压缩后若仍超预算，先摘要旧 reasoning，再降级旧工具 ---
+    if system_message is not None and prompt_budget_tokens is not None:
+        total_tokens = estimate_prompt_tokens(
+            compressed, system_message, chars_per_token
+        )
+        if total_tokens > prompt_budget_tokens:
+            before_tokens = total_tokens
+            compressed = _trim_old_reasoning(compressed, reasoning_history_keep)
+            total_tokens = estimate_prompt_tokens(
+                compressed, system_message, chars_per_token
+            )
+            logger.warning(
+                f"[compress] prompt estimate {before_tokens} > budget "
+                f"{prompt_budget_tokens}; after reasoning trim: {total_tokens}"
+            )
 
-    if total_compressed_chars > context_char_limit:
-        logger.warning(
-            f"[compress] total compressed chars ({total_compressed_chars}) exceeds "
-            f"context budget ({context_char_limit:.0f}), applying emergency downgrade "
-            f"for evidence/DEDUP messages to base limit ({max_tool_output_chars})"
-        )
-        emergency_compressed: list = []
-        emergency_downgraded = 0
-        for msg in compressed:
-            if isinstance(msg, ToolMessage) and isinstance(msg.content, str):
-                content = msg.content
-                if (
-                    msg.name in EVIDENCE_TOOL_COMMANDS
-                    or content.startswith(DEDUP_PREFIX)
-                ) and len(content) > max_tool_output_chars:
-                    tool_head_chars = max_tool_output_chars * 3 // 5
-                    tool_tail_chars = max_tool_output_chars - tool_head_chars
-                    truncated_content = truncate_middle(
-                        content, tool_head_chars, tool_tail_chars
-                    )
-                    msg = msg.model_copy(update={"content": truncated_content})
-                    emergency_downgraded += 1
-            emergency_compressed.append(msg)
-        compressed = emergency_compressed
-        logger.warning(
-            f"[compress] emergency downgrade applied to {emergency_downgraded} messages"
-        )
+        if total_tokens > prompt_budget_tokens:
+            before_tokens = total_tokens
+            compressed, downgraded, saved_chars = _emergency_downgrade(
+                compressed,
+                recent_tool_messages_to_keep,
+                max_tool_output_chars,
+            )
+            total_tokens = estimate_prompt_tokens(
+                compressed, system_message, chars_per_token
+            )
+            logger.warning(
+                f"[compress] emergency downgrade of old evidence/DEDUP: "
+                f"messages={downgraded}, saved={saved_chars} chars, "
+                f"tokens {before_tokens} -> {total_tokens} "
+                f"(budget {prompt_budget_tokens})"
+            )
+
+        if total_tokens > prompt_budget_tokens:
+            logger.warning(
+                f"[compress] still over prompt budget after all stages: "
+                f"{total_tokens} > {prompt_budget_tokens}; caller must decide"
+            )
+        else:
+            logger.info(
+                f"[compress] within prompt budget: {total_tokens} <= {prompt_budget_tokens}"
+            )
 
     return compressed
 
 
-def estimate_message_char_budget(messages: list) -> int:
-    """
-    估算消息列表的字符预算
-
-    该函数遍历消息列表，计算所有消息内容的字符总数，包括普通内容和 AI 消息的推理内容，
-    用于后续计算上下文窗口中已使用的字符预算。
-
-    Args:
-        messages (list): 消息对象列表，通常包含 SystemMessage、HumanMessage、
-                         AIMessage、ToolMessage 等类型的消息
-
-    Returns:
-        int: 消息列表中所有内容的字符总数
-    """
-    # 初始化总字符数为 0
-    total_chars = 0
-
-    # 遍历消息列表中的每条消息
-    for message in messages:
-        # 获取消息的 content 属性，如果不存在则默认为空字符串
-        content = getattr(message, "content", "")
-        # 判断 content 是否为字符串类型
-        if isinstance(content, str):
-            # 如果是字符串，直接计算其长度并加入总字符数
-            total_chars += len(content)
-        else:
-            # 如果不是字符串，将其转换为字符串后计算长度
-            total_chars += len(str(content))
-
-        # 检查当前消息是否为 AI 消息类型
-        if isinstance(message, AIMessage):
-            # 从 AI 消息的额外参数中获取推理内容
-            reasoning = message.additional_kwargs.get("reasoning_content")
-            # 检查推理内容是否为字符串类型
-            if isinstance(reasoning, str):
-                # 如果是字符串，将其长度加入总字符数
-                total_chars += len(reasoning)
-
-        # 检查当前消息是否为系统消息、人类消息或工具消息类型
-        if isinstance(message, (SystemMessage, HumanMessage, ToolMessage)):
-            # 这些类型的消息已处理过基本内容，跳过后续特殊处理
-            continue
-
-    # 返回计算得到的总字符数
-    return total_chars
-
-
-def compute_adaptive_max_tokens(
+def prepare_messages_for_llm(
+    system_message: SystemMessage,
     messages: list,
-    *,
-    default_max_tokens: int = DEFAULT_REASONER_MAX_TOKENS,
-    context_limit_tokens: int = REASONER_CONTEXT_LIMIT_TOKENS,
-    min_max_tokens: int = MIN_REASONER_MAX_TOKENS,
-    safety_margin_tokens: int = REASONER_TOKEN_SAFETY_MARGIN,
-    approx_chars_per_token: float = APPROX_CHARS_PER_TOKEN,
-) -> int:
-    # 计算消息列表中所有内容的字符预算估计值，并转换为 token 数
-    approx_message_tokens = math.ceil(
-        estimate_message_char_budget(messages) / approx_chars_per_token
+    config: LLMBudgetConfig,
+) -> tuple[list, OutputBudget]:
+    """压缩消息并规划输出预算；无法放入预算时抛 ContextBudgetError。"""
+    target_output_tokens = (
+        config.min_thinking_output_tokens
+        if config.thinking_enabled
+        else config.min_output_tokens
     )
-    # 计算可用的 completion tokens 数量：上下文限制 - 消息 tokens - 安全边距
-    available_completion_tokens = (
-        context_limit_tokens - approx_message_tokens - safety_margin_tokens
+    prompt_budget_tokens = (
+        config.context_window - target_output_tokens - config.safety_margin_tokens
     )
+    compressed = compress_messages_for_llm(
+        messages,
+        system_message=system_message,
+        prompt_budget_tokens=prompt_budget_tokens,
+        reasoning_history_keep=config.reasoning_history_keep,
+        chars_per_token=config.chars_per_token,
+    )
+    prompt_chars = estimate_prompt_chars(compressed, system_message)
+    prompt_tokens = estimate_prompt_tokens(
+        compressed, system_message, config.chars_per_token
+    )
+    budget = plan_output_budget(prompt_tokens, prompt_chars, config)
 
-    # 如果可用的 completion tokens 小于等于最小最大 token 数，返回最小值
-    if available_completion_tokens <= min_max_tokens:
-        return min_max_tokens
+    # thinking 预算放不下时，plan 会选择关闭 thinking；若提示词本身仍放不下，
+    # 再按正文模式的最低输出预算压缩一次。
+    if budget.must_compress and config.thinking_enabled:
+        prompt_budget_tokens = (
+            config.context_window - config.min_output_tokens - config.safety_margin_tokens
+        )
+        compressed = compress_messages_for_llm(
+            compressed,
+            system_message=system_message,
+            prompt_budget_tokens=prompt_budget_tokens,
+            reasoning_history_keep=config.reasoning_history_keep,
+            chars_per_token=config.chars_per_token,
+        )
+        prompt_chars = estimate_prompt_chars(compressed, system_message)
+        prompt_tokens = estimate_prompt_tokens(
+            compressed, system_message, config.chars_per_token
+        )
+        budget = plan_output_budget(prompt_tokens, prompt_chars, config)
 
-    # 返回默认最大 token 数和可用 completion tokens 中的较小值
-    return min(default_max_tokens, available_completion_tokens)
+    if budget.must_compress:
+        raise ContextBudgetError(
+            f"Prompt does not fit context budget: {budget.reason}; "
+            f"context_window={config.context_window}, "
+            f"prompt_tokens={prompt_tokens}, prompt_chars={prompt_chars}"
+        )
+
+    logger.info(
+        f"[budget] prompt_est={prompt_tokens} chars={prompt_chars} "
+        f"window={config.context_window} max_tokens={budget.max_tokens} "
+        f"thinking={budget.thinking} effort={budget.reasoning_effort}"
+    )
+    return compressed, budget
 
 
 def _recent_index_set(indices: list[int], keep_count: int) -> set[int]:
