@@ -21,6 +21,7 @@ from .action_guard import (
     validate_tool_call_request,
 )
 from .consistency import (
+    MAX_VALUE_CONFLICT_AUDIT_INJECTIONS,
     format_conflict_fact,
     parse_conflict_fact,
     prune_resolved_value_conflicts,
@@ -1461,6 +1462,7 @@ def apply_value_conflict_audit(
     *,
     log_prefix: str = "",
     force_wrapup: bool = False,
+    audit_counts: Optional[dict[str, int]] = None,
 ) -> VMCoreLLMAnalysisStep:
     """[阶段 5] 取值级矛盾审计：已读内存内容与结构体布局不相容。
 
@@ -1478,6 +1480,9 @@ def apply_value_conflict_audit(
         force_wrapup: 是否处于强制收口/最后一步。此时仍注入审计说明（让最终结论
             带上矛盾告警），但不再撤销结论、不再降级根因、不再压制置信度 ——
             否则步数耗尽时任何残留矛盾都会让 agent 只能输出 unknown。
+        audit_counts: 可选的“事实 -> 已累计处理次数”计数器。调用方传入同一个 dict
+            即可跨步骤累计；同一冲突超过 MAX_VALUE_CONFLICT_AUDIT_INJECTIONS 次后
+            只保留一次简短 residual 提示，避免重复刷屏和反复降级。
 
     Returns:
         VMCoreLLMAnalysisStep: 审计修正后的分析步骤
@@ -1487,6 +1492,10 @@ def apply_value_conflict_audit(
     if not conflicts:
         return analysis_step
 
+    counts = audit_counts if audit_counts is not None else {}
+    for fact in conflicts:
+        counts[fact] = counts.get(fact, 0) + 1
+
     if _mentions_value_level_conflict(analysis_step, conflicts):
         logger.debug(
             "%sExecutor audit found a value-level contradiction, but the model already referenced it.",
@@ -1494,12 +1503,39 @@ def apply_value_conflict_audit(
         )
         return analysis_step
 
+    limit = MAX_VALUE_CONFLICT_AUDIT_INJECTIONS
+    full_conflicts = [fact for fact in conflicts if counts[fact] <= limit]
+    exhausted_conflicts = [fact for fact in conflicts if counts[fact] > limit]
+
+    if not full_conflicts:
+        # 只在首次进入“已审计超限”状态时留一条简短 residual；强制收口时
+        # 即使计数已超过该阈值也要再留一次，保证最终报告带有 residual caveat。
+        if force_wrapup or any(
+            counts[fact] == limit + 1 for fact in exhausted_conflicts
+        ):
+            bases = []
+            for fact in exhausted_conflicts:
+                parsed = parse_conflict_fact(fact)
+                if parsed is not None:
+                    type_name, base = parsed
+                    bases.append(f"{type_name}@0x{base:x}")
+            residual_summary = ", ".join(bases) if bases else "; ".join(exhausted_conflicts)
+            residual_note = (
+                "Executor audit: value-level contradiction remains unresolved for "
+                f"{residual_summary}; it is retained as a residual caveat. "
+                "Do not re-audit the same object again; treat it as an unverified/foreign "
+                "object rather than a valid instance."
+            )
+            logger.warning("%s%s", prefix, residual_note)
+            _append_audit_note(analysis_step, residual_note)
+        return analysis_step
+
     rendered = [
         text
-        for text in (format_conflict_fact(fact) for fact in conflicts)
+        for text in (format_conflict_fact(fact) for fact in full_conflicts)
         if text is not None
     ]
-    summary = "; ".join(rendered) if rendered else "; ".join(conflicts)
+    summary = "; ".join(rendered) if rendered else "; ".join(full_conflicts)
     audit_note = (
         "Executor audit: unresolved value-level contradiction between the memory you read "
         f"and the declared struct layout. {summary}"

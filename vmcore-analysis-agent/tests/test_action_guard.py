@@ -36,31 +36,45 @@ class KmemCommandGuardTests(unittest.TestCase):
 
 
 class StructDotSyntaxGuardTests(unittest.TestCase):
-    def test_struct_dot_syntax_enforces_base_type_layout_cache(self) -> None:
+    def test_struct_instance_query_ignores_unrelated_global_offsets(self) -> None:
         layout_cache = {
             "device": {
                 "size": 0x40,
                 "field_offsets": [0x0, 0x8, 0x10],
-            }
+            },
+            "irqaction": {
+                "size": 0x80,
+                "field_offsets": [0x0, 0x18, 0x20, 0x50],
+            },
         }
-        # Offset 0x50 exceeds size 0x40 -> must be rejected even when using device.driver dot syntax
-        err = validate_tool_call_request(
+        # 0x50 来自别的 crash-path 基址寄存器，不能据此拒绝 device 实例查询。
+        ok = validate_tool_call_request(
             "struct",
             {"command": "struct device.driver ffff888100000000"},
             observed_struct_offsets=[0x50],
             struct_layout_cache=layout_cache,
         )
-        self.assertIsNotNone(err)
-        self.assertIn("struct type device is too small", err or "")
+        self.assertIsNone(ok)
 
-        # Observed offset 0x8 is covered -> dot syntax is allowed
+        # show_interrupts 同时出现 irq_desc 的 0x1b0 与 irqaction 的 0x50；
+        # 全局最大偏移 0x1b0 不能把合法的 irqaction 查询误杀。
         ok = validate_tool_call_request(
             "struct",
-            {"command": "struct device.driver,p ffff888100000000"},
-            observed_struct_offsets=[0x8],
+            {"command": "struct irqaction ff292187ae124a80"},
+            observed_struct_offsets=[0x18, 0x50, 0x1b0],
             struct_layout_cache=layout_cache,
         )
         self.assertIsNone(ok)
+
+    def test_struct_layout_and_instance_in_one_call_still_rejected(self) -> None:
+        err = validate_tool_call_request(
+            "run_script",
+            {"script": "struct -o device\nstruct device ffff888100000000"},
+            observed_struct_offsets=[0x8],
+            struct_layout_cache={},
+        )
+        self.assertIsNotNone(err)
+        self.assertIn("cannot be combined with first-time struct -o", err or "")
 
     def test_struct_minus_o_rejects_dot_syntax(self) -> None:
         err = _validate_command_line("struct -o device.driver", allow_bt_a=False)

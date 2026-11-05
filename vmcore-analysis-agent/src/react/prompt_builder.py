@@ -9,7 +9,11 @@ from typing import Iterable, Optional, Sequence, cast
 from langchain_core.messages import AIMessage, BaseMessage
 
 from .action_guard import canonicalize_command_line, extract_command_lines
-from .consistency import format_conflict_fact
+from .consistency import (
+    MAX_VALUE_CONFLICT_AUDIT_INJECTIONS,
+    format_conflict_fact,
+    parse_conflict_fact,
+)
 from .evidence import has_executor_closure_rule
 from .graph_state import (
     AgentState,
@@ -161,18 +165,35 @@ _EVIDENCE_CATEGORY_HINTS = {
 _MAX_RENDERED_VALUE_CONFLICTS = 5
 
 
-def _format_value_conflicts(value_conflicts: object) -> list[str]:
+def _format_value_conflicts(
+    value_conflicts: object,
+    audit_counts: object = None,
+) -> list[str]:
     """把 value_conflicts 渲染为可读句子列表（最多 _MAX_RENDERED_VALUE_CONFLICTS 条）。
 
     无内容或全部无法解析时返回空列表，使提示词在"没有矛盾"时与改动前完全一致。
+    超过审计次数上限的冲突只渲染一行 compact residual，避免每一步重复整段字段细节。
     """
     if not isinstance(value_conflicts, (list, tuple, set, frozenset)):
         return []
+    counts = audit_counts if isinstance(audit_counts, dict) else {}
     # 保持发现顺序（最新发现的在最后），只渲染最后 _MAX_RENDERED_VALUE_CONFLICTS 条，
     # 避免字典序把最新（通常也是当前调查对象）的矛盾挤出渲染窗口。
     rendered: list[str] = []
     for fact in value_conflicts:
         if not isinstance(fact, str):
+            continue
+        try:
+            count = int(counts.get(fact, 0))
+        except (TypeError, ValueError):
+            count = 0
+        parsed = parse_conflict_fact(fact)
+        if count > MAX_VALUE_CONFLICT_AUDIT_INJECTIONS and parsed is not None:
+            type_name, base = parsed
+            rendered.append(
+                f"{type_name} @ 0x{base:x} (already audited; unresolved/foreign object; "
+                "do not re-audit the same address)"
+            )
             continue
         text = format_conflict_fact(fact)
         if text is not None:
@@ -241,7 +262,10 @@ def _build_replan_probe_menu(state: AgentState) -> list[str]:
     # 与"全部已关闭"语义相反，故必须先确认门控确实存在。
     gates_exhausted = _gates_exhausted(state)
 
-    value_conflicts = _format_value_conflicts(state.get("value_conflicts"))
+    value_conflicts = _format_value_conflicts(
+        state.get("value_conflicts"),
+        state.get("value_conflict_audit_counts"),
+    )
     if value_conflicts:
         lines.append(
             "- Unresolved value-level contradictions (highest priority: memory you already read "
@@ -413,7 +437,10 @@ def build_executor_state_section(state: AgentState) -> str:
         f"- Reasoning gate contract: {reasoning_gate_contract}",
     ]
 
-    value_conflicts = _format_value_conflicts(state.get("value_conflicts"))
+    value_conflicts = _format_value_conflicts(
+        state.get("value_conflicts"),
+        state.get("value_conflict_audit_counts"),
+    )
     if value_conflicts:
         lines.append(
             "- Observed value-level conflicts (memory you already read does not match the "
@@ -515,7 +542,16 @@ def _select_sop_fragments(state: AgentState, recent_text: str) -> list[str]:
     ) and any(fact.startswith("vtop_phys:") for fact in evidence_facts)
     has_driver_storm = any(
         token in lowered_recent_text
-        for token in ("log_info", "sense pool", "reply_dma", "mpi2", "protocol frame")
+        for token in (
+            "log_info",
+            "sense pool",
+            "reply_dma",
+            "reply_free",
+            "reply_post",
+            "mpi2",
+            "protocol frame",
+            "get_reply_virt_addr",
+        )
     )
 
     # DMA 相关风险在中后期满足门控/关键词/结构化候选时优先提示。

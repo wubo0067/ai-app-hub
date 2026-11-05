@@ -164,6 +164,33 @@ class ReplanProbeMenuTests(unittest.TestCase):
             [],
         )
 
+    def test_repeated_value_conflict_renders_compact_residual(self) -> None:
+        from src.react.consistency import MAX_VALUE_CONFLICT_AUDIT_INJECTIONS
+        from src.react.prompt_builder import _format_value_conflicts
+
+        fact = (
+            "conflict:object_does_not_match_type:irqaction@0xff292187ae124a80:"
+            "next@0x18=0x12,thread_fn@0x20=0x5c"
+        )
+        full = _format_value_conflicts([fact], {fact: 1})
+        self.assertIn("next@0x18=0x12", full[0])
+
+        compact = _format_value_conflicts(
+            [fact], {fact: MAX_VALUE_CONFLICT_AUDIT_INJECTIONS + 1}
+        )
+        self.assertIn("already audited", compact[0])
+        self.assertNotIn("next@0x18=0x12", compact[0])
+
+    def test_dmesg_rule_distinguishes_payload_provenance_from_dma_writer(self) -> None:
+        from src.react.prompt_overlays import DRIVER_OBJECT_OVERLAY
+        from src.react.sop_fragments import SOP_FRAGMENTS
+
+        self.assertIn("confirmed payload provenance", DRIVER_OBJECT_OVERLAY)
+        self.assertIn("mpt3sas_base_get_reply_virt_addr", DRIVER_OBJECT_OVERLAY)
+        self.assertIn("ioc->reply_dma_min_address", DRIVER_OBJECT_OVERLAY)
+        self.assertIn("Sub-step C2", SOP_FRAGMENTS["dma_corruption"])
+        self.assertIn("reply_dma_min_address", SOP_FRAGMENTS["dma_corruption"])
+
     def test_protocol_candidate_routes_to_dma_sop(self) -> None:
         from src.react.prompt_builder import _select_sop_fragments
         from src.react.sop_fragments import SOP_FRAGMENTS
@@ -183,6 +210,22 @@ class ReplanProbeMenuTests(unittest.TestCase):
             state_with_candidate, "rd -x ff292187ae125ab0 2"
         )
 
+        self.assertIn(SOP_FRAGMENTS["dma_corruption"], fragments)
+
+    def test_reply_helper_routes_to_dma_sop(self) -> None:
+        from src.react.prompt_builder import _select_sop_fragments
+        from src.react.sop_fragments import SOP_FRAGMENTS
+
+        state = {
+            "current_signature_class": "pointer_corruption",
+            "current_root_cause_class": None,
+            "step_count": 26,
+            "messages": [],
+        }
+        fragments = _select_sop_fragments(
+            state,
+            "call 0xffffffffc21598f0 <mpt3sas_base_get_reply_virt_addr>",
+        )
         self.assertIn(SOP_FRAGMENTS["dma_corruption"], fragments)
 
     def test_no_menu_without_replan(self) -> None:

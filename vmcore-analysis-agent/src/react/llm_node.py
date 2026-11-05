@@ -211,6 +211,8 @@ async def call_llm_analysis(state: AgentState, llm) -> dict:
             )
         )
 
+    audit_counts = dict(state.get("value_conflict_audit_counts") or {})
+
     def _audit_and_project(step: VMCoreLLMAnalysisStep, raw_msg: AIMessage):
         """一致性审计 + 状态投影：首次解析与收口强制重试共用同一条链路。"""
         step = apply_executor_consistency_audit(
@@ -223,6 +225,7 @@ async def call_llm_analysis(state: AgentState, llm) -> dict:
             cast(dict[str, Any], state),
             log_prefix=llm_analysis_node,
             force_wrapup=effective_last_step,
+            audit_counts=audit_counts,
         )
         # 模型已显式核对的矛盾从状态中剔除，避免追加式列表在后续步数里
         # 持续把根因压回 unknown、永久阻塞收敛。
@@ -469,6 +472,7 @@ async def call_llm_analysis(state: AgentState, llm) -> dict:
         **managed_updates,
         # 模型已显式核对的取值级矛盾不再保留在状态中（见 unresolved_value_conflicts）。
         "value_conflicts": remaining_value_conflicts,
+        "value_conflict_audit_counts": audit_counts,
         # 置位后 after_crash_tool / should_continue 不再给予额外轮次，
         # 保证强制收口最多发生一次。
         "force_terminal_wrapup": wrapup_triggered,
@@ -608,6 +612,7 @@ async def structure_reasoning_content(state: AgentState, llm) -> dict:
                 f"Raw: {repr(raw_chat_message.content[:200])}"
             )
 
+        audit_counts = dict(state.get("value_conflict_audit_counts") or {})
         llm_step = apply_executor_consistency_audit(
             llm_step,
             cast(dict[str, Any], state),
@@ -618,6 +623,7 @@ async def structure_reasoning_content(state: AgentState, llm) -> dict:
             cast(dict[str, Any], state),
             log_prefix=structure_reasoning_node,
             force_wrapup=effective_last_step,
+            audit_counts=audit_counts,
         )
         remaining_value_conflicts = unresolved_value_conflicts(
             llm_step, cast(dict[str, Any], state)
@@ -684,6 +690,7 @@ async def structure_reasoning_content(state: AgentState, llm) -> dict:
         **managed_updates,
         # 模型已显式核对的取值级矛盾不再保留在状态中（见 unresolved_value_conflicts）。
         "value_conflicts": remaining_value_conflicts,
+        "value_conflict_audit_counts": audit_counts,
         # 强制收口标志：保证 should_continue 不再重试，直接 __end__。
         "force_terminal_wrapup": wrapup_triggered,
         "error": None,

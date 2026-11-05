@@ -252,6 +252,41 @@ class ValueConflictAuditTests(unittest.TestCase):
         )
         self.assertEqual(remaining, [CONFLICT_FACT])
 
+    def test_audit_stops_downgrading_after_repeat_limit(self) -> None:
+        """同一冲突超过注入上限后只留 residual caveat，不再反复降级/刷屏。"""
+        from src.react.consistency import MAX_VALUE_CONFLICT_AUDIT_INJECTIONS
+        from src.react.output_parser import apply_value_conflict_audit
+
+        counts: dict[str, int] = {}
+        for _ in range(MAX_VALUE_CONFLICT_AUDIT_INJECTIONS):
+            step = _make_conclusive_step()
+            audited = apply_value_conflict_audit(
+                step,
+                {"value_conflicts": [CONFLICT_FACT]},
+                log_prefix="test",
+                audit_counts=counts,
+            )
+            self.assertFalse(audited.is_conclusive)
+            self.assertEqual(audited.root_cause_class, "unknown")
+            self.assertIn("value-level contradiction", audited.reasoning)
+
+        # 第 N+1 次：不再完整注入，也不再撤销结论/压低置信度。
+        step = _make_conclusive_step()
+        audited = apply_value_conflict_audit(
+            step,
+            {"value_conflicts": [CONFLICT_FACT]},
+            log_prefix="test",
+            audit_counts=counts,
+        )
+        self.assertTrue(audited.is_conclusive)
+        self.assertEqual(audited.root_cause_class, "wild_pointer")
+        self.assertEqual(audited.confidence, "high")
+        self.assertIn("residual caveat", audited.reasoning)
+        self.assertNotIn("between the memory you read", audited.reasoning)
+        self.assertEqual(
+            counts[CONFLICT_FACT], MAX_VALUE_CONFLICT_AUDIT_INJECTIONS + 1
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

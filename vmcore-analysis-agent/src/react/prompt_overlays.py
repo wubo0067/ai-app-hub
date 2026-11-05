@@ -142,10 +142,10 @@ Incorrect pattern to avoid:
 
 ### Step H: Dmesg Log Value vs DMA Payload (CRITICAL Distinction)
 
-A value that appears in kernel log output (emitted via log_info, dev_info, dev_err, pr_err,
-printk, or any equivalent) and also appears at a location in slab memory does NOT constitute
-evidence that the device DMA-wrote that value to the slab location. These are two independent
-facts that share a value coincidence. The causal chain is as follows:
+A single value that appears in kernel log output (emitted via log_info, dev_info, dev_err,
+pr_err, printk, or any equivalent) and also appears at a location in slab memory does NOT
+constitute evidence that the device DMA-wrote that value to the slab location. Log output and
+DMA writes are causally distinct. The causal chain is as follows:
 - In a driver such as mpt3sas: firmware sends a reply message → driver reads the reply from
   its DMA reply ring → driver extracts event codes or status codes from the reply fields →
   driver passes those codes to printk/log_info for display in dmesg.
@@ -158,15 +158,35 @@ facts that share a value coincidence. The causal chain is as follows:
   (b) the driver stored that event code in a field, (c) the object was freed without zeroing,
   and (d) the current allocation received that slab page with the stale value intact.
 
+**Strength tiers for a log-value / slab-value match:**
+1. A single low-entropy value, or an isolated matching word with no coherent surrounding
+   frame, is a "value coincidence" and NOT DMA evidence.
+2. Two or more distinct high-entropy values embedded in one or more aligned, coherent,
+   documented protocol frames (consistent header/length/status, stable stride) are stronger:
+   they establish **confirmed payload provenance** and make independent coincidence
+   implausible. This still does NOT prove a DMA write; a software copy, stale DMA buffer
+   content, or slot reuse can produce the same bytes.
+3. Payload provenance plus validated DMA-range / ownership evidence (the corrupted physical
+   page lies inside the device's DMA reply/receive buffer range) supports a DMA-write
+   conclusion. Without the range/ownership check, DMA remains a mechanism hypothesis.
+
 **Mandatory actions when a log-value / slab-value match is found:**
-1. State explicitly that this is a "dmesg log value coincidence" and NOT independent DMA evidence.
+1. Classify the match using the tiers above. Do not call a multi-code coherent protocol frame
+   a "mere value coincidence"; label payload provenance separately from writer provenance.
 2. Examine whether the slab cache involved is used by the suspected driver for internal objects.
 3. Check whether the value could be stale data from a prior driver allocation of that slab slot.
-4. Require DMA range overlap proof (physical address of the slab page vs device DMA buffer
+4. For a coherent composite frame, inspect the driver's actual DMA reply/receive pool rather
+   than only its software event log: read `ioc->reply`, `ioc->reply_dma`,
+   `ioc->reply_dma_min_address`, `ioc->reply_dma_max_address`, `ioc->reply_sz`, `ioc->reply_free`,
+   and `ioc->reply_post`, or the equivalent `rx_ring`/completion-queue fields for the driver.
+   If a callback calls an address-conversion helper such as
+   `mpt3sas_base_get_reply_virt_addr`, follow that helper to recover the pool base and then
+   compare the corrupted physical address against the computed range.
+5. Require DMA range overlap proof (physical address of the slab page vs device DMA buffer
    physical addresses) as a SEPARATE and INDEPENDENT evidence item before elevating DMA confidence.
-5. Never use "the value 0xXXXXXXXX was logged by driver Y AND appears in slab memory" as a
+6. Never use "the value 0xXXXXXXXX was logged by driver Y AND appears in slab memory" as a
    standalone argument that driver Y performed a stray DMA write to that slab location.
-6. {ADJACENT_SLAB_VALUE_COINCIDENCE_RULE}
+7. {ADJACENT_SLAB_VALUE_COINCIDENCE_RULE}
 
 ### Step I: Slab OOB Directionality (CRITICAL Distinction)
 

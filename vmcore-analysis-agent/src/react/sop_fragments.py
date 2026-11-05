@@ -324,6 +324,12 @@ Sub-step B: extract suspect-device DMA ranges only after fingerprint work or whe
 
 Sub-step C: when driver structs are unavailable, inspect generic dma_ops and coherent_dma_mask to understand protection level.
 
+Sub-step C2: for a coherent driver reply-frame / receive-ring template, close ownership against the actual DMA pool before naming DMA:
+- Resolve the driver object (for mpt3sas, `struct MPT3SAS_ADAPTER`) and read its DMA pool fields: `reply`, `reply_dma`, `reply_dma_min_address`, `reply_dma_max_address`, `reply_sz`, `reply_free`, `reply_free_dma`, `reply_post`, and the reply-post free DMA addresses.
+- Compute the legal range from the pool base and depth/size, then compare the corrupted page's physical address (`vtop`) against it. A protocol-looking frame outside every pool range is payload provenance only, not DMA-range proof.
+- When disassembly shows an address-conversion helper call (for example `mpt3sas_base_get_reply_virt_addr`), follow that helper to identify the pool base; do not infer the frame size from the helper, because the size comes from the driver facts (`reply_sz = ReplyFrameSize * 4`).
+- Repeat the check for every candidate controller, not just the first HBA. A reply-frame pool owned by another adapter can land on the same physical page.
+
 Sub-step D: field-type disambiguation before naming the root cause.
 - After identifying the corrupted object and field offset, determine the declared C type of that field from driver source, debug info, or a defensible offset-to-source correlation.
 - If the field type is dma_addr_t: the observed bus address may be type-correct but used in the wrong semantic role. Classify this as field_type_misuse or missing_conversion, not generic overwrite.
@@ -367,7 +373,9 @@ validate the following:
    log_info code, verify that the entire object can be decoded as a valid reply frame before
    treating the field match as a payload fingerprint. At least two aligned records with a
    coherent documented header (version/action, message length consistent with the record size,
-   function/event, zero or reserved tail) are stronger than a single matching word.
+   function/event, zero or reserved tail) are stronger than a single matching word. Two or
+   more distinct high-entropy codes in such frames establish payload provenance, but still do
+   NOT establish a DMA write until the reply/receive-pool range check succeeds.
 4. **Minimum assertion threshold**: do NOT assert "DMA burst overwrote the slab page" unless
    you have: (a) at least 4 contiguous 8-byte words showing coherent device-specific data,
    OR (b) validated DMA-range overlap PLUS a decoded protocol structure. A single matching

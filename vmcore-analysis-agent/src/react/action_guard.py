@@ -334,8 +334,8 @@ def validate_tool_call_request(
         if struct_error is not None:
             return struct_error
     else:
-        # 独立 struct 调用同样受已知崩溃路径偏移覆盖校验约束
-        # （注意：observed_struct_offsets 为崩溃指令级偏移集合，跨不相关结构体查询时需保证偏移兼容或先通过 struct -o 验证）
+        # 独立 struct 调用同样只做布局时序校验；observed_struct_offsets 是
+        # 跨类型的全局集合，不能用来判定某个具体实例查询的类型是否合法。
         struct_error = _validate_struct_requests(
             lines,
             observed_struct_offsets=observed_struct_offsets,
@@ -764,9 +764,11 @@ def _validate_struct_requests(
     验证 struct 查询请求与已知偏移量的兼容性。
 
     验证逻辑：
-    1. 如果已知某些偏移量（来自反汇编分析），检查 struct 查询是否能覆盖这些偏移
-    2. 禁止同时使用 struct -o <type> 和 struct <type> <addr>（应先检查布局再查实例）
-    3. 检查结构体大小是否足够大以包含所有已知偏移
+    1. 禁止同时使用 struct -o <type> 和 struct <type> <addr>（应先检查布局再查实例）
+    2. 不再用 crash-path 全局偏移拒绝显式 struct 实例查询：observed_struct_offsets
+       是跨类型、跨基址寄存器聚合的全局集合，无法归属到具体类型；把某个类型的
+       最大偏移套到另一个类型上会产生误杀（如 irq_desc 的 0x1b0 误杀 irqaction）。
+       实例查询是否真的类型不匹配，由读取后的 value-conflict audit 负责。
 
     Args:
         lines: 待验证的命令列表
@@ -810,31 +812,8 @@ def _validate_struct_requests(
                 "struct <type> <addr> only after validating offset coverage."
             )
 
-        # 如果缓存中没有布局，跳过后续检查
-        if cached_layout is None:
-            continue
-
-        # 检查结构体大小是否足够
-        size = int(cached_layout.get("size", 0))
-        field_offsets = {
-            int(offset) for offset in cached_layout.get("field_offsets", [])
-        }
-        max_observed = max(observed_offsets)
-        if max_observed >= size:
-            return (
-                f"struct type {type_name} is too small for the observed crash-path offsets "
-                f"(max observed offset 0x{max_observed:x}, size 0x{size:x})."
-            )
-
-        # 检查是否有未覆盖的偏移量
-        uncovered_offsets = [
-            offset for offset in observed_offsets if offset not in field_offsets
-        ]
-        if uncovered_offsets:
-            uncovered_str = ", ".join(f"0x{offset:x}" for offset in uncovered_offsets)
-            return (
-                f"struct type {type_name} does not cover the observed crash-path field offsets {uncovered_str}; "
-                "do not interpret this type until a compatible layout is validated."
-            )
+        # 已缓存布局也不能证明 observed_offsets 属于该类型；这里只保留
+        # "先 struct -o 再 struct <type> <addr>" 的时序约束，不按全局最大偏移硬拒。
+        # 显式实例查询若类型真的不匹配，会在读取后由 detect_value_conflicts 捕获。
 
     return None
