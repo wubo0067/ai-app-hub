@@ -92,6 +92,8 @@ class ReplanProbeMenuTests(unittest.TestCase):
         self.assertIn("Bounded uncertainty convergence", LAYER0_SYSTEM_PROMPT_TEMPLATE)
         self.assertIn("Corrupted payload handling", LAYER0_SYSTEM_PROMPT_TEMPLATE)
         self.assertIn("CORRUPTED PAYLOAD", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        self.assertIn("coherent, documented protocol template", LAYER0_SYSTEM_PROMPT_TEMPLATE)
+        self.assertIn("candidate writers", LAYER0_SYSTEM_PROMPT_TEMPLATE)
         self.assertIn("Bounded low-confidence convergence is always preferred", LAYER0_SYSTEM_PROMPT_TEMPLATE)
         # N3: Neither LAYER0 nor the assembled prompt may recommend "memory_corruption" alongside pointer_corruption
         self.assertNotIn('"pointer_corruption" or "memory_corruption"', LAYER0_SYSTEM_PROMPT_TEMPLATE)
@@ -161,6 +163,27 @@ class ReplanProbeMenuTests(unittest.TestCase):
             _select_sop_fragments(state_no_signal, recent_with_signal),
             [],
         )
+
+    def test_protocol_candidate_routes_to_dma_sop(self) -> None:
+        from src.react.prompt_builder import _select_sop_fragments
+        from src.react.sop_fragments import SOP_FRAGMENTS
+
+        state_with_candidate = {
+            "current_signature_class": "pointer_corruption",
+            "current_root_cause_class": None,
+            "step_count": 26,
+            "messages": [],
+            "evidence_facts": [
+                "rd_ascii:0xff292187ae125ab0=sense pool",
+                "vtop_phys:0xff292187ae124a80=0x12e124a80",
+            ],
+        }
+
+        fragments = _select_sop_fragments(
+            state_with_candidate, "rd -x ff292187ae125ab0 2"
+        )
+
+        self.assertIn(SOP_FRAGMENTS["dma_corruption"], fragments)
 
     def test_no_menu_without_replan(self) -> None:
         rendered = _render(

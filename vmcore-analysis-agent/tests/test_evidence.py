@@ -121,6 +121,27 @@ class EvidenceExtractionTests(unittest.TestCase):
             kmem_facts,
         )
 
+    def test_extracts_mapped_physical_address_and_ascii_string(self) -> None:
+        vtop_facts = extract_evidence_facts(
+            "vtop",
+            {"command": "ff292187ae124a80"},
+            "VIRTUAL           PHYSICAL\n"
+            "ff292187ae124a80  12e124a80\n"
+            "PTE: 1f4405920 => 800000012e124163\n",
+        )
+        rd_facts = extract_evidence_facts(
+            "rd",
+            {"command": "rd -x ff292187ae125ab0 2"},
+            "ff292187ae125ab0: 6f702065736e6573 fe52cb0bb9006c6f  sense po\n",
+        )
+
+        self.assertIn(
+            "vtop_phys:0xff292187ae124a80=0x12e124a80", vtop_facts
+        )
+        self.assertIn(
+            "rd_ascii:0xff292187ae125ab0=sense pool", rd_facts
+        )
+
     def test_mapping_facts_support_lifetime_and_local_exclusion(self) -> None:
         facts = extract_evidence_facts(
             "vtop",

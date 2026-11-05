@@ -319,7 +319,7 @@ Sub-step B: extract suspect-device DMA ranges only after fingerprint work or whe
 - Use pci_dev.dev.driver_data to locate the runtime driver object when possible.
 - Verify object and field paths against the current kernel layout before dereferencing module-private objects.
 - Check whether the faulting PA lies within a validated DMA buffer range.
-- Do not guess protocol-layer or firmware-message struct names for a driver-private queue object. Load module symbols with mod -s first and then inspect the actual driver-private type or field path.
+- Do not guess private protocol-layer or firmware-message C type names for a driver-private queue object. Load module symbols with mod -s first and then inspect the actual driver-private type or field path. A manual decode against a documented public protocol header is allowed when repeated aligned records make the template coherent; a guessed private struct layout is not.
 - If struct -o <guessed_type> fails on a module crash path, do not keep guessing private types. Instead: (1) load module symbols with `mod -s <module>` first; (2) if symbol enumeration is then necessary, use `sym -m <module>` or `sym -m <module> | grep -i <keyword>`. `sym -l` is ALWAYS forbidden in any form (with or without a grep filter) — it dumps all kernel symbols, floods the context, and causes a hard failure or tool timeout.
 
 Sub-step C: when driver structs are unavailable, inspect generic dma_ops and coherent_dma_mask to understand protection level.
@@ -355,11 +355,19 @@ validate the following:
    valid (correct list_head self-links, plausible flags, non-garbage padding), the corruption
    is localized and inconsistent with a coarse-grained DMA write that would replace the
    entire cache line or page.
+2b. **Order-1 slab / 4KB page boundary**: when the object lives in an order-1 slab page,
+   compare objects in the first and second 4KB halves. A page-granular split (one half
+   overwritten with a repeated template, the other half still holding valid objects) is a
+   strong DMA/page-granularity candidate, but it is not proof by itself: software OOB can also
+   stop near a page boundary. Combine it with a validated protocol template, device ownership,
+   or DMA-range overlap before promoting DMA.
 3. **Value range and structure**: DMA reply payloads from SCSI/SAS/NVMe controllers contain
    structured fields (descriptor type, SMID, VP ID, flags, physical address). If the
    "suspicious" values are a mix of small integers, partial bit patterns, and one matching
    log_info code, verify that the entire object can be decoded as a valid reply frame before
-   treating the field match as a payload fingerprint.
+   treating the field match as a payload fingerprint. At least two aligned records with a
+   coherent documented header (version/action, message length consistent with the record size,
+   function/event, zero or reserved tail) are stronger than a single matching word.
 4. **Minimum assertion threshold**: do NOT assert "DMA burst overwrote the slab page" unless
    you have: (a) at least 4 contiguous 8-byte words showing coherent device-specific data,
    OR (b) validated DMA-range overlap PLUS a decoded protocol structure. A single matching

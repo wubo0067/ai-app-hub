@@ -1,682 +1,250 @@
 # VMCore Analysis Agent
 
-[🇨🇳 Chinese Documentation](./README.zh-CN.md)
+[简体中文](./README.zh-CN.md) | English
 
-An intelligent Linux kernel crash (vmcore) analysis agent based on LangGraph ReAct pattern and MCP tools.
+A vmcore analysis service built with LangGraph, MCP, and the Linux `crash` utility. The application lives in [`vmcore-analysis-agent/`](./vmcore-analysis-agent/); this README explains its workflow, deployment, and outputs.
 
-## Project Introduction
+## What it does
 
-### Linux Kernel Crash Analysis
+The service accepts a vmcore, its matching `vmlinux`, `vmcore-dmesg.txt`, and optional module debug symbols. It runs an agent loop that invokes `crash` commands and produces a Markdown analysis report. Treat the result as diagnostic assistance: verify it against the kernel version, debug symbols, and incident context.
 
-**VMCore Analysis Agent** is a production-grade automated Linux kernel crash (vmcore) diagnosis platform. By integrating the **LangGraph ReAct** pattern with the **MCP (Model Context Protocol)** tooling system, it transforms the traditionally highly manual and experience-dependent complex kernel debugging process into an executable AI workflow.
-### Core Technical Highlights
-- **Layered Expert Knowledge System**: Unlike simple RAG, this project implements a **Three-Tier Dynamic Prompt Injection Architecture** (Global Foundation, Scenario Script, SOP Fragment). The system loads diagnostic logic on-demand based on crash characteristics (e.g., Soft Lockup or memory corruption), significantly reducing token noise and improving reasoning accuracy.
-- **Evidence-Driven State Machine Management**: The agent maintains a structured state containing **Active Hypotheses** and **Verification Gates**. It mandates that the LLM must collect specific diagnostic evidence (e.g., register source tracing, stack backtrace) before drawing conclusions, ensuring the rigor and traceability of the analysis process.
-- **Deep Tool Integration via MCP**: Leveraging the Model Context Protocol (MCP), the agent achieves high-fidelity connectivity with the Linux `crash` tool. The AI no longer "blindly guesses"; instead, it dynamically explores memory, disassembles code, and retrieves kernel object states based on its reasoning path.
-- **Executor-Level Safety Protection**: The built-in `action_guard` module prevents the LLM from executing commands that are overly resource-intensive or high-risk (e.g., blindly running `bt -a` on a large system). Simultaneously, a command deduplication mechanism ensures analysis efficiency and prevents reasoning from falling into infinite loops.
-- **Transparent Chain-of-Thought Reporting**: Each analysis generates a structured Markdown report, fully documenting the intent behind every command execution, the verification process of hypotheses, and the evidence-based final root cause isolation.
-- **Two-tier Crash Classification**: The system defines a rigorous two-tier classification for kernel diagnostics in `src/react/schema.py`. The **surface signature class** (`CrashSignatureClass`) captures immediately observable panic labels (e.g., `null_deref`, `use_after_free`, `stack_corruption`, `soft_lockup`, `hard_lockup`, `rcu_stall`) and routes them to the corresponding diagnostic Playbook. The **deep root cause class** (`RootCauseClass`) represents the final root cause determined after deep investigation and evidence validation (e.g., `out_of_bounds`, `double_free`, `race_condition`, `dma_corruption`, `mce`).
-- **Verification Gate Control Mechanism**: To fundamentally eliminate LLM "hallucination" and superficial guessing, the system introduces a mandatory gate-control mechanism. For each crash signature, the system enforces specific "proof gates" that must be closed (e.g., `pointer_corruption` requires closing `register_provenance`, `object_lifetime`, `local_corruption_exclusion`, etc.). The system strictly prohibits marking the diagnosis as conclusive (`is_conclusive=true`) until all required gates reach the `closed` (verified with concrete tool output) or `n/a` (confirmed not applicable) state. Gate closure is **executor-owned**: the LLM's reported gate status is advisory only, and the Evidence Evaluator (`src/react/evidence.py`) closes a gate solely when its executor-defined `completion_criteria` are satisfied by structured evidence facts; rejected closures and all status transitions are recorded in `gate_transition_history` and surfaced in the companion Gate Audit document (see [Report & Audit Output](#47-complete-client-parameter-description)). The reader-facing report keeps only a short plain-language **Verification Status** summary.
-- **Precision e820 BIOS Memory Map Verification & Adjacent Page Fingerprinting**: As confirmed by `memorandum.txt`, the agent demonstrates expert-level memory forensics. When encountering a `reserved` physical page, the AI extracts fingerprints from adjacent physical pages without triggering seek errors, enabling fine-grained memory authentication. It performs rigorous mathematical interval comparison between the crash physical address and the BIOS memory map (e820), determining whether the memory is hardware-reserved or overwritten by a specific device's DMA out-of-bounds access after boot — a diagnostic approach matching the caliber of senior kernel experts.
-- **Long-Connection Keep-Alive & Streaming Transmission**: Kernel crash tools can take extended periods (minutes) when searching large memory regions (GB-scale vmcore images) or loading debug symbols for massive modules. The FastAPI server introduces an independent Task queue with a 15-second heartbeat comment (Keep-Alive Heartbeat) sent to the client via SSE. Even when a single underlying operation exceeds 2 minutes, the client maintains a stable connection and displays diagnostic progress nodes in real time.
+Key capabilities:
 
-## Architecture Design
+- Collects crash basics first, then selects diagnostic actions from the current analysis state.
+- Calls `crash` and related tools through MCP, with action guards and command deduplication.
+- Tracks hypotheses and verification gates. Gate closure is evaluated by the executor against tool evidence rather than accepted from the model directly.
+- Provides synchronous and SSE streaming APIs; a separate Gate audit file can accompany the report.
 
-### Overall Architecture Diagram
+## How it works
 
-```
-graph TB
-    subgraph Client
-        A[client.py] -->|HTTP / SSE| B
-    end
-
-    subgraph "FastAPI Server"
-        B["POST /analyze\nGET /analyze/stream"] --> C[create_agent_graph]
-        B --> D[generate_markdown_report]
-    end
-
-    subgraph "LangGraph ReAct Agent"
-        C --> E["collect_crash_init_data_node\nsys / sys -t / bt"]
-        E -->|HumanMessage| F{should_continue}
-        F -->|Initial data ready | G["llm_analysis_node\nDeepSeek-Reasoner"]
-        G -->|AIMessage with tool_calls| H{should_continue}
-        H -->|Need tools| I[crash_tool_node]
-        H -->|reasoning_to_structure| J["structure_reasoning_node\ndeepseek-chat"]
-        H -->|Analysis complete| K[__end__]
-        I -->|after_crash_tool| G
-        J -->|Structured| H
-    end
-
-    subgraph "MCP Tools"
-        I -->|crash commands| L["crash MCP Server\nmcp_tools/crash/server.py"]
-        I -->|Source code patches| M["source_patch MCP Server\nmcp_tools/source_patch"]
-        L --> N["crash utility\nvmcore + vmlinux"]
-        M --> O[unified diff patch]
-    end
-
-    K --> D
-    D -->|Markdown report| P[reports]
-        D -->|Gate audit record| P
-    ```
-
-**Architecture Diagram Explanation**:
-- **Solid arrows** represent data flow or invocation relationships
-- **Curly brace nodes** (e.g., `{should_continue}`) represent conditional routing decisions
-- **Bracket nodes** represent concrete functional nodes or external services
-- The flow starts from `START`, goes through initial data collection, enters the loop of LLM analysis and tool invocation, and ends when `is_conclusive=true` or the recursion limit is reached
-
-### Runtime Request Flow Diagram
-
-The following SVG shows the full runtime path of a single `/analyze` or `/analyze/stream` request across the FastAPI entrypoint, LangGraph loop, MCP tools, and the crash executor. It is more detailed than the overview diagram above and is useful when tracing the real execution path.
-
-![VMCore Analysis Agent Runtime Request Flow](./vmcore-analysis-agent/doc/vmcore-analysis-agent-flow-2.0.svg)
-
-## Vmcore Analysis React Agent
-
-### Agent Architecture
-
-ReAct (Reasoning-Action) agent based on LangGraph, containing four core nodes:
-
-| Node | Description |
-|------|------|
-| `collect_crash_init_data_node` | Initial node, concurrently executes `sys`, `bt` and other commands to collect vmcore basic information |
-| `llm_analysis_node` | Calls DeepSeek-Reasoner, outputs structured `VMCoreAnalysisStep`, decides next action |
-| `crash_tool_node` | Parses LLM tool call requests, concurrently executes crash commands via MCP |
-| `structure_reasoning_node` | When Reasoner returns plain text `reasoning_content`, uses deepseek-chat to structure it (optional) |
-
-### Node Flow Diagram
-
-```
-stateDiagram-v2
-    [*] --> collect_crash_init_data_node
-    collect_crash_init_data_node --> llm_analysis_node : HumanMessage (basic info)
-
-    state llm_analysis_node {
-        [*] --> DeepSeek_Reasoner
-        DeepSeek_Reasoner --> has_tool_calls : Needs more data
-        DeepSeek_Reasoner --> reasoning_to_structure : Reasoner plain text output
-        DeepSeek_Reasoner --> analysis_complete : is_conclusive = true
-    }
-
-    llm_analysis_node --> crash_tool_node : has tool_calls
-    llm_analysis_node --> structure_reasoning_node : reasoning_to_structure
-    llm_analysis_node --> [*] : analysis_complete
-
-    crash_tool_node --> llm_analysis_node : ToolMessage (command results)
-    crash_tool_node --> [*] : is_last_step
-
-    structure_reasoning_node --> llm_analysis_node : Structured AIMessage
+```mermaid
+flowchart LR
+    A[Client request] --> B[FastAPI validates file paths]
+    B --> C[Collect basics: sys, sys -t, bt]
+    C --> D[LLM analyzes and selects an action]
+    D --> E[Execute MCP / crash tool]
+    E --> F[Extract evidence and evaluate gates]
+    F --> D
+    D -->|Analysis complete| G[Markdown report and audit]
 ```
 
-### Detailed Node Description
+An analysis follows these steps:
 
-#### Node 1: collect_crash_init_data_node
+1. FastAPI validates the supplied paths and creates the initial agent state.
+2. LangGraph runs initial `crash` commands to collect system, taint, and backtrace information.
+3. The LLM selects the next diagnostic step or tool call; `action_guard` and the executor constrain and run tool actions.
+4. The evidence evaluator extracts facts from tool output and updates gates. The analysis cannot be marked conclusive while required gates have not reached `closed` or `n/a`.
+5. The service returns the analysis. The client saves a Markdown report by default and, when Gate data is present, a companion `.audit.md` file.
 
-**Function**: Executes default crash command set, collects vmcore basic information
+### Core directories
 
-**Default Commands**:
-```python
-DEFAULT_CRASH_COMMANDS = [
-    "sys",  # System information (kernel version, crash time, etc.)
-    "bt",   # Stack backtrace at crash scene
-]
-```
-
-Execution results are written to the message queue as `HumanMessage`, serving as initial context for LLM analysis.
-
-#### Node 2: llm_analysis_node
-
-**Function**: Calls DeepSeek-Reasoner to output structured analysis steps following the ReAct pattern
-
-**Core Implementation Logic** ([`call_llm_analysis`](vmcore-analysis-agent/src/react/llm_node.py#L27-L212) function):
-
-1. **Message Compression**: Compresses historical messages via [`compress_messages_for_llm`](vmcore-analysis-agent/src/react/llm_runtime.py#L104-L134) to prevent token explosion from reasoning_content accumulation
-2. **System Prompt Construction**: Uses dynamic layered injection architecture via [`prompt_builder.py`](vmcore-analysis-agent/src/react/prompt_builder.py), including:
-   - Role definition: Senior Linux Kernel Crash Dump analysis expert
-   - Output contract: Strictly follows `VMCoreLLMAnalysisStep` JSON Schema
-   - Final step constraint: When `is_last_step=True`, must provide conclusion and prohibit tool calls
-3. **Structured Output**: Uses `llm_with_tools.with_structured_output(VMCoreLLMAnalysisStep, method="json_mode", include_raw=True)`
-4. **Error Handling**:
-   - Attempts JSON repair on format errors ([`repair_structured_output`](vmcore-analysis-agent/src/react/output_parser.py#L56-L94))
-   - Routes plain text `reasoning_content` to [`structure_reasoning_node`](vmcore-analysis-agent/src/react/llm_node.py#L215-L350)
-   - Injects HumanMessage on empty response to force LLM action or conclusion
-5. **State Management**: Merges LLM output with managed state (hypotheses, gates) via [`project_managed_analysis_step`](vmcore-analysis-agent/src/react/state_manager.py#L123-L198) — gate closures are re-validated by the Evidence Evaluator, and `is_conclusive` is forced to `false` while any mandatory gate remains open
-
-**Core Prompt Design**:
-- Built-in anti-repetition policy to prevent executing the same command repeatedly
-- Prohibits high-risk commands that trigger token overflow (`sym -l`, `bt -a`, `ps -m`, etc.)
-- Supports `run_script` for batch execution, ensuring module symbols are loaded within the same crash session
-- Emphasizes evidence-based reasoning, prohibiting speculation without diagnostic evidence
-
-**System Prompt Layered Injection Architecture**:
-The agent implements a sophisticated three-layer dynamic prompt injection system that embodies the production-grade principle of **"instruction loading on demand"**:
-
-- **Layer 0: Global Base**
-  - Composed of `LAYER0_SYSTEM_PROMPT_TEMPLATE`
-  - Defines the Agent's identity (Role), core forbidden operations, and output contracts
-  - Acts as the immutable "constitution" that remains active throughout all analysis stages
-
-- **Layer 1: Scenario Playbooks**
-  - Dynamically selected via `_select_playbook` based on `current_signature_class`
-  - Implements instruction isolation: when analyzing `null_deref`, the LLM has zero exposure to `lockup` or `rcu_stall` logic
-  - Eliminates interference and solves attention degradation issues during complex analyses
-
-- **Layer 2: Dynamic SOP Fragments**
-  - Injected via `_select_sop_fragments` based on step count, keywords, and Gate states
-  - Employs **context-triggered logic**: SOP fragments only appear when relevant conditions are met
-  - Examples: `per-cpu` SOP injects only when "%gs" or "per-cpu" appears in recent messages; `dma_corruption` SOP activates only when external corruption gates open
-
-**Implementation Highlights**:
-- **State-Driven Injection**: Uses `managed_gates` status to conditionally inject specialized SOPs, preventing speculative analysis without evidence
-- **Intelligent Deduplication**: `_dedupe_preserve_order` ensures clean, non-redundant prompts even when multiple triggers activate the same SOP
-- **Dynamic Executor State**: `build_executor_state_section` provides LLM with a clear "task map" showing current hypotheses, gates, and recent commands
-- **Token Optimization**: Reduces System Prompt token consumption by 40-70% compared to static full prompts, while maintaining comprehensive knowledge coverage
-
-**Output Schema** ([`VMCoreLLMAnalysisStep`](vmcore-analysis-agent/src/react/schema.py#L70-L114)):
-```json
-{
-  "step_id": 1,
-  "reasoning": "3-6 sentence structured analytic summary: (1) What did I learn from latest tool output? (2) How does this update hypotheses? (3) What is the ONE most diagnostic next action and why?",
-  "action": { "command_name": "bt", "arguments": ["-c", "3"] },
-  "is_conclusive": false,
-  "signature_class": "soft_lockup",
-  "root_cause_class": null,
-  "partial_dump": "full",
-  "active_hypotheses": null,  // Executor-managed, LLM omits
-  "gates": null,              // Executor-managed, LLM omits
-  "final_diagnosis": null,
-  "fix_suggestion": null,
-  "confidence": null,
-  "additional_notes": null
-}
-```
-
-**Token Management**:
-- Records token consumption per invocation (`usage_metadata`)
-- Accumulates `token_usage` in state for monitoring and optimization
-
-#### Node 3: crash_tool_node
-
-**Function**: Receives LLM tool call requests, concurrently executes crash commands via MCP
-
-**Technical Implementation**:
-- Uses `langchain-mcp-adapters` to load MCP tools
-- Concurrently executes multiple commands via `asyncio.gather` for efficiency
-- Independently manages MCP session lifecycle for each call
-- Safely encapsulates tool calls, captures exceptions and returns error strings without interrupting workflow
-
-**Supported MCP Tool Services**:
-- **crash MCP Server**: Provides `run_script` and various crash subcommands (`bt`, `dis`, `struct`, `kmem`, `sym`, etc.)
-- **source_patch MCP Server**: Generates unified diff patch files based on LLM's source code analysis conclusions
-
-#### Node 4: structure_reasoning_node (Optional)
-
-**Function**: DeepSeek-Reasoner sometimes returns only `reasoning_content` plain text with empty `content`. This node converts it into valid `VMCoreAnalysisStep` JSON using deepseek-chat to ensure proper graph flow.
-
-### Core Data Models
-
-The agent's reasoning and state are structured around a set of Pydantic models defined in `src/react/schema.py`. These models ensure strict, type-safe communication between the LLM and the executor, and enforce a disciplined analytical process.
-
-| Model | Description |
+| Path | Responsibility |
 |---|---|
-| [`VMCoreAnalysisStep`](vmcore-analysis-agent/src/react/schema.py#L230-L373) | The primary data structure representing a single step in the analysis. It contains the LLM's reasoning, the requested action ([`ToolCall`](vmcore-analysis-agent/src/react/schema.py#L11-L34)), and crucially, the managed state: [`active_hypotheses`](vmcore-analysis-agent/src/react/schema.py#L326-L333) and [`gates`](vmcore-analysis-agent/src/react/schema.py#L335-L343). |
-| [`VMCoreLLMAnalysisStep`](vmcore-analysis-agent/src/react/schema.py#L70-L114) | The minimal subset of [`VMCoreAnalysisStep`](vmcore-analysis-agent/src/react/schema.py#L230-L373) that the LLM is expected to output directly. The executor enriches this with the managed state fields. |
-| [`FinalDiagnosis`](vmcore-analysis-agent/src/react/schema.py#L45-L67) | A comprehensive record of the final conclusion, populated only when [`is_conclusive`](vmcore-analysis-agent/src/react/schema.py#L294-L294) is `true`. |
-| [`Hypothesis`](vmcore-analysis-agent/src/react/schema.py#L165-L192) | Represents a single candidate root cause being tracked by the agent. The [`active_hypotheses`](vmcore-analysis-agent/src/react/schema.py#L326-L333) list forces explicit management of competing theories. |
-| [`GateEntry`](vmcore-analysis-agent/src/react/schema.py#L195-L220) | Represents a mandatory verification checkpoint. The [`gates`](vmcore-analysis-agent/src/react/schema.py#L335-L343) dictionary ensures all required evidence is gathered before a conclusive diagnosis is allowed. Each gate carries executor-defined `completion_criteria` used by the Evidence Evaluator to decide closure. |
+| [`main.py`](./vmcore-analysis-agent/main.py) | FastAPI service, analysis APIs, and lifecycle initialization |
+| [`client/`](./vmcore-analysis-agent/client/) | HTTP/SSE client and CLI entry point |
+| [`src/react/`](./vmcore-analysis-agent/src/react/) | LangGraph nodes, routing, state, prompts, evidence evaluation, and report generation |
+| [`src/llm/`](./vmcore-analysis-agent/src/llm/) | LLM client creation |
+| [`src/mcp_tools/`](./vmcore-analysis-agent/src/mcp_tools/) | MCP tool registration and crash, source-patch, and related tools |
+| [`tests/`](./vmcore-analysis-agent/tests/) | Unit and integration tests |
+| [`doc/`](./vmcore-analysis-agent/doc/) | Architecture flow diagrams and project documentation |
+| [`reports/`](./vmcore-analysis-agent/reports/) | Local report output directory |
 
-#### `_REQUIRED_GATES`: The Verification Gatekeeper System
+## Prerequisites
 
-**What are Gates?**
+Run the service on a Linux host that can access the vmcore files. Prepare:
 
-Gates (门控/检查点) are a core concept in the VMCore crash analysis state machine—they represent mandatory verification steps (checkpoints) that must be completed before declaring the analysis as "conclusive" (`is_conclusive=True`).
+- Python 3.11 or later and [`uv`](https://docs.astral.sh/uv/).
+- The Linux `crash` utility and the `vmlinux` debug symbols matching the vmcore's kernel.
+- The corresponding `vmcore-dmesg.txt`.
+- Optional debug symbols (`.ko`) for third-party kernel modules under investigation.
+- An accessible OpenAI-compatible model service and API key.
 
-This is clearly visible from the `GateEntry` definition:
+The repository's mpykdump installer targets x86_64 and includes extensions for crash 8.0 and 9.0. For other crash versions, provide a compatible extension yourself.
 
-```python
-class GateEntry(BaseModel):
-    """
-    is_conclusive=True 前必须完成的验证检查点。
+## Quick start
 
-    每个 gate 代表一个必须完成的验证步骤，用于确认崩溃根因的特定假设。
-    在将分析结论标记为"最终结论"（is_conclusive=True）之前，所有相关的 gate
-    必须处于 closed 或 n/a 状态，且 evidence 字段必须填写具体的工具输出。
-    """
-    status: Literal["open", "closed", "blocked", "n/a"]
-    evidence: Optional[str]  # 必须填写具体的工具输出，不得使用泛泛总结
-    prerequisite: Optional[str]  # 前置依赖 gate
-    completion_criteria: List[str]  # 执行器定义的关闭完成条件，由证据评估器判定
-```
+Commands below use a Linux shell.
 
-**Gate States:**
+### 1. Install dependencies
 
-| Status | Meaning |
-|--------|---------|
-| `open` | Not yet investigated or investigation incomplete |
-| `closed` | Verified and passed (evidence must contain specific tool output) |
-| `blocked` | Prerequisite gate not closed, current gate cannot start |
-| `n/a` | Truly not applicable (evidence must explain why it's not applicable) |
+From the repository root:
 
-**Structure of `_REQUIRED_GATES`**
-
-`_REQUIRED_GATES` is a mapping from crash signature types to required gate lists:
-
-```python
-_REQUIRED_GATES: ClassVar[Dict[str, List[str]]] = {
-    "pointer_corruption": [
-        "register_provenance",         # Register provenance validation
-        "object_lifetime",             # Object lifetime validation
-        "local_corruption_exclusion",  # Exclude local corruption
-        "external_corruption_gate",    # External corruption gate
-        "field_type_classification",   # Field type classification
-    ],
-    "null_deref":     ["register_provenance"],
-    "use_after_free": ["register_provenance", "object_lifetime"],
-    "soft_lockup":    ["stack_integrity", "lock_holder"],
-    # ... and more
-}
-```
-
-Different crash types require different validation depths:
-- **Simple types** (e.g., `null_deref`, `divide_error`) require only 1-2 gates
-- **Complex types** (e.g., `pointer_corruption`) require 5 gates, forming a complete evidence chain
-
-**Role in the Project**
-
-Gates serve as **Quality Gatekeepers** throughout the analysis workflow:
-
-```
-┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│ LLM 逐步推理 │ ──► │ 更新 gates 状态   │ ──► │ 所有 gate closed │
-│ 调用 crash   │     │ (open→closed/n/a)│     │ 才能 is_        │
-│ 工具收集证据  │     │                  │     │ conclusive=true  │
-└─────────────┘     └──────────────────┘     └─────────────────┘
-```
-
-Specifically:
-
-- **Prevents premature conclusions**: LLMs tend to "rush to conclusions," but gates force completion of all necessary verification steps before allowing `is_conclusive=True`.
-
-- **Ensures evidence completeness**: For example, `pointer_corruption` must sequentially verify: register provenance → object lifetime → exclude local corruption → external corruption determination → field type classification, forming a complete evidence chain with no gaps.
-
-- **Supports dependencies**: Gates can have prerequisites (e.g., `external_corruption_gate` depends on `local_corruption_exclusion`), ensuring proper analysis order.
-
-- **Enables auditability**: Each closed gate must include `evidence` (specific tool output), making the entire analysis process traceable and verifiable—not just LLM "black box" reasoning.
-
-**Analogy**
-
-Think of gates as an aircraft pre-flight checklist: pilots must systematically check and confirm each item (flaps, fuel, engines...) before takeoff. Similarly, the analysis Agent must complete each required checkpoint for its crash type before announcing "root cause found"—all gates must be closed before the final diagnosis can be truly output.
-
-**Executor-Owned Gate Closure (Evidence Evaluator)**
-
-Gate closure authority belongs to the executor, not the LLM:
-
-- **Executor-defined completion criteria**: Each `GateEntry` carries a `completion_criteria` list defined by the executor (e.g., `register_provenance` requires the faulting register value, source object/address evidence, and an independently observed field/offset or symbol relation).
-- **The Evidence Evaluator is the sole closer**: [`evaluate_gate_closures`](vmcore-analysis-agent/src/react/evidence.py) extracts structured `evidence_facts` from tool outputs (e.g., `rd_word:`, `struct_*`, `dis_*`, `sym:`) and closes a gate only when its required evidence-category groups are all satisfied. `external_corruption_gate` additionally requires its prerequisite `local_corruption_exclusion` to be closed first.
-- **LLM gate status is advisory only**: If the LLM emits `status: closed` without sufficient evidence, the evaluator keeps the gate `open` and records an `llm_close_rejected` transition; the system prompt declares this rule explicitly.
-- **Conclusive answers stay gated**: While any mandatory gate remains `open`/`blocked`, [`project_managed_analysis_step`](vmcore-analysis-agent/src/react/state_manager.py) forces `is_conclusive=false` and strips a premature `final_diagnosis`.
-- **Full audit trail**: Every status change is appended to `gate_transition_history` in `AgentState`. This history is rendered into a standalone **Gate Audit** document (written next to the report as `<report>.audit.md`) listing each gate's criteria, review evidence, and status transitions, so the reader-facing report stays focused on the analysis itself.
-
-**Key Concepts**:
-- **[`CrashSignatureClass`](vmcore-analysis-agent/src/react/schema.py#L117-L134) vs [`RootCauseClass`](vmcore-analysis-agent/src/react/schema.py#L139-L162)**: The former is an observable symptom from the panic log (e.g., `soft_lockup`), while the latter is the inferred underlying mechanism (e.g., `deadlock`). They serve different purposes in the analysis flow.
-- **Managed State ([`active_hypotheses`](vmcore-analysis-agent/src/react/schema.py#L326-L333), [`gates`](vmcore-analysis-agent/src/react/schema.py#L335-L343))**: These fields are not generated by the LLM but are maintained by the agent's executor logic. They are the backbone of the agent's ability to perform transparent, traceable, and rigorous analysis.
-
-### Routing Logic (should_continue / after_crash_tool)
-
-```
-def should_continue(state: AgentState) -> str:
-    # 1. Error occurred → End
-    if error_state and error_state.get("is_error"):
-        return "__end__"
-
-    # 2. Need to structure reasoning_content → structure_reasoning_node
-    if state.get("reasoning_to_structure"):
-        return structure_reasoning_node
-
-    # 3. AIMessage with tool_calls → crash_tool_node (unless it's the last step)
-    if isinstance(last_message, AIMessage) and tool_calls:
-        return crash_tool_node if not is_last_step else "__end__"
-
-    # 4. AIMessage without tool_calls (is_conclusive=true) → End
-    if isinstance(last_message, AIMessage):
-        return "__end__"
-
-    # 5. HumanMessage (initial data collection complete) → llm_analysis_node
-    if isinstance(last_message, HumanMessage):
-        return llm_analysis_node
-```
-
-### MCP Crash Tool Call Example
-
-```
-# Concurrently execute multiple crash commands
-async def dispatch_crash_commands(commands, state):
-    async with crash_client(state) as tools:
-        tasks = [_invoke_tool(tool, cmd, state) for cmd in commands]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-    return list(zip(commands, results))
-
-# Single tool call
-result = await tool.ainvoke({
-    "command": "bt -c 3",
-    "vmcore_path": state["vmcore_path"],
-    "vmlinux_path": state["vmlinux_path"],
-})
-```
-
-## Project Structure
-
-```
-vmcore-analysis-agent/
-├── README.md                          # Project documentation
-├── README.zh-CN.md                    # Chinese project documentation
-├── main.py                            # FastAPI service entry point
-├── pyproject.toml                     # Python project configuration
-├── uv.lock                            # Dependency lock file
-├── .python-version                    # Python version specification
-├── config/
-│   └── config.yml                     # LLM / MCP configuration file
-├── client/
-│   ├── client.py                      # HTTP client implementation
-│   └── main.py                        # Command line client entry point
-├── src/
-│   ├── llm/
-│   │   └── model.py                   # DeepSeek LLM initialization and model configuration
-│   ├── react/
-│   │   ├── __init__.py                # Package initialization
-│   │   ├── action_guard.py            # Action guard and safety validation
-│   │   ├── edges.py                   # Routing logic and state transitions
-│   │   ├── evidence.py                # Evidence extraction and executor-owned gate evaluation
-│   │   ├── fragment_flags.py          # Fragment flags management
-│   │   ├── graph.py                   # LangGraph graph construction
-│   │   ├── graph_state.py             # AgentState definition
-│   │   ├── layer0_system.py           # System layer prompt definitions
-│   │   ├── llm_node.py                # LLM calling and response handling
-│   │   ├── llm_runtime.py             # LLM runtime configuration
-│   │   ├── logging_callback.py        # Graph execution log callback
-│   │   ├── nodes.py                   # Core node implementations
-│   │   ├── output_parser.py           # LLM output parsing and validation
-│   │   ├── playbooks.py               # Analysis playbook definitions
-│   │   ├── prompt_builder.py          # Prompt builder
-│   │   ├── prompt_layers.py           # Prompt layer management
-│   │   ├── prompt_overlays.py         # Prompt overlay definitions
-│   │   ├── prompt_phrases.py          # Prompt phrase templates
-│   │   ├── prompts.py                 # Professional analysis prompts
-│   │   ├── report_generator.py        # Markdown report generation
-│   │   ├── schema.py                  # Data schema definitions (VMCoreAnalysisStep)
-│   │   ├── sop_fragments.py           # Standard operating procedure fragments
-│   │   └── state_manager.py           # State manager
-│   ├── mcp_tools/
-│   │   ├── crash/                     # crash MCP Server implementation
-│   │   │   ├── server.py              # crash MCP server
-│   │   │   ├── client.py              # crash MCP client
-│   │   │   ├── executor.py            # crash command executor
-│   │   │   ├── scsishow.py            # SCSI show utility
-│   │   │   └── __init__.py            # crash tools package initialization
-│   │   ├── source_patch/              # source_patch MCP Server implementation
-│   │   │   ├── server.py              # Source patch MCP server
-│   │   │   ├── client.py              # Source patch MCP client
-│   │   │   └── __init__.py            # Source patch tools package initialization
-│   │   ├── stack_canary/              # Stack canary analysis tools
-│   │   │   ├── server.py              # Stack canary MCP server
-│   │   │   ├── client.py              # Stack canary MCP client
-│   │   │   ├── analyzer.py            # Stack canary analyzer
-│   │   │   └── __init__.py            # Stack canary tools package initialization
-│   │   ├── __init__.py                # MCP tools package initialization
-│   │   └── registry.py                # MCP tool registry
-│   └── utils/                         # Utility functions
-│       ├── config.py                  # Configuration management
-│       ├── logging.py                 # Logging configuration
-│       ├── os.py                      # Operating system utility functions
-│       └── __init__.py                # Utilities package initialization
-├── simulate-crash/                    # Kernel crash simulation module
-│   ├── rcu_stall/                     # RCU stall reproduction scenarios
-│   ├── soft_lockup/                   # Soft lockup reproduction scenarios
-│   └── dma_memory_corruption/         # DMA memory corruption reproduction scenarios
-├── reports/                           # Analysis report output directory
-├── tests/                             # Test suite
-│   ├── test_action_guard.py           # Action guard tests
-│   ├── test_crash_client.py           # Crash client tests
-│   ├── test_evidence.py               # Evidence extraction & gate evaluation tests
-│   ├── test_llm_runtime.py            # LLM runtime tests
-│   ├── test_output_parser.py          # Output parser tests
-│   ├── test_prompt_builder.py         # Prompt builder tests
-│   ├── test_prompts.py                # Prompt tests
-│   ├── test_report_generator.py       # Report generation & gate audit tests
-│   ├── test_schema.py                 # Schema tests
-│   ├── test_stack_canary_analyzer.py  # Stack canary analyzer tests
-│   ├── test_stack_canary_client.py    # Stack canary client tests
-│   ├── test_state_manager.py          # State manager tests
-│   └── test_vmcore_analysis_step.py   # VMCore analysis step tests
-├── tools/
-│   ├── show_first_global_func.sh      # Debug symbol verification script
-│   └── test_key.py                    # API key testing script
-└── test_simple.py                     # Simple integration test
-```
-
-## Quick Start
-
-### 1. Install Dependencies
-
-#### 1.1 Install crash extension (<span style="color: yellow;">Required - Critical Functionality Depends on It</span>)
-
-```
-bash tools/install_mpykdump.sh
-```
-
-#### 1.2 Install project dependencies
-
-```
+```bash
 cd vmcore-analysis-agent
 uv sync
 ```
 
-### 2. Configuration
-
-Edit `config/config.yml` to configure LLM API Key and MCP service paths:
-
-```yaml
-llm:
-  api_key: "your-deepseek-api-key"
-  model: "deepseek-v4-pro"
-  base_url: "https://api.deepseek.com"
-```
-
-### 3. Start FastAPI Service
+To install the bundled mpykdump extension, run this from the `vmcore-analysis-agent` directory. The script writes to the system crash extension directory and may require `sudo`:
 
 ```bash
-# Method 1: Direct run
-uv run main.py
-
-# Method 2: Use uvicorn (Recommended, supports hot reload)
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+bash tools/install_mpykdump.sh
 ```
 
-After service startup:
-- API documentation: http://localhost:8000/docs
-- Health check: http://localhost:8000/health
+### 2. Configure the model
 
-### 4. Use Client to Call Analysis API
+Copy the template:
 
-#### 4.1 Check Service Health Status
+```bash
+cp .env.example .env
+```
+
+Edit `vmcore-analysis-agent/.env` with valid model credentials and endpoint details:
+
+```dotenv
+REASONING_API_KEY=replace-with-your-api-key
+REASONING_BASE_URL=https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+REASONING_MODEL=deepseek-v4.1-flash-1017
+
+REASONING_THINKING=enabled
+REASONING_EFFORT=max
+REASONING_TEMPERATURE=0.1
+REASONING_CONTEXT_WINDOW=524288
+REASONING_MAX_OUTPUT_TOKENS=48000
+REASONING_MIN_THINKING_OUTPUT_TOKENS=40960
+REASONING_HISTORY_KEEP=2
+LANGSMITH_TRACING=false
+```
+
+| Variable | Required | Description |
+|---|---:|---|
+| `REASONING_API_KEY` | Yes | API key for the model service |
+| `REASONING_BASE_URL` | Yes | OpenAI-compatible model API endpoint |
+| `REASONING_MODEL` | Yes | Model name used by the service |
+| `REASONING_THINKING` | No | `enabled` or `disabled`; defaults to `disabled` |
+| `REASONING_EFFORT` | No | Reasoning effort; defaults to `max` |
+| `REASONING_TEMPERATURE` | No | Sampling temperature; defaults to `0.1` |
+| `REASONING_CONTEXT_WINDOW` | No | Context budget; defaults to `524288`. Set it according to the provider's actual limits. |
+| `REASONING_MAX_OUTPUT_TOKENS` | No | Maximum completion budget; defaults to `48000` |
+| `REASONING_MIN_THINKING_OUTPUT_TOKENS` | No | Minimum remaining output budget for thinking mode; defaults to `40960` |
+| `REASONING_HISTORY_KEEP` | No | Number of reasoning history items to keep during compression; defaults to `2` |
+| `LANGSMITH_TRACING` | No | Enable LangSmith tracing; defaults to `false` |
+
+Process environment variables take precedence over `.env`. The service fails during startup if a required model variable is missing or a setting is invalid. Do not commit `.env` files containing real credentials. MCP tools are discovered by the code; MCP server paths do not need to be added to `.env`.
+
+### 3. Start the service
+
+From the `vmcore-analysis-agent` directory:
+
+```bash
+uv run uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+- Health check: <http://localhost:8000/health>
+- API documentation: <http://localhost:8000/docs>
+- Metrics: <http://localhost:8000/metrics>
+
+The API currently has no built-in authentication. Restrict network access in production or put it behind a protected reverse proxy/API gateway.
+
+### 4. Run an analysis
+
+The client must be able to reach the service, and paths in the request must be **accessible on the server host** (the client does not upload vmcore files).
 
 ```bash
 cd client
-uv run main.py --health
+uv run main.py --health --url http://localhost:8000
+
+uv run main.py --url http://localhost:8000 --stream \
+  --vmcore-path /data/case/vmcore \
+  --vmlinux-path /usr/lib/debug/lib/modules/<kernel-version>/vmlinux \
+  --vmcore-dmesg-path /data/case/vmcore-dmesg.txt \
+  --debug-symbols /data/case/driver.ko \
+  --output-dir ../reports
 ```
 
-#### 4.2 Standard Streaming Analysis (Recommended)
+Common CLI options:
 
-```bash
-cd client
-uv run main.py --url http://192.168.14.132:8000 --stream \
-                       --vmcore-path "/crash_case/Case_04387188/vmcore" \
-                       --vmlinux-path "/usr/lib/debug/lib/modules/4.18.0-305.40.2.el8_4.x86_64/vmlinux" \
-                       --vmcore-dmesg-path "/crash_case/Case_04387188/vmcore-dmesg.txt"
+| Option | Description |
+|---|---|
+| `--url` | API service URL; defaults to `http://localhost:8000` |
+| `--health` | Only check service health |
+| `--stream` | Use the SSE endpoint; without it, use the synchronous endpoint |
+| `--vmcore-path` | Path to the vmcore |
+| `--vmlinux-path` | Path to the matching `vmlinux` |
+| `--vmcore-dmesg-path` | Path to `vmcore-dmesg.txt` |
+| `--debug-symbols` | Optional module debug-symbol paths; accepts multiple paths |
+| `--timeout` | Request timeout in seconds; defaults to `600` |
+| `--output-dir` | Report directory; defaults to `../reports` relative to the current `client` directory |
+| `--no-save` | Do not save report files |
+
+## API and outputs
+
+### API endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/health` | Return service, LLM, and tool initialization status |
+| `POST` | `/analyze` | Run an analysis synchronously |
+| `POST` | `/analyze/stream` | Return progress and results as Server-Sent Events |
+
+Both analysis endpoints use the same JSON request fields:
+
+```json
+{
+  "vmcore_path": "/data/case/vmcore",
+  "vmlinux_path": "/data/case/vmlinux",
+  "vmcore_dmesg_path": "/data/case/vmcore-dmesg.txt",
+  "debug_symbol_paths": ["/data/case/driver.ko"]
+}
 ```
 
-#### 4.3 Synchronous Mode Analysis (Optional)
+The first three fields are required; `debug_symbol_paths` is optional and may be an empty array. Paths are checked by the server. The synchronous response includes `success`, `task_id`, `agent_answer`, and `token_usage`, with optional `error` and `audit_report` fields. The streaming endpoint sends progress over SSE; its completion event includes the analysis and audit content.
 
-```bash
-cd client
-uv run main.py
-```
+### Report files
 
-#### 4.4 Custom Parameter Analysis
+The service currently generates reports in English by default. The client saves the Markdown analysis report by default. If Gate data is present, it also saves a sibling `.audit.md` file. `--no-save` skips both files. The audit file records gate states, evidence, and state transitions for traceability; for ordinary reading, start with the verification summary in the main report.
 
-```bash
-cd client
-uv run main.py --vmcore-path "/path/to/vmcore" \
-               --vmlinux-path "/path/to/vmlinux" \
-               --vmcore-dmesg-path "/path/to/vmcore-dmesg.txt" \
-               --debug-symbols "/path/to/module1.ko" "/path/to/module2.ko"
-```
+## Crash classification and verification gates
 
-#### 4.5 Specify Service Address
+`CrashSignatureClass` describes an initial classification from the crash context and is used to select a diagnostic path. `RootCauseClass` describes the root-cause category determined after investigation. They represent different levels of classification.
 
-```bash
-cd client
-uv run main.py --url http://192.168.1.100:8000 --stream
-```
-
-#### 4.6 Report Saving Options
-
-```
-# Streaming analysis and save report to current directory (default behavior)
-cd client
-uv run main.py --stream
-
-# Specify report output directory
-cd client
-uv run main.py --stream --output-dir ./reports
-
-# Don't save file, display only
-cd client
-uv run main.py --stream --no-save
-```
-
-#### 4.7 Complete Client Parameter Description
-
-```
-Parameter description:
-  --url URL                   API service address (default: http://localhost:8000)
-  --stream                    Use streaming mode
-  --health                    Check service health status only
-  --vmcore-path PATH          vmcore file path
-  --vmlinux-path PATH         vmlinux debug symbol path
-  --vmcore-dmesg-path PATH    vmcore-dmesg.txt file path
-  --debug-symbols [PATH ...]  Additional debug symbol path list
-  --timeout SECONDS           Request timeout in seconds (default: 600)
-  --output-dir DIR            Report output directory (default: current directory)
-  --no-save                   Don't save markdown report file
-```
-
-**Note**:
-- After analysis completion, markdown reports are automatically saved to the specified directory by default
-- Report filename format: `127.0.0.1-2026-01-30-22-51-43.md` (generated from server IP and timestamp)
-- Reports include complete analysis process, reasoning steps, and final diagnostic conclusions
-- The report ends with a plain-language **Verification Status** section (one line per verification gate) so readers can see at a glance how well-supported the conclusion is
-- The full gate audit — per-gate status, prerequisites, completion criteria, review evidence, and every status transition — is written to a sibling file `127.0.0.1-2026-01-30-22-51-43.audit.md`. This keeps executor-internal bookkeeping out of the analysis report while preserving full traceability. The file is only created when gate data exists; `--no-save` skips both files
-- The same content is available over the API: `POST /analyze` returns `audit_report`, and the `/analyze/stream` SSE `complete` event carries the same field
-
-## Application Scenarios
-
-1. **Automated fault diagnosis**: Automatically analyze vmcore files, reducing manual intervention
-2. **Knowledge base construction**: Extract reusable diagnostic logic from historical cases
-3. **Novice training**: Serve as a teaching tool for learning kernel debugging
-4. **Production environment monitoring**: Integrate into operations platforms for automatic alert analysis
-
-## Future Extensions
-
-1. **More diagnostic scenarios**: Support other kernel issues beyond lockups
-2. **Multimodal analysis**: Combine logs, metrics, and other multidimensional data
-3. **Real-time analysis**: Support real-time diagnostics for online systems
-4. **Distributed deployment**: Support large-scale concurrent analysis
-
-## Glossary
-
-### Gate (门控 / Verification Gate)
-
-A **Gate** is a mandatory verification checkpoint in the VMCore crash analysis state machine. Before the agent can declare a conclusive diagnosis (`is_conclusive=true`), all gates required for the current crash signature class must reach a terminal state (`closed` or `n/a`).
-
-**Purpose**: Prevents the LLM from drawing premature or unsupported conclusions by enforcing that specific diagnostic evidence (e.g., register provenance, object lifetime, corruption exclusion) is collected and verified before the analysis is allowed to terminate.
-
-**States**:
+A Gate is a verification checkpoint in the analysis state machine. The executor evaluates gate closure against structured evidence from tool output; a gate status returned by the model is only advisory. The analysis is not marked conclusive until all gates required for the current signature reach a terminal state.
 
 | State | Meaning |
-|-------|---------|
-| `open` | Not yet investigated or investigation incomplete |
-| `closed` | Verified with concrete tool output evidence |
-| `blocked` | A prerequisite gate has not been closed yet |
-| `n/a` | Confirmed not applicable (with justification) |
+|---|---|
+| `open` | Verification is incomplete |
+| `blocked` | A prerequisite gate is not satisfied |
+| `closed` | The required evidence criteria have been met |
+| `n/a` | Confirmed not applicable, with a reason |
 
-**Key properties**:
-- **Executor-owned closure**: The LLM's reported gate status is advisory only. The Evidence Evaluator (`src/react/evidence.py`) is the sole authority that closes a gate, and only when the executor-defined `completion_criteria` are satisfied by structured evidence facts extracted from tool outputs.
-- **Signature-class specific**: Each `CrashSignatureClass` maps to a different set of required gates via `_REQUIRED_GATES` in `src/react/schema.py`. Simple signatures (e.g., `null_deref`) require 1–2 gates; complex ones (e.g., `pointer_corruption`) require 5.
-- **Auditable**: Every status transition is recorded in `gate_transition_history` and rendered in the standalone **Gate Audit** document (`<report>.audit.md`). The report itself only carries a short **Verification Status** summary.
+Examples:
 
-> See the detailed section [`_REQUIRED_GATES`: The Verification Gatekeeper System](#_required_gates-the-verification-gatekeeper-system) for full implementation details.
+- `register_provenance`: trace a faulting register value to its instruction, object, or field source.
+- `object_lifetime`: assess the current state of an object or memory slot in the dump. For example, `[ALLOCATED]` from `kmem -S` only describes the slot at dump time; it does not rule out an earlier free and reuse.
+- `local_corruption_exclusion`: use disassembly and memory observations to check whether local code could have written the unexpected value.
 
-### register_provenance (寄存器溯源)
+The required gates and completion criteria are defined in [`schema.py`](./vmcore-analysis-agent/src/react/schema.py) and [`evidence.py`](./vmcore-analysis-agent/src/react/evidence.py).
 
-A gate that answers: **Where did the bad value in the faulting register come from?**
+## Project layout
 
-Before this gate can be closed, the agent must establish a complete **bad-value propagation chain**: identify the faulting register's value, trace it back to the exact source object/field/offset that produced the operand, and independently verify the field/offset or symbol relation.
-
-**Completion criteria** (all must be satisfied):
-| # | Criterion | Typical evidence |
-|---|-----------|-----------------|
-| 1 | Faulting register value is present | `rd` read of the register or exception frame |
-| 2 | Source object or address evidence is present | `rd` / `struct` read of the source memory location |
-| 3 | Field/offset or symbol relation is independently observed | `struct -o` (field offset) + `sym` (symbol resolution) |
-
-**Required evidence types**: `rd` (memory read) **AND** (`dis` (disassembly) **OR** `sym` (symbol table))
-
-**Applicable signatures**: `pointer_corruption`, `null_deref`, `use_after_free`, `general_protection_fault`, `invalid_address_access`, `write_protection_violation`, `smap_smep_violation`
-
-### object_lifetime (Object and Slot State)
-
-A gate that answers: **What does the dump establish about the slot now, and what lifetime history remains unknown?**
-
-`kmem -S` reports the slot's state at dump time. `[ALLOCATED]` means it is allocated now; it does not prove that the current allocation is the original object. A stale pointer can still reference a slot that was freed and reused, so `ALLOCATED` does not exclude use-after-free (UAF) with reuse. A type mismatch supports that possibility but does not uniquely prove it; in-place corruption and traversal/owner errors remain alternatives.
-
-**Completion criteria**:
-- Observe the current slab-slot state and the relevant object contents/layout, or obtain direct temporal evidence such as a KASAN use-after-free report.
-- Do not interpret current allocation state or a dense-prefix/zero-tail byte pattern as proof for or against historical reuse.
-
-**Required evidence types**: `kmem -S` slot state plus `rd`/`struct` object evidence, or direct temporal lifetime evidence such as KASAN.
-
-**Applicable signatures**: `pointer_corruption`, `use_after_free`, `page_not_present`
-
-### local_corruption_exclusion (本地损坏排除)
-
-A gate that answers: **Was the bad value written by the local function/CPU, or by an external source (DMA, another CPU, hardware)?**
-
-This gate applies the **method of exclusion**: the agent disassembles the relevant function and checks whether any local instruction (`mov`, `st`, etc.) could have written the bad value to the faulting address. If **no local write path exists**, local corruption is excluded, and suspicion shifts to **external sources** (DMA out-of-bounds, cross-CPU race, hardware MCE, etc.). This is the critical pivot from "local" to "external" in the corruption analysis.
-
-**Completion criteria** (all must be satisfied):
-| # | Criterion | Typical evidence |
-|---|-----------|-----------------|
-| 1 | A relevant disassembly observation is present | `dis` of the function containing the faulting instruction |
-| 2 | A memory observation supports or excludes a local writer | `rd` of the target memory region, cross-referenced with the disassembly |
-
-**Required evidence types**: `dis` (disassembly) **AND** `rd` (memory read)
-
-**Applicable signatures**: `pointer_corruption` (also serves as a **prerequisite** for `external_corruption_gate`)
-
-**Progressive relationship of the three gates**:
-
-```
-register_provenance          object_lifetime           local_corruption_exclusion
-"Where did the bad value   "Was the source object    "Did the local function
- come from?"                still alive?"             write it, or was it
-    │                          │                       external?"
-    ▼                          ▼                       ▼
- rd + dis/sym              rd + struct               dis + rd
- (locate source)         (classify lifetime)      (exclude/confirm writer)
+```text
+ai-app-hub/                       # Repository root (contains multiple projects)
+├── README.md
+├── README.zh-CN.md
+└── vmcore-analysis-agent/         # Component described here
+    ├── main.py                   # FastAPI entry point
+    ├── client/                   # CLI and HTTP/SSE client
+    ├── src/
+    │   ├── llm/                  # Model initialization
+    │   ├── react/                # Agent graph, prompts, state, evidence, reports
+    │   ├── mcp_tools/            # MCP tools
+    │   └── utils/                # Settings and logging
+    ├── tests/                    # Tests
+    ├── tools/                    # Operations and debug helper scripts
+    ├── doc/                      # Flow diagrams and documentation
+    ├── simulate-crash/           # Crash reproduction scenarios
+    ├── reports/                  # Report output directory
+    ├── pyproject.toml
+    ├── uv.lock
+    └── .env.example
 ```
 
-All three must be `closed` before the agent can proceed to `external_corruption_gate` and `field_type_classification`, completing the full evidence chain for `pointer_corruption`.
+## Troubleshooting
+
+- **Missing configuration on startup:** Check `REASONING_API_KEY`, `REASONING_BASE_URL`, and `REASONING_MODEL` in `vmcore-analysis-agent/.env` or the process environment.
+- **File not found:** API paths are resolved on the server, not on the machine running the CLI.
+- **Unavailable crash command or extension:** Confirm that `crash` is installed on the service host and that symbols match the vmcore; the bundled installer supports x86_64 crash 8.0/9.0 only.
+- **Missing module source/symbol information:** Prepare debug symbols matching the kernel and module; see the appendix below.
+- **Long-running request:** Use `--stream` to observe progress and increase the client `--timeout` if needed.
 
 ## Appendix: Third-party Driver Debug Symbol Compilation Guide (mlx5_core example)
 
@@ -684,7 +252,7 @@ When analyzing vmcores involving third-party drivers (e.g., Mellanox NIC drivers
 
 ### 1. Environment Preparation
 
-Install driver source package and corresponding kernel development package:
+Install the driver source package and corresponding kernel development package:
 
 ```bash
 # Install Mellanox driver source
@@ -694,41 +262,39 @@ rpm -ivh mlnx-ofa_kernel-source-5.8-OFED.5.8.3.0.7.1.rhel8u4.x86_64.rpm
 rpm -ivh --oldpackage kernel-devel-4.18.0-305.130.1.el8.x86_64.rpm
 ```
 
-### 2. Compile Module with Debug Information
+### 2. Compile the module with debug information
 
-Enter source directory and configure compilation options:
+Enter the source directory and configure the build:
 
 ```bash
 cd /usr/src/ofa_kernel-5.8/source
 
-# Configure compilation options: enable debug info, specify kernel source path
+# Enable debug info and specify the kernel source path
 ./configure --with-debug-info --with-mlx5-mod \
                  --kernel-sources /usr/src/kernels/4.18.0-305.130.1.el8_4.x86_64 \
                  --cache-file=my_config.cache
 
-# Execute compilation
+# Build
 make -j$(nproc)
 ```
 
-### 3. Verify Debug Symbols
+### 3. Verify debug symbols
 
-After compilation, verify if the module contains debug information:
+After compilation, verify that the module contains debug information:
 
 ```bash
-# 1. Check if debug section exists
+# 1. Check for debug sections
 readelf -S drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.ko | grep debug
 
-# 2. Try disassembling to export source code (verify source association)
+# 2. Disassemble and include source, when available
 objdump -S -d drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.ko > mlx5_debug.asm
 
-# 3. Use tool script to verify symbol resolution
-./tools/show_first_global_func.sh /usr/src/ofa_kernel-5.8/source/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.ko
+# 3. Verify symbol resolution with the project helper
+# Run from the repository root
+cd /path/to/ai-app-hub
+bash vmcore-analysis-agent/tools/show_first_global_func.sh /usr/src/ofa_kernel-5.8/source/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.ko
 ```
 
-## Contribution Guidelines
+## Contributing and license
 
-Issues and Pull Requests are welcome to improve the project.
-
-## License
-
-MIT License
+Issues and pull requests are welcome. The existing project documentation identifies the license as MIT; include the corresponding license text in distributions.

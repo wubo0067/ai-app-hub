@@ -168,9 +168,10 @@ def _convergence_guard_error(state: AgentState, lines: List[str]) -> str | None:
         f"root_cause_class={state.get('current_root_cause_class')} is established and every "
         f"mandatory gate is closed, and the last "
         f"{state.get('no_progress_streak', 0)} actions produced no new evidence. This read-only "
-        f"value probe cannot strengthen the conclusion: bytes inside memory already proven to be "
-        f"corruption payload are the payload, not live state, so their protocol semantics can "
-        f"never be recovered from the vmcore. Emit the final JSON conclusion now "
+        f"value probe cannot strengthen the conclusion: an isolated overwritten scalar is payload, "
+        f"not live state. If the evidence already in hand contains at least two aligned records "
+        f"with a coherent documented protocol template, evaluate that template under the "
+        f"corrupted-payload exception. Emit the final JSON conclusion now "
         f"(is_conclusive=true, confidence=\"low\" is acceptable, action=null) and record the "
         f"residual unknown in final_diagnosis.detailed_analysis."
     )

@@ -269,11 +269,12 @@ def _build_replan_probe_menu(state: AgentState) -> list[str]:
             f"- TERMINATE ON THIS TURN: root_cause_class={root_cause_class} is set and every mandatory "
             f"gate for signature_class={signature_class} is closed. No further crash command can strengthen "
             f"this conclusion, so do not issue another read-only probe (rd/struct/dis/log/irq/sym). "
-            f"Decoding what an overwritten value 'means' (e.g. reading a corrupted field as an IRQ number, "
-            f"device id or flag) is NOT a prerequisite for concluding: bytes inside memory already proven "
-            f"to be corruption payload are the payload, not live state, and their protocol semantics can "
-            f"never be recovered from the vmcore. Emit the final JSON now with confidence=\"low\" and record "
-            f"the residual unknown in final_diagnosis.detailed_analysis."
+            f"Decoding one overwritten scalar is NOT a prerequisite for concluding: an isolated corrupted "
+            f"value is payload, not live state. If the evidence already in hand contains at least two "
+            f"aligned records with a coherent documented protocol template, evaluate that template under "
+            f"the corrupted-payload exception before finalizing; otherwise emit the final JSON now with "
+            f"confidence=\"low\" and record the residual unknown in "
+            f"final_diagnosis.detailed_analysis."
         )
     elif root_cause_class:
         lines.append(
@@ -508,8 +509,17 @@ def _select_sop_fragments(state: AgentState, recent_text: str) -> list[str]:
         "closed",
         "n/a",
     }
+    evidence_facts = state.get("evidence_facts") or []
+    has_page_or_string_candidate = any(
+        fact.startswith("rd_ascii:") for fact in evidence_facts
+    ) and any(fact.startswith("vtop_phys:") for fact in evidence_facts)
+    has_driver_storm = any(
+        token in lowered_recent_text
+        for token in ("log_info", "sense pool", "reply_dma", "mpi2", "protocol frame")
+    )
 
-    # DMA 相关风险在中后期满足门控/关键词证据时优先提示。
+    # DMA 相关风险在中后期满足门控/关键词/结构化候选时优先提示。
+    # 这里的候选事实只负责路由到 SOP，不负责闭合 external gate。
     if (
         signature_class in {"pointer_corruption", "use_after_free"}
         and step_count >= 10
@@ -518,6 +528,8 @@ def _select_sop_fragments(state: AgentState, recent_text: str) -> list[str]:
             or (dma_gate_open and local_exclusion_ready)
             or "dma" in lowered_recent_text
             or "iommu" in lowered_recent_text
+            or has_page_or_string_candidate
+            or has_driver_storm
         )
     ):
         fragments.append(SOP_FRAGMENTS["dma_corruption"])

@@ -19,14 +19,12 @@ _BROAD_ASCII_GREP_RE = re.compile(
 _FORBIDDEN_EXPR_RE = re.compile(
     r"\$\(|\$\(\(|\$[A-Za-z_][A-Za-z0-9_]*|%[A-Za-z0-9]+:|\(%[A-Za-z0-9]+\)|%rip\+|\$r[A-Za-z0-9]+"
 )
-# 地址算术运算模式检测，要求在执行前解析地址计算
-_ADDRESS_ARITHMETIC_RE = re.compile(
-    r"^(?:rd|ptov|vtop|struct|sym|kmem|search|dis|p(?:\s+/x|/x)?)\b.*"
-    r"(?:0x[0-9A-Fa-f]+|\b[0-9A-Fa-f]{8,}\b|[A-Za-z_][A-Za-z0-9_]*)"
-    r"(?:\s*[+-]\s*)"
-    r"(?:0x[0-9A-Fa-f]+|\d+|[A-Za-z_][A-Za-z0-9_]*)"
+# 地址算术运算检测：只检查单个操作数 token 内部的 "地址 +/- 偏移"。
+# 不能在整行上匹配 "十六进制 - 选项/标识符"，否则 search -s <start> -e <end> <value>
+# 会把 -e 误判成减法，直接拒绝合法的 bounded search。
+_ADDRESS_ARITHMETIC_TOKEN_RE = re.compile(
+    r"^(?:0x)?[0-9A-Fa-f]{8,}(?:[+-](?:0x)?[0-9A-Fa-f]+)$"
 )
-_KMEM_S_CACHE_NAME_RE = re.compile(r"^kmem\s+-S\s+[A-Za-z_][A-Za-z0-9_-]*$")
 # 反汇编行匹配：提取指令部分
 _DISASM_LINE_RE = re.compile(r"^\s*0x[0-9a-fA-F]+\s+<[^>]+>:\s+(?P<inst>.+)$")
 # 寄存器间 mov 指令匹配：追踪寄存器别名关系
@@ -53,6 +51,20 @@ def _collapse_whitespace(text: str) -> str:
         规范化后的字符串
     """
     return " ".join(text.strip().split())
+
+
+def _has_unresolved_address_arithmetic(command_line: str) -> bool:
+    """Return True only for a concrete address arithmetic operand.
+
+    ``search -s <start> -e <end> <value>`` is a valid bounded scan: the ``-e``
+    token is an option, not subtraction.  Checking each whitespace-delimited
+    token avoids that false positive while still rejecting ``addr+0x10`` and
+    ``addr-0x10`` operands that crash cannot evaluate.
+    """
+    for token in command_line.split():
+        if _ADDRESS_ARITHMETIC_TOKEN_RE.fullmatch(token):
+            return True
+    return False
 
 
 def canonicalize_command_line(command_line: str) -> str:
@@ -374,9 +386,7 @@ def _validate_command_line(command_line: str, *, allow_bt_a: bool) -> str | None
     # 地址算术只检查首个 pipe 之前的 crash 命令主体，避免把 grep tail
     # 中的选项或模式误判成 "identifier - identifier" 一类算术表达式。
     arithmetic_target = normalized.split("|", 1)[0].strip()
-    if not _KMEM_S_CACHE_NAME_RE.fullmatch(
-        arithmetic_target
-    ) and _ADDRESS_ARITHMETIC_RE.search(arithmetic_target):
+    if _has_unresolved_address_arithmetic(arithmetic_target):
         return f"address arithmetic must be resolved before execution: {normalized}"
 
     rd_ss_error = _validate_rd_ss_command(normalized)

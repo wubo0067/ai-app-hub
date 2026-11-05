@@ -19,6 +19,10 @@ _VTOP_UNMAPPED_RE = re.compile(
     rf"^\s*(?P<address>{_HEX})\s+\(not mapped\)\s*$",
     re.IGNORECASE,
 )
+_VTOP_MAPPED_RE = re.compile(
+    rf"^\s*(?P<virtual>{_HEX})\s+(?P<physical>{_HEX})\s*$",
+    re.IGNORECASE,
+)
 _VTOP_PTE_RE = re.compile(
     rf"^\s*PTE:\s*(?:{_HEX}\s*=>\s*)?(?P<value>{_HEX})\s*$",
     re.IGNORECASE,
@@ -68,7 +72,8 @@ def gate_completion_criteria(
     if gate_name == "external_corruption_gate":
         return [
             "the executor rule requires local_corruption_exclusion to be verified and an "
-            "external_source fact, but extraction of external_source facts is not implemented"
+            "external_source fact, but extraction of external_source facts is not implemented; "
+            "a protocol-template decode alone therefore cannot close this optional gate"
         ]
     criteria = _GATE_COMPLETION_CRITERIA.get(gate_name)
     if criteria is not None:
@@ -484,6 +489,44 @@ def _command_lines(tool_name: str, raw_args: Any) -> list[str]:
     return [line.strip() for line in str(script).splitlines() if line.strip()]
 
 
+def _extract_ascii_facts(byte_map: Mapping[int, int]) -> set[str]:
+    """Extract bounded printable-string facts from reconstructed ``rd`` bytes."""
+    facts: set[str] = set()
+    ordered = sorted(byte_map)
+    if not ordered:
+        return facts
+
+    max_strings = 8
+    index = 0
+    while index < len(ordered) and len(facts) < max_strings:
+        run_start = ordered[index]
+        run = bytearray()
+        previous = run_start
+        while index < len(ordered):
+            address = ordered[index]
+            if address != previous + 1:
+                if run:
+                    break
+                run_start = address
+            byte = byte_map[address]
+            if 0x20 <= byte <= 0x7E:
+                run.append(byte)
+            else:
+                if len(run) >= 8:
+                    facts.add(
+                        f"rd_ascii:0x{run_start:x}={run.decode('ascii')}"
+                    )
+                    if len(facts) >= max_strings:
+                        return facts
+                run = bytearray()
+                run_start = address + 1
+            previous = address
+            index += 1
+        if len(run) >= 8:
+            facts.add(f"rd_ascii:0x{run_start:x}={run.decode('ascii')}")
+    return facts
+
+
 def _parse_rd(output: str) -> set[str]:
     """
     解析 ``rd``（内存读取）命令的输出并提取事实（facts）。
@@ -495,7 +538,9 @@ def _parse_rd(output: str) -> set[str]:
 
     该函数将每个字与其所在地址关联，生成格式为
     ``rd_word:0x<address>=0x<value>`` 的事实。由于 64 位内核中每个字占 8 字节，
-    第 index 个字的地址为 ``起始地址 + index * 8``。
+    第 index 个字的地址为 ``起始地址 + index * 8``。连续原始内存中长度不少于
+    8 的可打印字符串还会生成 ``rd_ascii:0x<address>=<text>`` 事实，作为字符串
+    线索，不代表协议语义已被验证。
 
     Args:
         output (str): ``rd`` 命令的标准输出字符串。
@@ -504,6 +549,7 @@ def _parse_rd(output: str) -> set[str]:
         set[str]: 包含提取出的内存字事实的集合。
     """
     facts: set[str] = set()
+    byte_map: dict[int, int] = {}
     for line in output.splitlines():
         # 匹配 "地址: 数据..." 格式的行，例如 "ffff0000: 0000000000000010 ..."
         match = _RD_LINE_RE.match(line)
@@ -521,7 +567,13 @@ def _parse_rd(output: str) -> set[str]:
         # 每个字按其实际内存地址（起始地址 + 序号*8字节）记录一条事实，
         # 数值统一规范化为十六进制输出
         for index, word in enumerate(words):
-            facts.add(f"rd_word:0x{address + index * 8:x}=0x{_to_int(word):x}")
+            value = _to_int(word)
+            facts.add(f"rd_word:0x{address + index * 8:x}=0x{value:x}")
+            if value < (1 << 64):
+                for offset, byte in enumerate(value.to_bytes(8, "little")):
+                    byte_map[address + index * 8 + offset] = byte
+    # ASCII 只作为可读字符串线索；协议语义仍需按文档 bit layout 解码。
+    facts.update(_extract_ascii_facts(byte_map))
     return facts
 
 
@@ -621,6 +673,8 @@ def _parse_vtop(output: str) -> set[str]:
        说明该虚拟地址在当前页表中没有对应的物理页。
     2. 页表项（PTE）值 → 生成 ``vtop_pte:0x<value>`` 事实，
        记录该地址对应的页表项内容（可用于判断页面权限、有效性等）。
+    3. 已映射地址 → 生成 ``vtop_phys:0x<virtual>=0x<physical>`` 事实，
+       供 Slab 页边界和 4KB 对齐分析使用。
 
     Args:
         output (str): ``vtop`` 命令的标准输出字符串。
@@ -636,6 +690,13 @@ def _parse_vtop(output: str) -> set[str]:
             # 将地址转换为整数后以十六进制规范化输出
             address = _to_int(unmapped.group("address"))
             facts.add(f"vtop_unmapped:0x{address:x}")
+            continue
+
+        mapped = _VTOP_MAPPED_RE.match(line)
+        if mapped:
+            virtual = _to_int(mapped.group("virtual"))
+            physical = _to_int(mapped.group("physical"))
+            facts.add(f"vtop_phys:0x{virtual:x}=0x{physical:x}")
             continue
 
         # 尝试匹配 PTE 行，例如 "PTE: 0x123456789" 或 "PTE: 0x123 => 0x456"
@@ -712,7 +773,9 @@ def _fact_supports_gate(fact: str, gate_name: str) -> bool:
     if gate_name == "register_provenance":
         return fact.startswith(("rd_word:", "dis_", "sym:", "vtop_"))
     if gate_name == "local_corruption_exclusion":
-        return fact.startswith(("dis_", "rd_word:", "vtop_", "kmem_"))
+        return fact.startswith(
+            ("dis_", "rd_word:", "rd_ascii:", "vtop_", "kmem_")
+        )
     if gate_name == "field_type_classification":
         return fact.startswith(("struct_", "sym:"))
     if gate_name == "object_lifetime":
@@ -720,7 +783,9 @@ def _fact_supports_gate(fact: str, gate_name: str) -> bool:
     if gate_name == "external_corruption_gate":
         return fact.startswith("external_source:")
     # 兜底：未知门控接受所有已知前缀的事实
-    return fact.startswith(("rd_word:", "struct_", "dis_", "sym:", "vtop_", "kmem_"))
+    return fact.startswith(
+        ("rd_word:", "rd_ascii:", "struct_", "dis_", "sym:", "vtop_", "kmem_")
+    )
 
 
 def _to_int(value: str) -> int:

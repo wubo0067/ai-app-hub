@@ -33,7 +33,7 @@ Use this guide as part of {S1_S5_DMA_GATE_RULE} In this file, S1 mainly covers i
 - Validate task_struct, thread_info, kernel stack, and driver-private objects before escalating to external corruption.
 - For pointer-corruption branches, explicitly rule in or rule out stack overflow, UAF, struct overwrite, and hardware error before naming DMA.
 - Repeated abnormal 8-byte value patterns across nearby fields are corruption fingerprints. Compare neighboring fields and explain the pattern before escalating to DMA or generic wild-pointer language.
-- If vmcore-dmesg shows recurring driver reset or discovery messages immediately before the crash, analyze that timing as a possible reinitialization or race window affecting the corrupted object.
+- If vmcore-dmesg shows recurring driver reset or discovery messages immediately before the crash, treat that driver as a temporal writer CANDIDATE, not as a proven cause. If the crash task is a periodic poller and the storm falls within one polling period, explicitly run the protocol, device-ownership, or DMA-range checks needed to promote or reject the candidate; do not dismiss it as unrelated temporal context before those checks.
 """.strip()
 
 
@@ -130,7 +130,7 @@ Analysis:
 - If a driver or third-party module is on the crash path, validate the full driver object shape before escalating to external corruption.
 - If the bad value came from a concrete load like mov 0x10(%r13), %rcx, the next validation target is the r13-based object, not a different argument register.
 - If nearby fields repeat a suspicious high-bit prefix or bus-address-like pattern, preserve that as a corruption fingerprint and test it explicitly instead of hand-waving it as "looks physical".
-- If a guessed struct name fails on a module-private object, stop guessing protocol-layer types and switch to module-symbol loading plus raw-object validation.
+- If a guessed private struct name fails on a module-private object, stop guessing private C type names and switch to module-symbol loading plus raw-object validation. This does not forbid a manual, documented protocol-header decode of aligned repeated records; it forbids inventing a private C layout from resemblance alone.
 
 ### Corruption Mechanism Gate (mandatory before setting final_root_cause)
 

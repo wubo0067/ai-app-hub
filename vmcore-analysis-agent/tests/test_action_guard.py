@@ -75,6 +75,28 @@ class StructDotSyntaxGuardTests(unittest.TestCase):
             _validate_command_line("bt -f ffff888100000000", allow_bt_a=False)
         )
 
+    def test_bounded_search_options_are_not_address_arithmetic(self) -> None:
+        # search -s/-e 是合法的 bounded scan；不能把 -e 当成减法。
+        self.assertIsNone(
+            _validate_command_line(
+                "search -s ff292187ae124000 -e ff292187ae125fff "
+                "ffffffffc051f1e0",
+                allow_bt_a=False,
+            )
+        )
+        self.assertIsNone(
+            _validate_command_line(
+                "search -s 0x100 -e 0x200 0xdead", allow_bt_a=False
+            )
+        )
+
+    def test_inline_address_arithmetic_is_still_rejected(self) -> None:
+        err = _validate_command_line(
+            "rd -x ff292187ae124a80+0x10 8", allow_bt_a=False
+        )
+        self.assertIsNotNone(err)
+        self.assertIn("address arithmetic must be resolved", err or "")
+
 
 if __name__ == "__main__":
     unittest.main()
